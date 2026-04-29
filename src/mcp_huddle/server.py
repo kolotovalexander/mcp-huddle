@@ -1,7 +1,7 @@
-"""Agent Bus — FastMCP server on :8014.
+"""mcp-huddle — FastMCP server. Persistent multi-agent chat rooms.
 
-Exposes MCP tools for room management, messaging, status, and consensus.
-Also serves a web dashboard at http://127.0.0.1:8014/dashboard.
+Stdio mode (default): JSON-RPC over stdin/stdout for MCP clients.
+HTTP mode (`--http`): uvicorn + Liquid Glass dashboard on :8014.
 """
 
 import asyncio
@@ -16,7 +16,79 @@ from starlette.responses import FileResponse, JSONResponse
 from . import bus
 from . import spawn
 
-mcp = FastMCP("mcp-huddle")
+# Shown to LLM clients in the `initialize` response. Keep tight — every agent
+# session sees this verbatim. Goal: stop one-shot misuse, enforce anti-loop.
+_AGENT_INSTRUCTIONS = """\
+Persistent multi-agent chat rooms. Use to coordinate decisions ACROSS multiple
+agents (e.g. Claude + Codex + Gemini reviewing the same architectural choice).
+
+WHEN TO USE A ROOM (vs. answering directly or calling a one-shot advisor):
+- multi-step design / architecture decision with real trade-offs
+- code review needing clarifying questions back-and-forth
+- multi-file refactor where you want independent perspectives
+- consensus required (will use propose_resolution + resolution_vote)
+
+WHEN NOT TO USE A ROOM:
+- single factual lookup (just answer)
+- single-shot critique (use codex exec / gemini -p instead)
+- you already have enough context to act
+
+INVITING OTHER AGENTS:
+1. `room_create(name, owner=YourAgentName, owner_pid=PID, cwd=PROJECT,
+   session_id=SESSION, auto_spawn=True, goal="<short description>")`
+   spawns Codex + Gemini automatically if those CLIs are on PATH.
+2. If auto_spawn isn't available (binaries missing or you want a different
+   roster), shell out yourself with the room_id + brief, e.g.
+   `codex exec --dangerously-bypass-approvals-and-sandbox "Join huddle room
+   <ROOM_ID>: <task>. Read messages_read first, then post."` and same for
+   `gemini -y -p "..."`. Then call `room_invite(room_id, "Codex")` /
+   `room_invite(room_id, "Gemini")` so they appear in participants.
+3. Prefer auto_spawn unless you specifically need a non-default agent.
+
+ANTI-LOOP PROTOCOL (CRITICAL — without this rooms turn into infinite chat):
+- Reply ONLY to `kind=request` addressed to you (`to=YourName` or `to=all`).
+- NEVER reply to a `kind=request` that has `reply_to` set — that message is
+  already someone's answer, not a new task for you.
+- For `kind` in (`comment`, `ack`, `busy`, `result`, `final`, `system`,
+  `close`): READ ONLY, do not respond.
+- Track `reply_to` IDs you already answered locally; never answer twice.
+- The server has a circuit breaker that hard-blocks >5 messages-in-a-row from
+  the same agent without new requests — if you hit it, you're in a loop.
+
+DELTA READS (token efficiency):
+- Store last message id you saw; call `messages_read(room_id,
+  since_id=last_seen)` next turn — only new messages.
+- After a long absence, prefer `room_summarize(room_id, since_id=last_seen)`.
+
+KIND ENUM (vital — wrong kind breaks anti-loop):
+- `request`: a question/task expecting a reply (auto-notifies addressee)
+- `comment`: observation, no reply expected
+- `ack`: "received, working on it"
+- `busy`: "occupied, will reply later"
+- `result`: delivering output (set `to` = originator)
+- `final`: orchestrator's closing word, nobody replies
+- `system`: highest priority, agent="Human" only (or override)
+- `close`: room is closing
+
+CONSENSUS:
+- After agents converge, anyone calls `propose_resolution(room_id, agent,
+  text)` → all participants vote `ack`/`reject` via `resolution_vote(...)`.
+- All-ack → room becomes `resolved` (read-only for normal messages).
+
+CLOSE PROTOCOL (never close silently — humans want a heads-up):
+1. `room_request_close(room_id, agent)` — sets status to `closing_requested`.
+2. ASK THE USER explicitly: "Закрываем чат '<name>'?" (or in their language).
+3. On user yes → `room_close(room_id, owner)` — only the owner can do this.
+
+STORAGE: ~/.mcp-huddle/rooms/{room_id}/ (JSONL + meta.json, file-locked,
+shared across all agents on this machine).
+
+DASHBOARD: run `mcp-huddle --http` separately to watch rooms in browser
+at http://127.0.0.1:8014/dashboard. Humans can post `kind=system` messages
+that bypass anti-loop rules.
+"""
+
+mcp = FastMCP("mcp-huddle", instructions=_AGENT_INSTRUCTIONS)
 
 
 # ── Room tools ────────────────────────────────────────────────────────────────
