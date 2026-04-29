@@ -8,12 +8,14 @@ import fcntl
 import json
 import os
 import signal
+import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Optional
 
-BUS_DIR = Path.home() / ".mcp-huddle" / "rooms"
+HUDDLE_HOME = Path(os.environ.get("MCP_HUDDLE_HOME", Path.home() / ".mcp-huddle"))
+BUS_DIR = HUDDLE_HOME / "rooms"
 CIRCUIT_BREAKER_WINDOW = 10   # last N messages to check
 CIRCUIT_BREAKER_LIMIT = 5     # max consecutive from same agent (non-request kinds)
 DEADLOCK_TIMEOUT_SECS = 180   # 3 minutes of silence → system message
@@ -117,6 +119,8 @@ def post_message(room_id: str, agent: str, body: str, kind: str,
     meta = _read_meta(room_id)
     if meta["status"] == "closed":
         raise ValueError("Room is closed.")
+    if meta["status"] == "resolved" and kind not in ("system", "close"):
+        raise ValueError("Room is resolved and read-only.")
 
     # Human override bypasses circuit breaker
     if agent != "Human" and kind not in ("request", "system"):
@@ -359,7 +363,7 @@ def _read_meta(room_id: str) -> dict:
 
 
 def _write_json(path: Path, data: dict) -> None:
-    tmp = path.with_suffix(".tmp")
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
     tmp.replace(path)
 
@@ -423,6 +427,8 @@ class _lock:
 
     def __exit__(self, *_):
         if self._fh:
+            self._fh.flush()
+            os.fsync(self._fh.fileno())
             fcntl.flock(self._fh, fcntl.LOCK_UN)
             self._fh.close()
 

@@ -266,7 +266,7 @@ async def api_message_post(request: Request) -> JSONResponse:
     try:
         msg_id = bus.post_message(
             data["room_id"], data["agent"], data["body"], data["kind"],
-            data.get("to"), data.get("reply_to"),
+            data.get("to"), data.get("reply_to"), data.get("idempotency_key"),
         )
         return JSONResponse({"id": msg_id})
     except Exception as e:
@@ -355,5 +355,4 @@ def build_app():
 
     app.router.lifespan_context = combined_lifespan
     return app
-
 

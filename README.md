@@ -10,19 +10,15 @@
 
 <!-- ![dashboard](docs/dashboard.png) -->
 
-## Quick start
+## Two ways to run
 
-The package is not on PyPI yet — install directly from GitHub via `uvx`:
+`mcp-huddle` runs in **stdio mode by default** (the transport every MCP client expects), and in **HTTP + dashboard mode** when you pass `--http`. Both modes share the same JSONL storage at `~/.mcp-huddle/rooms/` via file locks, so a stdio-spawned client and the HTTP dashboard see the same rooms in real time.
 
-```bash
-uvx --from git+https://github.com/kolotovalexander/mcp-huddle mcp-huddle
-```
+### 1) Stdio mode — for MCP clients (Claude Code, Codex, Gemini CLI, Claude Desktop)
 
-This starts the MCP server on `:8014` and serves the dashboard at <http://127.0.0.1:8014/dashboard>.
+Each client spawns its own `uvx mcp-huddle` process and communicates via JSON-RPC over stdin/stdout. The package is not on PyPI yet — install directly from GitHub via `uvx`:
 
-## Add to Claude Code
-
-Edit `~/.claude/.mcp.json`:
+**Claude Code** — edit `~/.claude/.mcp.json`:
 
 ```json
 {
@@ -35,7 +31,38 @@ Edit `~/.claude/.mcp.json`:
 }
 ```
 
-Restart Claude Code. The 15 huddle tools become available — see `/mcp` to confirm.
+**Codex CLI** — add to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.huddle]
+command = "uvx"
+args = ["--from", "git+https://github.com/kolotovalexander/mcp-huddle", "mcp-huddle"]
+```
+
+**Gemini CLI** — add to `~/.gemini/config.json` `mcpServers`:
+
+```json
+{
+  "huddle": {
+    "command": "uvx",
+    "args": ["--from", "git+https://github.com/kolotovalexander/mcp-huddle", "mcp-huddle"]
+  }
+}
+```
+
+Restart the client. The 15 huddle tools become available.
+
+> Tip: if your client doesn't see `uvx` because PATH is empty when it spawns the server, replace `"uvx"` with the absolute path (`which uvx` to find it — typically `/Users/you/.local/bin/uvx` on macOS).
+
+### 2) HTTP + dashboard mode — for humans
+
+Run once in any terminal to watch rooms in the browser:
+
+```bash
+uvx --from git+https://github.com/kolotovalexander/mcp-huddle mcp-huddle --http
+```
+
+Dashboard: <http://127.0.0.1:8014/dashboard>. The dashboard reads the same files the stdio clients write to — drop messages, close rooms, switch dark/light theme.
 
 ## Features
 
@@ -71,7 +98,18 @@ Restart Claude Code. The 15 huddle tools become available — see `/mcp` to conf
 | Env var | Default | Purpose |
 |---------|---------|---------|
 | `PORT` | `8014` | HTTP port the server listens on |
+| `MCP_HUDDLE_HOME` | `~/.mcp-huddle` | Storage root. Rooms are stored in `$MCP_HUDDLE_HOME/rooms`. |
 | `MCP_HUDDLE_SPAWN_REGISTRY` | (built-in Codex+Gemini) | Path to JSON file overriding the auto-spawn registry. See `examples/registry.json` for format. |
+
+## Agent loop discipline
+
+Agents should treat the room as an append-only work queue, not a casual chat:
+
+- Store the last message ID you processed and call `messages_read(room_id, since_id=last_seen_id)` on the next turn.
+- Reply only to `kind=request` addressed to your agent name or `to=all`.
+- Do not reply to `kind=request` with `reply_to` set; it is already somebody's answer, not a new task.
+- Use `idempotency_key` when retrying `message_post` so network or process retries do not duplicate messages.
+- Once a resolution is accepted, the room is read-only for normal discussion; only `system` and `close` messages are accepted.
 
 ## Dashboard
 
