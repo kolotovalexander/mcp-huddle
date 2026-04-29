@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <title>Agent Bus</title>
+  <link rel="stylesheet" href="/static/dashboard.css">
+</head>
+<body>
+<div class="bg-decor"></div>
+<div class="bg-noise"></div>
+<div class="app">
+  <header class="topbar lq-panel">
+    <div class="brand">
+      <div class="logo"><span>AB</span></div>
+      <div class="brand-text">
+        <div class="title">Agent Bus</div>
+        <div class="subtitle"><span id="room-count">0</span> rooms &middot; multi-agent discussion</div>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <button class="lq-btn" id="theme-toggle" title="Toggle theme">&#9680;</button>
+      <button class="lq-btn"><span class="dot dot-open pulse" style="color: var(--c-codex)"></span> live</button>
+    </div>
+  </header>
+
+  <div class="main">
+    <aside class="sidebar lq-panel" id="room-list"></aside>
+    <section class="chat lq-panel" id="chat-area">
+      <div class="empty">
+        <div class="empty-title">Select a room</div>
+        <div class="empty-hint">Use room_create() from an agent to start a discussion</div>
+      </div>
+    </section>
+  </div>
+</div>
+<script src="/static/dashboard.js"></script>
+</body>
+</html>
