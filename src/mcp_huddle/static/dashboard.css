@@ -444,3 +444,72 @@
     [data-theme="light"] .messages::-webkit-scrollbar-thumb {
       background: rgba(0,0,0,0.10);
     }
+
+    /* ── Phase 1: Agent activity panels (live event stream) ───────── */
+    .agent-panels {
+      margin: 8px 12px 12px;
+      display: flex; flex-direction: column; gap: 6px;
+      border-top: 1px solid var(--border);
+      padding-top: 10px;
+    }
+    .agent-panels-header {
+      font-size: 11px; color: var(--text-sub);
+      text-transform: uppercase; letter-spacing: 0.06em;
+      padding: 0 4px 4px;
+    }
+    .agent-panel {
+      background: rgba(255,255,255,0.02);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .agent-panel[open] {
+      background: rgba(255,255,255,0.03);
+    }
+    [data-theme="light"] .agent-panel {
+      background: rgba(0,0,0,0.02);
+    }
+    [data-theme="light"] .agent-panel[open] {
+      background: rgba(0,0,0,0.03);
+    }
+    .agent-panel-summary {
+      display: flex; align-items: center; gap: 8px;
+      padding: 8px 10px;
+      cursor: pointer;
+      list-style: none;
+      font-size: 12px;
+    }
+    .agent-panel-summary::-webkit-details-marker { display: none; }
+    .agent-panel-name {
+      font-weight: 600;
+      color: var(--text);
+    }
+    .agent-panel-status {
+      margin-left: auto;
+      font-size: 10px;
+      color: var(--text-sub);
+      font-family: ui-monospace, monospace;
+    }
+    .agent-events {
+      max-height: 180px;
+      overflow-y: auto;
+      padding: 6px 10px 8px;
+      font-family: ui-monospace, "SF Mono", Consolas, monospace;
+      font-size: 11px;
+      line-height: 1.4;
+      color: var(--text-sub);
+    }
+    .agent-event {
+      padding: 1px 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      cursor: help;
+    }
+    .agent-event:hover {
+      color: var(--text);
+      background: rgba(255,255,255,0.04);
+    }
+    [data-theme="light"] .agent-event:hover {
+      background: rgba(0,0,0,0.04);
+    }

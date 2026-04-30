@@ -159,9 +159,97 @@ async function openRoom(id, owner) {
   currentOwner = owner;
   lastId = 0;
   msgMap = {};
+  closeAgentStreams();  // tear down EventSources from previous room
   renderRooms();
   buildChatShell(rooms.find(x => x.id === id) || {id});
   await fetchMessages(true);
+  await attachAgentPanels(id);  // Phase 1: live Codex/Gemini event stream
+}
+
+// ── Phase 1: agent live event panels ─────────────────────────────────────────
+
+let agentStreams = {};  // {agentName: EventSource}
+
+function closeAgentStreams() {
+  for (const k in agentStreams) {
+    try { agentStreams[k].close(); } catch(e) {}
+  }
+  agentStreams = {};
+}
+
+async function attachAgentPanels(roomId) {
+  let resp;
+  try {
+    resp = await fetch('/api/room_agents?room_id=' + encodeURIComponent(roomId));
+  } catch(e) { return; }
+  if (!resp.ok) return;
+  const {agents} = await resp.json();
+  if (!agents || Object.keys(agents).length === 0) return;
+
+  const chat = document.getElementById('chat-area');
+  if (!chat) return;
+
+  const wrap = el('div', {class: 'agent-panels', id: 'agent-panels'});
+  const header = el('div', {class: 'agent-panels-header', text: 'Agent activity (live)'});
+  wrap.appendChild(header);
+
+  for (const name of Object.keys(agents)) {
+    const panel = el('details', {class: 'agent-panel', dataset: {agent: name}, open: ''}, [
+      el('summary', {class: 'agent-panel-summary'}, [
+        avatar(name, 'avatar-sm'),
+        el('span', {class: 'agent-panel-name', text: name}),
+        el('span', {class: 'agent-panel-status', id: `agent-status-${name}`, text: '·'}),
+      ]),
+      el('div', {class: 'agent-events', id: `agent-events-${name}`}),
+    ]);
+    wrap.appendChild(panel);
+
+    const url = `/agents/${encodeURIComponent(roomId)}/${encodeURIComponent(name)}/events`;
+    const es = new EventSource(url);
+    es.addEventListener('open', () => {
+      const s = document.getElementById(`agent-status-${name}`);
+      if (s) s.textContent = '● live';
+    });
+    es.addEventListener('error', () => {
+      const s = document.getElementById(`agent-status-${name}`);
+      if (s) s.textContent = '× closed';
+    });
+    es.onmessage = (ev) => appendAgentEvent(name, ev.data);
+    agentStreams[name] = es;
+  }
+
+  chat.appendChild(wrap);
+}
+
+function appendAgentEvent(agentName, raw) {
+  const list = document.getElementById(`agent-events-${agentName}`);
+  if (!list) return;
+  let summary = raw;
+  let detail = null;
+  try {
+    const obj = JSON.parse(raw);
+    // Codex --json events: {type, agent_message?, delta?, ...}
+    // Gemini stream-json: {type, content?, ...}
+    if (obj.type) {
+      summary = obj.type;
+      if (obj.agent_message) summary += ': ' + String(obj.agent_message).slice(0, 120);
+      else if (obj.delta) summary += ': ' + String(obj.delta).slice(0, 120);
+      else if (obj.content) summary += ': ' + String(obj.content).slice(0, 120);
+      detail = JSON.stringify(obj, null, 2);
+    }
+  } catch(e) {
+    // Not JSON — show as plain text (e.g. stderr lines).
+  }
+  const line = el('div', {class: 'agent-event'}, [
+    el('span', {class: 'agent-event-summary', text: summary}),
+  ]);
+  if (detail) {
+    line.title = detail;
+  }
+  list.appendChild(line);
+  // Auto-scroll: keep last 200 events to avoid runaway DOM.
+  while (list.children.length > 200) list.removeChild(list.firstChild);
+  list.scrollTop = list.scrollHeight;
 }
 
 function renderOne(m) {
