@@ -199,16 +199,21 @@ def codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str,
 
     Appends events to the same log_path so the dashboard SSE keeps streaming.
     Returns PID of the spawned codex exec resume process.
+
+    `codex exec resume` only accepts a small set of options (no -m/-s/-a
+    subcommand-local). Top-level `codex` flags must come BEFORE `exec`.
+    Model + reasoning effort overrides are passed via -c key=value (which
+    `exec resume` does support).
     """
     argv = [
-        "codex", "-a", "never", "exec", "resume", thread_id,
-        "--json",
-        "-m", "gpt-5.4",
+        "codex", "-a", "never",                          # top-level: never auto-approve tool calls
+        "exec", "resume", thread_id,                     # subcommand
+        "--json",                                        # JSONL events to stdout
+        "-c", 'model="gpt-5.4"',                         # config override (resume supports -c)
         "-c", 'model_reasoning_effort="medium"',
-        "-s", "workspace-write",
     ]
     if last_msg_path:
-        argv += ["--output-last-message", last_msg_path]
+        argv += ["-o", last_msg_path]                    # short form of --output-last-message
     argv.append(prompt)
 
     log_file = open(log_path, "ab", buffering=0)
