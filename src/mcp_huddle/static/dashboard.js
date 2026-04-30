@@ -40,14 +40,51 @@ function fmtTime(ts) {
 let currentRoom = null, currentOwner = null, lastId = 0;
 let rooms = [], msgMap = {};
 
-// ── Theme toggle ──────────────────────────────────────────
+// ── Theme: auto (follows OS) | dark | light ────────────────
+// Cycle order: auto → dark → light → auto. Click the moon icon to advance.
+// 'auto' listens to prefers-color-scheme so theme switches when OS does.
+const THEME_CYCLE = ['auto', 'dark', 'light'];
+const THEME_GLYPH = {auto: '🌓', dark: '🌙', light: '☀️'};
+const THEME_LABEL = {auto: 'Auto', dark: 'Dark', light: 'Light'};
+
+function applyTheme(mode) {
+  const html = document.documentElement;
+  if (mode === 'auto') {
+    const dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    html.setAttribute('data-theme', dark ? 'dark' : 'light');
+  } else {
+    html.setAttribute('data-theme', mode);
+  }
+  const btn = document.getElementById('theme-toggle');
+  if (btn) {
+    btn.textContent = THEME_GLYPH[mode];
+    btn.title = `Theme: ${THEME_LABEL[mode]} (click to cycle)`;
+  }
+}
+
 function initTheme() {
-  const saved = localStorage.getItem('agentbus-theme') || 'dark';
-  document.documentElement.setAttribute('data-theme', saved);
+  // Migrate legacy values: only 'dark'/'light' were stored before; treat them
+  // as explicit choices. Anything else (or unset) defaults to 'auto'.
+  const raw = localStorage.getItem('agentbus-theme');
+  let mode = THEME_CYCLE.includes(raw) ? raw : 'auto';
+  applyTheme(mode);
+
+  // Re-apply on OS theme change while in 'auto' mode.
+  const mq = window.matchMedia('(prefers-color-scheme: dark)');
+  const onSysChange = () => {
+    if ((localStorage.getItem('agentbus-theme') || 'auto') === 'auto') {
+      applyTheme('auto');
+    }
+  };
+  if (mq.addEventListener) mq.addEventListener('change', onSysChange);
+  else if (mq.addListener) mq.addListener(onSysChange);  // legacy Safari
+
   document.getElementById('theme-toggle').onclick = () => {
-    const next = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
-    document.documentElement.setAttribute('data-theme', next);
+    const cur = localStorage.getItem('agentbus-theme') || 'auto';
+    const idx = THEME_CYCLE.indexOf(cur);
+    const next = THEME_CYCLE[(idx + 1) % THEME_CYCLE.length];
     localStorage.setItem('agentbus-theme', next);
+    applyTheme(next);
   };
 }
 

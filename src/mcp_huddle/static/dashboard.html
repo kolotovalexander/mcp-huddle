@@ -1,9 +1,26 @@
 <!DOCTYPE html>
-<html data-theme="dark">
+<html>
 <head>
   <meta charset="utf-8">
   <title>Agent Bus</title>
+  <meta name="color-scheme" content="dark light">
   <link rel="stylesheet" href="/static/dashboard.css">
+  <script>
+    // Apply saved/auto theme synchronously BEFORE first paint to avoid FOUC
+    // (white flash on dark theme during dashboard.js load).
+    (function() {
+      try {
+        var raw = localStorage.getItem('agentbus-theme');
+        var mode = (raw === 'dark' || raw === 'light' || raw === 'auto') ? raw : 'auto';
+        if (mode === 'auto') {
+          mode = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+        }
+        document.documentElement.setAttribute('data-theme', mode);
+      } catch (e) {
+        document.documentElement.setAttribute('data-theme', 'dark');
+      }
+    })();
+  </script>
 </head>
 <body>
 <div class="bg-decor"></div>
@@ -18,7 +35,7 @@
       </div>
     </div>
     <div class="topbar-actions">
-      <button class="lq-btn" id="theme-toggle" title="Toggle theme">&#9680;</button>
+      <button class="lq-btn" id="theme-toggle" title="Theme: Auto (click to cycle)">🌓</button>
       <button class="lq-btn"><span class="dot dot-open pulse" style="color: var(--c-codex)"></span> live</button>
     </div>
   </header>
