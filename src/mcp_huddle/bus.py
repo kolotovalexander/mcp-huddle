@@ -93,6 +93,11 @@ def request_close(room_id: str, agent: str) -> str:
 
 def close_room(room_id: str, owner: str) -> None:
     meta = _read_meta(room_id)
+    if meta["status"] == "closed":
+        # Idempotent: уже закрыта. Не добавлять повторный system-message и не
+        # перезаписывать meta.json лишний раз. Дашборд / агенты могут безопасно
+        # дёрнуть room_close ещё раз без побочных эффектов.
+        return
     _kill_spawned(meta)
     _append_system(room_id, "Чат закрыт.")
     meta["status"] = "closed"

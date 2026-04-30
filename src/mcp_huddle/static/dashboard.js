@@ -120,24 +120,54 @@ function buildChatShell(room) {
   const chat = document.getElementById('chat-area');
   chat.innerHTML = '';
 
+  const isClosed = room.status === 'closed';
+  const isReadOnly = isClosed || room.status === 'resolved';
+
+  const titleChildren = [
+    el('span', {class: 'hash', text: '#'}),
+    el('span', {text: room.name || room.id || ''}),
+  ];
+  if (isClosed) {
+    titleChildren.push(el('span', {class: 'kind kind-close', text: 'closed'}));
+  } else if (room.status === 'resolved') {
+    titleChildren.push(el('span', {class: 'kind kind-final', text: 'resolved'}));
+  } else if (room.status === 'closing_requested') {
+    titleChildren.push(el('span', {class: 'kind kind-system', text: 'closing requested'}));
+  }
+
+  const closeBtnAttrs = {class: 'lq-btn danger', id: 'btn-close', text: 'Close'};
+  if (isClosed) {
+    closeBtnAttrs.disabled = '';
+    closeBtnAttrs.title = 'Room is already closed';
+  }
+
   const header = el('div', {class: 'chat-header'}, [
     el('div', {}, [
-      el('div', {class: 'chat-title'}, [
-        el('span', {class: 'hash', text: '#'}),
-        el('span', {text: room.name || room.id || ''}),
-      ]),
+      el('div', {class: 'chat-title'}, titleChildren),
       el('div', {class: 'chat-meta', id: 'chat-meta', text: 'Loading…'}),
     ]),
     el('div', {class: 'topbar-actions'}, [
       el('div', {class: 'avatar-stack', id: 'avatar-stack'}),
-      el('button', {class: 'lq-btn danger', id: 'btn-close', text: 'Close'}),
+      el('button', closeBtnAttrs),
     ]),
   ]);
 
   const messages = el('div', {class: 'messages', id: 'messages'});
 
-  const input = el('input', {id: 'human-inp', type: 'text', placeholder: 'Send as Human — system priority bypasses anti-loop rules…'});
-  const send  = el('button', {class: 'send-btn', id: 'btn-send', text: 'Send ↵'});
+  const inputAttrs = {
+    id: 'human-inp',
+    type: 'text',
+    placeholder: isReadOnly
+      ? (isClosed ? 'Room closed — read-only' : 'Room resolved — read-only')
+      : 'Send as Human — system priority bypasses anti-loop rules…',
+  };
+  if (isReadOnly) inputAttrs.disabled = '';
+  const input = el('input', inputAttrs);
+
+  const sendAttrs = {class: 'send-btn', id: 'btn-send', text: 'Send ↵'};
+  if (isReadOnly) sendAttrs.disabled = '';
+  const send = el('button', sendAttrs);
+
   const inputWrap = el('div', {class: 'input-wrap'}, [
     el('div', {class: 'input-row'}, [
       avatar('Human', 'avatar-sm'),
@@ -149,9 +179,13 @@ function buildChatShell(room) {
   chat.appendChild(messages);
   chat.appendChild(inputWrap);
 
-  document.getElementById('btn-close').onclick = closeRoom;
-  send.onclick = sendMsg;
-  input.onkeydown = e => { if (e.key === 'Enter') sendMsg(); };
+  if (!isClosed) {
+    document.getElementById('btn-close').onclick = closeRoom;
+  }
+  if (!isReadOnly) {
+    send.onclick = sendMsg;
+    input.onkeydown = e => { if (e.key === 'Enter') sendMsg(); };
+  }
 }
 
 async function openRoom(id, owner) {
