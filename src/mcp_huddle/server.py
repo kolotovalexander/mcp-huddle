@@ -152,6 +152,20 @@ def room_close(room_id: str, owner: str) -> str:
 
 
 @mcp.tool()
+def room_delete(room_id: str, owner: str) -> str:
+    """Permanently remove a closed room from disk (history wipe).
+
+    Safety: only allowed on rooms with status == 'closed'. Open or
+    closing_requested rooms must be closed first via room_close().
+
+    Side effects: deletes the entire ~/.mcp-huddle/rooms/<room_id>/ directory,
+    including messages.jsonl, meta.json, agent logs. Cannot be undone.
+    """
+    bus.delete_room(room_id, owner)
+    return "deleted"
+
+
+@mcp.tool()
 def room_close_session(session_id: str) -> list:
     """Close all open rooms belonging to a session (called by Stop hook)."""
     return bus.close_session_rooms(session_id)
@@ -430,6 +444,20 @@ async def api_room_close(request: Request) -> JSONResponse:
     try:
         bus.close_room(data["room_id"], data["owner"])
         return JSONResponse({"status": "closed"})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@mcp.custom_route("/api/room_delete", methods=["POST"])
+async def api_room_delete(request: Request) -> JSONResponse:
+    """Wipe a closed room from disk. Backed by bus.delete_room() — only works
+    on status='closed' rooms (raises ValueError otherwise)."""
+    data = await request.json()
+    try:
+        bus.delete_room(data["room_id"], data["owner"])
+        return JSONResponse({"status": "deleted"})
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=409)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 

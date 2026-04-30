@@ -113,6 +113,29 @@ def close_session_rooms(session_id: str) -> list[str]:
     return closed
 
 
+def delete_room(room_id: str, owner: str) -> None:
+    """Permanently remove a room from disk (history wipe).
+
+    Safety: only allowed on rooms with status == 'closed'. Open rooms must be
+    closed first via close_room() — это защита от случайной потери активного
+    обсуждения.
+
+    Side effects: рекурсивно удаляет ~/.mcp-huddle/rooms/<room_id>/, including
+    messages.jsonl, meta.json, status.json, agents/<name>.events.jsonl.
+    Не убивает spawned PIDs (это делает close_room).
+    """
+    import shutil
+    meta = _read_meta(room_id)
+    if meta["status"] != "closed":
+        raise ValueError(
+            f"Cannot delete room with status '{meta['status']}'. "
+            "Close it first via room_close()."
+        )
+    rdir = _room_dir(room_id)
+    if rdir.exists():
+        shutil.rmtree(rdir)
+
+
 # ── Messages ─────────────────────────────────────────────────────────────────
 
 def post_message(room_id: str, agent: str, body: str, kind: str,

@@ -135,11 +135,11 @@ function buildChatShell(room) {
     titleChildren.push(el('span', {class: 'kind kind-system', text: 'closing requested'}));
   }
 
-  const closeBtnAttrs = {class: 'lq-btn danger', id: 'btn-close', text: 'Close'};
-  if (isClosed) {
-    closeBtnAttrs.disabled = '';
-    closeBtnAttrs.title = 'Room is already closed';
-  }
+  // Closed rooms: show Delete button instead of Close (Close is irrelevant; user
+  // wants either to keep history read-only or wipe the room from disk).
+  const actionBtn = isClosed
+    ? el('button', {class: 'lq-btn danger', id: 'btn-delete', text: 'Delete', title: 'Permanently remove this room from disk'})
+    : el('button', {class: 'lq-btn danger', id: 'btn-close', text: 'Close'});
 
   const header = el('div', {class: 'chat-header'}, [
     el('div', {}, [
@@ -148,7 +148,7 @@ function buildChatShell(room) {
     ]),
     el('div', {class: 'topbar-actions'}, [
       el('div', {class: 'avatar-stack', id: 'avatar-stack'}),
-      el('button', closeBtnAttrs),
+      actionBtn,
     ]),
   ]);
 
@@ -179,7 +179,9 @@ function buildChatShell(room) {
   chat.appendChild(messages);
   chat.appendChild(inputWrap);
 
-  if (!isClosed) {
+  if (isClosed) {
+    document.getElementById('btn-delete').onclick = deleteRoom;
+  } else {
     document.getElementById('btn-close').onclick = closeRoom;
   }
   if (!isReadOnly) {
@@ -424,6 +426,30 @@ async function closeRoom() {
   chat.innerHTML = '';
   chat.appendChild(el('div', {class: 'empty'}, [
     el('div', {class: 'empty-title', text: 'Room closed'}),
+    el('div', {class: 'empty-hint', text: 'Pick another room from the sidebar'}),
+  ]));
+  await loadRooms();
+}
+
+async function deleteRoom() {
+  if (!currentRoom) return;
+  if (!confirm('Permanently delete this room from disk?\n\nAll messages, agent logs and metadata will be lost. This cannot be undone.')) return;
+  closeAgentStreams();
+  const resp = await fetch('/api/room_delete', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({room_id: currentRoom, owner: currentOwner}),
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({error: 'unknown error'}));
+    alert(`Failed to delete: ${err.error || 'unknown error'}`);
+    return;
+  }
+  currentRoom = null;
+  const chat = document.getElementById('chat-area');
+  chat.innerHTML = '';
+  chat.appendChild(el('div', {class: 'empty'}, [
+    el('div', {class: 'empty-title', text: 'Room deleted'}),
     el('div', {class: 'empty-hint', text: 'Pick another room from the sidebar'}),
   ]));
   await loadRooms();
