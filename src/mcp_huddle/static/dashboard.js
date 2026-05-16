@@ -39,6 +39,53 @@ function fmtTime(ts) {
 // ── State ─────────────────────────────────────────────────
 let currentRoom = null, currentOwner = null, lastId = 0;
 let rooms = [], msgMap = {};
+let agentMetaTotals = {}; // {agentName: {tokens_total, tokens_in, tokens_out, msgs, models:Set, last_reasoning}}
+
+function metaBadge(meta) {
+  if (!meta) return null;
+  const parts = [];
+  if (meta.model) parts.push(meta.model);
+  if (meta.reasoning) parts.push('r=' + meta.reasoning);
+  const tokTotal = (meta.tokens_total ?? ((meta.tokens_in || 0) + (meta.tokens_out || 0))) || null;
+  if (tokTotal) parts.push(tokTotal.toLocaleString() + ' tok');
+  if (!parts.length) return null;
+  const span = el('span', {class: 'msg-meta', text: parts.join(' · ')});
+  if (meta.tokens_in || meta.tokens_out) {
+    span.title = `in=${meta.tokens_in||0} out=${meta.tokens_out||0}` +
+                 (meta.duration_ms != null ? ` · ${meta.duration_ms}ms` : '');
+  }
+  return span;
+}
+
+function bumpAgentTotals(agent, meta) {
+  if (!agent || !meta) return;
+  const t = agentMetaTotals[agent] = agentMetaTotals[agent] || {
+    tokens_total: 0, tokens_in: 0, tokens_out: 0, msgs: 0, models: new Set(), last_reasoning: null,
+  };
+  t.msgs += 1;
+  if (meta.tokens_total) t.tokens_total += meta.tokens_total;
+  if (meta.tokens_in)    t.tokens_in    += meta.tokens_in;
+  if (meta.tokens_out)   t.tokens_out   += meta.tokens_out;
+  if (!meta.tokens_total && (meta.tokens_in || meta.tokens_out)) {
+    t.tokens_total += (meta.tokens_in || 0) + (meta.tokens_out || 0);
+  }
+  if (meta.model) t.models.add(meta.model);
+  if (meta.reasoning) t.last_reasoning = meta.reasoning;
+}
+
+function renderAgentTotalsBadge(agent) {
+  const t = agentMetaTotals[agent];
+  if (!t) return;
+  const tag = document.getElementById(`agent-totals-${agent}`);
+  if (!tag) return;
+  const models = [...t.models].join(',');
+  const parts = [];
+  if (models) parts.push(models);
+  if (t.last_reasoning) parts.push('r=' + t.last_reasoning);
+  if (t.tokens_total) parts.push(t.tokens_total.toLocaleString() + ' tok');
+  if (t.msgs) parts.push(`${t.msgs} msg`);
+  tag.textContent = parts.join(' · ') || '·';
+}
 
 // ── Theme: auto (follows OS) | dark | light ────────────────
 // Cycle order: auto → dark → light → auto. Click the moon icon to advance.
@@ -232,11 +279,14 @@ async function openRoom(id, owner) {
   currentOwner = owner;
   lastId = 0;
   msgMap = {};
+  agentMetaTotals = {};
   closeAgentStreams();  // tear down EventSources from previous room
   renderRooms();
   buildChatShell(rooms.find(x => x.id === id) || {id});
   await fetchMessages(true);
   await attachAgentPanels(id);  // Phase 1: live Codex/Gemini event stream
+  // Re-paint totals badges after panels rebuilt
+  Object.keys(agentMetaTotals).forEach(renderAgentTotalsBadge);
 }
 
 // ── Phase 1: agent live event panels ─────────────────────────────────────────
@@ -248,34 +298,58 @@ function closeAgentStreams() {
     try { agentStreams[k].close(); } catch(e) {}
   }
   agentStreams = {};
+  resetActivityPanel('Откроется при выборе комнаты со spawned-агентами');
+}
+
+function resetActivityPanel(emptyHint) {
+  const panel = document.getElementById('activity-panel');
+  if (!panel) return null;
+  panel.innerHTML = '';
+  if (emptyHint) {
+    panel.appendChild(el('div', {class: 'activity-empty'}, [
+      el('div', {class: 'activity-empty-title', text: 'Agent activity'}),
+      el('div', {class: 'activity-empty-hint', text: emptyHint}),
+    ]));
+  }
+  return panel;
 }
 
 async function attachAgentPanels(roomId) {
   let resp;
   try {
     resp = await fetch('/api/room_agents?room_id=' + encodeURIComponent(roomId));
-  } catch(e) { return; }
-  if (!resp.ok) return;
+  } catch(e) {
+    resetActivityPanel('Не удалось загрузить агентов');
+    return;
+  }
+  if (!resp.ok) {
+    resetActivityPanel('Нет данных об агентах');
+    return;
+  }
   const {agents} = await resp.json();
-  if (!agents || Object.keys(agents).length === 0) return;
+  const panel = resetActivityPanel(null);
+  if (!panel) return;
 
-  const chat = document.getElementById('chat-area');
-  if (!chat) return;
+  if (!agents || Object.keys(agents).length === 0) {
+    resetActivityPanel('В этой комнате нет spawned-агентов');
+    return;
+  }
 
   const wrap = el('div', {class: 'agent-panels', id: 'agent-panels'});
   const header = el('div', {class: 'agent-panels-header', text: 'Agent activity (live)'});
   wrap.appendChild(header);
 
   for (const name of Object.keys(agents)) {
-    const panel = el('details', {class: 'agent-panel', dataset: {agent: name}, open: ''}, [
+    const detailsEl = el('details', {class: 'agent-panel', dataset: {agent: name}, open: ''}, [
       el('summary', {class: 'agent-panel-summary'}, [
         avatar(name, 'avatar-sm'),
         el('span', {class: 'agent-panel-name', text: name}),
+        el('span', {class: 'agent-panel-totals', id: `agent-totals-${name}`, text: '·'}),
         el('span', {class: 'agent-panel-status', id: `agent-status-${name}`, text: '·'}),
       ]),
       el('div', {class: 'agent-events', id: `agent-events-${name}`}),
     ]);
-    wrap.appendChild(panel);
+    wrap.appendChild(detailsEl);
 
     const url = `/agents/${encodeURIComponent(roomId)}/${encodeURIComponent(name)}/events`;
     const es = new EventSource(url);
@@ -291,7 +365,7 @@ async function attachAgentPanels(roomId) {
     agentStreams[name] = es;
   }
 
-  chat.appendChild(wrap);
+  panel.appendChild(wrap);
 }
 
 function appendAgentEvent(agentName, raw) {
@@ -341,11 +415,17 @@ function renderOne(m) {
     return;
   }
 
+  const badge = metaBadge(m.meta);
+  if (m.meta) {
+    bumpAgentTotals(m.agent, m.meta);
+    renderAgentTotalsBadge(m.agent);
+  }
   const line = el('div', {class: 'msg-line'}, [
     el('span', {class: 'msg-name', text: m.agent}),
     m.to ? el('span', {class: 'msg-to', text: '→ ' + m.to}) : null,
     el('span', {class: `kind kind-${m.kind}`, text: m.kind}),
     el('span', {class: 'msg-time', text: fmtTime(m.timestamp)}),
+    badge,
   ]);
 
   const bubble = el('div', {class: 'msg-bubble'});
@@ -398,6 +478,10 @@ function renderChatMeta(room, statuses) {
   const parts = (room.participants || []);
   meta.appendChild(document.createTextNode(parts.join(' · ') + ' · '));
   meta.appendChild(el('span', {class: 'msg-time', text: room.status}));
+  if (room.session_id) {
+    meta.appendChild(document.createTextNode(' · '));
+    meta.appendChild(el('span', {class: 'msg-meta', text: 'sid: ' + room.session_id, title: 'session_id'}));
+  }
   for (const [agent, st] of Object.entries(statuses || {})) {
     if (!st || st === 'online') continue;
     meta.appendChild(document.createTextNode(' '));
@@ -492,10 +576,73 @@ async function deleteRoom() {
   await loadRooms();
 }
 
+// ── Bulk room actions ─────────────────────────────────────
+function fmtBulkSummary(label, r) {
+  const parts = [];
+  if (r.closed) parts.push(`closed: ${r.closed.length}`);
+  if (r.already_closed?.length) parts.push(`already closed: ${r.already_closed.length}`);
+  if (r.deleted) parts.push(`deleted: ${r.deleted.length}`);
+  if (r.skipped_open?.length) parts.push(`skipped open: ${r.skipped_open.length}`);
+  if (r.killed != null) parts.push(`killed: ${r.killed}`);
+  if (r.skipped_dead != null) parts.push(`dead skipped: ${r.skipped_dead}`);
+  if (r.skipped_owner != null) parts.push(`owners spared: ${r.skipped_owner}`);
+  if (r.errors?.length) parts.push(`errors: ${r.errors.length}`);
+  return `${label}\n${parts.join(' · ')}`;
+}
+
+async function bulkAction(endpoint, confirmMsg, label) {
+  if (!confirm(confirmMsg)) return;
+  closeAgentStreams();
+  const resp = await fetch(endpoint, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+  const data = await resp.json().catch(() => ({error: 'invalid response'}));
+  if (!resp.ok) {
+    alert(`${label} failed: ${data.error || resp.status}`);
+    return;
+  }
+  if (currentRoom) {
+    currentRoom = null;
+    const chat = document.getElementById('chat-area');
+    chat.innerHTML = '';
+    chat.appendChild(el('div', {class: 'empty'}, [
+      el('div', {class: 'empty-title', text: label}),
+      el('div', {class: 'empty-hint', text: 'Pick another room from the sidebar'}),
+    ]));
+  }
+  await loadRooms();
+  alert(fmtBulkSummary(label, data));
+}
+
+async function bulkCloseAll() {
+  await bulkAction(
+    '/api/rooms_close_all',
+    'Закрыть ВСЕ открытые комнаты?\n\nЖивые spawned агенты (кроме owner-ов) получат SIGTERM. Owner PIDs не трогаются. Мёртвые PIDs пропускаются.',
+    'Bulk close',
+  );
+}
+
+async function bulkDeleteClosed() {
+  await bulkAction(
+    '/api/rooms_delete_closed',
+    'Удалить с диска ВСЕ закрытые комнаты?\n\nИстория, логи агентов, метаданные потеряны навсегда. Открытые комнаты не трогаются.',
+    'Bulk delete',
+  );
+}
+
+async function bulkNuke() {
+  await bulkAction(
+    '/api/rooms_nuke',
+    '🔥 NUKE ALL ROOMS?\n\n1. Kill живых spawned PIDs (кроме owner-ов всех комнат).\n2. Закрыть все open комнаты.\n3. Wipe всех комнат с диска.\n\nOwner PIDs не трогаются. Действие необратимо.',
+    'Nuke all',
+  );
+}
+
 // ── Event delegation ──────────────────────────────────────
 document.addEventListener('click', e => {
   const item = e.target.closest('.room-item');
-  if (item) openRoom(item.dataset.id, item.dataset.owner);
+  if (item) { openRoom(item.dataset.id, item.dataset.owner); return; }
+  if (e.target.closest('#bulk-close-all'))      { bulkCloseAll(); return; }
+  if (e.target.closest('#bulk-delete-closed'))  { bulkDeleteClosed(); return; }
+  if (e.target.closest('#bulk-nuke'))           { bulkNuke(); return; }
 });
 
 // ── Polling ───────────────────────────────────────────────
@@ -504,6 +651,52 @@ async function tick() {
   if (currentRoom) await fetchMessages(false);
 }
 
+// ── Activity panel resize ─────────────────────────────────
+const ACTIVITY_MIN = 220, ACTIVITY_MAX_FRAC = 0.6;
+
+function applyActivityWidth(px) {
+  const minPx = ACTIVITY_MIN;
+  const maxPx = Math.max(minPx + 40, Math.floor(window.innerWidth * ACTIVITY_MAX_FRAC));
+  const clamped = Math.max(minPx, Math.min(maxPx, px | 0));
+  document.documentElement.style.setProperty('--activity-w', clamped + 'px');
+  return clamped;
+}
+
+function initActivityResizer() {
+  const saved = parseInt(localStorage.getItem('agentbus-activity-w') || '380', 10);
+  applyActivityWidth(isFinite(saved) ? saved : 380);
+
+  const resizer = document.getElementById('activity-resizer');
+  if (!resizer) return;
+  let dragging = false;
+
+  resizer.addEventListener('pointerdown', e => {
+    dragging = true;
+    resizer.classList.add('dragging');
+    resizer.setPointerCapture?.(e.pointerId);
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+  });
+  resizer.addEventListener('pointermove', e => {
+    if (!dragging) return;
+    const w = window.innerWidth - e.clientX - 14; // 14px = .app padding right
+    applyActivityWidth(w);
+  });
+  const stop = e => {
+    if (!dragging) return;
+    dragging = false;
+    resizer.classList.remove('dragging');
+    try { resizer.releasePointerCapture?.(e.pointerId); } catch(_){}
+    document.body.style.cursor = '';
+    document.body.style.userSelect = '';
+    const cur = getComputedStyle(document.documentElement).getPropertyValue('--activity-w').trim();
+    if (cur) localStorage.setItem('agentbus-activity-w', parseInt(cur, 10));
+  };
+  resizer.addEventListener('pointerup', stop);
+  resizer.addEventListener('pointercancel', stop);
+}
+
 initTheme();
+initActivityResizer();
 loadRooms();
 setInterval(tick, 3000);

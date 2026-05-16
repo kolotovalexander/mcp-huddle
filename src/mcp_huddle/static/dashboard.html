@@ -2,8 +2,9 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Agent Bus</title>
+  <title>🤖 Agent Bus</title>
   <meta name="color-scheme" content="dark light">
+  <link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🤖</text></svg>">
   <link rel="stylesheet" href="/static/dashboard.css">
   <script>
     // Apply saved/auto theme synchronously BEFORE first paint to avoid FOUC
@@ -35,6 +36,9 @@
       </div>
     </div>
     <div class="topbar-actions">
+      <button class="lq-btn" id="bulk-close-all" title="Закрыть все открытые комнаты — kill живых spawned PIDs (кроме owner-ов)">Close all</button>
+      <button class="lq-btn" id="bulk-delete-closed" title="Удалить с диска все закрытые комнаты">Delete closed</button>
+      <button class="lq-btn danger" id="bulk-nuke" title="Закрыть + удалить ВСЕ комнаты. Owner PIDs не трогаются.">🔥 Nuke all</button>
       <button class="lq-btn" id="theme-toggle" title="Theme: Auto (click to cycle)">🌓</button>
       <button class="lq-btn"><span class="dot dot-open pulse" style="color: var(--c-codex)"></span> live</button>
     </div>
@@ -48,6 +52,13 @@
         <div class="empty-hint">Use room_create() from an agent to start a discussion</div>
       </div>
     </section>
+    <div class="activity-resizer" id="activity-resizer" title="Drag to resize agent activity panel"></div>
+    <aside class="activity lq-panel" id="activity-panel">
+      <div class="activity-empty">
+        <div class="activity-empty-title">Agent activity</div>
+        <div class="activity-empty-hint">Откроется при выборе комнаты со spawned-агентами</div>
+      </div>
+    </aside>
   </div>
 </div>
 <script src="/static/dashboard.js"></script>

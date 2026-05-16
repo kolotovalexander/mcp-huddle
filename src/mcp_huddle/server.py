@@ -6,6 +6,7 @@ HTTP mode (`--http`): uvicorn + Liquid Glass dashboard on :8014.
 
 import asyncio
 import json
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -194,6 +195,7 @@ def message_post(
     to: Optional[str] = None,
     reply_to: Optional[int] = None,
     idempotency_key: Optional[str] = None,
+    meta: Optional[dict] = None,
 ) -> int:
     """Post a message to a room. Returns assigned message_id.
 
@@ -212,7 +214,10 @@ def message_post(
       kind=request with reply_to!=null is someone's answer — NOT a new request to you.
       For all other kinds: read silently, do not reply.
     """
-    return bus.post_message(room_id, agent, body, kind, to, reply_to, idempotency_key)
+    msg_id = bus.post_message(room_id, agent, body, kind, to, reply_to, idempotency_key, msg_meta=meta)
+    if kind == "request":
+        _wake_agents_for_request(room_id, agent, body, to, reply_to, msg_id)
+    return msg_id
 
 
 @mcp.tool()
@@ -263,10 +268,13 @@ def respond_via_agent(
     Returns: {"pid": int, "thread_id": str, "log_path": str, "agent": str}.
     """
     meta = bus._read_meta(room_id)
-    agent_meta = meta.get("agent_meta", {})
+    agent_meta = meta.setdefault("agent_meta", {})
     info = agent_meta.get(agent_name)
+    if not info and agent_name not in meta.get("participants", []):
+        raise ValueError(f"Agent {agent_name} not in room {room_id} (not invited or auto_spawn'd?)")
     if not info:
-        raise ValueError(f"Agent {agent_name} not in room {room_id} (not auto_spawn'd?)")
+        info = {}
+        agent_meta[agent_name] = info
 
     if agent_name == "Codex":
         thread_id = info.get("thread_id")
@@ -289,18 +297,31 @@ def respond_via_agent(
         }
 
     # Gemini and others — fresh spawn with context-prepended prompt as fallback.
-    # (UUID-based resume is not available for Gemini in v0.39.)
-    digest = bus.summarize_messages(room_id, since_id=0)
-    full_prompt = (
-        f"You are continuing a multi-agent discussion in mcp-huddle room {room_id}. "
-        f"Context:\n\n{digest}\n\n---\n\nNew prompt for you:\n{prompt}"
+    # UUID-based resume is not available for Gemini, but a fresh CLI process can
+    # still read the full huddle transcript and post a grounded reply. This keeps
+    # follow-up turns working for all registry-backed agents instead of silently
+    # degrading to Codex-only rooms.
+    transcript = bus.read_messages(room_id, since_id=0, limit=50)
+    full_prompt = _build_fresh_agent_prompt(room_id, agent_name, prompt, transcript)
+    pid, log_path, last_msg_path = _spawn_fresh_room_agent(
+        room_id,
+        agent_name,
+        full_prompt,
+        meta,
+        msg_id=None,
     )
-    raise ValueError(
-        f"respond_via_agent for {agent_name}: no UUID resume available. "
-        f"Use room_create with auto_spawn dict + fresh brief instead, "
-        f"or call this tool with agent_name='Codex'. Computed context digest "
-        f"is {len(full_prompt)} chars."
-    )
+    return {
+        "pid": pid,
+        "thread_id": "",
+        "log_path": log_path,
+        "last_message_path": last_msg_path,
+        "agent": agent_name,
+        "post_as_message": post_as_message,
+        "note": (
+            f"{agent_name} has no UUID resume; spawned a fresh registry-backed "
+            "turn with the room transcript prepended."
+        ),
+    }
 
 
 # ── Status tools ──────────────────────────────────────────────────────────────
@@ -381,25 +402,39 @@ async def _background_watchdog():
         except Exception as e:
             print(f"[watchdog] deadlock check error: {e}", flush=True)
 
+        try:
+            wakes = _wake_pending_agents()
+            if wakes:
+                print(f"[watchdog] Agent wake-ups: {wakes}", flush=True)
+        except Exception as e:
+            print(f"[watchdog] agent wake-up error: {e}", flush=True)
+
 
 # ── Web Dashboard ─────────────────────────────────────────────────────────────
 
 _STATIC_DIR = Path(__file__).parent / "static"
 
 
+_NO_CACHE_HDRS = {"Cache-Control": "no-cache, no-store, must-revalidate",
+                  "Pragma": "no-cache", "Expires": "0"}
+
+
 @mcp.custom_route("/dashboard", methods=["GET"])
 async def dashboard_handler(request: Request):
-    return FileResponse(_STATIC_DIR / "dashboard.html", media_type="text/html")
+    return FileResponse(_STATIC_DIR / "dashboard.html",
+                        media_type="text/html", headers=_NO_CACHE_HDRS)
 
 
 @mcp.custom_route("/static/dashboard.css", methods=["GET"])
 async def dashboard_css(request: Request):
-    return FileResponse(_STATIC_DIR / "dashboard.css", media_type="text/css")
+    return FileResponse(_STATIC_DIR / "dashboard.css",
+                        media_type="text/css", headers=_NO_CACHE_HDRS)
 
 
 @mcp.custom_route("/static/dashboard.js", methods=["GET"])
 async def dashboard_js(request: Request):
-    return FileResponse(_STATIC_DIR / "dashboard.js", media_type="application/javascript")
+    return FileResponse(_STATIC_DIR / "dashboard.js",
+                        media_type="application/javascript", headers=_NO_CACHE_HDRS)
 
 
 @mcp.custom_route("/api/rooms", methods=["GET"])
@@ -432,7 +467,17 @@ async def api_message_post(request: Request) -> JSONResponse:
         msg_id = bus.post_message(
             data["room_id"], data["agent"], data["body"], data["kind"],
             data.get("to"), data.get("reply_to"), data.get("idempotency_key"),
+            msg_meta=data.get("meta"),
         )
+        if data["kind"] == "request":
+            _wake_agents_for_request(
+                data["room_id"],
+                data["agent"],
+                data["body"],
+                data.get("to"),
+                data.get("reply_to"),
+                msg_id,
+            )
         return JSONResponse({"id": msg_id})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
@@ -460,6 +505,34 @@ async def api_room_delete(request: Request) -> JSONResponse:
         return JSONResponse({"error": str(e)}, status_code=409)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@mcp.custom_route("/api/rooms_close_all", methods=["POST"])
+async def api_rooms_close_all(request: Request) -> JSONResponse:
+    """Bulk close: every non-closed room. Kills alive spawned PIDs only,
+    excluding owner PIDs of any room. Dead PIDs skipped."""
+    try:
+        return JSONResponse(bus.close_all_rooms())
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/rooms_delete_closed", methods=["POST"])
+async def api_rooms_delete_closed(request: Request) -> JSONResponse:
+    """Wipe every room with status=closed from disk. Open rooms untouched."""
+    try:
+        return JSONResponse(bus.delete_closed_rooms())
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/rooms_nuke", methods=["POST"])
+async def api_rooms_nuke(request: Request) -> JSONResponse:
+    """Hard reset: close all + delete all. Owner PIDs preserved."""
+    try:
+        return JSONResponse(bus.nuke_all_rooms())
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 # ── Agent live event streaming (Phase 1) ──────────────────────────────────────
@@ -593,8 +666,13 @@ def _spawn_agents(
                     "log_path": log_path,
                     "last_message_path": last_msg,
                 }
-            except (FileNotFoundError, OSError):
+            except (FileNotFoundError, PermissionError) as exc:
+                spawn.log_spawn_failure(spec, agent_brief, cwd, log_dir, exc)
+            except spawn.AgentSpawnError:
                 pass
+            except OSError as exc:
+                spawn.log_spawn_failure(spec, agent_brief, cwd, log_dir, exc)
+                raise
     else:
         names, pids, agent_meta = spawn.spawn_all(default_brief, cwd, log_dir)
 
@@ -610,7 +688,7 @@ def _spawn_agents(
             continue  # Only Codex has UUID-based resume; Gemini's --resume is index-based.
         log_path = info.get("log_path")
         if log_path:
-            tid = spawn.parse_codex_thread_id(log_path, timeout=5.0)
+            tid = spawn.parse_codex_thread_id(log_path, timeout=10.0)
             if tid:
                 info["thread_id"] = tid
 
@@ -621,6 +699,297 @@ def _spawn_agents(
     (bus._room_dir(room_id) / "meta.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=2)
     )
+
+
+def _wake_agents_for_request(
+    room_id: str,
+    sender: str,
+    body: str,
+    to: Optional[str],
+    reply_to: Optional[int],
+    msg_id: int,
+) -> list[dict]:
+    """Wake persistent room agents for a newly posted request.
+
+    Codex is resumed through its captured thread_id, preserving one logical
+    Codex session per room. Requests with reply_to are treated as answers, not
+    new tasks, per the anti-loop contract.
+    """
+    if reply_to is not None:
+        return []
+
+    meta = bus.get_room_info(room_id)
+    agent_meta = meta.get("agent_meta", {})
+    statuses = bus.get_status(room_id)
+    wakes: list[dict] = []
+    changed = False
+
+    for agent_name, info in agent_meta.items():
+        if agent_name == sender:
+            continue
+        if to and to not in (agent_name, "all"):
+            continue
+
+        if statuses.get(agent_name) == "busy":
+            continue
+
+        last_wake = int(info.get("last_wake_msg_id", 0) or 0)
+        if last_wake >= msg_id:
+            continue
+        if _agent_replied_to_request(room_id, agent_name, msg_id):
+            info["last_wake_msg_id"] = msg_id
+            info["last_seen_id"] = max(int(info.get("last_seen_id", 0) or 0), msg_id)
+            changed = True
+            continue
+
+        log_path = info.get("log_path")
+        last_seen = int(info.get("last_seen_id", 0) or 0)
+
+        if agent_name == "Codex":
+            thread_id = info.get("thread_id")
+            if not log_path:
+                continue
+            if not thread_id:
+                thread_id = spawn.parse_codex_thread_id(log_path, timeout=1.0)
+                if not thread_id:
+                    continue
+                info["thread_id"] = thread_id
+                changed = True
+            if not spawn.codex_log_has_completed_turn(log_path):
+                continue
+
+            prompt = _build_codex_wakeup_prompt(room_id, sender, body, to, msg_id, last_seen)
+            bus.set_status(room_id, agent_name, "busy", 300, meta.get("session_id", ""))
+            pid = spawn.codex_resume(
+                thread_id,
+                prompt,
+                meta.get("cwd", "") or "",
+                log_path,
+                info.get("last_message_path"),
+            )
+            info["last_wake_msg_id"] = msg_id
+            info["last_seen_id"] = msg_id
+            info["last_wake_pid"] = pid
+            info["last_wake_at"] = int(time.time())
+            wakes.append({"agent": agent_name, "pid": pid, "thread_id": thread_id})
+            changed = True
+            continue
+
+        transcript = bus.read_messages(room_id, since_id=0, limit=50)
+        prompt = _build_registry_agent_wakeup_prompt(
+            room_id,
+            agent_name,
+            sender,
+            body,
+            to,
+            msg_id,
+            last_seen,
+            transcript,
+        )
+        if changed:
+            meta["agent_meta"] = agent_meta
+            bus._write_json(bus._room_dir(room_id) / "meta.json", meta)
+            changed = False
+        try:
+            pid, _, _ = _spawn_fresh_room_agent(
+                room_id,
+                agent_name,
+                prompt,
+                meta,
+                msg_id=msg_id,
+            )
+        except ValueError:
+            continue
+        wakes.append({"agent": agent_name, "pid": pid, "thread_id": ""})
+        meta = bus.get_room_info(room_id)
+        agent_meta = meta.get("agent_meta", {})
+        changed = False
+
+    if changed:
+        meta["agent_meta"] = agent_meta
+        bus._write_json(bus._room_dir(room_id) / "meta.json", meta)
+
+    return wakes
+
+
+def _agent_replied_to_request(room_id: str, agent_name: str, msg_id: int) -> bool:
+    """Return True if this agent already posted a visible reply to a request."""
+    for msg in bus._load_messages(room_id):
+        if msg.get("agent") == agent_name and msg.get("reply_to") == msg_id:
+            return True
+    return False
+
+
+def _wake_pending_agents() -> list[dict]:
+    """Retry wake-ups for open requests that arrived before an agent was ready."""
+    wakes: list[dict] = []
+    for meta in bus.list_rooms():
+        if meta.get("status") != "open":
+            continue
+        room_id = meta["id"]
+        agent_meta = meta.get("agent_meta", {})
+        if not agent_meta:
+            continue
+        statuses = bus.get_status(room_id)
+        for agent_name, info in agent_meta.items():
+            if statuses.get(agent_name) == "busy":
+                continue
+            last_wake = int(info.get("last_wake_msg_id", 0) or 0)
+            for msg in bus._load_messages(room_id):
+                if msg.get("id", 0) <= last_wake:
+                    continue
+                if msg.get("kind") != "request" or msg.get("reply_to") is not None:
+                    continue
+                sender = msg.get("agent", "")
+                if sender == agent_name:
+                    continue
+                to = msg.get("to")
+                if to and to not in (agent_name, "all"):
+                    continue
+                wakes.extend(_wake_agents_for_request(
+                    room_id,
+                    sender,
+                    msg.get("body", ""),
+                    to,
+                    None,
+                    msg["id"],
+                ))
+                break
+    return wakes
+
+
+def _spawn_fresh_room_agent(
+    room_id: str,
+    agent_name: str,
+    prompt: str,
+    meta: dict,
+    msg_id: Optional[int] = None,
+) -> tuple[int, str, str | None]:
+    """Spawn a registry-backed one-shot turn for an agent without UUID resume."""
+    spec = spawn.get_enabled_spec(agent_name)
+    if not spec:
+        raise ValueError(f"Agent {agent_name} has no enabled spawn registry entry")
+
+    if agent_name not in meta.get("participants", []):
+        bus.invite_agent(room_id, agent_name)
+        meta = bus.get_room_info(room_id)
+
+    bus.set_status(room_id, agent_name, "busy", 300, meta.get("session_id", ""))
+    pid, log_path, last_msg_path = spawn.spawn_agent(
+        spec,
+        prompt,
+        meta.get("cwd", "") or "",
+        bus._room_dir(room_id) / "agents",
+    )
+
+    updated = bus.get_room_info(room_id)
+    agent_meta = updated.setdefault("agent_meta", {})
+    info = dict(agent_meta.get(agent_name) or {})
+    info["log_path"] = log_path
+    info["last_message_path"] = last_msg_path
+    info["last_wake_pid"] = pid
+    info["last_wake_at"] = int(time.time())
+    if msg_id is not None:
+        info["last_wake_msg_id"] = msg_id
+        info["last_seen_id"] = msg_id
+    agent_meta[agent_name] = info
+    updated["agent_meta"] = agent_meta
+    bus._write_json(bus._room_dir(room_id) / "meta.json", updated)
+    return pid, log_path, last_msg_path
+
+
+def _build_fresh_agent_prompt(
+    room_id: str,
+    agent_name: str,
+    prompt: str,
+    transcript: str,
+) -> str:
+    return f"""You are {agent_name}, continuing an mcp-huddle discussion.
+
+Room: {room_id}
+You are: {agent_name}
+
+Current room transcript:
+{transcript}
+
+New prompt:
+{prompt}
+
+Before replying, call messages_read(room_id="{room_id}", since_id=0, limit=50)
+if huddle MCP tools are available. Ground your reply in concrete message ids.
+Post any room-visible answer via message_post with your agent name. Do not
+answer non-request messages unless this prompt explicitly asks for a status
+or verification response.
+"""
+
+
+def _build_registry_agent_wakeup_prompt(
+    room_id: str,
+    agent_name: str,
+    sender: str,
+    body: str,
+    to: Optional[str],
+    msg_id: int,
+    last_seen: int,
+    transcript: str,
+) -> str:
+    addressed = to or "all"
+    return f"""A new mcp-huddle request arrived.
+
+Room: {room_id}
+You are: {agent_name}
+New request id: {msg_id}
+From: {sender}
+To: {addressed}
+Last delivered message id: {last_seen}
+
+Current full transcript:
+{transcript}
+
+Request body:
+{body}
+
+Protocol:
+1. Call status_set(room_id="{room_id}", agent="{agent_name}", status="busy", expires_in_sec=300).
+2. Call messages_read(room_id="{room_id}", since_id=0, limit=50).
+3. If message #{msg_id} is kind=request addressed to {agent_name} or all and has no reply_to, answer it exactly once.
+4. Post your answer with message_post(room_id="{room_id}", agent="{agent_name}", kind="result", to="{sender}", reply_to={msg_id}, idempotency_key="{agent_name.lower()}-wake:{room_id}:{msg_id}").
+5. Call status_set(room_id="{room_id}", agent="{agent_name}", status="done", expires_in_sec=60).
+
+Do not answer requests that already have reply_to set. Do not send thanks/ack-only chatter.
+"""
+
+
+def _build_codex_wakeup_prompt(
+    room_id: str,
+    sender: str,
+    body: str,
+    to: Optional[str],
+    msg_id: int,
+    last_seen: int,
+) -> str:
+    addressed = to or "all"
+    return f"""A new mcp-huddle request arrived in your existing room.
+
+Room: {room_id}
+You are: Codex
+New request id: {msg_id}
+From: {sender}
+To: {addressed}
+Last delivered message id: {last_seen}
+
+Request body:
+{body}
+
+Use only huddle MCP tools for room coordination:
+1. Call status_set(room_id="{room_id}", agent="Codex", status="busy", expires_in_sec=300).
+2. Call messages_read(room_id="{room_id}", since_id=0, limit=50).
+3. If message #{msg_id} is a kind=request addressed to Codex or all and has no reply_to, answer it exactly once.
+4. Post your answer with message_post(room_id="{room_id}", agent="Codex", kind="result", to="{sender}", reply_to={msg_id}, idempotency_key="codex-wake:{room_id}:{msg_id}").
+5. Call status_set(room_id="{room_id}", agent="Codex", status="done", expires_in_sec=60).
+
+Do not answer requests that already have reply_to set. Do not send thanks/ack-only chatter.
+"""
 
 
 def _build_default_brief(room_id: str, name: str, goal: str, cwd: str) -> str:
@@ -648,6 +1017,22 @@ Use MCP tools from mcp-huddle:
   messages_read("{room_id}") — read chat
   message_post("{room_id}", "YourName", "...", kind="comment"|"request"|"result", ...) — post
   status_set("{room_id}", "YourName", "busy"|"online") — update status
+
+## MANDATORY: read full history BEFORE every reply
+Always call `messages_read(room_id, since_id=0)` as the FIRST tool call on each
+turn — even if you "remember" prior context. Other agents may have posted
+since your last turn, and your reply must reference what they actually said,
+not what you assume.
+- If you do NOT cite at least one specific id (e.g. "agree with #3", quote
+  from #2), your reply is considered ungrounded.
+- Disagreement is welcome; silent agreement is not — name what you accept and
+  what you reject, with a one-line reason.
+
+Lifecycle:
+- You may exit after your first response.
+- When a later kind=request is addressed to you or all, huddle wakes a new
+  turn. Codex uses thread resume when available; other registry agents are
+  started fresh with the room transcript prepended.
 """
 
 
@@ -679,4 +1064,3 @@ def build_app():
 
     app.router.lifespan_context = combined_lifespan
     return app
-

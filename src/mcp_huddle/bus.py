@@ -18,7 +18,7 @@ HUDDLE_HOME = Path(os.environ.get("MCP_HUDDLE_HOME", Path.home() / ".mcp-huddle"
 BUS_DIR = HUDDLE_HOME / "rooms"
 CIRCUIT_BREAKER_WINDOW = 10   # last N messages to check
 CIRCUIT_BREAKER_LIMIT = 5     # max consecutive from same agent (non-request kinds)
-DEADLOCK_TIMEOUT_SECS = 180   # 3 minutes of silence → system message
+DEADLOCK_TIMEOUT_SECS = 600   # 10 minutes of silence → system message
 ZOMBIE_CHECK_SECS = 30        # how often to check owner_pid liveness
 
 VALID_KINDS = {"request", "comment", "ack", "busy", "result", "final", "system", "close"}
@@ -63,6 +63,39 @@ def invite_agent(room_id: str, agent_name: str) -> None:
         meta["participants"].append(agent_name)
     _write_json(_room_dir(room_id) / "meta.json", meta)
     _patch_status(room_id, agent_name, "online", 0, "")
+
+
+def register_external_agent(room_id: str, agent_name: str) -> dict:
+    """Reserve <name>.events.jsonl + last_message.txt for an agent that wasn't
+    auto-spawned by huddle (e.g. orchestrator-launched CLIs). Adds an entry to
+    room_meta.agent_meta so /api/room_agents and the dashboard activity panel
+    pick it up. Returns {log_path, last_message_path}."""
+    rdir = _room_dir(room_id)
+    agents_dir = rdir / "agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    log_path = agents_dir / f"{agent_name.lower()}.events.jsonl"
+    last_path = agents_dir / f"{agent_name.lower()}.last_message.txt"
+    log_path.touch(exist_ok=True)
+    meta = _read_meta(room_id)
+    am = meta.setdefault("agent_meta", {})
+    am[agent_name] = {
+        "log_path": str(log_path),
+        "last_message_path": str(last_path),
+        "thread_id": am.get(agent_name, {}).get("thread_id", ""),
+        "external": True,
+    }
+    _write_json(rdir / "meta.json", meta)
+    return {"log_path": str(log_path), "last_message_path": str(last_path)}
+
+
+def append_agent_event(room_id: str, agent_name: str, event: dict) -> None:
+    """Append a JSONL event line that the SSE handler tails into the dashboard's
+    Agent-activity panel. Persists, so re-opening a closed room replays history."""
+    log_path = _room_dir(room_id) / "agents" / f"{agent_name.lower()}.events.jsonl"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(event, ensure_ascii=False)
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(payload + "\n")
 
 
 def get_room_info(room_id: str) -> dict:
@@ -140,7 +173,8 @@ def delete_room(room_id: str, owner: str) -> None:
 
 def post_message(room_id: str, agent: str, body: str, kind: str,
                  to: Optional[str] = None, reply_to: Optional[int] = None,
-                 idempotency_key: Optional[str] = None) -> int:
+                 idempotency_key: Optional[str] = None,
+                 msg_meta: Optional[dict] = None) -> int:
     if kind not in VALID_KINDS:
         raise ValueError(f"Invalid kind '{kind}'. Valid: {sorted(VALID_KINDS)}")
 
@@ -185,6 +219,12 @@ def post_message(room_id: str, agent: str, body: str, kind: str,
             entry["reply_to"] = reply_to
         if idempotency_key:
             entry["idempotency_key"] = idempotency_key
+        if msg_meta:
+            clean = {k: msg_meta[k] for k in ("model", "reasoning", "tokens_in",
+                                               "tokens_out", "tokens_total", "duration_ms")
+                     if k in msg_meta and msg_meta[k] is not None}
+            if clean:
+                entry["meta"] = clean
 
         f.seek(0, 2)  # EOF
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -516,3 +556,114 @@ def _kill_spawned(meta: dict) -> None:
             os.kill(pid, signal.SIGTERM)
         except (ProcessLookupError, PermissionError):
             pass
+
+
+def _pid_alive(pid: int) -> bool:
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _collect_protected_owner_pids() -> set[int]:
+    """Union of owner_pid across all rooms — but only those still alive.
+    Dead owner PIDs are not protected (can be reused by unrelated processes)."""
+    protected: set[int] = set()
+    for meta in list_rooms():
+        pid = int(meta.get("owner_pid") or 0)
+        if pid > 0 and _pid_alive(pid):
+            protected.add(pid)
+    return protected
+
+
+def _kill_spawned_safe(meta: dict, protected: set[int]) -> dict:
+    """Kill alive spawned PIDs, skipping any that are dead or protected.
+    Returns counts: {killed: int, skipped_dead: int, skipped_owner: int}."""
+    counts = {"killed": 0, "skipped_dead": 0, "skipped_owner": 0}
+    for pid in meta.get("spawned_pids", []) or []:
+        try:
+            pid_int = int(pid)
+        except (TypeError, ValueError):
+            continue
+        if pid_int <= 0:
+            continue
+        if not _pid_alive(pid_int):
+            counts["skipped_dead"] += 1
+            continue
+        if pid_int in protected:
+            counts["skipped_owner"] += 1
+            continue
+        try:
+            os.kill(pid_int, signal.SIGTERM)
+            counts["killed"] += 1
+        except (ProcessLookupError, PermissionError):
+            counts["skipped_dead"] += 1
+    return counts
+
+
+def close_all_rooms() -> dict:
+    """Bulk close: every non-closed room → kill alive spawned (excluding owner
+    PIDs of any room) → status=closed. Owners are never touched."""
+    protected = _collect_protected_owner_pids()
+    result = {
+        "closed": [], "already_closed": [],
+        "killed": 0, "skipped_dead": 0, "skipped_owner": 0,
+        "errors": [],
+    }
+    for meta in list_rooms():
+        rid = meta.get("id", "")
+        try:
+            if meta.get("status") == "closed":
+                result["already_closed"].append(rid)
+                continue
+            counts = _kill_spawned_safe(meta, protected)
+            result["killed"] += counts["killed"]
+            result["skipped_dead"] += counts["skipped_dead"]
+            result["skipped_owner"] += counts["skipped_owner"]
+            _append_system(rid, "Чат закрыт (bulk close).")
+            meta["status"] = "closed"
+            _write_json(_room_dir(rid) / "meta.json", meta)
+            result["closed"].append(rid)
+        except Exception as e:
+            result["errors"].append({"room_id": rid, "error": str(e)})
+    return result
+
+
+def delete_closed_rooms() -> dict:
+    """Wipe every room with status=closed from disk. Open rooms untouched."""
+    import shutil
+    result = {"deleted": [], "skipped_open": [], "errors": []}
+    for meta in list_rooms():
+        rid = meta.get("id", "")
+        try:
+            if meta.get("status") != "closed":
+                result["skipped_open"].append(rid)
+                continue
+            rdir = _room_dir(rid)
+            if rdir.exists():
+                shutil.rmtree(rdir)
+            result["deleted"].append(rid)
+        except Exception as e:
+            result["errors"].append({"room_id": rid, "error": str(e)})
+    return result
+
+
+def nuke_all_rooms() -> dict:
+    """Hard reset: close_all_rooms() then delete_closed_rooms(). Returns merged
+    summary. Owner PIDs never killed; dead spawned PIDs skipped."""
+    close_summary = close_all_rooms()
+    delete_summary = delete_closed_rooms()
+    return {
+        "closed": close_summary["closed"],
+        "already_closed": close_summary["already_closed"],
+        "killed": close_summary["killed"],
+        "skipped_dead": close_summary["skipped_dead"],
+        "skipped_owner": close_summary["skipped_owner"],
+        "deleted": delete_summary["deleted"],
+        "errors": close_summary["errors"] + delete_summary["errors"],
+    }

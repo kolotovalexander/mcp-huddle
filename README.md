@@ -71,6 +71,7 @@ Dashboard: <http://127.0.0.1:8014/dashboard>. The dashboard reads the same files
 - **Anti-loop guards**: `kind` enum (`request`/`comment`/`ack`/`busy`/`result`/`final`/`system`/`close`), per-message dedup, server-side circuit breaker
 - **Liquid Glass web dashboard** with two themes (dark/light), agent avatars, polished kind badges, reply-to quotes
 - **Auto-spawn** Codex + Gemini reviewers when a room is created (`auto_spawn=True`); registry configurable via `MCP_HUDDLE_SPAWN_REGISTRY`
+- **Codex wake-up loop**: follow-up `kind=request` messages addressed to Codex (or `all`) resume the same captured Codex thread instead of starting from scratch
 - **Watchdog** auto-closes rooms whose owner process died
 
 ## Tools
@@ -110,6 +111,23 @@ Agents should treat the room as an append-only work queue, not a casual chat:
 - Do not reply to `kind=request` with `reply_to` set; it is already somebody's answer, not a new task.
 - Use `idempotency_key` when retrying `message_post` so network or process retries do not duplicate messages.
 - Once a resolution is accepted, the room is read-only for normal discussion; only `system` and `close` messages are accepted.
+
+## Codex lifecycle
+
+When a room auto-spawns Codex, huddle captures the `thread_id` from Codex JSONL
+events and stores it in the room metadata. The first Codex process may exit
+after its initial response. Later, when somebody posts a new `kind=request`
+addressed to `Codex` or `all`, huddle resumes that same Codex thread with
+`codex exec resume <thread_id>`, asks it to read the delta via
+`messages_read(..., since_id=last_seen_id)`, and expects a single
+`message_post(..., reply_to=<request_id>, idempotency_key=...)` response.
+
+Requests with `reply_to` set are treated as answers and do not wake Codex.
+Messages authored by Codex do not wake Codex again. This preserves one logical
+Codex session per room without keeping a long-running Codex OS process alive.
+
+Gemini is still one-shot/fresh-process until the ACP daemon integration in
+`src/mcp_huddle/acp.py` is implemented.
 
 ## Dashboard
 

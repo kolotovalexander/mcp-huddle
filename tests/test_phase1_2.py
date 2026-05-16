@@ -3,11 +3,13 @@ thread_id parsing, codex_resume helper, /api/room_agents and SSE endpoint)."""
 import json
 import os
 import tempfile
+import importlib
 from pathlib import Path
 
 import pytest
 
 from mcp_huddle import bus, spawn
+from mcp_huddle import server
 
 
 # ── Phase 1: spawn.py ─────────────────────────────────────────────────────────
@@ -75,6 +77,104 @@ def test_spawn_all_per_agent_briefs(tmp_path: Path, monkeypatch) -> None:
     assert "beta=DEFAULT" in beta_log  # falls back to default brief
 
 
+def test_spawn_all_logs_unexpected_oserror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Unexpected OSError subclasses must be logged, not silently swallowed."""
+    fake_registry: list[spawn.SpawnSpec] = [
+        {"name": "Gemini", "cmd": ["gemini", "-p", "{brief}"], "enabled": True},
+    ]
+    monkeypatch.setattr(spawn, "load_registry", lambda: fake_registry)
+
+    def broken_spawn(*args, **kwargs):
+        raise BlockingIOError("daemon spawn pipe blocked")
+
+    monkeypatch.setattr(spawn, "spawn_agent", broken_spawn)
+
+    with pytest.raises(BlockingIOError):
+        spawn.spawn_all("brief", str(tmp_path), tmp_path / "agents")
+
+    err = capsys.readouterr().err
+    assert "failed to spawn Gemini" in err
+    assert "BlockingIOError" in err
+    assert "daemon spawn pipe blocked" in err
+
+
+def test_binary_resolution_uses_absolute_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default agent registry must not depend only on the daemon PATH."""
+    fake_codex = tmp_path / "codex"
+    fake_codex.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(spawn.shutil, "which", lambda _name: None)
+
+    resolved = spawn._first_existing_binary(["codex", str(fake_codex)])
+
+    assert resolved == str(fake_codex)
+
+
+def test_spawn_agent_verify_alive_rejects_fast_exit(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Optional health check logs and rejects processes that die immediately."""
+    spec: spawn.SpawnSpec = {
+        "name": "FastExit",
+        "cmd": ["/bin/sh", "-c", "exit 42"],
+        "enabled": True,
+    }
+
+    with pytest.raises(spawn.AgentSpawnError):
+        spawn.spawn_agent(
+            spec,
+            "brief",
+            str(tmp_path),
+            tmp_path / "agents",
+            verify_alive_sec=0.05,
+        )
+
+    err = capsys.readouterr().err
+    assert "failed to spawn FastExit" in err
+    assert "exited within" in err
+    assert "status 42" in err
+
+
+def test_spawn_agent_registers_background_reaper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The long-running huddle daemon must reap spawned children after exit."""
+    popen_calls: list[dict] = []
+    reaped: list[tuple[int, str]] = []
+
+    class FakeProc:
+        pid = 12345
+
+        def poll(self):
+            return None
+
+    def fake_popen(argv, cwd, stdin, stdout, stderr):
+        popen_calls.append({"argv": argv, "cwd": cwd, "stdin": stdin, "stderr": stderr})
+        return FakeProc()
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        spawn,
+        "_reap_in_background",
+        lambda proc, name: reaped.append((proc.pid, name)),
+    )
+
+    spec: spawn.SpawnSpec = {
+        "name": "Gemini",
+        "cmd": ["gemini", "-p", "{brief}"],
+        "enabled": True,
+    }
+
+    pid, _, _ = spawn.spawn_agent(spec, "brief", str(tmp_path), tmp_path / "agents")
+
+    assert pid == 12345
+    assert popen_calls[0]["argv"] == ["gemini", "-p", "brief"]
+    assert reaped == [(12345, "Gemini")]
+
+
 # ── Phase 2: thread_id parsing ────────────────────────────────────────────────
 
 def test_parse_codex_thread_id_from_log(tmp_path: Path) -> None:
@@ -109,6 +209,18 @@ def test_parse_codex_thread_id_skips_garbage(tmp_path: Path) -> None:
     assert tid == "xyz"
 
 
+def test_codex_log_has_completed_turn(tmp_path: Path) -> None:
+    log = tmp_path / "codex.events.jsonl"
+    log.write_text(
+        '{"type":"thread.started","thread_id":"abc"}\n'
+        '{"type":"turn.started"}\n'
+    )
+    assert not spawn.codex_log_has_completed_turn(str(log))
+
+    log.write_text(log.read_text() + '{"type":"turn.completed"}\n')
+    assert spawn.codex_log_has_completed_turn(str(log))
+
+
 # ── ACP Phase 2.5 stub ────────────────────────────────────────────────────────
 
 def test_acp_stub_raises_clear_error() -> None:
@@ -119,3 +231,300 @@ def test_acp_stub_raises_clear_error() -> None:
         acp.gemini_acp_prompt(None, "test")
     assert "Phase 2.5" in str(exc.value)
     assert "Codex" in str(exc.value)  # mentions the working alternative
+
+
+# ── Phase 3: persistent room wake-up loop ────────────────────────────────────
+
+def test_request_message_wakes_existing_codex_thread(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    calls: list[dict] = []
+
+    def fake_codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str, last_msg_path: str | None = None) -> int:
+        calls.append({
+            "thread_id": thread_id,
+            "prompt": prompt,
+            "cwd": cwd,
+            "log_path": log_path,
+            "last_msg_path": last_msg_path,
+        })
+        return 4242
+
+    monkeypatch.setattr(server.spawn, "codex_resume", fake_codex_resume)
+
+    room_id = isolated_bus.create_room("Wake", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Codex")
+    isolated_bus.post_message(room_id, "Gemini", "Prior room context Codex must re-read.", "comment")
+    log_path = isolated_bus._room_dir(room_id) / "agents" / "codex.events.jsonl"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(
+        '{"type":"thread.started","thread_id":"thread-123"}\n'
+        '{"type":"turn.completed"}\n'
+    )
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {
+        "Codex": {
+            "log_path": str(log_path),
+            "last_message_path": str(isolated_bus._room_dir(room_id) / "agents" / "codex.last_message.txt"),
+            "last_seen_id": 1,
+        }
+    }
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+
+    msg_id = server.message_post(
+        room_id,
+        "Claude",
+        "Please review the plan delta.",
+        "request",
+        to="all",
+        idempotency_key="request-1",
+    )
+
+    assert msg_id == 2
+    assert len(calls) == 1
+    assert calls[0]["thread_id"] == "thread-123"
+    assert calls[0]["cwd"] == "/tmp/project"
+    assert calls[0]["last_msg_path"].endswith("codex.last_message.txt")
+    assert "since_id=0" in calls[0]["prompt"]
+    assert 'reply_to=2' in calls[0]["prompt"]
+    assert 'idempotency_key="codex-wake:' in calls[0]["prompt"]
+
+    updated = isolated_bus.get_room_info(room_id)["agent_meta"]["Codex"]
+    assert updated["thread_id"] == "thread-123"
+    assert updated["last_wake_msg_id"] == 2
+    assert updated["last_seen_id"] == 2
+    assert updated["last_wake_pid"] == 4242
+
+    duplicate_id = server.message_post(
+        room_id,
+        "Claude",
+        "Please review the plan delta.",
+        "request",
+        to="all",
+        idempotency_key="request-1",
+    )
+    assert duplicate_id == 2
+    assert len(calls) == 1
+
+
+def test_request_wakeup_skips_self_and_reply_requests(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    calls: list[tuple] = []
+    monkeypatch.setattr(server.spawn, "codex_resume", lambda *args, **kwargs: calls.append(args) or 100)
+
+    room_id = isolated_bus.create_room("Wake", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Codex")
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {
+        "Codex": {
+            "thread_id": "thread-123",
+            "log_path": str(isolated_bus._room_dir(room_id) / "agents" / "codex.events.jsonl"),
+            "last_message_path": str(isolated_bus._room_dir(room_id) / "agents" / "codex.last_message.txt"),
+        }
+    }
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+
+    server.message_post(room_id, "Codex", "Self request should not wake me.", "request", to="all")
+    server.message_post(room_id, "Claude", "This is a reply-shaped request.", "request", to="all", reply_to=1)
+
+    assert calls == []
+
+
+def test_pending_wakeup_retries_after_initial_turn_completes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    calls: list[tuple] = []
+    monkeypatch.setattr(server.spawn, "codex_resume", lambda *args, **kwargs: calls.append(args) or 200)
+
+    room_id = isolated_bus.create_room("Wake", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Codex")
+    log_path = isolated_bus._room_dir(room_id) / "agents" / "codex.events.jsonl"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(
+        '{"type":"thread.started","thread_id":"thread-123"}\n'
+        '{"type":"turn.started"}\n'
+    )
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {
+        "Codex": {
+            "log_path": str(log_path),
+            "last_message_path": str(isolated_bus._room_dir(room_id) / "agents" / "codex.last_message.txt"),
+        }
+    }
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+
+    server.message_post(room_id, "Claude", "Arrived before Codex was ready.", "request", to="Codex")
+    assert calls == []
+
+    log_path.write_text(log_path.read_text() + '{"type":"turn.completed"}\n')
+    wakes = server._wake_pending_agents()
+
+    assert len(calls) == 1
+    assert wakes[0]["thread_id"] == "thread-123"
+    updated = isolated_bus.get_room_info(room_id)["agent_meta"]["Codex"]
+    assert updated["last_wake_msg_id"] == 1
+
+
+def test_respond_via_agent_fresh_spawns_non_codex_with_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    fake_spec: spawn.SpawnSpec = {
+        "name": "Gemini",
+        "cmd": ["gemini", "-p", "{brief}"],
+        "enabled": True,
+    }
+    monkeypatch.setattr(server.spawn, "get_enabled_spec", lambda name: fake_spec if name == "Gemini" else None)
+
+    calls: list[dict] = []
+
+    def fake_spawn_agent(spec, brief, cwd, log_dir, verify_alive_sec=0.0):
+        calls.append({"spec": spec, "brief": brief, "cwd": cwd, "log_dir": log_dir})
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "gemini.events.jsonl"
+        log_path.write_text('{"type":"init"}\n')
+        return 5151, str(log_path), None
+
+    monkeypatch.setattr(server.spawn, "spawn_agent", fake_spawn_agent)
+
+    room_id = isolated_bus.create_room("Fresh", "CodexMain", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Gemini")
+    isolated_bus.post_message(room_id, "CodexMain", "Can you see this?", "request", to="Gemini")
+
+    result = server.respond_via_agent(
+        room_id,
+        "Gemini",
+        "Answer the latest CodexMain request and cite its message id.",
+        post_as_message=False,
+    )
+
+    assert result["pid"] == 5151
+    assert result["agent"] == "Gemini"
+    assert result["thread_id"] == ""
+    assert "spawned a fresh" in result["note"]
+    assert len(calls) == 1
+    assert calls[0]["cwd"] == "/tmp/project"
+    assert "[001] CodexMain" in calls[0]["brief"]
+    assert "Answer the latest CodexMain request" in calls[0]["brief"]
+
+    meta = isolated_bus.get_room_info(room_id)["agent_meta"]["Gemini"]
+    assert meta["log_path"].endswith("gemini.events.jsonl")
+    assert meta["last_wake_pid"] == 5151
+
+
+def test_request_message_wakes_registry_agent_without_uuid_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    fake_spec: spawn.SpawnSpec = {
+        "name": "Gemini",
+        "cmd": ["gemini", "-p", "{brief}"],
+        "enabled": True,
+    }
+    monkeypatch.setattr(server.spawn, "get_enabled_spec", lambda name: fake_spec if name == "Gemini" else None)
+
+    calls: list[dict] = []
+
+    def fake_spawn_agent(spec, brief, cwd, log_dir, verify_alive_sec=0.0):
+        calls.append({"spec": spec, "brief": brief, "cwd": cwd})
+        log_dir.mkdir(parents=True, exist_ok=True)
+        return 6161, str(log_dir / "gemini.events.jsonl"), None
+
+    monkeypatch.setattr(server.spawn, "spawn_agent", fake_spawn_agent)
+
+    room_id = isolated_bus.create_room("WakeGemini", "CodexMain", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Gemini")
+    isolated_bus.post_message(room_id, "CodexMain", "Earlier context Gemini must still see.", "comment")
+    log_path = isolated_bus._room_dir(room_id) / "agents" / "gemini.events.jsonl"
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {
+        "Gemini": {
+            "log_path": str(log_path),
+            "last_message_path": None,
+            "last_seen_id": 1,
+        }
+    }
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+
+    msg_id = server.message_post(
+        room_id,
+        "CodexMain",
+        "Gemini, please review delivery semantics.",
+        "request",
+        to="Gemini",
+        idempotency_key="request-gemini-1",
+    )
+
+    assert msg_id == 2
+    assert len(calls) == 1
+    assert calls[0]["cwd"] == "/tmp/project"
+    assert "New request id: 2" in calls[0]["brief"]
+    assert "Current full transcript:" in calls[0]["brief"]
+    assert "[001] CodexMain" in calls[0]["brief"]
+    assert "Earlier context Gemini must still see." in calls[0]["brief"]
+    assert "since_id=0" in calls[0]["brief"]
+    assert 'agent="Gemini"' in calls[0]["brief"]
+    assert 'reply_to=2' in calls[0]["brief"]
+
+    updated = isolated_bus.get_room_info(room_id)["agent_meta"]["Gemini"]
+    assert updated["last_wake_msg_id"] == 2
+    assert updated["last_seen_id"] == 2
+    assert updated["last_wake_pid"] == 6161
+
+
+def test_pending_wakeup_skips_request_agent_already_replied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    calls: list[dict] = []
+    monkeypatch.setattr(server.spawn, "spawn_agent", lambda *args, **kwargs: calls.append({"args": args}) or (1, "", None))
+
+    room_id = isolated_bus.create_room("AlreadyReplied", "CodexMain", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Gemini")
+    isolated_bus.post_message(
+        room_id,
+        "CodexMain",
+        "Gemini, answer once.",
+        "request",
+        to="Gemini",
+    )
+    isolated_bus.post_message(
+        room_id,
+        "Gemini",
+        "Answered already.",
+        "result",
+        to="CodexMain",
+        reply_to=1,
+    )
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {
+        "Gemini": {
+            "log_path": str(isolated_bus._room_dir(room_id) / "agents" / "gemini.events.jsonl"),
+            "last_message_path": None,
+        }
+    }
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+
+    wakes = server._wake_pending_agents()
+
+    assert wakes == []
+    assert calls == []
+    updated = isolated_bus.get_room_info(room_id)["agent_meta"]["Gemini"]
+    assert updated["last_wake_msg_id"] == 1
+    assert updated["last_seen_id"] == 1
