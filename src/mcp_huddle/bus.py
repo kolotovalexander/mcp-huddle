@@ -22,6 +22,7 @@ DEADLOCK_TIMEOUT_SECS = 600   # 10 minutes of silence → system message
 ZOMBIE_CHECK_SECS = 30        # how often to check owner_pid liveness
 
 VALID_KINDS = {"request", "comment", "ack", "busy", "result", "final", "system", "close"}
+VALID_STATUSES = {"open", "idle", "closing_requested", "closed", "resolved"}
 
 
 # ── Rooms ────────────────────────────────────────────────────────────────────
@@ -36,6 +37,7 @@ def create_room(name: str, owner: str, owner_pid: int, cwd: str = "",
     rdir = _room_dir(room_id)
     rdir.mkdir(parents=True, exist_ok=True)
 
+    now = int(time.time())
     meta = {
         "id": room_id,
         "name": name,
@@ -44,10 +46,11 @@ def create_room(name: str, owner: str, owner_pid: int, cwd: str = "",
         "session_id": session_id,
         "participants": [owner],
         "spawned_pids": [],
-        "created_at": int(time.time()),
+        "created_at": now,
         "status": "open",
         "cwd": cwd,
-        "last_activity": int(time.time()),
+        "last_activity": now,
+        "last_activity_at": now,
         "resolution": None,
     }
     _write_json(rdir / "meta.json", meta)
@@ -100,6 +103,29 @@ def append_agent_event(room_id: str, agent_name: str, event: dict) -> None:
 
 def get_room_info(room_id: str) -> dict:
     return _read_meta(room_id)
+
+
+def mark_idle(room_id: str) -> None:
+    """Mark an open room idle under a file lock."""
+    def update(meta: dict) -> dict:
+        if meta.get("status") == "open":
+            meta["status"] = "idle"
+        return meta
+
+    _update_meta_locked(room_id, update)
+
+
+def revive(room_id: str) -> None:
+    """Reopen an idle room under a file lock."""
+    def update(meta: dict) -> dict:
+        if meta.get("status") == "idle":
+            meta["status"] = "open"
+            now = int(time.time())
+            meta["last_activity"] = now
+            meta["last_activity_at"] = now
+        return meta
+
+    _update_meta_locked(room_id, update)
 
 
 def list_rooms() -> list[dict]:
@@ -229,9 +255,14 @@ def post_message(room_id: str, agent: str, body: str, kind: str,
         f.seek(0, 2)  # EOF
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
-    # Update last_activity in meta
-    meta["last_activity"] = int(time.time())
-    _write_json(rdir / "meta.json", meta)
+    # Update activity in meta.
+    def update_activity(current: dict) -> dict:
+        now = int(time.time())
+        current["last_activity"] = now
+        current["last_activity_at"] = now
+        return current
+
+    meta = _update_meta_locked(room_id, update_activity)
 
     # Notify relevant agents (only for kind=request)
     if kind == "request":
@@ -434,6 +465,18 @@ def _write_json(path: Path, data: dict) -> None:
     tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
     tmp.replace(path)
+
+
+def _update_meta_locked(room_id: str, update_fn) -> dict:
+    rdir = _room_dir(room_id)
+    meta_path = rdir / "meta.json"
+    with _lock(rdir / "meta.lock"):
+        if not meta_path.exists():
+            raise ValueError(f"Room '{room_id}' not found")
+        meta = json.loads(meta_path.read_text())
+        updated = update_fn(meta)
+        _write_json(meta_path, updated)
+        return updated
 
 
 def _patch_status(room_id: str, agent: str, status: str, expires_at: int, session_id: str) -> None:

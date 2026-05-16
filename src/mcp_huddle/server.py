@@ -6,6 +6,7 @@ HTTP mode (`--http`): uvicorn + Liquid Glass dashboard on :8014.
 
 import asyncio
 import json
+import os
 import time
 from pathlib import Path
 from typing import Optional
@@ -90,6 +91,7 @@ that bypass anti-loop rules.
 """
 
 mcp = FastMCP("mcp-huddle", instructions=_AGENT_INSTRUCTIONS)
+IDLE_TIMEOUT_SECS = int(os.environ.get("IDLE_TIMEOUT_SECS", "600"))
 
 
 # ── Room tools ────────────────────────────────────────────────────────────────
@@ -214,7 +216,7 @@ def message_post(
       kind=request with reply_to!=null is someone's answer — NOT a new request to you.
       For all other kinds: read silently, do not reply.
     """
-    msg_id = bus.post_message(room_id, agent, body, kind, to, reply_to, idempotency_key, msg_meta=meta)
+    msg_id = _post_message_checked(room_id, agent, body, kind, to, reply_to, idempotency_key, meta)
     if kind == "request":
         _wake_agents_for_request(room_id, agent, body, to, reply_to, msg_id)
     return msg_id
@@ -348,6 +350,35 @@ def status_get(room_id: str) -> dict:
     return bus.get_status(room_id)
 
 
+def _post_message_checked(
+    room_id: str,
+    agent: str,
+    body: str,
+    kind: str,
+    to: Optional[str] = None,
+    reply_to: Optional[int] = None,
+    idempotency_key: Optional[str] = None,
+    meta: Optional[dict] = None,
+) -> int:
+    info = bus.get_room_info(room_id)
+    if info.get("status") == "idle" and kind == "request":
+        bus.revive(room_id)
+    if reply_to is not None:
+        _validate_reply_to(room_id, int(reply_to))
+    return bus.post_message(room_id, agent, body, kind, to, reply_to, idempotency_key, msg_meta=meta)
+
+
+def _validate_reply_to(room_id: str, target_id: int) -> None:
+    messages = bus._load_messages(room_id)
+    target = next((msg for msg in messages if msg.get("id") == target_id), None)
+    if target is None:
+        raise ValueError("reply_to target not found")
+    if target.get("kind") != "request":
+        raise ValueError("reply_to target must be a request")
+    if any(msg.get("reply_to") == target_id for msg in messages):
+        raise ValueError("reply_to target already answered")
+
+
 # ── Consensus tools ───────────────────────────────────────────────────────────
 
 @mcp.tool()
@@ -396,6 +427,13 @@ async def _background_watchdog():
             print(f"[watchdog] zombie check error: {e}", flush=True)
 
         try:
+            idled = _mark_idle_rooms()
+            if idled:
+                print(f"[watchdog] Idle rooms: {idled}", flush=True)
+        except Exception as e:
+            print(f"[watchdog] idle check error: {e}", flush=True)
+
+        try:
             notified = bus.check_deadlock_rooms()
             if notified:
                 print(f"[watchdog] Deadlock-notified rooms: {notified}", flush=True)
@@ -408,6 +446,19 @@ async def _background_watchdog():
                 print(f"[watchdog] Agent wake-ups: {wakes}", flush=True)
         except Exception as e:
             print(f"[watchdog] agent wake-up error: {e}", flush=True)
+
+
+def _mark_idle_rooms() -> list[str]:
+    idled = []
+    now = int(time.time())
+    for meta in bus.list_rooms():
+        if meta.get("status") != "open":
+            continue
+        last = int(meta.get("last_activity_at") or meta.get("last_activity") or meta.get("created_at") or now)
+        if now - last > IDLE_TIMEOUT_SECS:
+            bus.mark_idle(meta["id"])
+            idled.append(meta["id"])
+    return idled
 
 
 # ── Web Dashboard ─────────────────────────────────────────────────────────────
@@ -464,10 +515,10 @@ async def api_messages_json(request: Request) -> JSONResponse:
 async def api_message_post(request: Request) -> JSONResponse:
     data = await request.json()
     try:
-        msg_id = bus.post_message(
+        msg_id = _post_message_checked(
             data["room_id"], data["agent"], data["body"], data["kind"],
             data.get("to"), data.get("reply_to"), data.get("idempotency_key"),
-            msg_meta=data.get("meta"),
+            data.get("meta"),
         )
         if data["kind"] == "request":
             _wake_agents_for_request(
