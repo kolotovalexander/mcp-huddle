@@ -528,3 +528,77 @@ def test_pending_wakeup_skips_request_agent_already_replied(
     updated = isolated_bus.get_room_info(room_id)["agent_meta"]["Gemini"]
     assert updated["last_wake_msg_id"] == 1
     assert updated["last_seen_id"] == 1
+
+
+# ── Tools surface cleanup (room_c216d6e8 consensus) ──────────────────────────
+
+def test_dropped_tools_no_longer_exposed_as_mcp_tools() -> None:
+    """8 tools dropped from agent MCP per design discussion in room_c216d6e8:
+    lifecycle close-variants are human-only, telemetry tools without consumers
+    are removed, respond_via_agent is superseded by Phase 3 wake-up.
+    Functions remain importable for internal use; only @mcp.tool() is gone."""
+    import re
+    source = (Path(server.__file__)).read_text()
+    pat = re.compile(r"@mcp\.tool\(\)\s*\ndef\s+(\w+)\s*\(", re.M)
+    exposed = set(pat.findall(source))
+    dropped = {
+        "room_request_close", "room_close", "room_delete", "room_close_session",
+        "respond_via_agent", "status_set", "status_get", "notify_register",
+    }
+    assert dropped.isdisjoint(exposed), (
+        f"Tools that must NOT be MCP-exposed are still exposed: {dropped & exposed}"
+    )
+    # The 9 we keep:
+    expected_kept = {
+        "room_create", "room_invite", "room_info", "room_list",
+        "message_post", "messages_read", "room_summarize",
+        "propose_resolution", "resolution_vote",
+    }
+    assert expected_kept <= exposed, f"Missing expected tools: {expected_kept - exposed}"
+
+
+def test_room_invite_requires_owner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """room_invite is owner-only escape hatch. Non-owner caller → PermissionError."""
+    home = tmp_path / "huddle-home"
+    monkeypatch.setattr(bus, "HUDDLE_HOME", home)
+    monkeypatch.setattr(bus, "BUS_DIR", home / "rooms")
+    room_id = bus.create_room("rs", owner="Alice", owner_pid=1, cwd="", session_id="")
+    # Non-owner attempt → PermissionError
+    with pytest.raises(PermissionError):
+        server.room_invite(room_id, "Bob", by="Eve")
+    # Missing `by` → also rejected
+    with pytest.raises(PermissionError):
+        server.room_invite(room_id, "Bob")
+    # Owner → ok
+    assert server.room_invite(room_id, "Bob", by="Alice") == "ok"
+    info = bus.get_room_info(room_id)
+    assert "Bob" in info["participants"]
+
+
+def test_no_dropped_tool_references_in_agent_facing_prompts() -> None:
+    """Generated agent prompts and MCP server instructions must not advertise
+    tools that were dropped from the agent surface (room_c216d6e8 consensus).
+    This catches a class of regression that the surface-only test misses:
+    documentation/prompts pointing agents at non-existent MCP tools.
+
+    Per Codex review of feat/agent-tools-cleanup."""
+    dropped = [
+        "room_close", "room_close_session", "room_delete", "room_request_close",
+        "status_set", "status_get", "notify_register", "respond_via_agent",
+    ]
+    samples = {
+        "default_brief": server._build_default_brief(
+            "room_test", "test-room", "test goal", "/tmp"),
+        "codex_wakeup": server._build_codex_wakeup_prompt(
+            "room_test", "Claude", "test body", "Codex", 42, 0),
+        "agent_instructions": server._AGENT_INSTRUCTIONS,
+    }
+    if hasattr(server, "_build_agent_wakeup_prompt"):
+        samples["agent_wakeup"] = server._build_agent_wakeup_prompt(
+            "room_test", "Gemini", "Claude", "test body", "Gemini", 42, 0, "")
+    failures = []
+    for source_name, text in samples.items():
+        for tool in dropped:
+            if tool in text:
+                failures.append(f"{source_name} mentions dropped tool {tool!r}")
+    assert not failures, "\n".join(failures)
