@@ -602,3 +602,46 @@ def test_no_dropped_tool_references_in_agent_facing_prompts() -> None:
             if tool in text:
                 failures.append(f"{source_name} mentions dropped tool {tool!r}")
     assert not failures, "\n".join(failures)
+def test_room_marks_idle_after_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+    monkeypatch.setattr(server, "IDLE_TIMEOUT_SECS", 10)
+    monkeypatch.setattr(server.time, "time", lambda: 100)
+
+    room_id = isolated_bus.create_room("Idle", "Claude", 0, "/tmp/project", "session-1")
+    meta = isolated_bus.get_room_info(room_id)
+    meta["last_activity_at"] = 89
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+
+    assert server._mark_idle_rooms() == [room_id]
+    assert isolated_bus.get_room_info(room_id)["status"] == "idle"
+
+
+def test_request_revives_idle_room(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    room_id = isolated_bus.create_room("Revive", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.mark_idle(room_id)
+
+    msg_id = server.message_post(room_id, "Claude", "Anyone back?", "request", to="all")
+
+    assert msg_id == 1
+    meta = isolated_bus.get_room_info(room_id)
+    assert meta["status"] == "open"
+    assert meta["last_activity_at"] >= meta["created_at"]
+
+
+def test_reply_to_answered_request_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    room_id = isolated_bus.create_room("Answered", "Claude", 0, "/tmp/project", "session-1")
+    server.message_post(room_id, "Claude", "Codex, answer once.", "request", to="Codex")
+    server.message_post(room_id, "Codex", "First answer.", "result", to="Claude", reply_to=1)
+
+    with pytest.raises(ValueError, match="reply_to target already answered"):
+        server.message_post(room_id, "Gemini", "Second answer.", "result", to="Claude", reply_to=1)
