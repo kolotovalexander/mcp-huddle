@@ -573,3 +573,32 @@ def test_room_invite_requires_owner(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert server.room_invite(room_id, "Bob", by="Alice") == "ok"
     info = bus.get_room_info(room_id)
     assert "Bob" in info["participants"]
+
+
+def test_no_dropped_tool_references_in_agent_facing_prompts() -> None:
+    """Generated agent prompts and MCP server instructions must not advertise
+    tools that were dropped from the agent surface (room_c216d6e8 consensus).
+    This catches a class of regression that the surface-only test misses:
+    documentation/prompts pointing agents at non-existent MCP tools.
+
+    Per Codex review of feat/agent-tools-cleanup."""
+    dropped = [
+        "room_close", "room_close_session", "room_delete", "room_request_close",
+        "status_set", "status_get", "notify_register", "respond_via_agent",
+    ]
+    samples = {
+        "default_brief": server._build_default_brief(
+            "room_test", "test-room", "test goal", "/tmp"),
+        "codex_wakeup": server._build_codex_wakeup_prompt(
+            "room_test", "Claude", "test body", "Codex", 42, 0),
+        "agent_instructions": server._AGENT_INSTRUCTIONS,
+    }
+    if hasattr(server, "_build_agent_wakeup_prompt"):
+        samples["agent_wakeup"] = server._build_agent_wakeup_prompt(
+            "room_test", "Gemini", "Claude", "test body", "Gemini", 42, 0, "")
+    failures = []
+    for source_name, text in samples.items():
+        for tool in dropped:
+            if tool in text:
+                failures.append(f"{source_name} mentions dropped tool {tool!r}")
+    assert not failures, "\n".join(failures)

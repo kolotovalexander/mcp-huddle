@@ -42,8 +42,9 @@ INVITING OTHER AGENTS:
    roster), shell out yourself with the room_id + brief, e.g.
    `codex exec --dangerously-bypass-approvals-and-sandbox "Join huddle room
    <ROOM_ID>: <task>. Read messages_read first, then post."` and same for
-   `gemini -y -p "..."`. Then call `room_invite(room_id, "Codex")` /
-   `room_invite(room_id, "Gemini")` so they appear in participants.
+   `gemini -y -p "..."`. Then (owner only) call
+   `room_invite(room_id, "Codex", by="<owner>")` / `..., by="<owner>"` so
+   they appear in participants.
 3. Prefer auto_spawn unless you specifically need a non-default agent.
 
 ANTI-LOOP PROTOCOL (CRITICAL — without this rooms turn into infinite chat):
@@ -76,10 +77,12 @@ CONSENSUS:
   text)` → all participants vote `ack`/`reject` via `resolution_vote(...)`.
 - All-ack → room becomes `resolved` (read-only for normal messages).
 
-CLOSE PROTOCOL (never close silently — humans want a heads-up):
-1. `room_request_close(room_id, agent)` — sets status to `closing_requested`.
-2. ASK THE USER explicitly: "Закрываем чат '<name>'?" (or in their language).
-3. On user yes → `room_close(room_id, owner)` — only the owner can do this.
+CLOSE PROTOCOL (lifecycle is human-only — agents never close):
+1. Agents express "discussion is done" via `message_post(kind="final", ...)`.
+2. Rooms auto-transition to `status=idle` after IDLE_TIMEOUT_SECS of silence
+   (default 600s); a new `kind=request` revives them to `open`.
+3. Permanent closure/deletion happens through the dashboard or `huddle` CLI,
+   not through agent MCP tools.
 
 STORAGE: ~/.mcp-huddle/rooms/{room_id}/ (JSONL + meta.json, file-locked,
 shared across all agents on this machine).
@@ -954,11 +957,9 @@ Request body:
 {body}
 
 Protocol:
-1. Call status_set(room_id="{room_id}", agent="{agent_name}", status="busy", expires_in_sec=300).
-2. Call messages_read(room_id="{room_id}", since_id=0, limit=50).
-3. If message #{msg_id} is kind=request addressed to {agent_name} or all and has no reply_to, answer it exactly once.
-4. Post your answer with message_post(room_id="{room_id}", agent="{agent_name}", kind="result", to="{sender}", reply_to={msg_id}, idempotency_key="{agent_name.lower()}-wake:{room_id}:{msg_id}").
-5. Call status_set(room_id="{room_id}", agent="{agent_name}", status="done", expires_in_sec=60).
+1. Call messages_read(room_id="{room_id}", since_id=0, limit=50).
+2. If message #{msg_id} is kind=request addressed to {agent_name} or all and has no reply_to, answer it exactly once.
+3. Post your answer with message_post(room_id="{room_id}", agent="{agent_name}", kind="result", to="{sender}", reply_to={msg_id}, idempotency_key="{agent_name.lower()}-wake:{room_id}:{msg_id}").
 
 Do not answer requests that already have reply_to set. Do not send thanks/ack-only chatter.
 """
@@ -986,11 +987,9 @@ Request body:
 {body}
 
 Use only huddle MCP tools for room coordination:
-1. Call status_set(room_id="{room_id}", agent="Codex", status="busy", expires_in_sec=300).
-2. Call messages_read(room_id="{room_id}", since_id=0, limit=50).
-3. If message #{msg_id} is a kind=request addressed to Codex or all and has no reply_to, answer it exactly once.
-4. Post your answer with message_post(room_id="{room_id}", agent="Codex", kind="result", to="{sender}", reply_to={msg_id}, idempotency_key="codex-wake:{room_id}:{msg_id}").
-5. Call status_set(room_id="{room_id}", agent="Codex", status="done", expires_in_sec=60).
+1. Call messages_read(room_id="{room_id}", since_id=0, limit=50).
+2. If message #{msg_id} is a kind=request addressed to Codex or all and has no reply_to, answer it exactly once.
+3. Post your answer with message_post(room_id="{room_id}", agent="Codex", kind="result", to="{sender}", reply_to={msg_id}, idempotency_key="codex-wake:{room_id}:{msg_id}").
 
 Do not answer requests that already have reply_to set. Do not send thanks/ack-only chatter.
 """
@@ -1020,7 +1019,7 @@ You are an independent reviewer, NOT an executor.
 Use MCP tools from mcp-huddle:
   messages_read("{room_id}") — read chat
   message_post("{room_id}", "YourName", "...", kind="comment"|"request"|"result", ...) — post
-  status_set("{room_id}", "YourName", "busy"|"online") — update status
+  room_summarize("{room_id}", since_id=N) — token-efficient digest after absence
 
 ## MANDATORY: read full history BEFORE every reply
 Always call `messages_read(room_id, since_id=0)` as the FIRST tool call on each
