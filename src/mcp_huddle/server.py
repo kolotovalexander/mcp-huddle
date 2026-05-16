@@ -131,13 +131,24 @@ def room_create(
 
 
 @mcp.tool()
-def room_invite(room_id: str, agent_name: str) -> str:
-    """Add an agent to an existing room."""
+def room_invite(room_id: str, agent_name: str, by: str = "") -> str:
+    """Owner-only roster escape hatch — add an agent to an existing room.
+
+    Requires `by` to equal the room's owner. Regular participants must not
+    expand the roster; orchestration is the owner's responsibility.
+    """
+    info = bus.get_room_info(room_id)
+    if not info:
+        raise ValueError(f"Room {room_id} not found")
+    owner = info.get("owner", "")
+    if not by or by != owner:
+        raise PermissionError(
+            f"room_invite is owner-only. by={by!r} does not match owner={owner!r}"
+        )
     bus.invite_agent(room_id, agent_name)
     return "ok"
 
 
-@mcp.tool()
 def room_request_close(room_id: str, agent: str) -> str:
     """Signal intent to close. Returns 'closing_requested'.
     Human must confirm by calling room_close().
@@ -145,14 +156,12 @@ def room_request_close(room_id: str, agent: str) -> str:
     return bus.request_close(room_id, agent)
 
 
-@mcp.tool()
 def room_close(room_id: str, owner: str) -> str:
     """Permanently close a room (owner only). Kills spawned agents."""
     bus.close_room(room_id, owner)
     return "closed"
 
 
-@mcp.tool()
 def room_delete(room_id: str, owner: str) -> str:
     """Permanently remove a closed room from disk (history wipe).
 
@@ -166,7 +175,6 @@ def room_delete(room_id: str, owner: str) -> str:
     return "deleted"
 
 
-@mcp.tool()
 def room_close_session(session_id: str) -> list:
     """Close all open rooms belonging to a session (called by Stop hook)."""
     return bus.close_session_rooms(session_id)
@@ -242,7 +250,6 @@ def room_summarize(room_id: str, since_id: int = 0) -> str:
     return bus.summarize_messages(room_id, since_id)
 
 
-@mcp.tool()
 def respond_via_agent(
     room_id: str,
     agent_name: str,
@@ -326,7 +333,6 @@ def respond_via_agent(
 
 # ── Status tools ──────────────────────────────────────────────────────────────
 
-@mcp.tool()
 def status_set(
     room_id: str,
     agent: str,
@@ -342,7 +348,6 @@ def status_set(
     return "ok"
 
 
-@mcp.tool()
 def status_get(room_id: str) -> dict:
     """Get all agent statuses in a room (expired leases auto-reset to online)."""
     return bus.get_status(room_id)
@@ -371,7 +376,6 @@ def resolution_vote(room_id: str, agent: str, resolution_id: str, vote: str) -> 
 
 # ── Notification tools ────────────────────────────────────────────────────────
 
-@mcp.tool()
 def notify_register(room_id: str, agent: str, notify_file_path: str) -> str:
     """Register a file path to receive notifications when kind=request arrives.
 
