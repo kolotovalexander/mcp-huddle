@@ -32,6 +32,85 @@ function avatar(agent, sizeCls) {
   return el('div', {class: `avatar ${sizeCls || 'avatar-md'} ${avatarCls(agent)}`, text: agentLetter(agent)});
 }
 
+// ── Markdown rendering (Telegram-style, dependency-free & XSS-safe) ──────────
+// Agents post Markdown (## headers, **bold**, `code`, ```fences```, - lists).
+// We escape ALL message text first, then re-introduce a fixed whitelist of
+// tags — message content can never inject HTML.
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
+    {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function renderMarkdown(src) {
+  src = String(src == null ? '' : src);
+
+  // 1. Pull out fenced code blocks + inline code so their content is never
+  //    treated as Markdown. Placeholders are wrapped in a Private-Use-Area
+  //    char (U+E000) — it never appears in real chat text.
+  const blocks = [];
+  src = src.replace(/```[^\n`]*\n?([\s\S]*?)```/g, (_, code) => {
+    blocks.push(code.replace(/\n+$/, ''));
+    return 'CB' + (blocks.length - 1) + '';
+  });
+  const inlines = [];
+  src = src.replace(/`([^`\n]+)`/g, (_, code) => {
+    inlines.push(code);
+    return 'IC' + (inlines.length - 1) + '';
+  });
+
+  const restoreInline = t => t
+    .replace(/IC(\d+)/g, (_, i) => `<code>${escapeHtml(inlines[+i])}</code>`)
+    .replace(/CB(\d+)/g, (_, i) => `<pre class="md-pre"><code>${escapeHtml(blocks[+i])}</code></pre>`);
+
+  function inline(text) {
+    let t = escapeHtml(text);
+    // links [label](url) — only http(s)/mailto survive, else neutralised
+    t = t.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (_, label, url) => {
+      const safe = /^(https?:\/\/|mailto:)/i.test(url) ? url : '#';
+      return `<a href="${safe}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+    });
+    t = t.replace(/\*\*([^\n]+?)\*\*/g, '<strong>$1</strong>');
+    t = t.replace(/__([^\n]+?)__/g, '<strong>$1</strong>');
+    t = t.replace(/~~([^\n]+?)~~/g, '<del>$1</del>');
+    t = t.replace(/(^|[^*\w])\*([^*\n]+?)\*(?!\*)/g, '$1<em>$2</em>');
+    t = t.replace(/(^|[^_\w])_([^_\n]+?)_(?![_\w])/g, '$1<em>$2</em>');
+    return restoreInline(t);
+  }
+
+  const lines = src.split('\n');
+  let html = '', listType = null;
+  const closeList = () => { if (listType) { html += `</${listType}>`; listType = null; } };
+
+  for (const line of lines) {
+    const cb = line.match(/^\s*CB(\d+)\s*$/);
+    if (cb) { closeList(); html += restoreInline('CB' + cb[1] + ''); continue; }
+    if (/^\s*$/.test(line)) { closeList(); continue; }
+
+    const h = line.match(/^(#{1,6})\s+(.*)$/);
+    if (h) { closeList(); html += `<div class="md-h md-h${h[1].length}">${inline(h[2])}</div>`; continue; }
+    if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) { closeList(); html += '<hr class="md-hr">'; continue; }
+
+    const q = line.match(/^\s*>\s?(.*)$/);
+    if (q) { closeList(); html += `<blockquote class="md-quote">${inline(q[1])}</blockquote>`; continue; }
+
+    const ol = line.match(/^\s*\d+[.)]\s+(.*)$/);
+    if (ol) {
+      if (listType !== 'ol') { closeList(); html += '<ol class="md-list">'; listType = 'ol'; }
+      html += `<li>${inline(ol[1])}</li>`; continue;
+    }
+    const ul = line.match(/^\s*[-*+]\s+(.*)$/);
+    if (ul) {
+      if (listType !== 'ul') { closeList(); html += '<ul class="md-list">'; listType = 'ul'; }
+      html += `<li>${inline(ul[1])}</li>`; continue;
+    }
+
+    closeList();
+    html += `<div class="md-line">${inline(line)}</div>`;
+  }
+  closeList();
+  return html;
+}
+
 function fmtTime(ts) {
   return new Date((ts || 0) * 1000).toLocaleTimeString('ru', {hour:'2-digit', minute:'2-digit'});
 }
@@ -40,6 +119,7 @@ function fmtTime(ts) {
 let currentRoom = null, currentOwner = null, lastId = 0;
 let rooms = [], msgMap = {};
 let agentMetaTotals = {}; // {agentName: {tokens_total, tokens_in, tokens_out, msgs, models:Set, last_reasoning}}
+let lastStatuses = {};    // {agentName: 'online'|'busy'|...} — latest room status snapshot
 
 function metaBadge(meta) {
   if (!meta) return null;
@@ -241,9 +321,19 @@ function buildChatShell(room) {
   const inputAttrs = {
     id: 'human-inp',
     type: 'text',
+    // A bare <input type="text"> with no name makes Safari/Chrome offer
+    // contact autofill (phone number etc.). Opt out explicitly: it is a
+    // free-text chat field, not a contact form.
+    name: 'huddle-message',
+    autocomplete: 'off',
+    autocorrect: 'off',
+    autocapitalize: 'sentences',
+    spellcheck: 'false',
+    'data-1p-ignore': '',
+    'data-lpignore': 'true',
     placeholder: isReadOnly
       ? (isClosed ? 'Room closed — read-only' : 'Room resolved — read-only')
-      : 'Send as Human — system priority bypasses anti-loop rules…',
+      : 'Сообщение от имени Human — system-приоритет, обходит anti-loop…',
   };
   if (isReadOnly) inputAttrs.disabled = '';
   const input = el('input', inputAttrs);
@@ -326,46 +416,99 @@ async function attachAgentPanels(roomId) {
     resetActivityPanel('Нет данных об агентах');
     return;
   }
-  const {agents} = await resp.json();
+  const {agents, health} = await resp.json();
+  const spawned = agents || {};
+  const healthMap = health || {};
   const panel = resetActivityPanel(null);
   if (!panel) return;
 
-  if (!agents || Object.keys(agents).length === 0) {
-    resetActivityPanel('В этой комнате нет spawned-агентов');
+  // Show EVERY participant — not just huddle-spawned ones. The room owner
+  // (Claude) has no spawned process / event log, but the user still wants to
+  // see that it is in the room and its online/busy status.
+  const room = rooms.find(x => x.id === roomId) || {};
+  const seen = new Set();
+  const participants = [];
+  for (const p of (room.participants || [])) { if (!seen.has(p)) { seen.add(p); participants.push(p); } }
+  for (const p of Object.keys(spawned)) { if (!seen.has(p)) { seen.add(p); participants.push(p); } }
+
+  if (!participants.length) {
+    resetActivityPanel('В этой комнате нет участников');
     return;
   }
 
   const wrap = el('div', {class: 'agent-panels', id: 'agent-panels'});
-  const header = el('div', {class: 'agent-panels-header', text: 'Agent activity (live)'});
-  wrap.appendChild(header);
+  wrap.appendChild(el('div', {class: 'agent-panels-header', text: 'Agent activity (live)'}));
+  const scroll = el('div', {class: 'agent-panels-scroll'});
+  wrap.appendChild(scroll);
 
-  for (const name of Object.keys(agents)) {
-    const detailsEl = el('details', {class: 'agent-panel', dataset: {agent: name}, open: ''}, [
-      el('summary', {class: 'agent-panel-summary'}, [
-        avatar(name, 'avatar-sm'),
-        el('span', {class: 'agent-panel-name', text: name}),
-        el('span', {class: 'agent-panel-totals', id: `agent-totals-${name}`, text: '·'}),
-        el('span', {class: 'agent-panel-status', id: `agent-status-${name}`, text: '·'}),
-      ]),
-      el('div', {class: 'agent-events', id: `agent-events-${name}`}),
+  for (const name of participants) {
+    const isSpawned = !!spawned[name];
+    const healthSpan = el('span', {class: 'agent-panel-health', id: `agent-health-${name}`});
+
+    const summary = el('summary', {class: 'agent-panel-summary'}, [
+      avatar(name, 'avatar-sm'),
+      el('span', {class: 'agent-panel-name', text: name}),
+      el('span', {class: 'agent-status-dot offline', id: `agent-sdot-${name}`,
+                  title: `${name}: offline`}),
+      el('span', {class: 'agent-panel-totals', id: `agent-totals-${name}`, text: ''}),
+      el('span', {class: 'agent-panel-status', id: `agent-status-${name}`,
+                  text: isSpawned ? '·' : 'no live stream'}),
+      healthSpan,
     ]);
-    wrap.appendChild(detailsEl);
 
-    const url = `/agents/${encodeURIComponent(roomId)}/${encodeURIComponent(name)}/events`;
-    const es = new EventSource(url);
-    es.addEventListener('open', () => {
-      const s = document.getElementById(`agent-status-${name}`);
-      if (s) s.textContent = '● live';
-    });
-    es.addEventListener('error', () => {
-      const s = document.getElementById(`agent-status-${name}`);
-      if (s) s.textContent = '× closed';
-    });
-    es.onmessage = (ev) => appendAgentEvent(name, ev.data);
-    agentStreams[name] = es;
+    const body = isSpawned
+      ? el('div', {class: 'agent-events', id: `agent-events-${name}`})
+      : el('div', {class: 'agent-panel-hint', text: name === room.owner
+          ? 'Оркестратор комнаты. Его реплики видны в чате слева — huddle не spawn-ит owner-а, поэтому отдельного live-лога событий у него нет.'
+          : 'Участник без spawned-процесса: live-потока событий нет, только статус.'});
+
+    const detailsEl = el('details', {
+      class: 'agent-panel' + (isSpawned ? '' : ' static'),
+      dataset: {agent: name}, open: '',
+    }, [summary, body]);
+    scroll.appendChild(detailsEl);
+
+    if (isSpawned) {
+      const hLabel = activityHealthLabel(healthMap[name]);
+      if (hLabel) { healthSpan.textContent = hLabel; healthSpan.classList.add('warn'); }
+      const url = `/agents/${encodeURIComponent(roomId)}/${encodeURIComponent(name)}/events`;
+      const es = new EventSource(url);
+      es.addEventListener('open', () => {
+        const s = document.getElementById(`agent-status-${name}`);
+        if (s) s.textContent = '● live';
+      });
+      es.addEventListener('error', () => {
+        const s = document.getElementById(`agent-status-${name}`);
+        if (s) s.textContent = '× closed';
+      });
+      es.onmessage = (ev) => appendAgentEvent(name, ev.data);
+      agentStreams[name] = es;
+    }
   }
 
   panel.appendChild(wrap);
+  updateActivityStatuses(lastStatuses);
+}
+
+// Wake-health label for an agent panel (from /api/room_agents `health`).
+function activityHealthLabel(h) {
+  if (!h) return '';
+  if (h.stale_lease) return '⚠ stale lease';
+  if (h.last_wake_failed) return `✗ wake failed (rc ${h.last_wake_rc})`;
+  if (h.wake_fail_count > 0) return `⚠ ${h.wake_fail_count} wake fail(s)`;
+  return '';
+}
+
+// Refresh the online/busy dot on each agent panel from a status snapshot.
+function updateActivityStatuses(statuses) {
+  statuses = statuses || {};
+  document.querySelectorAll('[id^="agent-sdot-"]').forEach(dot => {
+    const name = dot.id.slice('agent-sdot-'.length);
+    const st = statuses[name] || 'offline';
+    const cls = st === 'busy' ? 'busy' : st === 'online' ? 'online' : 'offline';
+    dot.className = 'agent-status-dot ' + cls;
+    dot.title = `${name}: ${st}`;
+  });
 }
 
 function appendAgentEvent(agentName, raw) {
@@ -379,9 +522,10 @@ function appendAgentEvent(agentName, raw) {
     // Gemini stream-json: {type, content?, ...}
     if (obj.type) {
       summary = obj.type;
-      if (obj.agent_message) summary += ': ' + String(obj.agent_message).slice(0, 120);
-      else if (obj.delta) summary += ': ' + String(obj.delta).slice(0, 120);
-      else if (obj.content) summary += ': ' + String(obj.content).slice(0, 120);
+      // Lines word-wrap in the panel now, so we can afford a fuller preview.
+      if (obj.agent_message) summary += ': ' + String(obj.agent_message).slice(0, 400);
+      else if (obj.delta) summary += ': ' + String(obj.delta).slice(0, 400);
+      else if (obj.content) summary += ': ' + String(obj.content).slice(0, 400);
       detail = JSON.stringify(obj, null, 2);
     }
   } catch(e) {
@@ -448,7 +592,9 @@ function renderOne(m) {
     replyEl.querySelector('.reply-name').style.color = replyAgentColor;
     bubble.appendChild(replyEl);
   }
-  bubble.appendChild(el('div', {class: 'msg-body', text: m.body}));
+  const bodyEl = el('div', {class: 'msg-body md'});
+  bodyEl.innerHTML = renderMarkdown(m.body);
+  bubble.appendChild(bodyEl);
 
   const div = el('div', {
     class: `msg ${agentCls(m.agent)} kind-${m.kind}`,
@@ -501,6 +647,8 @@ async function fetchMessages(initial) {
       renderChatMeta(data.room, data.statuses);
       renderAvatarStack(data.room.participants);
     }
+    lastStatuses = data.statuses || {};
+    updateActivityStatuses(lastStatuses);
 
     if (initial) {
       const list = document.getElementById('messages');

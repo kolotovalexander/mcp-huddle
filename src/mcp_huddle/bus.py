@@ -61,10 +61,11 @@ def create_room(name: str, owner: str, owner_pid: int, cwd: str = "",
 
 
 def invite_agent(room_id: str, agent_name: str) -> None:
-    meta = _read_meta(room_id)
-    if agent_name not in meta["participants"]:
-        meta["participants"].append(agent_name)
-    _write_json(_room_dir(room_id) / "meta.json", meta)
+    def _update(meta: dict) -> dict:
+        if agent_name not in meta["participants"]:
+            meta["participants"].append(agent_name)
+        return meta
+    _update_meta_locked(room_id, _update)
     _patch_status(room_id, agent_name, "online", 0, "")
 
 
@@ -229,6 +230,12 @@ def post_message(room_id: str, agent: str, body: str, kind: str,
                 except Exception:
                     pass
 
+        # reply_to validation — done under the messages lock so the check is
+        # atomic with the append below: a parallel duplicate reply from the
+        # same agent cannot slip through the gap between validate and write.
+        if reply_to is not None:
+            _validate_reply_to_locked(room_id, int(reply_to), agent)
+
         # Assign next ID
         msg_id = _next_id(msgs_file)
 
@@ -269,6 +276,35 @@ def post_message(room_id: str, agent: str, body: str, kind: str,
         _notify_agents(room_id, meta["participants"], agent, to, msg_id)
 
     return msg_id
+
+
+def _validate_reply_to_locked(room_id: str, target_id: int, agent: str) -> None:
+    """Validate a reply_to target. Call ONLY while holding the messages lock so
+    the check is atomic with the append that follows.
+
+    Rules:
+      * target must exist and be a `request`;
+      * the replying agent must have been an addressee (`to` empty / "all" /
+        the agent itself) — Human/System bypass this;
+      * a broadcast request (`to=all` / no `to`) expects one reply per
+        addressee, so we reject only a SECOND reply from the SAME agent —
+        replies from other agents are allowed.
+    """
+    messages = _load_messages(room_id)
+    target = next((m for m in messages if m.get("id") == target_id), None)
+    if target is None:
+        raise ValueError("reply_to target not found")
+    if target.get("kind") != "request":
+        raise ValueError("reply_to target must be a request")
+    target_to = target.get("to")
+    if (agent not in ("Human", "System")
+            and target_to and target_to not in ("all", agent)):
+        raise ValueError(
+            f"reply_to target #{target_id} was addressed to {target_to!r}, "
+            f"not to {agent!r}")
+    if any(m.get("reply_to") == target_id and m.get("agent") == agent
+           for m in messages):
+        raise ValueError(f"{agent} already answered request #{target_id}")
 
 
 def read_messages(room_id: str, since_id: int = 0, limit: int = 20) -> str:

@@ -76,6 +76,32 @@ _GEMINI_BIN = _first_existing_binary([
 ])
 
 
+def _is_ascii(text: str) -> bool:
+    return all(ord(ch) < 128 for ch in text)
+
+
+# Codex CLI crashes when cwd contains non-ASCII characters: it copies the path
+# into the `x-codex-turn-metadata` HTTP header and the UTF-8 bytes break the
+# request (upstream issue #17468). When a project lives under such a path we
+# run Codex from an ASCII fallback cwd and hand it the real project path as an
+# absolute path inside the brief instead.
+_CODEX_NONASCII_CWD_NOTE = (
+    "\n\n[ВАЖНО — рабочее окружение]\n"
+    "Codex CLI падает на не-ASCII cwd, поэтому этот процесс запущен из "
+    "служебного ASCII-каталога, НЕ из каталога проекта. Файлы проекта — по "
+    "абсолютному пути:\n  {real}\n"
+    "Обращайся к ним только по абсолютным путям; cwd использовать нельзя.\n"
+)
+
+
+def _codex_safe_cwd_and_brief(cwd: str, brief: str) -> tuple[str, str]:
+    """Return (cwd, brief) safe for a Codex spawn. If cwd is non-ASCII, swap to
+    an ASCII fallback cwd and append the real project path to the brief."""
+    if cwd and not _is_ascii(cwd):
+        return str(Path.home()), brief + _CODEX_NONASCII_CWD_NOTE.format(real=cwd)
+    return cwd, brief
+
+
 # Default registry: enabled=False if the binary is missing.
 # `--json` (Codex) / `-o stream-json` (Gemini) emit structured events to stdout
 # which the dashboard SSE endpoint streams to the browser. `{last_message}` is
@@ -89,7 +115,8 @@ DEFAULT_REGISTRY: list[SpawnSpec] = [
             "--disable", "guardian_approval",
             "--json",
             "--output-last-message", "{last_message}",
-            "-m", "gpt-5.5",
+            # Model is NOT pinned — it comes from ~/.codex/config.toml (SoT).
+            # Hardcoding it here drifts the moment the config default changes.
             "-c", 'model_reasoning_effort="medium"',
             "-s", "read-only",
             "{brief}",
@@ -150,13 +177,24 @@ def log_spawn_failure(
     traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
 
 
-def _reap_in_background(proc: subprocess.Popen, name: str) -> None:
-    """Ensure short-lived spawned agents do not remain as defunct children."""
+def _reap_in_background(proc: subprocess.Popen, name: str,
+                        on_exit=None) -> None:
+    """Ensure short-lived spawned agents do not remain as defunct children.
+
+    on_exit: optional callable(returncode) invoked once the process exits.
+    Used by the wake machinery to clear the busy lease and drain queued
+    requests the moment an agent turn ends (event-driven, no polling)."""
     def wait_for_exit() -> None:
+        returncode = None
         try:
-            proc.wait()
+            returncode = proc.wait()
         except Exception:
             pass
+        if on_exit is not None:
+            try:
+                on_exit(returncode)
+            except Exception:
+                pass
 
     thread = threading.Thread(
         target=wait_for_exit,
@@ -192,17 +230,22 @@ def spawn_agent(
     cwd: str,
     log_dir: Path,
     verify_alive_sec: float = 0.0,
+    on_exit=None,
 ) -> tuple[int, str, str | None]:
     """Spawn one agent.
 
     Returns (pid, log_path, last_message_path).
     last_message_path is None for agents whose argv doesn't reference {last_message}.
 
+    on_exit: optional callable(returncode) fired when the process exits.
+
     Side effects: creates log_dir, opens log file, redirects stdout+stderr to it.
     """
     log_dir.mkdir(parents=True, exist_ok=True)
     name = spec["name"]
     log_path = log_dir / f"{name.lower()}.events.jsonl"
+    if name == "Codex":
+        cwd, brief = _codex_safe_cwd_and_brief(cwd, brief)
     argv, last_msg_path = _resolve_spawn_args(spec, brief, log_dir)
 
     log_file = open(log_path, "ab", buffering=0)
@@ -218,7 +261,7 @@ def spawn_agent(
         # Popen dups the fd into the child; we can close ours so the parent
         # process doesn't keep the log file held open after the child exits.
         log_file.close()
-    _reap_in_background(proc, name)
+    _reap_in_background(proc, name, on_exit=on_exit)
     if verify_alive_sec > 0:
         time.sleep(verify_alive_sec)
         returncode = proc.poll()
@@ -237,6 +280,7 @@ def spawn_all(
     log_dir: Path,
     briefs: dict[str, str] | None = None,
     verify_alive_sec: float = 0.0,
+    on_exit_factory=None,
 ) -> tuple[list[str], list[int], dict[str, dict[str, str | None]]]:
     """Spawn every enabled agent in the registry.
 
@@ -260,7 +304,9 @@ def spawn_all(
         agent_brief = briefs.get(spec["name"], brief)
         try:
             pid, log_path, last_msg = spawn_agent(
-                spec, agent_brief, cwd, log_dir, verify_alive_sec=verify_alive_sec
+                spec, agent_brief, cwd, log_dir,
+                verify_alive_sec=verify_alive_sec,
+                on_exit=on_exit_factory(spec["name"]) if on_exit_factory else None,
             )
             pids.append(pid)
             names.append(spec["name"])
@@ -335,24 +381,26 @@ def codex_log_has_completed_turn(log_path: str) -> bool:
 
 
 def codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str,
-                 last_msg_path: str | None = None) -> int:
+                 last_msg_path: str | None = None, on_exit=None) -> int:
     """Resume a Codex thread with a new prompt. Cheaper than fresh spawn —
     Codex remembers prior conversation via its rollout file.
 
     Appends events to the same log_path so the dashboard SSE keeps streaming.
     Returns PID of the spawned codex exec resume process.
 
-    `codex exec resume` only accepts a small set of options (no -m/-s/-a
-    subcommand-local). Top-level `codex` flags must come BEFORE `exec`.
-    Model + reasoning effort overrides are passed via -c key=value (which
-    `exec resume` does support).
+    `codex exec resume` has no `-s/--sandbox` flag — sandbox must be pinned
+    via `-c sandbox_mode=...`, else it falls back to ~/.codex/config.toml
+    (potentially danger-full-access). `-a` is a top-level flag (before `exec`).
+    Reasoning / sandbox overrides go through `-c key=value`. The model is left
+    to ~/.codex/config.toml (SoT) — not pinned here, to avoid drift.
     """
+    cwd, prompt = _codex_safe_cwd_and_brief(cwd, prompt)
     argv = [
         _CODEX_BIN or "codex", "-a", "never",            # top-level: never auto-approve tool calls
         "exec", "resume", thread_id,                     # subcommand
         "--json",                                        # JSONL events to stdout
-        "-c", 'model="gpt-5.5"',                         # config override (resume supports -c)
         "-c", 'model_reasoning_effort="medium"',
+        "-c", 'sandbox_mode="read-only"',                # pin read-only — resume has no -s flag
         "-c", "features.guardian_approval=false",
     ]
     if last_msg_path:
@@ -370,5 +418,5 @@ def codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str,
         )
     finally:
         log_file.close()
-    _reap_in_background(proc, "Codex")
+    _reap_in_background(proc, "Codex", on_exit=on_exit)
     return proc.pid

@@ -7,7 +7,9 @@ HTTP mode (`--http`): uvicorn + Liquid Glass dashboard on :8014.
 import asyncio
 import json
 import os
+import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -371,20 +373,9 @@ def _post_message_checked(
     info = bus.get_room_info(room_id)
     if info.get("status") == "idle" and kind == "request":
         bus.revive(room_id)
-    if reply_to is not None:
-        _validate_reply_to(room_id, int(reply_to))
+    # reply_to is validated inside bus.post_message under the messages lock —
+    # atomic with the append, so a duplicate reply cannot race through the gap.
     return bus.post_message(room_id, agent, body, kind, to, reply_to, idempotency_key, msg_meta=meta)
-
-
-def _validate_reply_to(room_id: str, target_id: int) -> None:
-    messages = bus._load_messages(room_id)
-    target = next((msg for msg in messages if msg.get("id") == target_id), None)
-    if target is None:
-        raise ValueError("reply_to target not found")
-    if target.get("kind") != "request":
-        raise ValueError("reply_to target must be a request")
-    if any(msg.get("reply_to") == target_id for msg in messages):
-        raise ValueError("reply_to target already answered")
 
 
 # ── Consensus tools ───────────────────────────────────────────────────────────
@@ -410,11 +401,14 @@ def resolution_vote(room_id: str, agent: str, resolution_id: str, vote: str) -> 
 
 # ── Notification tools ────────────────────────────────────────────────────────
 
+@mcp.tool()
 def notify_register(room_id: str, agent: str, notify_file_path: str) -> str:
-    """Register a file path to receive notifications when kind=request arrives.
+    """Register a file path to be notified when a kind=request is addressed to
+    you. Useful for externally-launched agents (not auto_spawn'd by huddle):
+    register a path, then have a hook poll it.
 
-    Server writes JSON to notify_file_path when a request is addressed to you.
-    Your hook script should poll /tmp/mcp-huddle-*-notify.json files.
+    On every matching request huddle writes JSON to notify_file_path:
+      {"room_id", "from_agent", "kind": "request", "msg_id"}
     """
     bus.register_notify(room_id, agent, notify_file_path)
     return "ok"
@@ -597,13 +591,53 @@ async def api_rooms_nuke(request: Request) -> JSONResponse:
 
 @mcp.custom_route("/api/room_agents", methods=["GET"])
 async def api_room_agents(request: Request) -> JSONResponse:
-    """List spawned agents for a room (name + log_path + last_message_path)."""
+    """List spawned agents for a room + computed wake-health per agent
+    (stale leases, failed wakes)."""
     room_id = request.query_params.get("room_id", "")
     try:
         meta = bus._read_meta(room_id)
-        return JSONResponse({"agents": meta.get("agent_meta", {})})
+        agent_meta = meta.get("agent_meta", {})
+        statuses = bus.get_status(room_id)
+        health = {name: _agent_wake_health(info, statuses.get(name))
+                  for name, info in agent_meta.items()}
+        return JSONResponse({"agents": agent_meta, "health": health})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@mcp.custom_route("/api/health", methods=["GET"])
+async def api_health(request: Request) -> JSONResponse:
+    """Wake-health across all open/idle rooms — stale leases and failed wakes.
+    Powers the dashboard health indicator."""
+    try:
+        rooms_health = []
+        for meta in bus.list_rooms():
+            if meta.get("status") not in ("open", "idle"):
+                continue
+            room_id = meta["id"]
+            agent_meta = meta.get("agent_meta", {})
+            if not agent_meta:
+                continue
+            statuses = bus.get_status(room_id)
+            agents = {name: _agent_wake_health(info, statuses.get(name))
+                      for name, info in agent_meta.items()}
+            rooms_health.append({
+                "room_id": room_id,
+                "name": meta.get("name", ""),
+                "status": meta.get("status"),
+                "agents": agents,
+            })
+        stale = sum(1 for r in rooms_health for h in r["agents"].values()
+                    if h["stale_lease"])
+        failed = sum(1 for r in rooms_health for h in r["agents"].values()
+                     if h["last_wake_failed"])
+        return JSONResponse({
+            "rooms": rooms_health,
+            "stale_leases": stale,
+            "failed_wakes": failed,
+        })
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @mcp.custom_route("/agents/{room_id}/{agent_name}/events", methods=["GET"])
@@ -717,7 +751,9 @@ def _spawn_agents(
                 continue
             agent_brief = briefs_arg[spec["name"]]
             try:
-                pid, log_path, last_msg = spawn.spawn_agent(spec, agent_brief, cwd, log_dir)
+                pid, log_path, last_msg = spawn.spawn_agent(
+                    spec, agent_brief, cwd, log_dir,
+                    on_exit=_make_initial_spawn_callback(room_id, spec["name"]))
                 pids.append(pid)
                 names.append(spec["name"])
                 agent_meta[spec["name"]] = {
@@ -732,7 +768,9 @@ def _spawn_agents(
                 spawn.log_spawn_failure(spec, agent_brief, cwd, log_dir, exc)
                 raise
     else:
-        names, pids, agent_meta = spawn.spawn_all(default_brief, cwd, log_dir)
+        names, pids, agent_meta = spawn.spawn_all(
+            default_brief, cwd, log_dir,
+            on_exit_factory=lambda n: _make_initial_spawn_callback(room_id, n))
 
     for n in names:
         bus.invite_agent(room_id, n)
@@ -750,13 +788,167 @@ def _spawn_agents(
             if tid:
                 info["thread_id"] = tid
 
-    # Save PIDs + log paths for dashboard / zombie cleanup
-    meta = bus.get_room_info(room_id)
-    meta["spawned_pids"] = pids
-    meta["agent_meta"] = agent_meta
-    (bus._room_dir(room_id) / "meta.json").write_text(
-        json.dumps(meta, ensure_ascii=False, indent=2)
-    )
+    # Save PIDs + log paths for dashboard / zombie cleanup — locked
+    # read-modify-write so a concurrent meta.json update isn't clobbered.
+    def _save_spawn_meta(m: dict) -> dict:
+        m["spawned_pids"] = pids
+        m["agent_meta"] = agent_meta
+        return m
+    bus._update_meta_locked(room_id, _save_spawn_meta)
+
+
+# ── Wake lease helpers ────────────────────────────────────────────────────────
+#
+# A wake records a `wake_id` (generation token) + `last_wake_pid` in agent_meta
+# and sets status=busy. The agent counts as busy ONLY while that pid is alive —
+# a 'busy' whose pid is dead is a stale lease and must not block the next
+# request. When the wake process exits, its reaper callback releases the lease
+# and drains the next queued request (event-driven); the watchdog is a fallback.
+
+# Per-(room, agent) in-process lock: serialises wake attempts coming from this
+# process's own threads (MCP request handler, watchdog, reaper callbacks).
+_wake_locks: dict = {}
+_wake_locks_guard = threading.Lock()
+
+
+def _wake_lock(room_id: str, agent_name: str) -> threading.Lock:
+    key = (room_id, agent_name)
+    with _wake_locks_guard:
+        lock = _wake_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _wake_locks[key] = lock
+    return lock
+
+
+def _merge_agent_meta(room_id: str, agent_name: str, fields: dict) -> None:
+    """Locked read-modify-write of one agent's agent_meta entry — never clobbers
+    a concurrent meta.json update (last_activity, another agent's wake state)."""
+    def _update(meta: dict) -> dict:
+        am = meta.setdefault("agent_meta", {})
+        info = am.get(agent_name)
+        if not isinstance(info, dict):
+            info = {}
+        info.update(fields)
+        am[agent_name] = info
+        return meta
+    bus._update_meta_locked(room_id, _update)
+
+
+def _wake_in_progress(info: dict, status: Optional[str]) -> bool:
+    """True if the agent has a LIVE wake process — do not wake it again. A
+    'busy' status whose last_wake_pid is dead is a stale lease (the process
+    already exited) and must NOT block a fresh wake."""
+    if status != "busy":
+        return False
+    pid = info.get("last_wake_pid")
+    return bool(pid) and bus._pid_alive(pid)
+
+
+def _agent_wake_health(info: dict, status: Optional[str]) -> dict:
+    """Computed wake-health for one agent — surfaces stale leases / failed
+    wakes for the dashboard health view."""
+    pid = info.get("last_wake_pid")
+    pid_alive = bool(pid) and bus._pid_alive(pid)
+    rc = info.get("last_wake_rc")
+    return {
+        "status": status or "offline",
+        "wake_id": info.get("wake_id"),
+        "last_wake_pid": pid,
+        "pid_alive": pid_alive,
+        "stale_lease": status == "busy" and not pid_alive,
+        "last_wake_msg_id": info.get("last_wake_msg_id"),
+        "last_wake_at": info.get("last_wake_at"),
+        "last_wake_rc": rc,
+        "last_wake_failed": rc is not None and rc != 0,
+        "wake_fail_count": int(info.get("wake_fail_count", 0) or 0),
+    }
+
+
+def _make_wake_done_callback(room_id: str, agent_name: str, wake_id: str):
+    """Reaper on_exit callback for a wake: release the busy lease + drain the
+    next queued request the moment the agent turn ends."""
+    def _callback(returncode) -> None:
+        try:
+            _on_wake_exit(room_id, agent_name, wake_id, returncode)
+        except Exception as exc:  # never let a callback kill the reaper thread
+            print(f"[huddle] wake-exit callback error "
+                  f"({agent_name}@{room_id}): {exc}", flush=True)
+    return _callback
+
+
+def _make_initial_spawn_callback(room_id: str, agent_name: str):
+    """Reaper on_exit callback for the room_create spawn: no busy lease to
+    release — just drain any request queued during the agent's first turn."""
+    def _callback(returncode) -> None:
+        try:
+            _drain_pending_wakes(room_id, agent_name)
+        except Exception as exc:
+            print(f"[huddle] initial-spawn drain error "
+                  f"({agent_name}@{room_id}): {exc}", flush=True)
+    return _callback
+
+
+def _on_wake_exit(room_id: str, agent_name: str, wake_id: str,
+                  returncode) -> None:
+    try:
+        meta = bus.get_room_info(room_id)
+    except Exception:
+        return
+    info = (meta.get("agent_meta") or {}).get(agent_name) or {}
+    # Act only if this wake still owns the lease — a newer wake may have
+    # superseded us (then it owns the busy state and the drain).
+    if info.get("wake_id") != wake_id:
+        return
+    rc = -999 if returncode is None else int(returncode)
+    fail_count = int(info.get("wake_fail_count", 0) or 0)
+    _merge_agent_meta(room_id, agent_name, {
+        "last_wake_rc": rc,
+        "last_wake_exit_at": int(time.time()),
+        "wake_fail_count": (fail_count + 1) if rc != 0 else 0,
+    })
+    bus.set_status(room_id, agent_name, "online", 0, meta.get("session_id", ""))
+    try:
+        _drain_pending_wakes(room_id, agent_name)
+    except Exception as exc:
+        print(f"[huddle] wake drain error ({agent_name}@{room_id}): {exc}",
+              flush=True)
+
+
+def _next_pending_request(room_id: str, agent_name: str,
+                          info: dict) -> Optional[dict]:
+    """Oldest request addressed to agent_name it has not been woken for yet.
+    The message log itself is the per-agent wake queue."""
+    last_wake = int(info.get("last_wake_msg_id", 0) or 0)
+    for msg in bus._load_messages(room_id):
+        if msg.get("id", 0) <= last_wake:
+            continue
+        if msg.get("kind") != "request" or msg.get("reply_to") is not None:
+            continue
+        if msg.get("agent") == agent_name:
+            continue
+        to = msg.get("to")
+        if to and to not in (agent_name, "all"):
+            continue
+        return msg
+    return None
+
+
+def _drain_pending_wakes(room_id: str, agent_name: str) -> None:
+    """Wake the agent for the next request that queued while it was busy."""
+    try:
+        meta = bus.get_room_info(room_id)
+    except Exception:
+        return
+    if meta.get("status") not in ("open", "idle"):
+        return
+    info = (meta.get("agent_meta") or {}).get(agent_name) or {}
+    pending = _next_pending_request(room_id, agent_name, info)
+    if pending is None:
+        return
+    _wake_agents_for_request(
+        room_id, pending.get("agent", ""), pending.get("body", ""),
+        pending.get("to"), None, pending["id"])
 
 
 def _wake_agents_for_request(
@@ -767,105 +959,99 @@ def _wake_agents_for_request(
     reply_to: Optional[int],
     msg_id: int,
 ) -> list[dict]:
-    """Wake persistent room agents for a newly posted request.
+    """Wake room agents for a newly posted request.
 
-    Codex is resumed through its captured thread_id, preserving one logical
-    Codex session per room. Requests with reply_to are treated as answers, not
-    new tasks, per the anti-loop contract.
+    Codex is resumed via its captured thread_id (one logical session per room);
+    other registry agents get a fresh spawn. A request that finds an agent
+    mid-turn is left queued — the message log is the queue, drained by the
+    agent's reaper callback (the watchdog is only a fallback). Requests that
+    carry reply_to are answers, not new tasks → ignored.
     """
     if reply_to is not None:
         return []
 
     meta = bus.get_room_info(room_id)
     agent_meta = meta.get("agent_meta", {})
-    statuses = bus.get_status(room_id)
+    cwd = meta.get("cwd", "") or ""
+    session_id = meta.get("session_id", "")
     wakes: list[dict] = []
-    changed = False
 
-    for agent_name, info in agent_meta.items():
+    for agent_name in list(agent_meta.keys()):
         if agent_name == sender:
             continue
         if to and to not in (agent_name, "all"):
             continue
 
-        if statuses.get(agent_name) == "busy":
-            continue
+        with _wake_lock(room_id, agent_name):
+            # Re-read under the lock — another thread may have just woken it.
+            fresh = bus.get_room_info(room_id)
+            info = (fresh.get("agent_meta") or {}).get(agent_name) or {}
+            status = bus.get_status(room_id).get(agent_name)
 
-        last_wake = int(info.get("last_wake_msg_id", 0) or 0)
-        if last_wake >= msg_id:
-            continue
-        if _agent_replied_to_request(room_id, agent_name, msg_id):
-            info["last_wake_msg_id"] = msg_id
-            info["last_seen_id"] = max(int(info.get("last_seen_id", 0) or 0), msg_id)
-            changed = True
-            continue
-
-        log_path = info.get("log_path")
-        last_seen = int(info.get("last_seen_id", 0) or 0)
-
-        if agent_name == "Codex":
-            thread_id = info.get("thread_id")
-            if not log_path:
+            if _wake_in_progress(info, status):
+                continue  # live wake → request stays queued, drained on exit
+            last_wake = int(info.get("last_wake_msg_id", 0) or 0)
+            if last_wake >= msg_id:
                 continue
-            if not thread_id:
-                thread_id = spawn.parse_codex_thread_id(log_path, timeout=1.0)
-                if not thread_id:
+            if _agent_replied_to_request(room_id, agent_name, msg_id):
+                _merge_agent_meta(room_id, agent_name, {
+                    "last_wake_msg_id": msg_id,
+                    "last_seen_id": max(int(info.get("last_seen_id", 0) or 0), msg_id),
+                })
+                continue
+
+            log_path = info.get("log_path")
+            last_seen = int(info.get("last_seen_id", 0) or 0)
+            wake_id = uuid.uuid4().hex[:12]
+
+            if agent_name == "Codex":
+                thread_id = info.get("thread_id")
+                if not log_path:
                     continue
-                info["thread_id"] = thread_id
-                changed = True
-            if not spawn.codex_log_has_completed_turn(log_path):
+                if not thread_id:
+                    thread_id = spawn.parse_codex_thread_id(log_path, timeout=1.0)
+                    if not thread_id:
+                        continue
+                    _merge_agent_meta(room_id, agent_name, {"thread_id": thread_id})
+                if not spawn.codex_log_has_completed_turn(log_path):
+                    continue
+                prompt = _build_codex_wakeup_prompt(
+                    room_id, sender, body, to, msg_id, last_seen)
+                bus.set_status(room_id, agent_name, "busy", 300, session_id)
+                try:
+                    pid = spawn.codex_resume(
+                        thread_id, prompt, cwd, log_path,
+                        info.get("last_message_path"),
+                        on_exit=_make_wake_done_callback(room_id, agent_name, wake_id),
+                    )
+                except Exception as exc:
+                    bus.set_status(room_id, agent_name, "online", 0, session_id)
+                    print(f"[huddle] codex_resume failed ({room_id}): {exc}",
+                          flush=True)
+                    continue
+                _merge_agent_meta(room_id, agent_name, {
+                    "last_wake_msg_id": msg_id, "last_seen_id": msg_id,
+                    "last_wake_pid": pid, "last_wake_at": int(time.time()),
+                    "wake_id": wake_id,
+                })
+                wakes.append({"agent": agent_name, "pid": pid,
+                              "thread_id": thread_id})
                 continue
 
-            prompt = _build_codex_wakeup_prompt(room_id, sender, body, to, msg_id, last_seen)
-            bus.set_status(room_id, agent_name, "busy", 300, meta.get("session_id", ""))
-            pid = spawn.codex_resume(
-                thread_id,
-                prompt,
-                meta.get("cwd", "") or "",
-                log_path,
-                info.get("last_message_path"),
-            )
-            info["last_wake_msg_id"] = msg_id
-            info["last_seen_id"] = msg_id
-            info["last_wake_pid"] = pid
-            info["last_wake_at"] = int(time.time())
-            wakes.append({"agent": agent_name, "pid": pid, "thread_id": thread_id})
-            changed = True
-            continue
-
-        transcript = bus.read_messages(room_id, since_id=0, limit=50)
-        prompt = _build_registry_agent_wakeup_prompt(
-            room_id,
-            agent_name,
-            sender,
-            body,
-            to,
-            msg_id,
-            last_seen,
-            transcript,
-        )
-        if changed:
-            meta["agent_meta"] = agent_meta
-            bus._write_json(bus._room_dir(room_id) / "meta.json", meta)
-            changed = False
-        try:
-            pid, _, _ = _spawn_fresh_room_agent(
-                room_id,
-                agent_name,
-                prompt,
-                meta,
-                msg_id=msg_id,
-            )
-        except ValueError:
-            continue
-        wakes.append({"agent": agent_name, "pid": pid, "thread_id": ""})
-        meta = bus.get_room_info(room_id)
-        agent_meta = meta.get("agent_meta", {})
-        changed = False
-
-    if changed:
-        meta["agent_meta"] = agent_meta
-        bus._write_json(bus._room_dir(room_id) / "meta.json", meta)
+            # Registry agents without UUID resume — fresh spawn each turn.
+            transcript = bus.read_messages(room_id, since_id=0, limit=50)
+            prompt = _build_registry_agent_wakeup_prompt(
+                room_id, agent_name, sender, body, to, msg_id, last_seen,
+                transcript)
+            try:
+                pid, _, _ = _spawn_fresh_room_agent(
+                    room_id, agent_name, prompt, fresh, msg_id=msg_id,
+                    wake_id=wake_id)
+            except Exception as exc:
+                print(f"[huddle] fresh spawn failed for {agent_name} "
+                      f"({room_id}): {exc}", flush=True)
+                continue
+            wakes.append({"agent": agent_name, "pid": pid, "thread_id": ""})
 
     return wakes
 
@@ -879,7 +1065,10 @@ def _agent_replied_to_request(room_id: str, agent_name: str, msg_id: int) -> boo
 
 
 def _wake_pending_agents() -> list[dict]:
-    """Retry wake-ups for open requests that arrived before an agent was ready."""
+    """Fallback retry for wakes the event-driven path missed (e.g. a reaper
+    thread that died together with a short-lived stdio huddle process). The
+    primary drain is the reaper on_exit callback — this is belt-and-suspenders.
+    """
     wakes: list[dict] = []
     for meta in bus.list_rooms():
         if meta.get("status") != "open":
@@ -890,29 +1079,14 @@ def _wake_pending_agents() -> list[dict]:
             continue
         statuses = bus.get_status(room_id)
         for agent_name, info in agent_meta.items():
-            if statuses.get(agent_name) == "busy":
+            if _wake_in_progress(info, statuses.get(agent_name)):
                 continue
-            last_wake = int(info.get("last_wake_msg_id", 0) or 0)
-            for msg in bus._load_messages(room_id):
-                if msg.get("id", 0) <= last_wake:
-                    continue
-                if msg.get("kind") != "request" or msg.get("reply_to") is not None:
-                    continue
-                sender = msg.get("agent", "")
-                if sender == agent_name:
-                    continue
-                to = msg.get("to")
-                if to and to not in (agent_name, "all"):
-                    continue
-                wakes.extend(_wake_agents_for_request(
-                    room_id,
-                    sender,
-                    msg.get("body", ""),
-                    to,
-                    None,
-                    msg["id"],
-                ))
-                break
+            pending = _next_pending_request(room_id, agent_name, info)
+            if pending is None:
+                continue
+            wakes.extend(_wake_agents_for_request(
+                room_id, pending.get("agent", ""), pending.get("body", ""),
+                pending.get("to"), None, pending["id"]))
     return wakes
 
 
@@ -922,37 +1096,47 @@ def _spawn_fresh_room_agent(
     prompt: str,
     meta: dict,
     msg_id: Optional[int] = None,
+    wake_id: Optional[str] = None,
 ) -> tuple[int, str, str | None]:
-    """Spawn a registry-backed one-shot turn for an agent without UUID resume."""
+    """Spawn a registry-backed one-shot turn for an agent without UUID resume.
+
+    Records a wake lease (wake_id + last_wake_pid) and wires a reaper callback
+    so the busy lease is released — and the next request drained — when the
+    process exits."""
     spec = spawn.get_enabled_spec(agent_name)
     if not spec:
         raise ValueError(f"Agent {agent_name} has no enabled spawn registry entry")
 
     if agent_name not in meta.get("participants", []):
         bus.invite_agent(room_id, agent_name)
-        meta = bus.get_room_info(room_id)
 
-    bus.set_status(room_id, agent_name, "busy", 300, meta.get("session_id", ""))
-    pid, log_path, last_msg_path = spawn.spawn_agent(
-        spec,
-        prompt,
-        meta.get("cwd", "") or "",
-        bus._room_dir(room_id) / "agents",
-    )
+    if wake_id is None:
+        wake_id = uuid.uuid4().hex[:12]
+    session_id = meta.get("session_id", "")
+    bus.set_status(room_id, agent_name, "busy", 300, session_id)
+    try:
+        pid, log_path, last_msg_path = spawn.spawn_agent(
+            spec,
+            prompt,
+            meta.get("cwd", "") or "",
+            bus._room_dir(room_id) / "agents",
+            on_exit=_make_wake_done_callback(room_id, agent_name, wake_id),
+        )
+    except Exception:
+        bus.set_status(room_id, agent_name, "online", 0, session_id)
+        raise
 
-    updated = bus.get_room_info(room_id)
-    agent_meta = updated.setdefault("agent_meta", {})
-    info = dict(agent_meta.get(agent_name) or {})
-    info["log_path"] = log_path
-    info["last_message_path"] = last_msg_path
-    info["last_wake_pid"] = pid
-    info["last_wake_at"] = int(time.time())
+    fields = {
+        "log_path": log_path,
+        "last_message_path": last_msg_path,
+        "last_wake_pid": pid,
+        "last_wake_at": int(time.time()),
+        "wake_id": wake_id,
+    }
     if msg_id is not None:
-        info["last_wake_msg_id"] = msg_id
-        info["last_seen_id"] = msg_id
-    agent_meta[agent_name] = info
-    updated["agent_meta"] = agent_meta
-    bus._write_json(bus._room_dir(room_id) / "meta.json", updated)
+        fields["last_wake_msg_id"] = msg_id
+        fields["last_seen_id"] = msg_id
+    _merge_agent_meta(room_id, agent_name, fields)
     return pid, log_path, last_msg_path
 
 

@@ -407,6 +407,60 @@
       white-space: pre-wrap; word-break: break-word;
     }
 
+    /* ── Markdown rendering inside message bubbles (Telegram-style) ─── */
+    .msg-body.md { white-space: normal; }
+    .msg-body.md > *:first-child { margin-top: 0; }
+    .msg-body.md > *:last-child  { margin-bottom: 0; }
+    .md-line  { margin: 3px 0; }
+    .md-line:empty { display: none; }
+    .md-h {
+      font-weight: 700; line-height: 1.3;
+      margin: 12px 0 5px;
+    }
+    .md-h1 { font-size: 1.32em; }
+    .md-h2 { font-size: 1.18em; }
+    .md-h3 { font-size: 1.07em; }
+    .md-h4, .md-h5, .md-h6 {
+      font-size: 0.95em; color: var(--text-muted);
+      text-transform: uppercase; letter-spacing: 0.04em;
+    }
+    .md-list { margin: 5px 0 5px 1.35em; padding: 0; }
+    .md-list li { margin: 2px 0; }
+    .md-list li::marker { color: var(--text-sub); }
+    .msg-body.md code {
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 0.86em;
+      background: rgba(128,128,128,0.18);
+      padding: 1px 5px; border-radius: 5px;
+      word-break: break-word;
+    }
+    .md-pre {
+      margin: 7px 0; padding: 10px 12px;
+      background: rgba(128,128,128,0.14);
+      border: 1px solid var(--bubble-border);
+      border-radius: 10px;
+      overflow-x: auto;
+    }
+    .md-pre code {
+      background: none; padding: 0;
+      font-size: 0.84em; line-height: 1.5;
+      white-space: pre;
+    }
+    .md-quote {
+      margin: 5px 0; padding: 2px 0 2px 11px;
+      border-left: 3px solid var(--text-sub);
+      color: var(--text-muted);
+    }
+    .md-hr {
+      border: none; border-top: 1px solid var(--bubble-border);
+      margin: 11px 0;
+    }
+    .msg-body.md a { color: var(--c-claude); text-decoration: none; }
+    .msg-body.md a:hover { text-decoration: underline; }
+    .msg-body.md strong { font-weight: 700; }
+    .msg-body.md em { font-style: italic; }
+    .msg-body.md del { opacity: 0.6; }
+
     /* Reply quote */
     .reply {
       display: flex; gap: 8px;
@@ -501,6 +555,21 @@
       padding: 0 4px 6px;
       flex-shrink: 0;
     }
+    /* Scrollable list of agent panels — lets the whole side column be
+       paged through when there are many participants / long event logs. */
+    .agent-panels-scroll {
+      flex: 1; min-height: 0;
+      overflow-y: auto; overscroll-behavior: contain;
+      display: flex; flex-direction: column; gap: 6px;
+      padding-right: 3px;
+    }
+    .agent-panels-scroll::-webkit-scrollbar { width: 6px; }
+    .agent-panels-scroll::-webkit-scrollbar-thumb {
+      background: rgba(255,255,255,0.10); border-radius: 3px;
+    }
+    [data-theme="light"] .agent-panels-scroll::-webkit-scrollbar-thumb {
+      background: rgba(0,0,0,0.12);
+    }
     .agent-panel {
       background: rgba(255,255,255,0.02);
       border: 1px solid var(--border);
@@ -511,13 +580,8 @@
       min-height: 0;
     }
     .agent-panel[open] {
-      flex: 1 1 0;
-      min-height: 64px;
-    }
-    .agent-panel[open] {
+      flex: 0 0 auto;
       background: rgba(255,255,255,0.03);
-      flex: 1 1 0;
-      min-height: 64px;
     }
     [data-theme="light"] .agent-panel {
       background: rgba(0,0,0,0.02);
@@ -553,6 +617,17 @@
       font-family: ui-monospace, monospace;
       flex-shrink: 0;
     }
+    /* Wake-health badge: stale lease / failed wake (N4 health view). */
+    .agent-panel-health {
+      font-size: 10px;
+      font-family: ui-monospace, monospace;
+      color: var(--text-sub);
+      flex-shrink: 0;
+    }
+    .agent-panel-health.warn {
+      color: #d29922;
+      font-weight: 600;
+    }
     .msg-meta {
       font-size: 10px;
       color: var(--text-muted);
@@ -563,20 +638,28 @@
       margin-left: 4px;
     }
     .agent-events {
-      flex: 1 1 0;
+      max-height: 38vh;
       min-height: 0;
-      overflow-y: auto;
+      overflow-y: auto; overscroll-behavior: contain;
       padding: 6px 10px 8px;
       font-family: ui-monospace, "SF Mono", Consolas, monospace;
       font-size: 11px;
-      line-height: 1.4;
+      line-height: 1.45;
       color: var(--text-sub);
     }
+    .agent-events::-webkit-scrollbar { width: 6px; }
+    .agent-events::-webkit-scrollbar-thumb {
+      background: rgba(255,255,255,0.10); border-radius: 3px;
+    }
+    [data-theme="light"] .agent-events::-webkit-scrollbar-thumb {
+      background: rgba(0,0,0,0.12);
+    }
+    /* Word-wrap event lines to the panel width instead of clipping them. */
     .agent-event {
-      padding: 1px 0;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
+      padding: 2px 0;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      word-break: break-word;
       cursor: help;
     }
     .agent-event:hover {
@@ -586,3 +669,19 @@
     [data-theme="light"] .agent-event:hover {
       background: rgba(0,0,0,0.04);
     }
+
+    /* Static (non-spawned) participant panel — e.g. the room owner Claude,
+       who posts in chat but has no huddle-spawned live event stream. */
+    .agent-panel-hint {
+      padding: 7px 10px 9px;
+      font-size: 11px; line-height: 1.5;
+      color: var(--text-sub);
+    }
+    .agent-status-dot {
+      width: 7px; height: 7px; border-radius: 50%;
+      flex-shrink: 0;
+      background: var(--c-system);
+    }
+    .agent-status-dot.online  { background: var(--c-codex); }
+    .agent-status-dot.busy    { background: #d29922; }
+    .agent-status-dot.offline { background: var(--c-system); opacity: 0.5; }

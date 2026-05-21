@@ -159,7 +159,7 @@ def test_spawn_agent_registers_background_reaper(
     monkeypatch.setattr(
         spawn,
         "_reap_in_background",
-        lambda proc, name: reaped.append((proc.pid, name)),
+        lambda proc, name, on_exit=None: reaped.append((proc.pid, name)),
     )
 
     spec: spawn.SpawnSpec = {
@@ -242,7 +242,7 @@ def test_request_message_wakes_existing_codex_thread(tmp_path: Path, monkeypatch
 
     calls: list[dict] = []
 
-    def fake_codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str, last_msg_path: str | None = None) -> int:
+    def fake_codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str, last_msg_path: str | None = None, on_exit=None) -> int:
         calls.append({
             "thread_id": thread_id,
             "prompt": prompt,
@@ -388,7 +388,7 @@ def test_respond_via_agent_fresh_spawns_non_codex_with_transcript(
 
     calls: list[dict] = []
 
-    def fake_spawn_agent(spec, brief, cwd, log_dir, verify_alive_sec=0.0):
+    def fake_spawn_agent(spec, brief, cwd, log_dir, verify_alive_sec=0.0, on_exit=None):
         calls.append({"spec": spec, "brief": brief, "cwd": cwd, "log_dir": log_dir})
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / "gemini.events.jsonl"
@@ -438,7 +438,7 @@ def test_request_message_wakes_registry_agent_without_uuid_resume(
 
     calls: list[dict] = []
 
-    def fake_spawn_agent(spec, brief, cwd, log_dir, verify_alive_sec=0.0):
+    def fake_spawn_agent(spec, brief, cwd, log_dir, verify_alive_sec=0.0, on_exit=None):
         calls.append({"spec": spec, "brief": brief, "cwd": cwd})
         log_dir.mkdir(parents=True, exist_ok=True)
         return 6161, str(log_dir / "gemini.events.jsonl"), None
@@ -543,16 +543,17 @@ def test_dropped_tools_no_longer_exposed_as_mcp_tools() -> None:
     exposed = set(pat.findall(source))
     dropped = {
         "room_request_close", "room_close", "room_delete", "room_close_session",
-        "respond_via_agent", "status_set", "status_get", "notify_register",
+        "respond_via_agent", "status_set", "status_get",
     }
     assert dropped.isdisjoint(exposed), (
         f"Tools that must NOT be MCP-exposed are still exposed: {dropped & exposed}"
     )
-    # The 9 we keep:
+    # The 10 we keep — notify_register re-exposed so externally-launched agents
+    # (not auto_spawn'd by huddle) can subscribe to request notifications.
     expected_kept = {
         "room_create", "room_invite", "room_info", "room_list",
         "message_post", "messages_read", "room_summarize",
-        "propose_resolution", "resolution_vote",
+        "propose_resolution", "resolution_vote", "notify_register",
     }
     assert expected_kept <= exposed, f"Missing expected tools: {expected_kept - exposed}"
 
@@ -584,7 +585,7 @@ def test_no_dropped_tool_references_in_agent_facing_prompts() -> None:
     Per Codex review of feat/agent-tools-cleanup."""
     dropped = [
         "room_close", "room_close_session", "room_delete", "room_request_close",
-        "status_set", "status_get", "notify_register", "respond_via_agent",
+        "status_set", "status_get", "respond_via_agent",
     ]
     samples = {
         "default_brief": server._build_default_brief(
@@ -634,7 +635,8 @@ def test_request_revives_idle_room(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert meta["last_activity_at"] >= meta["created_at"]
 
 
-def test_reply_to_answered_request_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_reply_to_same_agent_cannot_answer_twice(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Anti-loop: the same agent may not answer one request twice."""
     monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
     isolated_bus = importlib.reload(bus)
     monkeypatch.setattr(server, "bus", isolated_bus)
@@ -643,5 +645,37 @@ def test_reply_to_answered_request_raises(tmp_path: Path, monkeypatch: pytest.Mo
     server.message_post(room_id, "Claude", "Codex, answer once.", "request", to="Codex")
     server.message_post(room_id, "Codex", "First answer.", "result", to="Claude", reply_to=1)
 
-    with pytest.raises(ValueError, match="reply_to target already answered"):
-        server.message_post(room_id, "Gemini", "Second answer.", "result", to="Claude", reply_to=1)
+    with pytest.raises(ValueError, match="already answered"):
+        server.message_post(room_id, "Codex", "Second answer.", "result", to="Claude", reply_to=1)
+
+
+def test_reply_to_wrong_addressee_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An agent that was not an addressee of a single-recipient request cannot
+    answer it."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    room_id = isolated_bus.create_room("Addressee", "Claude", 0, "/tmp/project", "session-1")
+    server.message_post(room_id, "Claude", "Codex only.", "request", to="Codex")
+
+    with pytest.raises(ValueError, match="not to 'Gemini'"):
+        server.message_post(room_id, "Gemini", "Butting in.", "result", to="Claude", reply_to=1)
+
+
+def test_reply_to_broadcast_allows_one_reply_per_agent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A to=all request expects one reply per addressee — Codex AND Gemini must
+    both be able to answer it (the BUG-2 / multi-addressee fix)."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    room_id = isolated_bus.create_room("Broadcast", "Claude", 0, "/tmp/project", "session-1")
+    server.message_post(room_id, "Claude", "Everyone, review this.", "request", to="all")
+    server.message_post(room_id, "Gemini", "Gemini's review.", "result", to="Claude", reply_to=1)
+    # Second addressee must NOT be locked out by the first reply.
+    third = server.message_post(room_id, "Codex", "Codex's review.", "result", to="Claude", reply_to=1)
+    assert third == 3
+    # But the same agent still cannot answer the broadcast twice.
+    with pytest.raises(ValueError, match="already answered"):
+        server.message_post(room_id, "Gemini", "Gemini again.", "result", to="Claude", reply_to=1)
