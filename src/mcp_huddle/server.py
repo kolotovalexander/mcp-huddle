@@ -24,7 +24,7 @@ from . import spawn
 # session sees this verbatim. Goal: stop one-shot misuse, enforce anti-loop.
 _AGENT_INSTRUCTIONS = """\
 Persistent multi-agent chat rooms. Use to coordinate decisions ACROSS multiple
-agents (e.g. Claude + Codex + Gemini reviewing the same architectural choice).
+agents (e.g. Claude + Codex + Antigravity reviewing the same architectural choice).
 
 WHEN TO USE A ROOM (vs. answering directly or calling a one-shot advisor):
 - multi-step design / architecture decision with real trade-offs
@@ -34,18 +34,18 @@ WHEN TO USE A ROOM (vs. answering directly or calling a one-shot advisor):
 
 WHEN NOT TO USE A ROOM:
 - single factual lookup (just answer)
-- single-shot critique (use codex exec / gemini -p instead)
+- single-shot critique (use codex exec / agy -p instead)
 - you already have enough context to act
 
 INVITING OTHER AGENTS:
 1. `room_create(name, owner=YourAgentName, owner_pid=PID, cwd=PROJECT,
    session_id=SESSION, auto_spawn=True, goal="<short description>")`
-   spawns Codex + Gemini automatically if those CLIs are on PATH.
+   spawns Codex + Antigravity automatically if those CLIs are on PATH.
 2. If auto_spawn isn't available (binaries missing or you want a different
    roster), shell out yourself with the room_id + brief, e.g.
    `codex exec --dangerously-bypass-approvals-and-sandbox "Join huddle room
    <ROOM_ID>: <task>. Read messages_read first, then post."` and same for
-   `gemini -y -p "..."`. Then (owner only) call
+   `agy --dangerously-skip-permissions -p "..."`. Then (owner only) call
    `room_invite(room_id, "Codex", by="<owner>")` / `..., by="<owner>"` so
    they appear in participants.
 3. Prefer auto_spawn unless you specifically need a non-default agent.
@@ -115,11 +115,11 @@ def room_create(
 
     auto_spawn:
       False (default) — no agents spawned; you invite manually via room_invite.
-      True            — spawn every enabled agent in the registry (Codex + Gemini)
+      True            — spawn every enabled agent in the registry (Codex + Antigravity)
                         with a default reviewer brief built from `goal`.
       {Name: brief}   — spawn only these agents, each with its own custom brief.
                         Example: {"Codex": "Audit auth.py for security holes",
-                                  "Gemini": "Find race conditions in db.py"}.
+                                  "Antigravity": "Find race conditions in db.py"}.
                         Agents not in the dict are skipped even if enabled.
 
     goal: short description of the discussion topic (used in default brief
@@ -127,7 +127,7 @@ def room_create(
 
     With Phase 1 changes: each spawned agent's stdout/stderr is captured to
     ~/.mcp-huddle/rooms/<id>/agents/<name>.events.jsonl (Codex --json /
-    Gemini stream-json). Live-stream them via SSE at /agents/<id>/<name>/events.
+    Antigravity plain text). Live-stream them via SSE at /agents/<id>/<name>/events.
     """
     room_id = bus.create_room(name, owner, owner_pid, cwd, session_id)
 
@@ -266,14 +266,14 @@ def respond_via_agent(
     """Phase 2: trigger a spawned agent to respond using `codex exec resume`
     (no new process startup, retains conversation context from prior turns).
 
-    Useful when you want to ask Codex/Gemini a follow-up in an existing room
+    Useful when you want to ask Codex/Antigravity a follow-up in an existing room
     without manually spawning them again. The agent's thread_id was captured
     on initial spawn.
 
     Args:
       room_id: target room
       agent_name: which spawned agent to invoke (currently only Codex supports
-                  UUID-based resume; Gemini falls back to fresh spawn with
+                  UUID-based resume; Antigravity falls back to fresh spawn with
                   prompt-prepended context summary).
       prompt: the new message to send to the agent
       post_as_message: if True, after the agent finishes, post its last_message
@@ -310,8 +310,8 @@ def respond_via_agent(
             "note": "Codex resume triggered. Tail log for events; post_as_message scheduling TBD."
         }
 
-    # Gemini and others — fresh spawn with context-prepended prompt as fallback.
-    # UUID-based resume is not available for Gemini, but a fresh CLI process can
+    # Antigravity and others — fresh spawn with context-prepended prompt as fallback.
+    # UUID-based resume is not available for Antigravity, but a fresh CLI process can
     # still read the full huddle transcript and post a grounded reply. This keeps
     # follow-up turns working for all registry-backed agents instead of silently
     # degrading to Codex-only rooms.
@@ -643,7 +643,7 @@ async def api_health(request: Request) -> JSONResponse:
 @mcp.custom_route("/agents/{room_id}/{agent_name}/events", methods=["GET"])
 async def api_agent_events(request: Request) -> StreamingResponse:
     """Server-Sent Events stream of an agent's stdout (Codex --json /
-    Gemini stream-json events).
+    Antigravity plain text).
 
     Tails ~/.mcp-huddle/rooms/<room_id>/agents/<name>.events.jsonl.
     Each line in the file becomes one SSE `data:` event.
@@ -781,7 +781,7 @@ def _spawn_agents(
     # timeout so it usually returns within ~1s.
     for agent_name, info in agent_meta.items():
         if agent_name != "Codex":
-            continue  # Only Codex has UUID-based resume; Gemini's --resume is index-based.
+            continue  # Only Codex has UUID-based resume; Antigravity has none.
         log_path = info.get("log_path")
         if log_path:
             tid = spawn.parse_codex_thread_id(log_path, timeout=10.0)

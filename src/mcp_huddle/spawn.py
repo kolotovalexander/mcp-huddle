@@ -1,6 +1,6 @@
 """Configurable agent-spawn registry for auto_spawn rooms.
 
-Default registry uses Codex + Gemini CLIs. Override via the
+Default registry uses Codex + Antigravity CLIs. Override via the
 MCP_HUDDLE_SPAWN_REGISTRY env var pointing to a JSON file.
 
 Each registry entry is a SpawnSpec:
@@ -16,7 +16,8 @@ auto_spawn never crashes — it just spawns whatever is available.
 Phase 1 changes (2026-04-30):
   * Codex spawned with `--json` and `--output-last-message <file>` for
     structured event capture and last-message extraction.
-  * Gemini spawned with `-o stream-json` for streaming events.
+  * Google-model slot spawned via Antigravity CLI (`agy -p`, plain text);
+    Gemini CLI is the fallback until its 2026-06-18 shutdown.
   * stdout+stderr redirected to per-room per-agent JSONL log file
     (~/.mcp-huddle/rooms/<id>/agents/<name>.events.jsonl) instead of DEVNULL.
     This is what feeds the dashboard SSE pane.
@@ -74,6 +75,43 @@ _GEMINI_BIN = _first_existing_binary([
     "gemini",
     "/opt/homebrew/bin/gemini",
 ])
+_ANTIGRAVITY_BIN = _first_existing_binary([
+    "agy",
+    "/opt/homebrew/bin/agy",
+])
+
+
+def _google_advisor_spec() -> SpawnSpec:
+    """Build the Google-model advisor slot for the spawn registry.
+
+    Antigravity CLI (`agy`) is preferred; Gemini CLI is the fallback until
+    Google shuts it down on 2026-06-18. One slot, not both — two Google
+    models would share the same blind spots. `agy` has no `-m`/`-o`/`-y`
+    flags, so it prints plain text instead of a JSON event stream.
+    """
+    if _ANTIGRAVITY_BIN:
+        return {
+            "name": "Antigravity",
+            "cmd": [
+                _ANTIGRAVITY_BIN,
+                "--dangerously-skip-permissions",
+                "--print-timeout", "15m",
+                "-p", "{brief}",
+            ],
+            "enabled": True,
+        }
+    if _GEMINI_BIN:
+        return {
+            "name": "Antigravity",
+            "cmd": [
+                _GEMINI_BIN,
+                "-m", "gemini-3.1-pro-preview", "-y",
+                "-o", "stream-json",
+                "-p", "{brief}",
+            ],
+            "enabled": True,
+        }
+    return {"name": "Antigravity", "cmd": ["agy", "-p", "{brief}"], "enabled": False}
 
 
 def _is_ascii(text: str) -> bool:
@@ -103,10 +141,10 @@ def _codex_safe_cwd_and_brief(cwd: str, brief: str) -> tuple[str, str]:
 
 
 # Default registry: enabled=False if the binary is missing.
-# `--json` (Codex) / `-o stream-json` (Gemini) emit structured events to stdout
-# which the dashboard SSE endpoint streams to the browser. `{last_message}` is
-# replaced with a per-agent file path so the agent's last reply is captured for
-# downstream tools.
+# Codex emits `--json` structured events to stdout for the dashboard SSE
+# endpoint; Antigravity (`agy -p`) emits plain text. `{last_message}` is
+# replaced with a per-agent file path so the agent's last reply is captured
+# for downstream tools.
 DEFAULT_REGISTRY: list[SpawnSpec] = [
     {
         "name": "Codex",
@@ -123,16 +161,7 @@ DEFAULT_REGISTRY: list[SpawnSpec] = [
         ],
         "enabled": _CODEX_BIN is not None,
     },
-    {
-        "name": "Gemini",
-        "cmd": [
-            _GEMINI_BIN or "gemini",
-            "-m", "gemini-3.1-pro-preview", "-y",
-            "-o", "stream-json",
-            "-p", "{brief}",
-        ],
-        "enabled": _GEMINI_BIN is not None,
-    },
+    _google_advisor_spec(),
 ]
 
 
