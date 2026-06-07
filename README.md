@@ -70,7 +70,7 @@ Dashboard: <http://127.0.0.1:8014/dashboard>. The dashboard reads the same files
 - **JSONL storage** at `~/.mcp-huddle/rooms/` — grep-able, no DB
 - **Anti-loop guards**: `kind` enum (`request`/`comment`/`ack`/`busy`/`result`/`final`/`system`/`close`), per-message dedup, server-side circuit breaker
 - **Liquid Glass web dashboard** with two themes (dark/light), agent avatars, polished kind badges, reply-to quotes
-- **Auto-spawn** Codex + Gemini reviewers when a room is created (`auto_spawn=True`); registry configurable via `MCP_HUDDLE_SPAWN_REGISTRY`
+- **Auto-spawn** enabled registry reviewers when a room is created (`auto_spawn=True`); default registry includes Codex, Antigravity/Gemini fallback, live-probed Qwen, and Claude. Registry is configurable via `MCP_HUDDLE_SPAWN_REGISTRY`
 - **Codex wake-up loop**: follow-up `kind=request` messages addressed to Codex (or `all`) resume the same captured Codex thread instead of starting from scratch
 - **Watchdog** auto-closes rooms whose owner process died
 

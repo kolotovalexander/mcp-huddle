@@ -1,6 +1,6 @@
 """Configurable agent-spawn registry for auto_spawn rooms.
 
-Default registry uses Codex + Antigravity CLIs. Override via the
+Default registry uses Codex, Antigravity, Qwen, and Claude when available. Override via the
 MCP_HUDDLE_SPAWN_REGISTRY env var pointing to a JSON file.
 
 Each registry entry is a SpawnSpec:
@@ -35,13 +35,20 @@ import threading
 import time
 import traceback
 from pathlib import Path
-from typing import TypedDict
+from typing import NotRequired, TypedDict
+from urllib import error as urlerror
+from urllib import request as urlrequest
 
 
 class SpawnSpec(TypedDict):
     name: str
     cmd: list[str]
     enabled: bool
+    probe_url: NotRequired[str]
+    requires_model: NotRequired[str]
+    probe_chat_url: NotRequired[str]
+    probe_chat_model: NotRequired[str]
+    probe_timeout_sec: NotRequired[float]
 
 
 class AgentSpawnError(RuntimeError):
@@ -79,6 +86,12 @@ _ANTIGRAVITY_BIN = _first_existing_binary([
     "agy",
     "/opt/homebrew/bin/agy",
 ])
+_CLAUDE_BIN = _first_existing_binary([
+    "claude",
+    "/Applications/cmux.app/Contents/Resources/bin/claude",
+    "/opt/homebrew/bin/claude",
+    str(Path.home() / ".claude/local/claude"),
+])
 
 
 def _google_advisor_spec() -> SpawnSpec:
@@ -112,6 +125,120 @@ def _google_advisor_spec() -> SpawnSpec:
             "enabled": True,
         }
     return {"name": "Antigravity", "cmd": ["agy", "-p", "{brief}"], "enabled": False}
+
+
+def _qwen_advisor_spec() -> SpawnSpec:
+    """Build the local Qwen advisor slot.
+
+    Qwen is only useful in huddle when the local FreeQwenApi bridge is live and
+    exposes the max model. Keep the registry entry present for visibility, but
+    gate actual spawning via a dynamic /models probe in load_registry().
+    """
+    base_url = os.environ.get("MCP_HUDDLE_QWEN_BASE_URL", "http://127.0.0.1:3264/api").rstrip("/")
+    model = os.environ.get("MCP_HUDDLE_QWEN_MODEL", "qwen3.7-max")
+    return {
+        "name": "Qwen",
+        "cmd": [
+            sys.executable,
+            "-m", "mcp_huddle.openai_compatible_runner",
+            "--agent", "Qwen",
+            "--base-url", base_url,
+            "--model", model,
+            "--reasoning", "max",
+            "--brief", "{brief}",
+        ],
+        "enabled": os.environ.get("MCP_HUDDLE_QWEN_ENABLED", "1") != "0",
+        "probe_url": f"{base_url}/models",
+        "requires_model": model,
+        "probe_chat_url": f"{base_url}/chat/completions",
+        "probe_chat_model": model,
+        "probe_timeout_sec": float(os.environ.get("MCP_HUDDLE_QWEN_PROBE_TIMEOUT_SEC", "0.8")),
+    }
+
+
+def _models_payload_has_model(payload: object, model: str) -> bool:
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, list):
+            return any(isinstance(item, dict) and item.get("id") == model for item in data)
+        models = payload.get("models")
+        if isinstance(models, list):
+            return model in models or any(
+                isinstance(item, dict) and item.get("id") == model for item in models
+            )
+    if isinstance(payload, list):
+        return model in payload or any(
+            isinstance(item, dict) and item.get("id") == model for item in payload
+        )
+    return False
+
+
+_PROBE_CACHE: dict[tuple[str, ...], tuple[float, bool]] = {}
+
+
+def _cached_probe(key: tuple[str, ...], ttl_sec: float, check) -> bool:
+    now = time.time()
+    cached = _PROBE_CACHE.get(key)
+    if cached and now - cached[0] < ttl_sec:
+        return cached[1]
+    ok = bool(check())
+    _PROBE_CACHE[key] = (now, ok)
+    return ok
+
+
+def _chat_probe_available(url: str, model: str, timeout: float) -> bool:
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "Return only OK."}],
+        "temperature": 0,
+        "max_tokens": 8,
+    }
+    req = urlrequest.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "content-type": "application/json",
+            "authorization": "Bearer dummy-key",
+        },
+        method="POST",
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError, urlerror.URLError):
+        return False
+    return bool(data.get("choices"))
+
+
+def _spawn_spec_available(spec: SpawnSpec) -> bool:
+    if not spec.get("enabled"):
+        return False
+    probe_url = spec.get("probe_url")
+    required_model = spec.get("requires_model")
+    chat_url = spec.get("probe_chat_url")
+    chat_model = spec.get("probe_chat_model") or required_model
+    if not probe_url or not required_model:
+        return True
+    timeout = float(spec.get("probe_timeout_sec", 0.8))
+    ttl_sec = float(os.environ.get("MCP_HUDDLE_PROBE_CACHE_TTL_SEC", "300"))
+
+    def check_models() -> bool:
+        try:
+            with urlrequest.urlopen(probe_url, timeout=timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (OSError, ValueError, urlerror.URLError):
+            return False
+        return _models_payload_has_model(payload, required_model)
+
+    if not _cached_probe(("models", probe_url, required_model), ttl_sec, check_models):
+        return False
+    if chat_url and chat_model:
+        return _cached_probe(
+            ("chat", chat_url, chat_model),
+            ttl_sec,
+            lambda: _chat_probe_available(chat_url, chat_model, max(timeout, 10.0)),
+        )
+    return True
 
 
 def _is_ascii(text: str) -> bool:
@@ -162,6 +289,17 @@ DEFAULT_REGISTRY: list[SpawnSpec] = [
         "enabled": _CODEX_BIN is not None,
     },
     _google_advisor_spec(),
+    _qwen_advisor_spec(),
+    {
+        "name": "Claude",
+        "cmd": [
+            _CLAUDE_BIN or "claude",
+            "--dangerously-skip-permissions",
+            "--model", "sonnet",
+            "-p", "{brief}",
+        ],
+        "enabled": _CLAUDE_BIN is not None,
+    },
 ]
 
 
@@ -241,8 +379,8 @@ def load_registry() -> list[SpawnSpec]:
             data = json.load(f)
         if not isinstance(data, list):
             raise ValueError(f"{path}: expected JSON array of SpawnSpec")
-        return data
-    return DEFAULT_REGISTRY
+        return [spec for spec in data if _spawn_spec_available(spec)]
+    return [spec for spec in DEFAULT_REGISTRY if _spawn_spec_available(spec)]
 
 
 def get_enabled_spec(agent_name: str) -> SpawnSpec | None:
@@ -310,6 +448,7 @@ def spawn_all(
     briefs: dict[str, str] | None = None,
     verify_alive_sec: float = 0.0,
     on_exit_factory=None,
+    skip_names: set[str] | None = None,
 ) -> tuple[list[str], list[int], dict[str, dict[str, str | None]]]:
     """Spawn every enabled agent in the registry.
 
@@ -318,6 +457,8 @@ def spawn_all(
       cwd: working directory for spawned processes.
       log_dir: where each agent's <name>.events.jsonl is written.
       briefs: optional {AgentName: brief} for per-agent customization.
+      skip_names: registry names to NOT spawn (e.g. the room owner — already
+        present as the calling session, would otherwise spawn a duplicate).
 
     Returns:
       (names, pids, agent_meta) where agent_meta is
@@ -327,8 +468,11 @@ def spawn_all(
     pids: list[int] = []
     agent_meta: dict[str, dict[str, str | None]] = {}
     briefs = briefs or {}
+    skip_names = skip_names or set()
     for spec in load_registry():
         if not spec.get("enabled"):
+            continue
+        if spec["name"] in skip_names:
             continue
         agent_brief = briefs.get(spec["name"], brief)
         try:

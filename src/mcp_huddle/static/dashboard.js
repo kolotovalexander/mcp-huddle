@@ -1,13 +1,13 @@
 // ── Helpers ───────────────────────────────────────────────
 const AGENT_CLS = {
-  Claude:'agent-claude', Codex:'agent-codex', Gemini:'agent-gemini',
+  Claude:'agent-claude', Codex:'agent-codex', Gemini:'agent-gemini', Qwen:'agent-gemini',
   Human:'agent-human',   System:'agent-system',
 };
 const AVATAR_CLS = {
-  Claude:'avatar-claude', Codex:'avatar-codex', Gemini:'avatar-gemini',
+  Claude:'avatar-claude', Codex:'avatar-codex', Gemini:'avatar-gemini', Qwen:'avatar-gemini',
   Human:'avatar-human',   System:'avatar-system',
 };
-const AGENT_LETTER = {Claude:'C', Codex:'X', Gemini:'G', Human:'H', System:'S'};
+const AGENT_LETTER = {Claude:'C', Codex:'X', Gemini:'G', Qwen:'Q', Human:'H', System:'S'};
 
 function agentCls(a)  { return AGENT_CLS[a]  || 'agent-other'; }
 function avatarCls(a) { return AVATAR_CLS[a] || 'avatar-other'; }

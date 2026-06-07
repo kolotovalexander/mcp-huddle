@@ -40,7 +40,9 @@ WHEN NOT TO USE A ROOM:
 INVITING OTHER AGENTS:
 1. `room_create(name, owner=YourAgentName, owner_pid=PID, cwd=PROJECT,
    session_id=SESSION, auto_spawn=True, goal="<short description>")`
-   spawns Codex + Antigravity automatically if those CLIs are on PATH.
+   spawns every enabled registry agent automatically. Default registry includes
+   Codex, Antigravity/Gemini fallback, Qwen when its local bridge passes live
+   probes, and Claude when available.
 2. If auto_spawn isn't available (binaries missing or you want a different
    roster), shell out yourself with the room_id + brief, e.g.
    `codex exec --dangerously-bypass-approvals-and-sandbox "Join huddle room
@@ -115,7 +117,7 @@ def room_create(
 
     auto_spawn:
       False (default) — no agents spawned; you invite manually via room_invite.
-      True            — spawn every enabled agent in the registry (Codex + Antigravity)
+      True            — spawn every enabled agent in the registry
                         with a default reviewer brief built from `goal`.
       {Name: brief}   — spawn only these agents, each with its own custom brief.
                         Example: {"Codex": "Audit auth.py for security holes",
@@ -726,6 +728,11 @@ def _spawn_agents(
 
     log_dir = bus._room_dir(room_id) / "agents"
 
+    # Owner is already present as the calling session — never spawn a
+    # duplicate of them. Match by exact registry name (canonical: "Claude",
+    # "Codex", "Antigravity"). Caller is expected to pass canonical owner.
+    skip_owner = {owner} if owner else set()
+
     briefs_arg: dict[str, str] | None = None
     if isinstance(auto_spawn, dict):
         # Filter to enabled agents in the registry, but only those listed.
@@ -739,7 +746,7 @@ def _spawn_agents(
         # Since spawn.load_registry() returns a fresh list, we can mutate safely.
         registry = spawn.load_registry()
         for spec in registry:
-            if spec["name"] not in auto_spawn:
+            if spec["name"] not in auto_spawn or spec["name"] in skip_owner:
                 spec["enabled"] = False
         # spawn_all reads via load_registry() again — pass our filtered version
         # by temporarily patching the env. Simpler: call spawn_agent per spec.
@@ -770,7 +777,8 @@ def _spawn_agents(
     else:
         names, pids, agent_meta = spawn.spawn_all(
             default_brief, cwd, log_dir,
-            on_exit_factory=lambda n: _make_initial_spawn_callback(room_id, n))
+            on_exit_factory=lambda n: _make_initial_spawn_callback(room_id, n),
+            skip_names=skip_owner)
 
     for n in names:
         bus.invite_agent(room_id, n)

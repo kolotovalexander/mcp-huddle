@@ -77,6 +77,134 @@ def test_spawn_all_per_agent_briefs(tmp_path: Path, monkeypatch) -> None:
     assert "beta=DEFAULT" in beta_log  # falls back to default brief
 
 
+def test_spawn_all_skip_names_excludes_owner(tmp_path: Path, monkeypatch) -> None:
+    """skip_names removes matching specs so the room owner isn't duplicated."""
+    fake_registry: list[spawn.SpawnSpec] = [
+        {"name": "Codex",       "cmd": ["echo", "codex={brief}"],       "enabled": True},
+        {"name": "Antigravity", "cmd": ["echo", "antigravity={brief}"], "enabled": True},
+        {"name": "Claude",      "cmd": ["echo", "claude={brief}"],      "enabled": True},
+    ]
+    monkeypatch.setattr(spawn, "load_registry", lambda: fake_registry)
+    names, _, _ = spawn.spawn_all(
+        brief="B", cwd=str(tmp_path), log_dir=tmp_path / "agents",
+        skip_names={"Codex"},
+    )
+    assert sorted(names) == ["Antigravity", "Claude"]
+    assert "Codex" not in names
+
+
+def test_default_registry_includes_claude_codex_antigravity_qwen() -> None:
+    """All four canonical agents must be in DEFAULT_REGISTRY (enabled depends
+    on which binaries the test host has installed)."""
+    spec_names = {s["name"] for s in spawn.DEFAULT_REGISTRY}
+    assert spec_names == {"Codex", "Antigravity", "Qwen", "Claude"}
+
+
+def test_qwen_probe_requires_exact_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Qwen must auto-spawn only when the local bridge exposes the max model."""
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return b'{"data":[{"id":"qwen3.7-plus"},{"id":"qwen3.7-max"}]}'
+
+    monkeypatch.setattr(spawn.urlrequest, "urlopen", lambda _url, timeout: Response())
+
+    assert spawn._spawn_spec_available({
+        "name": "Qwen",
+        "cmd": ["qwen"],
+        "enabled": True,
+        "probe_url": "http://127.0.0.1:3264/api/models",
+        "requires_model": "qwen3.7-max",
+    })
+    assert not spawn._spawn_spec_available({
+        "name": "Qwen",
+        "cmd": ["qwen"],
+        "enabled": True,
+        "probe_url": "http://127.0.0.1:3264/api/models",
+        "requires_model": "qwen-missing",
+    })
+
+
+def test_qwen_probe_requires_working_chat(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A live /models endpoint is not enough; chat must answer too."""
+
+    class Response:
+        def __init__(self, body: bytes):
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return self.body
+
+    calls: list[str] = []
+
+    def fake_urlopen(req, timeout):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        calls.append(url)
+        if url.endswith("/models"):
+            return Response(b'{"data":[{"id":"qwen3.7-max"}]}')
+        return Response(b'{"choices":[{"message":{"content":"OK"}}]}')
+
+    spawn._PROBE_CACHE.clear()
+    monkeypatch.setattr(spawn.urlrequest, "urlopen", fake_urlopen)
+
+    assert spawn._spawn_spec_available({
+        "name": "Qwen",
+        "cmd": ["qwen"],
+        "enabled": True,
+        "probe_url": "http://127.0.0.1:3264/api/models",
+        "requires_model": "qwen3.7-max",
+        "probe_chat_url": "http://127.0.0.1:3264/api/chat/completions",
+        "probe_chat_model": "qwen3.7-max",
+    })
+    assert calls == [
+        "http://127.0.0.1:3264/api/models",
+        "http://127.0.0.1:3264/api/chat/completions",
+    ]
+
+
+def test_spawn_agents_skips_owner_via_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """server._spawn_agents must pass owner into skip_names — verifies the
+    end-to-end contract from room_create to spawn_all."""
+    fake_registry: list[spawn.SpawnSpec] = [
+        {"name": "Codex",       "cmd": ["echo", "codex"],       "enabled": True},
+        {"name": "Antigravity", "cmd": ["echo", "antigravity"], "enabled": True},
+        {"name": "Claude",      "cmd": ["echo", "claude"],      "enabled": True},
+    ]
+    monkeypatch.setattr(spawn, "load_registry", lambda: fake_registry)
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path / "huddle"))
+    monkeypatch.setattr(bus, "HUDDLE_HOME", tmp_path / "huddle")
+
+    captured: dict = {}
+    real_spawn_all = spawn.spawn_all
+
+    def capture(*args, **kwargs):
+        captured["skip_names"] = kwargs.get("skip_names")
+        return real_spawn_all(*args, **kwargs)
+
+    monkeypatch.setattr(spawn, "spawn_all", capture)
+
+    room_id = bus.create_room("test-room", "Claude", os.getpid(), str(tmp_path), "sess-1")
+    server._spawn_agents(
+        room_id=room_id, name="test-room", goal="g",
+        cwd=str(tmp_path), owner="Claude", auto_spawn=True,
+    )
+    assert captured["skip_names"] == {"Claude"}
+
+
 def test_spawn_all_logs_unexpected_oserror(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
