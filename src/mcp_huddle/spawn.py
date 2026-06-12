@@ -81,10 +81,9 @@ _CODEX_BIN = _first_existing_binary([
     "/opt/homebrew/bin/codex",
     "/Applications/Codex.app/Contents/Resources/codex",
 ])
-_GEMINI_BIN = _first_existing_binary([
-    "gemini",
-    "/opt/homebrew/bin/gemini",
-])
+# Gemini CLI removed 2026-06-11 (EOL 2026-06-18). The Google-model advisor slot
+# now runs exclusively on Antigravity (`agy`). GEMINI.md / ~/.gemini stay — they
+# are Antigravity's config home, not the dead CLI.
 _ANTIGRAVITY_BIN = _first_existing_binary([
     "agy",
     "/opt/homebrew/bin/agy",
@@ -100,10 +99,9 @@ _CLAUDE_BIN = _first_existing_binary([
 def _google_advisor_spec() -> SpawnSpec:
     """Build the Google-model advisor slot for the spawn registry.
 
-    Antigravity CLI (`agy`) is preferred; Gemini CLI is the fallback until
-    Google shuts it down on 2026-06-18. One slot, not both — two Google
-    models would share the same blind spots. `agy` has no `-m`/`-o`/`-y`
-    flags, so it prints plain text instead of a JSON event stream.
+    Runs on Antigravity CLI (`agy`) only — the Gemini CLI was removed (EOL
+    2026-06-18). `agy` has no `-m`/`-o`/`-y` flags, so it prints plain text
+    instead of a JSON event stream. Disabled if `agy` is not installed.
     """
     if _ANTIGRAVITY_BIN:
         return {
@@ -112,17 +110,6 @@ def _google_advisor_spec() -> SpawnSpec:
                 _ANTIGRAVITY_BIN,
                 "--dangerously-skip-permissions",
                 "--print-timeout", "15m",
-                "-p", "{brief}",
-            ],
-            "enabled": True,
-        }
-    if _GEMINI_BIN:
-        return {
-            "name": "Antigravity",
-            "cmd": [
-                _GEMINI_BIN,
-                "-m", "gemini-3.1-pro-preview", "-y",
-                "-o", "stream-json",
                 "-p", "{brief}",
             ],
             "enabled": True,
