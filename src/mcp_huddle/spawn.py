@@ -1,7 +1,10 @@
 """Configurable agent-spawn registry for auto_spawn rooms.
 
-Default registry uses Codex, Antigravity, Qwen, and Claude when available. Override via the
-MCP_HUDDLE_SPAWN_REGISTRY env var pointing to a JSON file.
+Default registry uses Codex, Antigravity, Qwen, and DeepSeek when available.
+Claude is present but OFF by default (opt-in via MCP_HUDDLE_CLAUDE_ENABLED=1)
+because since 2026-06-15 headless `claude -p` is metered against a separate
+Agent SDK credit pool, not the subscription. Override the whole registry via
+the MCP_HUDDLE_SPAWN_REGISTRY env var pointing to a JSON file.
 
 Each registry entry is a SpawnSpec:
   {
@@ -327,7 +330,20 @@ DEFAULT_REGISTRY: list[SpawnSpec] = [
             "--model", "sonnet",
             "-p", "{brief}",
         ],
-        "enabled": _CLAUDE_BIN is not None,
+        # Opt-in (default OFF). Since 2026-06-15 Anthropic moved `claude -p`
+        # (headless) off the subscription onto a separate, metered Agent SDK
+        # credit pool (Pro $20 / Max5x $100 / Max20x $200, no rollover, full
+        # API rates). Each invited-Claude turn here is a fresh `claude -p`
+        # spawn, so auto-spawning it bleeds that credit pool for the least
+        # differentiated voice in a multi-model room — the organizer's own
+        # interactive Claude session is already present for free. Enable
+        # deliberately via MCP_HUDDLE_CLAUDE_ENABLED=1 when you specifically
+        # want a second Claude perspective and accept the metered cost.
+        # Ref: support.claude.com article 15036540.
+        "enabled": (
+            _CLAUDE_BIN is not None
+            and os.environ.get("MCP_HUDDLE_CLAUDE_ENABLED", "0") != "0"
+        ),
     },
 ]
 

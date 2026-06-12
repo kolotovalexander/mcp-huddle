@@ -100,6 +100,21 @@ def test_default_registry_includes_claude_codex_antigravity_qwen_deepseek() -> N
     assert spec_names == {"Codex", "Antigravity", "Qwen", "DeepSeek", "Claude"}
 
 
+def test_claude_slot_is_opt_in_off_by_default() -> None:
+    """Claude headless slot must default to disabled: since 2026-06-15 `claude -p`
+    is metered against a separate Agent SDK credit pool, not the subscription.
+    enabled requires BOTH the binary present AND MCP_HUDDLE_CLAUDE_ENABLED=1.
+    Tests run without that env var, so the slot must be off regardless of host."""
+    spec = next(s for s in spawn.DEFAULT_REGISTRY if s["name"] == "Claude")
+    expected = (
+        spawn._CLAUDE_BIN is not None
+        and os.environ.get("MCP_HUDDLE_CLAUDE_ENABLED", "0") != "0"
+    )
+    assert spec["enabled"] == expected
+    if "MCP_HUDDLE_CLAUDE_ENABLED" not in os.environ:
+        assert spec["enabled"] is False
+
+
 def test_deepseek_spec_uses_max_local_model() -> None:
     """DeepSeek huddle slot should use the strongest local FreeDeepseekAPI alias."""
     spec = next(s for s in spawn.DEFAULT_REGISTRY if s["name"] == "DeepSeek")
