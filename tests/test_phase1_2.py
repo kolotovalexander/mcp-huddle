@@ -93,11 +93,21 @@ def test_spawn_all_skip_names_excludes_owner(tmp_path: Path, monkeypatch) -> Non
     assert "Codex" not in names
 
 
-def test_default_registry_includes_claude_codex_antigravity_qwen() -> None:
-    """All four canonical agents must be in DEFAULT_REGISTRY (enabled depends
+def test_default_registry_includes_claude_codex_antigravity_qwen_deepseek() -> None:
+    """All five canonical agents must be in DEFAULT_REGISTRY (enabled depends
     on which binaries the test host has installed)."""
     spec_names = {s["name"] for s in spawn.DEFAULT_REGISTRY}
-    assert spec_names == {"Codex", "Antigravity", "Qwen", "Claude"}
+    assert spec_names == {"Codex", "Antigravity", "Qwen", "DeepSeek", "Claude"}
+
+
+def test_deepseek_spec_uses_max_local_model() -> None:
+    """DeepSeek huddle slot should use the strongest local FreeDeepseekAPI alias."""
+    spec = next(s for s in spawn.DEFAULT_REGISTRY if s["name"] == "DeepSeek")
+    assert spec["requires_model"] == "deepseek-v4-pro"
+    assert spec["probe_url"] == "http://127.0.0.1:9655/v1/models"
+    assert spec["probe_chat_url"] == "http://127.0.0.1:9655/v1/chat/completions"
+    assert "--model" in spec["cmd"]
+    assert "deepseek-v4-pro" in spec["cmd"]
 
 
 def test_qwen_probe_requires_exact_model(monkeypatch: pytest.MonkeyPatch) -> None:

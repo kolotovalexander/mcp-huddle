@@ -156,6 +156,34 @@ def _qwen_advisor_spec() -> SpawnSpec:
     }
 
 
+def _deepseek_advisor_spec() -> SpawnSpec:
+    """Build the local DeepSeek advisor slot.
+
+    DeepSeek is only useful in huddle when the local FreeDeepseekAPI bridge is
+    live and its strongest Expert+thinking alias answers a chat probe.
+    """
+    base_url = os.environ.get("MCP_HUDDLE_DEEPSEEK_BASE_URL", "http://127.0.0.1:9655/v1").rstrip("/")
+    model = os.environ.get("MCP_HUDDLE_DEEPSEEK_MODEL", "deepseek-v4-pro")
+    return {
+        "name": "DeepSeek",
+        "cmd": [
+            sys.executable,
+            "-m", "mcp_huddle.openai_compatible_runner",
+            "--agent", "DeepSeek",
+            "--base-url", base_url,
+            "--model", model,
+            "--reasoning", "max",
+            "--brief", "{brief}",
+        ],
+        "enabled": os.environ.get("MCP_HUDDLE_DEEPSEEK_ENABLED", "1") != "0",
+        "probe_url": f"{base_url}/models",
+        "requires_model": model,
+        "probe_chat_url": f"{base_url}/chat/completions",
+        "probe_chat_model": model,
+        "probe_timeout_sec": float(os.environ.get("MCP_HUDDLE_DEEPSEEK_PROBE_TIMEOUT_SEC", "1.0")),
+    }
+
+
 def _models_payload_has_model(payload: object, model: str) -> bool:
     if isinstance(payload, dict):
         data = payload.get("data")
@@ -290,6 +318,7 @@ DEFAULT_REGISTRY: list[SpawnSpec] = [
     },
     _google_advisor_spec(),
     _qwen_advisor_spec(),
+    _deepseek_advisor_spec(),
     {
         "name": "Claude",
         "cmd": [
