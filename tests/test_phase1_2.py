@@ -94,10 +94,24 @@ def test_spawn_all_skip_names_excludes_owner(tmp_path: Path, monkeypatch) -> Non
 
 
 def test_default_registry_includes_claude_codex_antigravity_qwen_deepseek() -> None:
-    """All five canonical agents must be in DEFAULT_REGISTRY (enabled depends
+    """All six canonical agents must be in DEFAULT_REGISTRY (enabled depends
     on which binaries the test host has installed)."""
     spec_names = {s["name"] for s in spawn.DEFAULT_REGISTRY}
-    assert spec_names == {"Codex", "Antigravity", "Qwen", "DeepSeek", "Claude"}
+    assert spec_names == {"Codex", "Antigravity", "MiMo", "Qwen", "DeepSeek", "Claude"}
+
+
+def test_mimo_spec_uses_runner() -> None:
+    """MiMo huddle slot goes through mimo_runner (MCP hangs upstream in `mimo
+    run` 0.1.x, so MiMo cannot call huddle MCP tools itself) and is gated by
+    env flag."""
+    spec = next(s for s in spawn.DEFAULT_REGISTRY if s["name"] == "MiMo")
+    assert "mcp_huddle.mimo_runner" in spec["cmd"]
+    assert "{brief}" in spec["cmd"][-1]
+    if spawn._MIMO_BIN is None:
+        assert spec["enabled"] is False
+    else:
+        expected = os.environ.get("MCP_HUDDLE_MIMO_ENABLED", "1") != "0"
+        assert spec["enabled"] == expected
 
 
 def test_claude_slot_is_opt_in_off_by_default() -> None:

@@ -94,6 +94,10 @@ _CLAUDE_BIN = _first_existing_binary([
     "/opt/homebrew/bin/claude",
     str(Path.home() / ".claude/local/claude"),
 ])
+_MIMO_BIN = _first_existing_binary([
+    "mimo",
+    "/opt/homebrew/bin/mimo",
+])
 
 
 def _google_advisor_spec() -> SpawnSpec:
@@ -115,6 +119,36 @@ def _google_advisor_spec() -> SpawnSpec:
             "enabled": True,
         }
     return {"name": "Antigravity", "cmd": ["agy", "-p", "{brief}"], "enabled": False}
+
+
+def _mimo_advisor_spec() -> SpawnSpec:
+    """Build the MiMo Code advisor slot.
+
+    MiMo Code (Xiaomi, OpenCode fork) ships a built-in free "MiMo Auto"
+    provider, so headless `mimo run` works without API keys. Upstream bug in
+    0.1.x: `mimo run` hangs forever before the session starts when ANY MCP
+    server is configured, so MiMo cannot call huddle MCP tools itself. Like
+    Qwen/DeepSeek it goes through a runner (mimo_runner) that reads the room
+    from disk, generates via `mimo run` with MCP hard-disabled, and posts the
+    result through the bus. Disabled if the `mimo` binary is not installed.
+    """
+    if _MIMO_BIN:
+        return {
+            "name": "MiMo",
+            "cmd": [
+                sys.executable,
+                "-m", "mcp_huddle.mimo_runner",
+                "--agent", "MiMo",
+                "--mimo-bin", _MIMO_BIN,
+                "--brief", "{brief}",
+            ],
+            "enabled": os.environ.get("MCP_HUDDLE_MIMO_ENABLED", "1") != "0",
+        }
+    return {
+        "name": "MiMo",
+        "cmd": [sys.executable, "-m", "mcp_huddle.mimo_runner", "--brief", "{brief}"],
+        "enabled": False,
+    }
 
 
 def _qwen_advisor_spec() -> SpawnSpec:
@@ -307,6 +341,7 @@ DEFAULT_REGISTRY: list[SpawnSpec] = [
         "enabled": _CODEX_BIN is not None,
     },
     _google_advisor_spec(),
+    _mimo_advisor_spec(),
     _qwen_advisor_spec(),
     _deepseek_advisor_spec(),
     {
