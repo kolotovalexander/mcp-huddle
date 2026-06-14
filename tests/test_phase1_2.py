@@ -130,13 +130,15 @@ def test_claude_slot_is_opt_in_off_by_default() -> None:
 
 
 def test_deepseek_spec_uses_max_local_model() -> None:
-    """DeepSeek huddle slot should use the strongest local FreeDeepseekAPI alias."""
+    """DeepSeek huddle slot should use the strongest real FreeDeepseekAPI alias.
+    `deepseek-reasoner` (V4-Flash thinking mode) is the strongest supported id;
+    the old `deepseek-v4-pro` alias does not exist on the bridge → probe failed."""
     spec = next(s for s in spawn.DEFAULT_REGISTRY if s["name"] == "DeepSeek")
-    assert spec["requires_model"] == "deepseek-v4-pro"
+    assert spec["requires_model"] == "deepseek-reasoner"
     assert spec["probe_url"] == "http://127.0.0.1:9655/v1/models"
     assert spec["probe_chat_url"] == "http://127.0.0.1:9655/v1/chat/completions"
     assert "--model" in spec["cmd"]
-    assert "deepseek-v4-pro" in spec["cmd"]
+    assert "deepseek-reasoner" in spec["cmd"]
 
 
 def test_qwen_probe_requires_exact_model(monkeypatch: pytest.MonkeyPatch) -> None:

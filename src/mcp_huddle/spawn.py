@@ -1,6 +1,6 @@
 """Configurable agent-spawn registry for auto_spawn rooms.
 
-Default registry uses Codex, Antigravity, Qwen, and DeepSeek when available.
+Default registry uses Codex, Antigravity, MiMo, Qwen, and DeepSeek when available.
 Claude is present but OFF by default (opt-in via MCP_HUDDLE_CLAUDE_ENABLED=1)
 because since 2026-06-15 headless `claude -p` is metered against a separate
 Agent SDK credit pool, not the subscription. Override the whole registry via
@@ -19,8 +19,9 @@ auto_spawn never crashes — it just spawns whatever is available.
 Phase 1 changes (2026-04-30):
   * Codex spawned with `--json` and `--output-last-message <file>` for
     structured event capture and last-message extraction.
-  * Google-model slot spawned via Antigravity CLI (`agy -p`, plain text);
-    Gemini CLI is the fallback until its 2026-06-18 shutdown.
+  * Google-model slot spawned via Antigravity CLI (`agy -p`, plain text). The
+    legacy Gemini CLI was removed 2026-06-11 (EOL 2026-06-18); Antigravity is
+    now the only Google-model runner.
   * stdout+stderr redirected to per-room per-agent JSONL log file
     (~/.mcp-huddle/rooms/<id>/agents/<name>.events.jsonl) instead of DEVNULL.
     This is what feeds the dashboard SSE pane.
@@ -98,6 +99,16 @@ _MIMO_BIN = _first_existing_binary([
     "mimo",
     "/opt/homebrew/bin/mimo",
 ])
+
+# Codex sandbox for huddle participation. Codex talks to the room via the
+# huddle MCP server. Under a RESTRICTED sandbox (read-only / workspace-write)
+# Codex treats every MCP tool call as approval-requiring; with `-a never` that
+# approval is auto-denied → "user cancelled MCP tool call" (verified 2026-06-14
+# — even messages_read, a pure read, is cancelled). Only danger-full-access
+# lets MCP calls through without approval. This matches the user's global
+# ~/.codex/config.toml default (approval_policy=never + danger-full-access);
+# the previous read-only pin was the anomaly that silently muted Codex.
+_CODEX_SANDBOX = "danger-full-access"
 
 
 def _google_advisor_spec() -> SpawnSpec:
@@ -187,7 +198,11 @@ def _deepseek_advisor_spec() -> SpawnSpec:
     live and its strongest Expert+thinking alias answers a chat probe.
     """
     base_url = os.environ.get("MCP_HUDDLE_DEEPSEEK_BASE_URL", "http://127.0.0.1:9655/v1").rstrip("/")
-    model = os.environ.get("MCP_HUDDLE_DEEPSEEK_MODEL", "deepseek-v4-pro")
+    # FreeDeepseekAPI exposes aliases deepseek-chat/v3/default/reasoner/r1
+    # (all backed by DeepSeek-V4-Flash). `deepseek-reasoner` = thinking mode,
+    # the strongest. The old `deepseek-v4-pro` alias does not exist → /models
+    # probe failed and the slot was always gated off.
+    model = os.environ.get("MCP_HUDDLE_DEEPSEEK_MODEL", "deepseek-reasoner")
     return {
         "name": "DeepSeek",
         "cmd": [
@@ -335,7 +350,10 @@ DEFAULT_REGISTRY: list[SpawnSpec] = [
             # Model is NOT pinned — it comes from ~/.codex/config.toml (SoT).
             # Hardcoding it here drifts the moment the config default changes.
             "-c", 'model_reasoning_effort="medium"',
-            "-s", "read-only",
+            # Full access so Codex's huddle MCP tool calls aren't auto-cancelled
+            # under `-a never` (a restricted sandbox makes MCP calls need
+            # approval, which `never` denies). See _CODEX_SANDBOX note.
+            "-s", _CODEX_SANDBOX,
             "{brief}",
         ],
         "enabled": _CODEX_BIN is not None,
@@ -629,10 +647,11 @@ def codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str,
     Returns PID of the spawned codex exec resume process.
 
     `codex exec resume` has no `-s/--sandbox` flag — sandbox must be pinned
-    via `-c sandbox_mode=...`, else it falls back to ~/.codex/config.toml
-    (potentially danger-full-access). `-a` is a top-level flag (before `exec`).
-    Reasoning / sandbox overrides go through `-c key=value`. The model is left
-    to ~/.codex/config.toml (SoT) — not pinned here, to avoid drift.
+    via `-c sandbox_mode=...`, else it falls back to ~/.codex/config.toml.
+    We pin danger-full-access so Codex's huddle MCP tool calls aren't auto-
+    cancelled: under a restricted sandbox + `-a never`, MCP calls need approval
+    that `never` denies ("user cancelled MCP tool call"). `-a` is a top-level
+    flag (before `exec`). The model is left to ~/.codex/config.toml (SoT).
     """
     cwd, prompt = _codex_safe_cwd_and_brief(cwd, prompt)
     argv = [
@@ -640,7 +659,10 @@ def codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str,
         "exec", "resume", thread_id,                     # subcommand
         "--json",                                        # JSONL events to stdout
         "-c", 'model_reasoning_effort="medium"',
-        "-c", 'sandbox_mode="read-only"',                # pin read-only — resume has no -s flag
+        # Full access (resume has no -s flag, so pin via -c). A restricted
+        # sandbox makes Codex's huddle MCP calls approval-requiring, which
+        # `-a never` auto-cancels — so the resumed turn would post nothing.
+        "-c", f'sandbox_mode="{_CODEX_SANDBOX}"',
         "-c", "features.guardian_approval=false",
     ]
     if last_msg_path:
