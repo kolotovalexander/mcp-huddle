@@ -27,6 +27,10 @@
       --avatar-stack-border: rgba(20,22,32,.6);
       --c-claude: #58a6ff;
       --c-codex:  #3fb950;
+      --c-antigravity: #a371f7;
+      --c-qwen:   #db61a2;
+      --c-mimo:   #d4a72c;
+      --c-deepseek: #39c5bb;
       --c-gemini: #bc8cff;
       --c-human:  #f78166;
       --c-system: #8b949e;
@@ -59,6 +63,10 @@
       --avatar-stack-border: rgba(255,255,255,.7);
       --c-claude: #0969da;
       --c-codex:  #1a7f37;
+      --c-antigravity: #6639ba;
+      --c-qwen:   #bf3989;
+      --c-mimo:   #8a6d00;
+      --c-deepseek: #0f766e;
       --c-gemini: #8250df;
       --c-human:  #cf4319;
       --c-system: #57606a;
@@ -321,6 +329,10 @@
     .avatar-md { width: 32px; height: 32px; font-size: 14px; }
     .avatar-claude  { background: radial-gradient(circle at 30% 25%, var(--c-claude) 0%, color-mix(in srgb, var(--c-claude) 80%, transparent) 70%); box-shadow: inset 0 1px 0 rgba(255,255,255,.4), inset 0 -1px 0 rgba(0,0,0,.15), 0 2px 6px -1px color-mix(in srgb, var(--c-claude) 50%, transparent); }
     .avatar-codex   { background: radial-gradient(circle at 30% 25%, var(--c-codex) 0%, color-mix(in srgb, var(--c-codex) 80%, transparent) 70%); box-shadow: inset 0 1px 0 rgba(255,255,255,.4), inset 0 -1px 0 rgba(0,0,0,.15), 0 2px 6px -1px color-mix(in srgb, var(--c-codex) 50%, transparent); }
+    .avatar-antigravity { background: radial-gradient(circle at 30% 25%, var(--c-antigravity) 0%, color-mix(in srgb, var(--c-antigravity) 80%, transparent) 70%); box-shadow: inset 0 1px 0 rgba(255,255,255,.4), inset 0 -1px 0 rgba(0,0,0,.15), 0 2px 6px -1px color-mix(in srgb, var(--c-antigravity) 50%, transparent); }
+    .avatar-qwen    { background: radial-gradient(circle at 30% 25%, var(--c-qwen) 0%, color-mix(in srgb, var(--c-qwen) 80%, transparent) 70%); box-shadow: inset 0 1px 0 rgba(255,255,255,.4), inset 0 -1px 0 rgba(0,0,0,.15), 0 2px 6px -1px color-mix(in srgb, var(--c-qwen) 50%, transparent); }
+    .avatar-mimo    { background: radial-gradient(circle at 30% 25%, var(--c-mimo) 0%, color-mix(in srgb, var(--c-mimo) 80%, transparent) 70%); box-shadow: inset 0 1px 0 rgba(255,255,255,.4), inset 0 -1px 0 rgba(0,0,0,.15), 0 2px 6px -1px color-mix(in srgb, var(--c-mimo) 50%, transparent); }
+    .avatar-deepseek { background: radial-gradient(circle at 30% 25%, var(--c-deepseek) 0%, color-mix(in srgb, var(--c-deepseek) 80%, transparent) 70%); box-shadow: inset 0 1px 0 rgba(255,255,255,.4), inset 0 -1px 0 rgba(0,0,0,.15), 0 2px 6px -1px color-mix(in srgb, var(--c-deepseek) 50%, transparent); }
     .avatar-gemini  { background: radial-gradient(circle at 30% 25%, var(--c-gemini) 0%, color-mix(in srgb, var(--c-gemini) 80%, transparent) 70%); box-shadow: inset 0 1px 0 rgba(255,255,255,.4), inset 0 -1px 0 rgba(0,0,0,.15), 0 2px 6px -1px color-mix(in srgb, var(--c-gemini) 50%, transparent); }
     .avatar-human   { background: radial-gradient(circle at 30% 25%, var(--c-human) 0%, color-mix(in srgb, var(--c-human) 80%, transparent) 70%); box-shadow: inset 0 1px 0 rgba(255,255,255,.4), inset 0 -1px 0 rgba(0,0,0,.15), 0 2px 6px -1px color-mix(in srgb, var(--c-human) 50%, transparent); }
     .avatar-system  { background: radial-gradient(circle at 30% 25%, var(--c-system) 0%, color-mix(in srgb, var(--c-system) 80%, transparent) 70%); }
@@ -359,6 +371,10 @@
     }
     .agent-claude  .msg-name { color: var(--c-claude); }
     .agent-codex   .msg-name { color: var(--c-codex); }
+    .agent-antigravity .msg-name { color: var(--c-antigravity); }
+    .agent-qwen    .msg-name { color: var(--c-qwen); }
+    .agent-mimo    .msg-name { color: var(--c-mimo); }
+    .agent-deepseek .msg-name { color: var(--c-deepseek); }
     .agent-gemini  .msg-name { color: var(--c-gemini); }
     .agent-human   .msg-name { color: var(--c-human); }
     .agent-system  .msg-name { color: var(--c-system); }

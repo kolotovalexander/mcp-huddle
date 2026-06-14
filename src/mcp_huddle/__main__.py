@@ -1,7 +1,7 @@
 """Entry point for `python -m mcp_huddle` and the `mcp-huddle` console script.
 
 Two modes:
-  default   stdio transport — for MCP clients (Claude Code, Codex, Gemini CLI,
+  default   stdio transport — for MCP clients (Claude Code, Codex, Antigravity,
             Claude Desktop). Spawned per-client; storage in ~/.mcp-huddle/rooms/
             is shared across processes via file locks.
   --http    HTTP server + Liquid Glass dashboard on :8014. Run once manually

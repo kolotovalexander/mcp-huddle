@@ -1,13 +1,20 @@
 // ── Helpers ───────────────────────────────────────────────
+// Active roster: Antigravity, Codex, Claude, MiMo, DeepSeek, Qwen.
+// Gemini is legacy (CLI EOL 2026-06-18) — kept only so old room history renders.
 const AGENT_CLS = {
-  Claude:'agent-claude', Codex:'agent-codex', Gemini:'agent-gemini', Qwen:'agent-gemini',
+  Claude:'agent-claude', Codex:'agent-codex', Antigravity:'agent-antigravity',
+  Qwen:'agent-qwen', MiMo:'agent-mimo', DeepSeek:'agent-deepseek',
+  Gemini:'agent-gemini',
   Human:'agent-human',   System:'agent-system',
 };
 const AVATAR_CLS = {
-  Claude:'avatar-claude', Codex:'avatar-codex', Gemini:'avatar-gemini', Qwen:'avatar-gemini',
+  Claude:'avatar-claude', Codex:'avatar-codex', Antigravity:'avatar-antigravity',
+  Qwen:'avatar-qwen', MiMo:'avatar-mimo', DeepSeek:'avatar-deepseek',
+  Gemini:'avatar-gemini',
   Human:'avatar-human',   System:'avatar-system',
 };
-const AGENT_LETTER = {Claude:'C', Codex:'X', Gemini:'G', Qwen:'Q', Human:'H', System:'S'};
+const AGENT_LETTER = {Claude:'C', Codex:'X', Antigravity:'A', Qwen:'Q', MiMo:'M',
+  DeepSeek:'D', Gemini:'G', Human:'H', System:'S'};
 
 function agentCls(a)  { return AGENT_CLS[a]  || 'agent-other'; }
 function avatarCls(a) { return AVATAR_CLS[a] || 'avatar-other'; }
@@ -374,7 +381,7 @@ async function openRoom(id, owner) {
   renderRooms();
   buildChatShell(rooms.find(x => x.id === id) || {id});
   await fetchMessages(true);
-  await attachAgentPanels(id);  // Phase 1: live Codex/Gemini event stream
+  await attachAgentPanels(id);  // Phase 1: live agent event stream (Codex / runner agents)
   // Re-paint totals badges after panels rebuilt
   Object.keys(agentMetaTotals).forEach(renderAgentTotalsBadge);
 }
@@ -519,13 +526,17 @@ function appendAgentEvent(agentName, raw) {
   try {
     const obj = JSON.parse(raw);
     // Codex --json events: {type, agent_message?, delta?, ...}
-    // Gemini stream-json: {type, content?, ...}
+    // Runner events (MiMo / DeepSeek / Qwen via *_runner): {type, error?,
+    //   reason?, model?, message_id?, ...}. Antigravity (agy -p) is plain text.
     if (obj.type) {
       summary = obj.type;
       // Lines word-wrap in the panel now, so we can afford a fuller preview.
       if (obj.agent_message) summary += ': ' + String(obj.agent_message).slice(0, 400);
       else if (obj.delta) summary += ': ' + String(obj.delta).slice(0, 400);
       else if (obj.content) summary += ': ' + String(obj.content).slice(0, 400);
+      else if (obj.error) summary += ': ' + String(obj.error).slice(0, 400);
+      else if (obj.reason) summary += ': ' + String(obj.reason).slice(0, 400);
+      else if (obj.model) summary += ': ' + String(obj.model).slice(0, 120);
       detail = JSON.stringify(obj, null, 2);
     }
   } catch(e) {

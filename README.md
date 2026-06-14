@@ -1,6 +1,6 @@
 # mcp-huddle
 
-> Persistent multi-agent chat MCP server. Rooms where AI agents (Claude, Codex, Gemini, ...) huddle to discuss, critique, and decide together — with a Liquid Glass web dashboard for humans to watch and intervene.
+> Persistent multi-agent chat MCP server. Rooms where AI agents (Claude, Codex, Antigravity, MiMo, DeepSeek, Qwen, ...) huddle to discuss, critique, and decide together — with a Liquid Glass web dashboard for humans to watch and intervene.
 
 <!-- Badges — uncomment once published to PyPI:
 ![PyPI version](https://img.shields.io/pypi/v/mcp-huddle)
@@ -14,7 +14,7 @@
 
 `mcp-huddle` runs in **stdio mode by default** (the transport every MCP client expects), and in **HTTP + dashboard mode** when you pass `--http`. Both modes share the same JSONL storage at `~/.mcp-huddle/rooms/` via file locks, so a stdio-spawned client and the HTTP dashboard see the same rooms in real time.
 
-### 1) Stdio mode — for MCP clients (Claude Code, Codex, Gemini CLI, Claude Desktop)
+### 1) Stdio mode — for MCP clients (Claude Code, Codex, Antigravity, Claude Desktop)
 
 Each client spawns its own `uvx mcp-huddle` process and communicates via JSON-RPC over stdin/stdout. The package is not on PyPI yet — install directly from GitHub via `uvx`:
 
@@ -39,7 +39,7 @@ command = "uvx"
 args = ["--from", "git+https://github.com/kolotovalexander/mcp-huddle", "mcp-huddle"]
 ```
 
-**Gemini CLI** — add to `~/.gemini/config.json` `mcpServers`:
+**Antigravity** (`agy`, Google-model slot — uses the `~/.gemini` config home) — add to `~/.gemini/config.json` `mcpServers`:
 
 ```json
 {
@@ -70,7 +70,7 @@ Dashboard: <http://127.0.0.1:8014/dashboard>. The dashboard reads the same files
 - **JSONL storage** at `~/.mcp-huddle/rooms/` — grep-able, no DB
 - **Anti-loop guards**: `kind` enum (`request`/`comment`/`ack`/`busy`/`result`/`final`/`system`/`close`), per-message dedup, server-side circuit breaker
 - **Liquid Glass web dashboard** with two themes (dark/light), agent avatars, polished kind badges, reply-to quotes
-- **Auto-spawn** enabled registry reviewers when a room is created (`auto_spawn=True`); default registry includes Codex, Antigravity/Gemini fallback, live-probed Qwen, and Claude. Registry is configurable via `MCP_HUDDLE_SPAWN_REGISTRY`
+- **Auto-spawn** enabled registry reviewers when a room is created (`auto_spawn=True`); default registry includes Codex, Antigravity, MiMo, live-probed Qwen, live-probed DeepSeek, and Claude. Registry is configurable via `MCP_HUDDLE_SPAWN_REGISTRY`
 - **Codex wake-up loop**: follow-up `kind=request` messages addressed to Codex (or `all`) resume the same captured Codex thread instead of starting from scratch
 - **Watchdog** auto-closes rooms whose owner process died
 
@@ -78,7 +78,7 @@ Dashboard: <http://127.0.0.1:8014/dashboard>. The dashboard reads the same files
 
 | Tool | Purpose |
 |------|---------|
-| `room_create` | Create a new discussion room; returns `room_id`. Optionally auto-spawns Codex + Gemini. |
+| `room_create` | Create a new discussion room; returns `room_id`. Optionally auto-spawns enabled registry agents. |
 | `room_invite` | Add an agent to an existing room. |
 | `room_request_close` | Signal intent to close; human must confirm with `room_close`. |
 | `room_close` | Permanently close a room (owner only); kills spawned agents. |
@@ -100,7 +100,7 @@ Dashboard: <http://127.0.0.1:8014/dashboard>. The dashboard reads the same files
 |---------|---------|---------|
 | `PORT` | `8014` | HTTP port the server listens on |
 | `MCP_HUDDLE_HOME` | `~/.mcp-huddle` | Storage root. Rooms are stored in `$MCP_HUDDLE_HOME/rooms`. |
-| `MCP_HUDDLE_SPAWN_REGISTRY` | (built-in Codex+Gemini) | Path to JSON file overriding the auto-spawn registry. See `examples/registry.json` for format. |
+| `MCP_HUDDLE_SPAWN_REGISTRY` | (built-in Codex+Antigravity+MiMo+Qwen+DeepSeek+Claude) | Path to JSON file overriding the auto-spawn registry. See `examples/registry.json` for format. |
 
 ## Agent loop discipline
 
@@ -126,7 +126,9 @@ Requests with `reply_to` set are treated as answers and do not wake Codex.
 Messages authored by Codex do not wake Codex again. This preserves one logical
 Codex session per room without keeping a long-running Codex OS process alive.
 
-Gemini is still one-shot/fresh-process until the ACP daemon integration in
+Only Codex has UUID-based thread resume. The other registry agents
+(Antigravity, MiMo, DeepSeek, Qwen) are one-shot/fresh-process per wake — each
+turn re-reads the room transcript — until the ACP daemon integration in
 `src/mcp_huddle/acp.py` is implemented.
 
 ## Dashboard

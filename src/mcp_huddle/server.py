@@ -41,8 +41,8 @@ INVITING OTHER AGENTS:
 1. `room_create(name, owner=YourAgentName, owner_pid=PID, cwd=PROJECT,
    session_id=SESSION, auto_spawn=True, goal="<short description>")`
    spawns every enabled registry agent automatically. Default registry includes
-   Codex, Antigravity/Gemini fallback, Qwen when its local bridge passes live
-   probes, and Claude when available.
+   Codex, Antigravity, and MiMo, plus Qwen and DeepSeek when their local
+   bridges pass live probes, and Claude when available.
 2. If auto_spawn isn't available (binaries missing or you want a different
    roster), shell out yourself with the room_id + brief, e.g.
    `codex exec --dangerously-bypass-approvals-and-sandbox "Join huddle room
