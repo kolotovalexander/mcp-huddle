@@ -80,15 +80,19 @@ def register_external_agent(room_id: str, agent_name: str) -> dict:
     log_path = agents_dir / f"{agent_name.lower()}.events.jsonl"
     last_path = agents_dir / f"{agent_name.lower()}.last_message.txt"
     log_path.touch(exist_ok=True)
-    meta = _read_meta(room_id)
-    am = meta.setdefault("agent_meta", {})
-    am[agent_name] = {
-        "log_path": str(log_path),
-        "last_message_path": str(last_path),
-        "thread_id": am.get(agent_name, {}).get("thread_id", ""),
-        "external": True,
-    }
-    _write_json(rdir / "meta.json", meta)
+
+    def _update(meta: dict) -> dict:
+        am = meta.setdefault("agent_meta", {})
+        am[agent_name] = {
+            "log_path": str(log_path),
+            "last_message_path": str(last_path),
+            "thread_id": am.get(agent_name, {}).get("thread_id", ""),
+            "external": True,
+        }
+        return meta
+
+    # Locked RMW: a concurrent wake-thread agent_meta update must not be lost.
+    _update_meta_locked(room_id, _update)
     return {"log_path": str(log_path), "last_message_path": str(last_path)}
 
 
@@ -142,13 +146,20 @@ def list_rooms() -> list[dict]:
 
 
 def request_close(room_id: str, agent: str) -> str:
-    meta = _read_meta(room_id)
-    if meta["status"] != "open":
-        return meta["status"]
-    meta["status"] = "closing_requested"
-    _write_json(_room_dir(room_id) / "meta.json", meta)
-    _append_system(room_id, f"[{agent}] запросил закрытие комнаты. Подтверди: room_close('{room_id}')")
-    return "closing_requested"
+    outcome: dict = {}
+
+    def _update(meta: dict) -> dict:
+        if meta["status"] != "open":
+            outcome["status"] = meta["status"]
+            return meta
+        meta["status"] = "closing_requested"
+        outcome["status"] = "closing_requested"
+        return meta
+
+    _update_meta_locked(room_id, _update)
+    if outcome["status"] == "closing_requested":
+        _append_system(room_id, f"[{agent}] запросил закрытие комнаты. Подтверди: room_close('{room_id}')")
+    return outcome["status"]
 
 
 def close_room(room_id: str, owner: str) -> None:
@@ -160,8 +171,8 @@ def close_room(room_id: str, owner: str) -> None:
         return
     _kill_spawned(meta)
     _append_system(room_id, "Чат закрыт.")
-    meta["status"] = "closed"
-    _write_json(_room_dir(room_id) / "meta.json", meta)
+    # Locked flip preserves any agent_meta a wake thread wrote concurrently.
+    _update_meta_locked(room_id, lambda m: {**m, "status": "closed"})
 
 
 def close_session_rooms(session_id: str) -> list[str]:
@@ -194,6 +205,7 @@ def delete_room(room_id: str, owner: str) -> None:
     rdir = _room_dir(room_id)
     if rdir.exists():
         shutil.rmtree(rdir)
+    _evict_msg_cache(room_id)
 
 
 # ── Messages ─────────────────────────────────────────────────────────────────
@@ -219,6 +231,16 @@ def post_message(room_id: str, agent: str, body: str, kind: str,
     msgs_file = rdir / "messages.jsonl"
 
     with _lock(msgs_file) as f:
+        # Re-validate room state under the messages lock: a concurrent
+        # close_room / resolution_vote may have transitioned the room between
+        # the pre-lock read above and here. Without this, a message can land in
+        # an already-closed/resolved room.
+        cur = _read_meta(room_id)
+        if cur["status"] == "closed":
+            raise ValueError("Room is closed.")
+        if cur["status"] == "resolved" and kind not in ("system", "close"):
+            raise ValueError("Room is resolved and read-only.")
+
         # Idempotency: scan last 20 lines
         if idempotency_key:
             existing = _read_last_n_raw(msgs_file, 20)
@@ -290,7 +312,8 @@ def _validate_reply_to_locked(room_id: str, target_id: int, agent: str) -> None:
         addressee, so we reject only a SECOND reply from the SAME agent —
         replies from other agents are allowed.
     """
-    messages = _load_messages(room_id)
+    # Caller holds the messages LOCK_EX; read lock-free to avoid self-deadlock.
+    messages = _load_messages_unlocked(room_id)
     target = next((m for m in messages if m.get("id") == target_id), None)
     if target is None:
         raise ValueError("reply_to target not found")
@@ -370,35 +393,61 @@ def get_status(room_id: str) -> dict:
     status_file = _room_dir(room_id) / "status.json"
     if not status_file.exists():
         return {}
-    data = json.loads(status_file.read_text())
+    try:
+        data = json.loads(status_file.read_text())
+    except Exception:
+        return {}
     now = int(time.time())
     result = {}
-    changed = False
+    expired = []
     for agent, info in data.items():
         expires = info.get("expires_at", 0)
         if expires > 0 and now > expires:
-            info["status"] = "online"
-            info["expires_at"] = 0
-            changed = True
-        result[agent] = info["status"]
-    if changed:
-        _write_json(status_file, data)
+            result[agent] = "online"
+            expired.append(agent)
+        else:
+            result[agent] = info.get("status", "online")
+    # Persist expiry resets under the lock with a fresh read so we never
+    # clobber a busy lease another thread wrote between our read and write.
+    if expired:
+        with _lock(_room_dir(room_id) / "status.lock"):
+            if status_file.exists():
+                try:
+                    data = json.loads(status_file.read_text())
+                except Exception:
+                    data = {}
+                changed = False
+                for agent in expired:
+                    info = data.get(agent)
+                    if (info and info.get("expires_at", 0) > 0
+                            and now > info["expires_at"]):
+                        info["status"] = "online"
+                        info["expires_at"] = 0
+                        changed = True
+                if changed:
+                    _write_json(status_file, data)
     return result
 
 
 # ── Resolution / consensus ────────────────────────────────────────────────────
 
 def propose_resolution(room_id: str, agent: str, text: str) -> str:
-    meta = _read_meta(room_id)
     res_id = f"res_{uuid.uuid4().hex[:6]}"
-    meta["resolution"] = {
-        "id": res_id,
-        "proposed_by": agent,
-        "text": text,
-        "votes": {agent: "ack"},
-        "status": "voting",
-    }
-    _write_json(_room_dir(room_id) / "meta.json", meta)
+
+    def _update(meta: dict) -> dict:
+        meta["resolution"] = {
+            "id": res_id,
+            "proposed_by": agent,
+            "text": text,
+            "votes": {agent: "ack"},
+            "status": "voting",
+        }
+        return meta
+
+    # Locked RMW so a concurrent wake-thread agent_meta update isn't clobbered.
+    _update_meta_locked(room_id, _update)
+    # System message posted AFTER the lock — post_message re-acquires the meta
+    # lock, so doing it inside _update would self-deadlock.
     _append_system(room_id,
         f"[Resolution proposed by {agent}]: {text}\n"
         f"Все участники: вызовите resolution_vote('{room_id}', ..., '{res_id}', 'ack'|'reject')")
@@ -406,30 +455,34 @@ def propose_resolution(room_id: str, agent: str, text: str) -> str:
 
 
 def resolution_vote(room_id: str, agent: str, resolution_id: str, vote: str) -> str:
-    meta = _read_meta(room_id)
-    res = meta.get("resolution")
-    if not res or res["id"] != resolution_id:
-        raise ValueError(f"Resolution {resolution_id} not found")
     if vote not in ("ack", "reject"):
         raise ValueError("vote must be 'ack' or 'reject'")
 
-    res["votes"][agent] = vote
-    participants = [p for p in meta["participants"] if p != "Human"]
+    outcome: dict = {}
 
-    if vote == "reject":
-        res["status"] = "rejected"
-        _write_json(_room_dir(room_id) / "meta.json", meta)
-        _append_system(room_id, f"[{agent}] отклонил резолюцию: {res['text'][:80]}")
-    elif all(res["votes"].get(p) == "ack" for p in participants):
-        res["status"] = "accepted"
-        meta["status"] = "resolved"
-        _write_json(_room_dir(room_id) / "meta.json", meta)
-        _append_system(room_id,
-            f"Консенсус достигнут! Резолюция принята: {res['text']}\n"
-            "Чат переведён в read-only. Оркестратор может закрыть чат.")
-    else:
-        _write_json(_room_dir(room_id) / "meta.json", meta)
-    return res["status"]
+    def _update(meta: dict) -> dict:
+        res = meta.get("resolution")
+        if not res or res["id"] != resolution_id:
+            raise ValueError(f"Resolution {resolution_id} not found")
+        res["votes"][agent] = vote
+        participants = [p for p in meta["participants"] if p != "Human"]
+        if vote == "reject":
+            res["status"] = "rejected"
+            outcome["system_msg"] = f"[{agent}] отклонил резолюцию: {res['text'][:80]}"
+        elif all(res["votes"].get(p) == "ack" for p in participants):
+            res["status"] = "accepted"
+            meta["status"] = "resolved"
+            outcome["system_msg"] = (
+                f"Консенсус достигнут! Резолюция принята: {res['text']}\n"
+                "Чат переведён в read-only. Оркестратор может закрыть чат.")
+        outcome["status"] = res["status"]
+        return meta
+
+    # ValueError from _update (unknown resolution) propagates with no write.
+    _update_meta_locked(room_id, _update)
+    if outcome.get("system_msg"):
+        _append_system(room_id, outcome["system_msg"])
+    return outcome["status"]
 
 
 # ── Notifications ─────────────────────────────────────────────────────────────
@@ -437,14 +490,16 @@ def resolution_vote(room_id: str, agent: str, resolution_id: str, vote: str) -> 
 def register_notify(room_id: str, agent: str, notify_file: str) -> None:
     rdir = _room_dir(room_id)
     notif_registry = rdir / "notify_registry.json"
-    data = {}
-    if notif_registry.exists():
-        try:
-            data = json.loads(notif_registry.read_text())
-        except Exception:
-            pass
-    data[agent] = notify_file
-    _write_json(notif_registry, data)
+    # Locked RMW: parallel registrations must not clobber each other.
+    with _lock(rdir / "notify.lock"):
+        data = {}
+        if notif_registry.exists():
+            try:
+                data = json.loads(notif_registry.read_text())
+            except Exception:
+                data = {}
+        data[agent] = notify_file
+        _write_json(notif_registry, data)
 
 
 # ── Zombie watchdog (called by server background task) ────────────────────────
@@ -477,13 +532,13 @@ def check_deadlock_rooms() -> list[str]:
             continue
         last = meta.get("last_activity", meta["created_at"])
         if now - last > DEADLOCK_TIMEOUT_SECS:
+            # _append_system → post_message bumps last_activity under the meta
+            # lock, which resets the timer. No extra (unlocked) write needed —
+            # the previous manual rewrite here could clobber a concurrent
+            # agent_meta wake update.
             _append_system(meta["id"],
                 f"[System] Timeout: комната молчит {DEADLOCK_TIMEOUT_SECS // 60} мин. "
                 "Есть незакрытый вопрос?")
-            # reset timer to avoid spam
-            m = _read_meta(meta["id"])
-            m["last_activity"] = now
-            _write_json(_room_dir(meta["id"]) / "meta.json", m)
             notified.append(meta["id"])
     return notified
 
@@ -517,22 +572,33 @@ def _update_meta_locked(room_id: str, update_fn) -> dict:
 
 def _patch_status(room_id: str, agent: str, status: str, expires_at: int, session_id: str) -> None:
     p = _room_dir(room_id) / "status.json"
-    data = {}
-    if p.exists():
-        try:
-            data = json.loads(p.read_text())
-        except Exception:
-            pass
-    data[agent] = {"status": status, "expires_at": expires_at, "session_id": session_id}
-    _write_json(p, data)
+    # Locked read-modify-write: concurrent wake threads / reaper callbacks /
+    # watchdog all patch status.json. Without the lock, two writers that read
+    # the same snapshot and write back their own agent silently lose updates
+    # (a dropped busy lease then triggers a spurious duplicate wake).
+    with _lock(_room_dir(room_id) / "status.lock"):
+        data = {}
+        if p.exists():
+            try:
+                data = json.loads(p.read_text())
+            except Exception:
+                data = {}
+        data[agent] = {"status": status, "expires_at": expires_at, "session_id": session_id}
+        _write_json(p, data)
 
 
-def _load_messages(room_id: str) -> list[dict]:
-    p = _room_dir(room_id) / "messages.jsonl"
-    if not p.exists():
-        return []
+# Parsed-message cache keyed by file identity (size, mtime_ns). messages.jsonl
+# is append-only under a lock, so any new message grows the file — the key
+# changes and the cache self-invalidates. A full rewrite to the same size in
+# the same nanosecond is not reachable for this workload. Returned lists are
+# treated read-only by every caller (internal `_`-prefixed contract).
+_msg_cache: dict[str, tuple] = {}
+_msg_cache_lock = threading.Lock()
+
+
+def _parse_messages_text(raw: str) -> list[dict]:
     msgs = []
-    for line in p.read_text().splitlines():
+    for line in raw.splitlines():
         line = line.strip()
         if line:
             try:
@@ -540,6 +606,54 @@ def _load_messages(room_id: str) -> list[dict]:
             except Exception:
                 pass
     return msgs
+
+
+def _load_messages(room_id: str) -> list[dict]:
+    p = _room_dir(room_id) / "messages.jsonl"
+    try:
+        st = p.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    pstr = str(p)
+    key = (st.st_size, st.st_mtime_ns)
+    with _msg_cache_lock:
+        cached = _msg_cache.get(pstr)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+    # Cache miss: read under a shared lock so we never parse a half-written
+    # final line while a writer is mid-append (it holds LOCK_EX). Recompute the
+    # key from the fd we actually read, so the cache reflects that exact state.
+    # NB: callers already holding the messages LOCK_EX (e.g.
+    # _validate_reply_to_locked) must NOT use this — they would self-deadlock.
+    try:
+        with _lock(p, shared=True) as fh:
+            fh.seek(0)
+            raw = fh.read()
+            fst = os.fstat(fh.fileno())
+            key = (fst.st_size, fst.st_mtime_ns)
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    msgs = _parse_messages_text(raw)
+    with _msg_cache_lock:
+        _msg_cache[pstr] = (key, msgs)
+    return msgs
+
+
+def _load_messages_unlocked(room_id: str) -> list[dict]:
+    """Parse messages WITHOUT taking the messages lock. Only safe to call from
+    code that already holds the LOCK_EX on messages.jsonl (re-locking the same
+    file from a second fd in the same thread would deadlock)."""
+    p = _room_dir(room_id) / "messages.jsonl"
+    try:
+        return _parse_messages_text(p.read_text())
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+
+
+def _evict_msg_cache(room_id: str) -> None:
+    pstr = str(_room_dir(room_id) / "messages.jsonl")
+    with _msg_cache_lock:
+        _msg_cache.pop(pstr, None)
 
 
 def _next_id(msgs_file: Path) -> int:
@@ -562,20 +676,32 @@ def _read_last_n_raw(msgs_file: Path, n: int) -> list[str]:
 
 
 class _lock:
-    """Context manager: open file with exclusive lock."""
-    def __init__(self, path: Path):
+    """Context manager: open file with an advisory lock.
+
+    shared=False (default) → exclusive (LOCK_EX) for writers; flush+fsync on
+    exit. shared=True → shared (LOCK_SH) for readers: multiple readers proceed
+    together but block while any writer holds the exclusive lock, so a reader
+    never observes a half-written line. Readers skip flush/fsync."""
+    def __init__(self, path: Path, shared: bool = False):
         self._path = path
+        self._shared = shared
         self._fh = None
 
     def __enter__(self):
-        self._fh = open(self._path, "a+", encoding="utf-8")
-        fcntl.flock(self._fh, fcntl.LOCK_EX)
+        # Shared (reader) locks open read-only: requesting write access ("a+")
+        # for a pure read needlessly fails on read-only filesystems and inside
+        # restrictive sandboxes (e.g. a Codex resume pinned to sandbox_mode=
+        # read-only), where O_RDONLY is fine but O_RDWR/append is denied.
+        mode = "r" if self._shared else "a+"
+        self._fh = open(self._path, mode, encoding="utf-8")
+        fcntl.flock(self._fh, fcntl.LOCK_SH if self._shared else fcntl.LOCK_EX)
         return self._fh
 
     def __exit__(self, *_):
         if self._fh:
-            self._fh.flush()
-            os.fsync(self._fh.fileno())
+            if not self._shared:
+                self._fh.flush()
+                os.fsync(self._fh.fileno())
             fcntl.flock(self._fh, fcntl.LOCK_UN)
             self._fh.close()
 
@@ -705,8 +831,7 @@ def close_all_rooms() -> dict:
             result["skipped_dead"] += counts["skipped_dead"]
             result["skipped_owner"] += counts["skipped_owner"]
             _append_system(rid, "Чат закрыт (bulk close).")
-            meta["status"] = "closed"
-            _write_json(_room_dir(rid) / "meta.json", meta)
+            _update_meta_locked(rid, lambda m: {**m, "status": "closed"})
             result["closed"].append(rid)
         except Exception as e:
             result["errors"].append({"room_id": rid, "error": str(e)})
@@ -726,6 +851,7 @@ def delete_closed_rooms() -> dict:
             rdir = _room_dir(rid)
             if rdir.exists():
                 shutil.rmtree(rdir)
+            _evict_msg_cache(rid)
             result["deleted"].append(rid)
         except Exception as e:
             result["errors"].append({"room_id": rid, "error": str(e)})
