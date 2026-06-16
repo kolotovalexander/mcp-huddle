@@ -700,12 +700,23 @@ class _lock:
         return self._fh
 
     def __exit__(self, *_):
-        if self._fh:
+        if not self._fh:
+            return
+        try:
             if not self._shared:
-                self._fh.flush()
-                os.fsync(self._fh.fileno())
-            fcntl.flock(self._fh, fcntl.LOCK_UN)
-            self._fh.close()
+                try:
+                    self._fh.flush()
+                    os.fsync(self._fh.fileno())
+                except OSError:
+                    # e.g. ENOSPC — durability is best-effort, but we MUST still
+                    # release the lock and close the fd below, otherwise every
+                    # later writer of this file deadlocks on the held LOCK_EX.
+                    pass
+        finally:
+            try:
+                fcntl.flock(self._fh, fcntl.LOCK_UN)
+            finally:
+                self._fh.close()
 
 
 def _check_circuit_breaker(room_id: str, agent: str) -> None:

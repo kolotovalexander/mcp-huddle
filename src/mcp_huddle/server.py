@@ -533,8 +533,8 @@ async def api_messages_json(request: Request) -> JSONResponse:
 
 @mcp.custom_route("/api/message_post", methods=["POST"])
 async def api_message_post(request: Request) -> JSONResponse:
-    data = await request.json()
     try:
+        data = await request.json()
         msg_id = _post_message_checked(
             data["room_id"], data["agent"], data["body"], data["kind"],
             data.get("to"), data.get("reply_to"), data.get("idempotency_key"),
@@ -556,8 +556,8 @@ async def api_message_post(request: Request) -> JSONResponse:
 
 @mcp.custom_route("/api/room_close", methods=["POST"])
 async def api_room_close(request: Request) -> JSONResponse:
-    data = await request.json()
     try:
+        data = await request.json()
         bus.close_room(data["room_id"], data["owner"])
         return JSONResponse({"status": "closed"})
     except Exception as e:
@@ -568,10 +568,14 @@ async def api_room_close(request: Request) -> JSONResponse:
 async def api_room_delete(request: Request) -> JSONResponse:
     """Wipe a closed room from disk. Backed by bus.delete_room() — only works
     on status='closed' rooms (raises ValueError otherwise)."""
-    data = await request.json()
     try:
+        data = await request.json()
         bus.delete_room(data["room_id"], data["owner"])
         return JSONResponse({"status": "deleted"})
+    except json.JSONDecodeError as e:
+        # JSONDecodeError subclasses ValueError — catch it first so a malformed
+        # body is a 400 (bad request), not a 409 (room-not-closed conflict).
+        return JSONResponse({"error": f"invalid JSON: {e}"}, status_code=400)
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=409)
     except Exception as e:
