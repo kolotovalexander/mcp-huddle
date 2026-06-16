@@ -355,3 +355,46 @@ def test_resolved_room_allows_only_system_or_close_messages(isolated_bus) -> Non
     system_id = isolated_bus.post_message(room_id, "System", "allowed", "system")
     close_id = isolated_bus.post_message(room_id, "Codex", "closing", "close")
     assert close_id == system_id + 1
+
+
+def test_delete_old_terminal_rooms_respects_age_and_status(isolated_bus) -> None:
+    import os
+
+    # old closed room → deleted
+    old = _create_room(isolated_bus)
+    isolated_bus.close_room(old, "Codex")
+    old_dir = isolated_bus._room_dir(old)
+    eight_days = time.time() - 8 * 86400
+    os.utime(old_dir, (eight_days, eight_days))
+
+    # recently closed room → kept (below age cutoff)
+    recent = _create_room(isolated_bus)
+    isolated_bus.close_room(recent, "Codex")
+
+    # open room → never touched, regardless of mtime
+    live = _create_room(isolated_bus)
+    os.utime(isolated_bus._room_dir(live), (eight_days, eight_days))
+
+    result = isolated_bus.delete_old_terminal_rooms(7)
+
+    assert old in result["deleted"]
+    assert recent not in result["deleted"]
+    assert live not in result["deleted"]
+    assert not old_dir.exists()
+    assert isolated_bus._room_dir(recent).exists()
+    assert isolated_bus._room_dir(live).exists()
+
+    # disabled (0 days) is a no-op even on old terminal rooms
+    assert isolated_bus.delete_old_terminal_rooms(0)["deleted"] == []
+
+
+def test_zombie_check_reaps_idle_room_with_dead_owner(isolated_bus) -> None:
+    # idle room whose owner_pid is dead must be auto-closed (was leaking before)
+    room_id = isolated_bus.create_room("Idle", "Codex", 999_999_999, "/tmp", "s")
+    isolated_bus.mark_idle(room_id)
+    assert isolated_bus._read_meta(room_id)["status"] == "idle"
+
+    closed = isolated_bus.check_zombie_rooms()
+
+    assert room_id in closed
+    assert isolated_bus._read_meta(room_id)["status"] == "closed"

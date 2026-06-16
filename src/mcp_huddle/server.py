@@ -99,6 +99,11 @@ that bypass anti-loop rules.
 
 mcp = FastMCP("mcp-huddle", instructions=_AGENT_INSTRUCTIONS)
 IDLE_TIMEOUT_SECS = int(os.environ.get("IDLE_TIMEOUT_SECS", "600"))
+# Retention: terminal rooms (closed/resolved) older than this are purged by the
+# background sweep. 0 disables. Sweep runs at most once per RETENTION_SWEEP_SECS
+# (not every zombie-check tick) — deletion is cheap but no need to scan hourly.
+RETENTION_DAYS = float(os.environ.get("HUDDLE_RETENTION_DAYS", "7"))
+RETENTION_SWEEP_SECS = int(os.environ.get("HUDDLE_RETENTION_SWEEP_SECS", "3600"))
 
 
 # ── Room tools ────────────────────────────────────────────────────────────────
@@ -420,6 +425,7 @@ def notify_register(room_id: str, agent: str, notify_file_path: str) -> str:
 
 async def _background_watchdog():
     """Periodically check for zombie rooms and deadlocks."""
+    last_retention_sweep = 0.0
     while True:
         await asyncio.sleep(bus.ZOMBIE_CHECK_SECS)
         try:
@@ -428,6 +434,17 @@ async def _background_watchdog():
                 print(f"[watchdog] Zombie-closed rooms: {closed}", flush=True)
         except Exception as e:
             print(f"[watchdog] zombie check error: {e}", flush=True)
+
+        try:
+            now = time.time()
+            if RETENTION_DAYS > 0 and now - last_retention_sweep >= RETENTION_SWEEP_SECS:
+                last_retention_sweep = now
+                purged = bus.delete_old_terminal_rooms(RETENTION_DAYS)
+                if purged.get("deleted"):
+                    print(f"[watchdog] Retention-purged {len(purged['deleted'])} "
+                          f"terminal rooms (>{RETENTION_DAYS}d)", flush=True)
+        except Exception as e:
+            print(f"[watchdog] retention sweep error: {e}", flush=True)
 
         try:
             idled = _mark_idle_rooms()

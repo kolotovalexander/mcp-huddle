@@ -508,7 +508,9 @@ def check_zombie_rooms() -> list[str]:
     """Return list of room_ids that were auto-closed due to dead owner."""
     closed = []
     for meta in list_rooms():
-        if meta["status"] not in ("open", "closing_requested"):
+        # idle rooms whose owner has died are dead weight — reap them too, so
+        # they don't pile up forever (idle has no auto-close transition otherwise).
+        if meta["status"] not in ("open", "closing_requested", "idle"):
             continue
         pid = meta.get("owner_pid", 0)
         if pid <= 0:
@@ -851,6 +853,40 @@ def delete_closed_rooms() -> dict:
             rdir = _room_dir(rid)
             if rdir.exists():
                 shutil.rmtree(rdir)
+            _evict_msg_cache(rid)
+            result["deleted"].append(rid)
+        except Exception as e:
+            result["errors"].append({"room_id": rid, "error": str(e)})
+    return result
+
+
+def delete_old_terminal_rooms(max_age_days: float) -> dict:
+    """Delete terminal rooms (closed/resolved) whose dir is older than
+    max_age_days. Open/idle rooms and recently-closed rooms are untouched.
+    Used by the background retention sweep so terminal rooms don't pile up
+    forever (and don't keep inflating the O(N) list_rooms() scan).
+
+    Age = room-dir mtime (a closed room gets no more writes, so mtime ≈ close
+    time; reads don't bump mtime). Cache evicted on delete. max_age_days <= 0
+    disables (returns empty)."""
+    import shutil
+    result = {"deleted": [], "skipped": [], "errors": []}
+    if max_age_days <= 0:
+        return result
+    cutoff = time.time() - max_age_days * 86400
+    for meta in list_rooms():
+        rid = meta.get("id", "")
+        try:
+            if meta.get("status") not in ("closed", "resolved"):
+                result["skipped"].append(rid)
+                continue
+            rdir = _room_dir(rid)
+            if not rdir.exists():
+                continue
+            if rdir.stat().st_mtime > cutoff:
+                result["skipped"].append(rid)
+                continue
+            shutil.rmtree(rdir)
             _evict_msg_cache(rid)
             result["deleted"].append(rid)
         except Exception as e:
