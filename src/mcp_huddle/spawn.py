@@ -638,6 +638,88 @@ def codex_log_has_completed_turn(log_path: str) -> bool:
     return False
 
 
+# Substrings that mark a provider usage/rate-limit refusal. Matched
+# case-insensitively. Kept narrow on purpose: a generic word like "limit"
+# alone would false-positive on agents that merely *discuss* rate limits in
+# their reply body.
+_RATE_LIMIT_MARKERS = (
+    "usage limit",
+    "rate limit",
+    "rate_limit",
+    "too many requests",
+    "quota exceeded",
+    "insufficient_quota",
+    "error code: 429",
+)
+# Extra hints required for a PLAIN-TEXT line to count as a limit (structured
+# JSON error events are trusted on the marker alone). Avoids flagging an
+# agent's prose that happens to mention "rate limit".
+_RATE_LIMIT_PLAINTEXT_HINTS = (
+    "try again",
+    "upgrade",
+    "retry after",
+    "retry-after",
+    "resets at",
+    "reset at",
+    "429",
+)
+
+
+def _looks_like_rate_limit(text: str, *, require_hint: bool) -> bool:
+    low = text.lower()
+    if not any(marker in low for marker in _RATE_LIMIT_MARKERS):
+        return False
+    if not require_hint:
+        return True
+    return any(hint in low for hint in _RATE_LIMIT_PLAINTEXT_HINTS)
+
+
+def detect_rate_limit(log_path: str) -> str | None:
+    """Scan an agent log for a provider usage/rate-limit refusal.
+
+    Returns a short reason string (the offending message) or None.
+
+    Detection is conservative to avoid false positives from message bodies:
+      * Codex `--json` logs — trust only `error` / `turn.failed` event types
+        (an agent that *posts about* rate limits does so via `item.*` events,
+        which are ignored here).
+      * Plain-text logs (e.g. Antigravity `agy -p`) — a line must contain both
+        a limit marker AND a recovery hint ("try again", "upgrade", ...).
+    """
+    p = Path(log_path)
+    if not p.exists():
+        return None
+    try:
+        with open(p, "rb") as f:
+            text = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+    reason: str | None = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("{"):
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            etype = obj.get("type")
+            if etype == "error":
+                candidate = obj.get("message", "") or ""
+            elif etype == "turn.failed":
+                candidate = (obj.get("error") or {}).get("message", "") or ""
+            else:
+                continue
+            if candidate and _looks_like_rate_limit(candidate, require_hint=False):
+                reason = candidate.strip()
+        else:
+            if _looks_like_rate_limit(line, require_hint=True):
+                reason = line
+    return reason
+
+
 def codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str,
                  last_msg_path: str | None = None, on_exit=None) -> int:
     """Resume a Codex thread with a new prompt. Cheaper than fresh spawn —

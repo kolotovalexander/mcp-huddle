@@ -104,6 +104,10 @@ IDLE_TIMEOUT_SECS = int(os.environ.get("IDLE_TIMEOUT_SECS", "600"))
 # (not every zombie-check tick) — deletion is cheap but no need to scan hourly.
 RETENTION_DAYS = float(os.environ.get("HUDDLE_RETENTION_DAYS", "7"))
 RETENTION_SWEEP_SECS = int(os.environ.get("HUDDLE_RETENTION_SWEEP_SECS", "3600"))
+# When a spawned agent exits because it hit its provider usage/rate-limit, do
+# not re-spawn it for this many seconds — a fresh spawn would instantly fail
+# again, post nothing, and burn a wake. 0 disables the cooldown gate.
+RATE_LIMIT_COOLDOWN_SECS = int(os.environ.get("MCP_HUDDLE_RATE_LIMIT_COOLDOWN_SEC", "900"))
 
 
 # ── Room tools ────────────────────────────────────────────────────────────────
@@ -891,6 +895,9 @@ def _agent_wake_health(info: dict, status: Optional[str]) -> dict:
         "last_wake_rc": rc,
         "last_wake_failed": rc is not None and rc != 0,
         "wake_fail_count": int(info.get("wake_fail_count", 0) or 0),
+        "rate_limited": _agent_in_rate_limit_cooldown(info),
+        "rate_limited_until": int(info.get("rate_limited_until", 0) or 0),
+        "rate_limit_reason": info.get("rate_limit_reason"),
     }
 
 
@@ -908,14 +915,73 @@ def _make_wake_done_callback(room_id: str, agent_name: str, wake_id: str):
 
 def _make_initial_spawn_callback(room_id: str, agent_name: str):
     """Reaper on_exit callback for the room_create spawn: no busy lease to
-    release — just drain any request queued during the agent's first turn."""
+    release — just announce a rate-limit (if any) and drain any request queued
+    during the agent's first turn."""
     def _callback(returncode) -> None:
         try:
+            if returncode not in (0, None):
+                _handle_rate_limit_on_exit(room_id, agent_name)
             _drain_pending_wakes(room_id, agent_name)
         except Exception as exc:
             print(f"[huddle] initial-spawn drain error "
                   f"({agent_name}@{room_id}): {exc}", flush=True)
     return _callback
+
+
+def _agent_in_rate_limit_cooldown(info: dict) -> bool:
+    """True if the agent is inside an active usage/rate-limit cooldown window."""
+    until = int(info.get("rate_limited_until", 0) or 0)
+    return until > 0 and time.time() < until
+
+
+def _handle_rate_limit_on_exit(room_id: str, agent_name: str) -> bool:
+    """Inspect a just-exited agent's log for a provider usage/rate-limit refusal.
+
+    On detection: record a cooldown window in agent_meta and post ONE comment
+    to the room so the organizer knows no reply is coming (instead of silent
+    death). Returns True if a rate-limit was detected.
+
+    Idempotent per episode: while the cooldown is still active we neither
+    re-stamp nor re-post, so repeated wakes don't spam the room.
+    """
+    if RATE_LIMIT_COOLDOWN_SECS <= 0:
+        return False
+    try:
+        meta = bus.get_room_info(room_id)
+    except Exception:
+        return False
+    info = (meta.get("agent_meta") or {}).get(agent_name) or {}
+    log_path = info.get("log_path")
+    if not log_path:
+        return False
+    reason = spawn.detect_rate_limit(log_path)
+    if not reason:
+        return False
+    if _agent_in_rate_limit_cooldown(info):
+        return True  # episode already recorded + announced
+
+    now = int(time.time())
+    until = now + RATE_LIMIT_COOLDOWN_SECS
+    _merge_agent_meta(room_id, agent_name, {
+        "rate_limited_until": until,
+        "rate_limited_at": now,
+        "rate_limit_reason": reason[:500],
+    })
+    mins = max(1, RATE_LIMIT_COOLDOWN_SECS // 60)
+    short = reason if len(reason) <= 200 else reason[:197] + "..."
+    try:
+        _post_message_checked(
+            room_id, agent_name,
+            f"⚠️ {agent_name} недоступен: исчерпан лимит провайдера — "
+            f"ответа не будет. Не буду повторять попытки ~{mins} мин. "
+            f"Причина: {short}",
+            kind="comment",
+            idempotency_key=f"ratelimit:{room_id}:{agent_name}:{until}",
+        )
+    except Exception as exc:
+        print(f"[huddle] rate-limit notice post failed "
+              f"({agent_name}@{room_id}): {exc}", flush=True)
+    return True
 
 
 def _on_wake_exit(room_id: str, agent_name: str, wake_id: str,
@@ -931,11 +997,22 @@ def _on_wake_exit(room_id: str, agent_name: str, wake_id: str,
         return
     rc = -999 if returncode is None else int(returncode)
     fail_count = int(info.get("wake_fail_count", 0) or 0)
-    _merge_agent_meta(room_id, agent_name, {
+    updates = {
         "last_wake_rc": rc,
         "last_wake_exit_at": int(time.time()),
         "wake_fail_count": (fail_count + 1) if rc != 0 else 0,
-    })
+    }
+    if rc == 0:
+        # A clean turn clears any prior rate-limit cooldown so the agent can be
+        # woken again immediately.
+        updates["rate_limited_until"] = 0
+    _merge_agent_meta(room_id, agent_name, updates)
+    if rc != 0:
+        try:
+            _handle_rate_limit_on_exit(room_id, agent_name)
+        except Exception as exc:
+            print(f"[huddle] rate-limit check error "
+                  f"({agent_name}@{room_id}): {exc}", flush=True)
     bus.set_status(room_id, agent_name, "online", 0, meta.get("session_id", ""))
     try:
         _drain_pending_wakes(room_id, agent_name)
@@ -1019,6 +1096,8 @@ def _wake_agents_for_request(
 
             if _wake_in_progress(info, status):
                 continue  # live wake → request stays queued, drained on exit
+            if _agent_in_rate_limit_cooldown(info):
+                continue  # provider limit hit → a fresh spawn would instantly fail
             last_wake = int(info.get("last_wake_msg_id", 0) or 0)
             if last_wake >= msg_id:
                 continue

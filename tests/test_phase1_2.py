@@ -3,6 +3,7 @@ thread_id parsing, codex_resume helper, /api/room_agents and SSE endpoint)."""
 import json
 import os
 import tempfile
+import time
 import importlib
 from pathlib import Path
 
@@ -848,3 +849,134 @@ def test_reply_to_broadcast_allows_one_reply_per_agent(tmp_path: Path, monkeypat
     # But the same agent still cannot answer the broadcast twice.
     with pytest.raises(ValueError, match="already answered"):
         server.message_post(room_id, "Gemini", "Gemini again.", "result", to="Claude", reply_to=1)
+
+
+# ── Rate-limit detection + cooldown ───────────────────────────────────────────
+
+def test_detect_rate_limit_from_codex_turn_failed(tmp_path: Path) -> None:
+    log = tmp_path / "codex.events.jsonl"
+    log.write_text(
+        '{"type":"thread.started","thread_id":"t1"}\n'
+        '{"type":"turn.started"}\n'
+        '{"type":"turn.failed","error":{"message":"You\'ve hit your usage limit. '
+        'Upgrade to Plus, or try again at Jul 16th, 2026 5:17 PM."}}\n'
+    )
+    reason = spawn.detect_rate_limit(str(log))
+    assert reason is not None
+    assert "usage limit" in reason.lower()
+
+
+def test_detect_rate_limit_from_codex_error_event(tmp_path: Path) -> None:
+    log = tmp_path / "codex.events.jsonl"
+    log.write_text('{"type":"error","message":"Error code: 429 too many requests"}\n')
+    assert spawn.detect_rate_limit(str(log)) is not None
+
+
+def test_detect_rate_limit_ignores_message_body_false_positive(tmp_path: Path) -> None:
+    """An agent that POSTS about rate limits must not be flagged as limited."""
+    log = tmp_path / "codex.events.jsonl"
+    log.write_text(
+        '{"type":"item.completed","item":{"type":"mcp_tool_call","tool":"message_post",'
+        '"arguments":{"body":"We should add backoff when we hit a usage limit, try again later."},'
+        '"error":null,"status":"completed"}}\n'
+        '{"type":"turn.completed"}\n'
+    )
+    assert spawn.detect_rate_limit(str(log)) is None
+
+
+def test_detect_rate_limit_plaintext_requires_hint(tmp_path: Path) -> None:
+    hit = tmp_path / "agy.events.jsonl"
+    hit.write_text("Error: you've hit your usage limit. Please try again later.\n")
+    assert spawn.detect_rate_limit(str(hit)) is not None
+
+    prose = tmp_path / "agy2.events.jsonl"
+    prose.write_text("In my opinion the rate limit design is the core tradeoff here.\n")
+    assert spawn.detect_rate_limit(str(prose)) is None
+
+
+def test_detect_rate_limit_missing_file(tmp_path: Path) -> None:
+    assert spawn.detect_rate_limit(str(tmp_path / "nope.jsonl")) is None
+
+
+def test_wake_skips_agent_in_rate_limit_cooldown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    calls: list[tuple] = []
+    monkeypatch.setattr(server.spawn, "codex_resume", lambda *a, **k: calls.append(a) or 1)
+
+    room_id = isolated_bus.create_room("Wake", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Codex")
+    log_path = isolated_bus._room_dir(room_id) / "agents" / "codex.events.jsonl"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text('{"type":"thread.started","thread_id":"t1"}\n{"type":"turn.completed"}\n')
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {
+        "Codex": {
+            "thread_id": "t1",
+            "log_path": str(log_path),
+            "last_message_path": str(log_path.parent / "codex.last_message.txt"),
+            "rate_limited_until": int(time.time()) + 10_000,
+        }
+    }
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+
+    server.message_post(room_id, "Claude", "Please review.", "request", to="all")
+    assert calls == []  # cooldown gate prevented the doomed re-spawn
+
+
+def test_handle_rate_limit_sets_cooldown_and_posts_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    monkeypatch.setattr(server, "RATE_LIMIT_COOLDOWN_SECS", 900)
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    room_id = isolated_bus.create_room("Wake", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Codex")
+    log_path = isolated_bus._room_dir(room_id) / "agents" / "codex.events.jsonl"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(
+        '{"type":"turn.failed","error":{"message":"You\'ve hit your usage limit. Try again later."}}\n'
+    )
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {"Codex": {"log_path": str(log_path)}}
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+
+    assert server._handle_rate_limit_on_exit(room_id, "Codex") is True
+
+    info = isolated_bus.get_room_info(room_id)["agent_meta"]["Codex"]
+    assert info["rate_limited_until"] > time.time()
+    assert "usage limit" in info["rate_limit_reason"].lower()
+
+    msgs = [m for m in isolated_bus._load_messages(room_id) if m["agent"] == "Codex"]
+    assert len(msgs) == 1
+    assert msgs[0]["kind"] == "comment"
+    assert "лимит" in msgs[0]["body"]
+
+    # Second call within the active window must not re-post or re-stamp.
+    assert server._handle_rate_limit_on_exit(room_id, "Codex") is True
+    msgs2 = [m for m in isolated_bus._load_messages(room_id) if m["agent"] == "Codex"]
+    assert len(msgs2) == 1
+
+
+def test_clean_turn_clears_rate_limit_cooldown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    room_id = isolated_bus.create_room("Wake", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Codex")
+    wake_id = "wake-abc"
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {"Codex": {
+        "wake_id": wake_id,
+        "rate_limited_until": int(time.time()) + 10_000,
+    }}
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+    isolated_bus.set_status(room_id, "Codex", "busy", 300, "session-1")
+
+    server._on_wake_exit(room_id, "Codex", wake_id, 0)
+
+    info = isolated_bus.get_room_info(room_id)["agent_meta"]["Codex"]
+    assert int(info.get("rate_limited_until", 0)) == 0
