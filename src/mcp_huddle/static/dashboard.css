@@ -171,20 +171,30 @@
       transition: background .15s ease;
       touch-action: none;
     }
+    /* Wider invisible grab zone (±5px) so the whole edge is easy to grab
+       anywhere along its height — the event still targets the resizer. */
+    .panel-resizer::before {
+      content: '';
+      position: absolute;
+      top: 0; bottom: 0; left: -5px; right: -5px;
+    }
+    /* Full-height draggable indicator: a faint hairline always, brighter on
+       hover/drag — makes clear you can grab anywhere along the edge, not just
+       a centre handle. */
     .panel-resizer::after {
       content: '';
       position: absolute;
-      left: 50%; top: 50%;
-      transform: translate(-50%, -50%);
-      width: 2px; height: 36px;
+      left: 50%; top: 6px; bottom: 6px;
+      transform: translateX(-50%);
+      width: 2px;
       border-radius: 2px;
-      background: rgba(128,128,128,0.25);
-      transition: background .15s ease, height .15s ease;
+      background: rgba(128,128,128,0.18);
+      transition: background .15s ease, width .15s ease;
     }
     .panel-resizer:hover::after,
     .panel-resizer.dragging::after {
       background: var(--c-codex, #6aa9ff);
-      height: 56px;
+      width: 3px;
     }
 
     /* ── Liquid panel base ───────────────────────────────────────── */
