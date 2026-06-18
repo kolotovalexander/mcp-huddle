@@ -1225,10 +1225,14 @@ function relayout() {
   root.style.setProperty('--act-rsz', (activityGone || activityRail) ? '0px' : '6px');
 
   // Resizers only make sense when both sides of them are real panels.
+  // Keep resizers IN the grid (their track just goes to 0) — display:none would
+  // drop them from flow and the panels would reflow into the wrong columns
+  // (the bug where a railed activity panel rendered ~2px instead of 48px).
+  // Disable pointer-events instead so a collapsed panel can't be resized.
   const sRes = document.getElementById('sidebar-resizer');
   const aRes = document.getElementById('activity-resizer');
-  if (sRes) sRes.style.display = sidebarRail ? 'none' : '';
-  if (aRes) aRes.style.display = (activityGone || activityRail) ? 'none' : '';
+  if (sRes) sRes.style.pointerEvents = sidebarRail ? 'none' : '';
+  if (aRes) aRes.style.pointerEvents = (activityGone || activityRail) ? 'none' : '';
 
   // In-panel button is ALWAYS visible: it collapses an open panel and, in the
   // rail state, becomes the single expand button (arrow points to where the
