@@ -122,10 +122,35 @@
     .main.sidebar-off.activity-off { grid-template-columns: 0 0 1fr 0 0; }
     .activity {
       min-width: 0;
+      position: relative;
+      display: flex; flex-direction: column;
+      padding: 0;
+      overflow: hidden;
+    }
+    .activity-scroll {
+      flex: 1; min-height: 0;
       display: flex; flex-direction: column;
       padding: 14px 12px 12px;
       overflow: hidden;
     }
+    /* In-panel collapse button (top inner corner, reveals on panel hover) */
+    .panel-collapse-btn {
+      position: absolute; top: 8px; z-index: 6;
+      width: 24px; height: 24px; padding: 0;
+      display: flex; align-items: center; justify-content: center;
+      border-radius: 8px; line-height: 1; font-size: 15px; font-weight: 600;
+      background: var(--active-bg); color: var(--text-muted);
+      border: 1px solid var(--panel-border);
+      backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+      cursor: pointer; opacity: 0;
+      transition: opacity .15s ease, color .15s ease, background .15s ease;
+    }
+    .panel-collapse-btn.pc-left  { right: 8px; }
+    .panel-collapse-btn.pc-right { right: 8px; }
+    .sidebar:hover .panel-collapse-btn,
+    .activity:hover .panel-collapse-btn,
+    .panel-collapse-btn:focus-visible { opacity: 1; }
+    .panel-collapse-btn:hover { color: var(--text); }
     .activity-empty {
       color: var(--text-muted);
       padding: 18px 8px;
@@ -231,9 +256,15 @@
     /* ── Sidebar ─────────────────────────────────────────────────── */
     .sidebar {
       min-width: 0;
+      padding: 0;
+      overflow: hidden;
+      position: relative;
+      display: flex; flex-direction: column;
+    }
+    .sidebar-scroll {
+      flex: 1; min-height: 0;
+      overflow-y: auto; overflow-x: hidden;
       padding: 14px 0;
-      overflow-y: auto;
-      overflow-x: hidden;
     }
     .empty-sidebar {
       padding: 20px 18px; font-size: 12px;
@@ -560,13 +591,13 @@
     }
 
     /* ── Scrollbars ──────────────────────────────────────────────── */
-    .sidebar::-webkit-scrollbar,
+    .sidebar-scroll::-webkit-scrollbar,
     .messages::-webkit-scrollbar { width: 6px; }
-    .sidebar::-webkit-scrollbar-thumb,
+    .sidebar-scroll::-webkit-scrollbar-thumb,
     .messages::-webkit-scrollbar-thumb {
       background: rgba(255,255,255,0.08); border-radius: 3px;
     }
-    [data-theme="light"] .sidebar::-webkit-scrollbar-thumb,
+    [data-theme="light"] .sidebar-scroll::-webkit-scrollbar-thumb,
     [data-theme="light"] .messages::-webkit-scrollbar-thumb {
       background: rgba(0,0,0,0.10);
     }
@@ -936,14 +967,14 @@
 [data-skin="web"] .agent-panel[open] { background: var(--active-bg); }
 
 /* ── Scrollbars: warm tint ─────────────────────────────────────── */
-[data-skin="web"] .sidebar::-webkit-scrollbar-thumb,
+[data-skin="web"] .sidebar-scroll::-webkit-scrollbar-thumb,
 [data-skin="web"] .messages::-webkit-scrollbar-thumb,
 [data-skin="web"] .agent-panels-scroll::-webkit-scrollbar-thumb,
 [data-skin="web"] .agent-events::-webkit-scrollbar-thumb {
   background: rgba(255,255,255,0.10);
   border-radius: 3px;
 }
-:root[data-skin="web"][data-theme="light"] .sidebar::-webkit-scrollbar-thumb,
+:root[data-skin="web"][data-theme="light"] .sidebar-scroll::-webkit-scrollbar-thumb,
 :root[data-skin="web"][data-theme="light"] .messages::-webkit-scrollbar-thumb,
 :root[data-skin="web"][data-theme="light"] .agent-panels-scroll::-webkit-scrollbar-thumb,
 :root[data-skin="web"][data-theme="light"] .agent-events::-webkit-scrollbar-thumb {
@@ -1343,17 +1374,35 @@
     /* ── Settings popover (single ⚙️ control for theme/skin/palette) ─ */
     .settings-wrap { position: relative; display: inline-flex; }
     .settings-popover {
-      position: fixed; top: var(--drawer-top, 70px); right: 14px; z-index: 60;
-      width: 280px; max-width: calc(100vw - 28px); padding: 12px;
-      background: var(--panel-bg);
+      position: fixed; top: var(--drawer-top, 70px); right: 14px; z-index: 1000;
+      width: 300px; max-width: calc(100vw - 28px); padding: 14px;
+      /* Near-opaque menu surface so it never blends into panels behind it. */
+      background: rgba(26, 28, 36, 0.97);
       backdrop-filter: blur(40px) saturate(180%);
       -webkit-backdrop-filter: blur(40px) saturate(180%);
-      border: 1px solid var(--panel-border);
+      border: 1px solid rgba(255, 255, 255, 0.14);
       border-radius: 16px;
-      box-shadow: var(--shadow-card);
+      box-shadow: 0 24px 60px -16px rgba(0,0,0,0.7);
       display: flex; flex-direction: column; gap: 12px;
+      max-height: calc(100vh - var(--drawer-top, 70px) - 24px);
+      overflow-y: auto;
+    }
+    [data-theme="light"] .settings-popover {
+      background: rgba(249, 250, 252, 0.98);
+      border-color: rgba(0,0,0,0.12);
+      box-shadow: 0 24px 60px -16px rgba(100,100,150,0.3);
     }
     .settings-popover[hidden] { display: none; }
+    .set-sep { height: 1px; background: var(--panel-border); margin: 2px 0; }
+    .set-copy { display: flex; gap: 4px; }
+    .set-copy-input {
+      flex: 1 1 auto; min-width: 0; padding: 6px 8px; border-radius: 8px;
+      background: var(--input-bg); border: 1px solid var(--input-border);
+      color: var(--text); font: inherit; font-size: 10.5px;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    }
+    .set-copy-btn { flex: 0 0 auto; }
+    .set-hint { font-size: 10px; color: var(--text-sub); line-height: 1.4; }
     .set-title {
       font-size: 11px; font-weight: 700; text-transform: uppercase;
       letter-spacing: .8px; color: var(--text-sub);

@@ -49,17 +49,16 @@
       <button class="lq-btn" id="bulk-close-all" title="Закрыть все открытые комнаты — kill живых spawned PIDs (кроме owner-ов)">Close all</button>
       <button class="lq-btn" id="bulk-delete-closed" title="Удалить с диска все закрытые комнаты">Delete closed</button>
       <button class="lq-btn danger" id="bulk-nuke" title="Закрыть + удалить ВСЕ комнаты. Owner PIDs не трогаются.">🔥 Nuke all</button>
-      <div class="settings-wrap">
-        <button class="lq-btn" id="settings-btn" title="Настройки оформления (тема, дизайн, палитра)" aria-haspopup="true" aria-expanded="false">⚙️ Вид</button>
-        <div class="settings-popover" id="settings-popover" hidden></div>
-      </div>
+      <button class="lq-btn" id="settings-btn" title="Настройки (оформление + MCP)" aria-haspopup="true" aria-expanded="false">⚙️ Вид</button>
       <button class="lq-btn"><span class="dot dot-open pulse" style="color: var(--c-codex)"></span> live</button>
     </div>
   </header>
-  <div class="drawer-backdrop" id="drawer-backdrop" hidden></div>
 
   <div class="main">
-    <aside class="sidebar lq-panel" id="room-list"></aside>
+    <aside class="sidebar lq-panel">
+      <button class="panel-collapse-btn pc-left" data-side="sidebar" title="Свернуть список комнат" aria-label="Свернуть">‹</button>
+      <div class="sidebar-scroll" id="room-list"></div>
+    </aside>
     <div class="panel-resizer" id="sidebar-resizer" title="Drag to resize · double-click to collapse"></div>
     <section class="chat lq-panel" id="chat-area">
       <div class="empty">
@@ -68,14 +67,19 @@
       </div>
     </section>
     <div class="panel-resizer" id="activity-resizer" title="Drag to resize · double-click to collapse"></div>
-    <aside class="activity lq-panel" id="activity-panel">
-      <div class="activity-empty">
-        <div class="activity-empty-title">Agent activity</div>
-        <div class="activity-empty-hint">Откроется при выборе комнаты со spawned-агентами</div>
+    <aside class="activity lq-panel">
+      <button class="panel-collapse-btn pc-right" data-side="activity" title="Свернуть панель активности" aria-label="Свернуть">›</button>
+      <div class="activity-scroll" id="activity-panel">
+        <div class="activity-empty">
+          <div class="activity-empty-title">Agent activity</div>
+          <div class="activity-empty-hint">Откроется при выборе комнаты со spawned-агентами</div>
+        </div>
       </div>
     </aside>
   </div>
 </div>
+<div class="drawer-backdrop" id="drawer-backdrop" hidden></div>
+<div class="settings-popover" id="settings-popover" hidden></div>
 <script src="/static/dashboard.js"></script>
 </body>
 </html>

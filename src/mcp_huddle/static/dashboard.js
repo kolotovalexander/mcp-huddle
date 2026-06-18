@@ -221,6 +221,21 @@ function buildSettingsRow(title, opts, storeKey, getCur, apply) {
   return el('div', {class: 'set-row'}, [el('div', {class: 'set-label', text: title}), seg]);
 }
 
+function buildCopyRow(label, value) {
+  const inp = el('input', {class: 'set-copy-input', value: value, readonly: 'readonly', title: value});
+  const btn = el('button', {class: 'set-opt set-copy-btn', text: 'Copy'});
+  btn.onclick = () => {
+    try { navigator.clipboard && navigator.clipboard.writeText(value); } catch (_) {}
+    inp.focus(); inp.select && inp.select();
+    btn.textContent = '✓';
+    setTimeout(() => { btn.textContent = 'Copy'; }, 1200);
+  };
+  return el('div', {class: 'set-row'}, [
+    el('div', {class: 'set-label', text: label}),
+    el('div', {class: 'set-copy'}, [inp, btn]),
+  ]);
+}
+
 function initSettings() {
   // Apply saved values (head script already set them pre-paint; re-assert).
   applyTheme(localStorage.getItem('agentbus-theme') || 'auto');
@@ -243,6 +258,18 @@ function initSettings() {
     () => localStorage.getItem('agentbus-skin') || 'glass', applySkin));
   pop.appendChild(buildSettingsRow('Палитра', PALETTE_OPTS, 'agentbus-palette',
     () => localStorage.getItem('agentbus-palette') || 'default', applyPalette));
+
+  // ── MCP connection section: copy-paste configs to attach agents ──
+  pop.appendChild(el('div', {class: 'set-sep'}));
+  pop.appendChild(el('div', {class: 'set-title', text: 'MCP-подключение'}));
+  const origin = location.origin;
+  pop.appendChild(buildCopyRow('HTTP endpoint', origin + '/mcp'));
+  pop.appendChild(buildCopyRow('Claude Code', `claude mcp add --transport http huddle ${origin}/mcp`));
+  pop.appendChild(buildCopyRow('Codex (.codex/config.toml)',
+    `[mcp_servers.huddle]\nurl = "${origin}/mcp"`));
+  pop.appendChild(buildCopyRow('stdio (любой клиент)', 'mcp-huddle'));
+  pop.appendChild(el('div', {class: 'set-hint',
+    text: 'Дашборд и MCP на одном порту. Подключите агентов по HTTP, либо запустите бинарь mcp-huddle как stdio-сервер.'}));
 
   const close = () => { pop.hidden = true; btn.setAttribute('aria-expanded', 'false'); };
   const open  = () => { pop.hidden = false; btn.setAttribute('aria-expanded', 'true'); };
@@ -919,8 +946,10 @@ function relayout() {
     document.documentElement.style.setProperty(
       '--drawer-w', Math.min(360, Math.round(window.innerWidth * 0.86)) + 'px');
     if (backdrop) backdrop.hidden = !(sOpen || aOpen);
-    if (sBtn) sBtn.classList.toggle('active', sOpen);
-    if (aBtn) aBtn.classList.toggle('active', aOpen);
+    // Overlay: panels are off-screen drawers → topbar buttons always available
+    // to summon them; they reflect open state.
+    if (sBtn) { sBtn.style.display = ''; sBtn.classList.toggle('active', sOpen); }
+    if (aBtn) { aBtn.style.display = ''; aBtn.classList.toggle('active', aOpen); }
     return;
   }
 
@@ -951,8 +980,17 @@ function relayout() {
   if (!sOff) document.documentElement.style.setProperty('--sidebar-w', Math.round(sw) + 'px');
   if (!aOff) document.documentElement.style.setProperty('--activity-w', Math.round(aw) + 'px');
 
-  if (sBtn) sBtn.classList.toggle('active', layout.sidebarCollapsed);
-  if (aBtn) aBtn.classList.toggle('active', layout.activityCollapsed);
+  // Wide mode: collapsing is done by the in-panel ‹ / › buttons, so the
+  // topbar toggle auto-hides while the panel is visible and only reappears
+  // (as a "restore" control) once the panel is collapsed/auto-hidden.
+  if (sBtn) {
+    sBtn.style.display = sOff ? '' : 'none';
+    sBtn.title = 'Показать список комнат';
+  }
+  if (aBtn) {
+    aBtn.style.display = aOff ? '' : 'none';
+    aBtn.title = 'Показать панель активности';
+  }
 }
 
 function persistLayout() {
@@ -1027,6 +1065,11 @@ function initLayout() {
   if (sBtn) sBtn.onclick = () => togglePanel('sidebar');
   const aBtn = document.getElementById('activity-collapse');
   if (aBtn) aBtn.onclick = () => togglePanel('activity');
+
+  // In-panel collapse buttons (built into each panel header corner).
+  document.querySelectorAll('.panel-collapse-btn').forEach(b => {
+    b.onclick = () => togglePanel(b.dataset.side);
+  });
 
   const backdrop = document.getElementById('drawer-backdrop');
   if (backdrop) backdrop.onclick = () => { layout.drawer = null; relayout(); };
