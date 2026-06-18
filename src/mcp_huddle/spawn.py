@@ -162,65 +162,10 @@ def _mimo_advisor_spec() -> SpawnSpec:
     }
 
 
-def _qwen_advisor_spec() -> SpawnSpec:
-    """Build the local Qwen advisor slot.
-
-    Qwen is only useful in huddle when the local FreeQwenApi bridge is live and
-    exposes the max model. Keep the registry entry present for visibility, but
-    gate actual spawning via a dynamic /models probe in load_registry().
-    """
-    base_url = os.environ.get("MCP_HUDDLE_QWEN_BASE_URL", "http://127.0.0.1:3264/api").rstrip("/")
-    model = os.environ.get("MCP_HUDDLE_QWEN_MODEL", "qwen3.7-max")
-    return {
-        "name": "Qwen",
-        "cmd": [
-            sys.executable,
-            "-m", "mcp_huddle.openai_compatible_runner",
-            "--agent", "Qwen",
-            "--base-url", base_url,
-            "--model", model,
-            "--reasoning", "max",
-            "--brief", "{brief}",
-        ],
-        "enabled": os.environ.get("MCP_HUDDLE_QWEN_ENABLED", "1") != "0",
-        "probe_url": f"{base_url}/models",
-        "requires_model": model,
-        "probe_chat_url": f"{base_url}/chat/completions",
-        "probe_chat_model": model,
-        "probe_timeout_sec": float(os.environ.get("MCP_HUDDLE_QWEN_PROBE_TIMEOUT_SEC", "0.8")),
-    }
-
-
-def _deepseek_advisor_spec() -> SpawnSpec:
-    """Build the local DeepSeek advisor slot.
-
-    DeepSeek is only useful in huddle when the local FreeDeepseekAPI bridge is
-    live and its strongest Expert+thinking alias answers a chat probe.
-    """
-    base_url = os.environ.get("MCP_HUDDLE_DEEPSEEK_BASE_URL", "http://127.0.0.1:9655/v1").rstrip("/")
-    # FreeDeepseekAPI exposes aliases deepseek-chat/v3/default/reasoner/r1
-    # (all backed by DeepSeek-V4-Flash). `deepseek-reasoner` = thinking mode,
-    # the strongest. The old `deepseek-v4-pro` alias does not exist → /models
-    # probe failed and the slot was always gated off.
-    model = os.environ.get("MCP_HUDDLE_DEEPSEEK_MODEL", "deepseek-reasoner")
-    return {
-        "name": "DeepSeek",
-        "cmd": [
-            sys.executable,
-            "-m", "mcp_huddle.openai_compatible_runner",
-            "--agent", "DeepSeek",
-            "--base-url", base_url,
-            "--model", model,
-            "--reasoning", "max",
-            "--brief", "{brief}",
-        ],
-        "enabled": os.environ.get("MCP_HUDDLE_DEEPSEEK_ENABLED", "1") != "0",
-        "probe_url": f"{base_url}/models",
-        "requires_model": model,
-        "probe_chat_url": f"{base_url}/chat/completions",
-        "probe_chat_model": model,
-        "probe_timeout_sec": float(os.environ.get("MCP_HUDDLE_DEEPSEEK_PROBE_TIMEOUT_SEC", "1.0")),
-    }
+# NOTE: the local Qwen (:3264) and DeepSeek (:9655) advisor slots were removed
+# 2026-06-18 together with the reverse-API browser-session bridges they fronted.
+# Those bridges (Qwen/GLM/Kimi/DeepSeek + the :3274 failover proxy) were retired
+# as legacy once agentmemory and remember moved to the Mac LiteLLM router (:4000).
 
 
 def _models_payload_has_model(payload: object, model: str) -> bool:
@@ -360,8 +305,6 @@ DEFAULT_REGISTRY: list[SpawnSpec] = [
     },
     _google_advisor_spec(),
     _mimo_advisor_spec(),
-    _qwen_advisor_spec(),
-    _deepseek_advisor_spec(),
     {
         "name": "Claude",
         "cmd": [

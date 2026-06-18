@@ -17,8 +17,16 @@
           mode = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
         }
         document.documentElement.setAttribute('data-theme', mode);
+        var skin = localStorage.getItem('agentbus-skin');
+        skin = (skin === 'web' || skin === 'code' || skin === 'glass') ? skin : 'glass';
+        document.documentElement.setAttribute('data-skin', skin);
+        var PALETTES = ['default','dracula','nord','tokyonight','catppuccin','gruvbox'];
+        var pal = localStorage.getItem('agentbus-palette');
+        document.documentElement.setAttribute('data-palette', PALETTES.indexOf(pal) >= 0 ? pal : 'default');
       } catch (e) {
         document.documentElement.setAttribute('data-theme', 'dark');
+        document.documentElement.setAttribute('data-skin', 'glass');
+        document.documentElement.setAttribute('data-palette', 'default');
       }
     })();
   </script>
@@ -36,9 +44,13 @@
       </div>
     </div>
     <div class="topbar-actions">
+      <button class="lq-btn" id="sidebar-collapse" title="Свернуть/развернуть список комнат">◧</button>
+      <button class="lq-btn" id="activity-collapse" title="Свернуть/развернуть панель активности">◨</button>
       <button class="lq-btn" id="bulk-close-all" title="Закрыть все открытые комнаты — kill живых spawned PIDs (кроме owner-ов)">Close all</button>
       <button class="lq-btn" id="bulk-delete-closed" title="Удалить с диска все закрытые комнаты">Delete closed</button>
       <button class="lq-btn danger" id="bulk-nuke" title="Закрыть + удалить ВСЕ комнаты. Owner PIDs не трогаются.">🔥 Nuke all</button>
+      <button class="lq-btn" id="skin-toggle" title="Design: Glass (click to cycle)">🪟 Glass</button>
+      <button class="lq-btn" id="palette-toggle" title="Palette: Default (click to cycle)">🎨 Default</button>
       <button class="lq-btn" id="theme-toggle" title="Theme: Auto (click to cycle)">🌓</button>
       <button class="lq-btn"><span class="dot dot-open pulse" style="color: var(--c-codex)"></span> live</button>
     </div>
@@ -46,13 +58,14 @@
 
   <div class="main">
     <aside class="sidebar lq-panel" id="room-list"></aside>
+    <div class="panel-resizer" id="sidebar-resizer" title="Drag to resize · double-click to collapse"></div>
     <section class="chat lq-panel" id="chat-area">
       <div class="empty">
         <div class="empty-title">Select a room</div>
         <div class="empty-hint">Use room_create() from an agent to start a discussion</div>
       </div>
     </section>
-    <div class="activity-resizer" id="activity-resizer" title="Drag to resize agent activity panel"></div>
+    <div class="panel-resizer" id="activity-resizer" title="Drag to resize · double-click to collapse"></div>
     <aside class="activity lq-panel" id="activity-panel">
       <div class="activity-empty">
         <div class="activity-empty-title">Agent activity</div>

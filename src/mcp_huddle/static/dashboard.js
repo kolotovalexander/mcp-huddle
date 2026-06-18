@@ -222,6 +222,35 @@ function initTheme() {
   };
 }
 
+// ── Skin: selectable visual identity (orthogonal to theme) ──
+// Cycle order: glass → web → code → glass. Persisted in localStorage.
+// 'glass' = default Liquid Glass. 'web' = claude.ai look. 'code' = IDE look.
+const SKIN_CYCLE = ['glass', 'web', 'code'];
+const SKIN_LABEL = {glass: '🪟 Glass', web: '💬 Web', code: '⌨️ Code'};
+const SKIN_NAME  = {glass: 'Glass', web: 'Web', code: 'Code'};
+
+function applySkin(skin) {
+  if (!SKIN_CYCLE.includes(skin)) skin = 'glass';
+  document.documentElement.setAttribute('data-skin', skin);
+  const btn = document.getElementById('skin-toggle');
+  if (btn) {
+    btn.textContent = SKIN_LABEL[skin];
+    btn.title = `Design: ${SKIN_NAME[skin]} (click to cycle)`;
+  }
+}
+
+function initSkin() {
+  const raw = localStorage.getItem('agentbus-skin');
+  applySkin(SKIN_CYCLE.includes(raw) ? raw : 'glass');
+  const btn = document.getElementById('skin-toggle');
+  if (btn) btn.onclick = () => {
+    const cur = localStorage.getItem('agentbus-skin') || 'glass';
+    const next = SKIN_CYCLE[(SKIN_CYCLE.indexOf(cur) + 1) % SKIN_CYCLE.length];
+    localStorage.setItem('agentbus-skin', next);
+    applySkin(next);
+  };
+}
+
 // ── Rooms ─────────────────────────────────────────────────
 async function loadRooms() {
   try {
@@ -810,22 +839,98 @@ async function tick() {
   if (currentRoom) await fetchMessages(false);
 }
 
-// ── Activity panel resize ─────────────────────────────────
-const ACTIVITY_MIN = 220, ACTIVITY_MAX_FRAC = 0.6;
+// ── Palette: terminal/Ghostty colour schemes (orthogonal axis) ──
+// Cycle: default → dracula → nord → tokyonight → catppuccin → gruvbox.
+const PALETTE_CYCLE = ['default', 'dracula', 'nord', 'tokyonight', 'catppuccin', 'gruvbox'];
+const PALETTE_LABEL = {
+  default: 'Default', dracula: 'Dracula', nord: 'Nord',
+  tokyonight: 'Tokyo Night', catppuccin: 'Catppuccin', gruvbox: 'Gruvbox',
+};
 
-function applyActivityWidth(px) {
-  const minPx = ACTIVITY_MIN;
-  const maxPx = Math.max(minPx + 40, Math.floor(window.innerWidth * ACTIVITY_MAX_FRAC));
-  const clamped = Math.max(minPx, Math.min(maxPx, px | 0));
-  document.documentElement.style.setProperty('--activity-w', clamped + 'px');
-  return clamped;
+function applyPalette(pal) {
+  if (!PALETTE_CYCLE.includes(pal)) pal = 'default';
+  document.documentElement.setAttribute('data-palette', pal);
+  const btn = document.getElementById('palette-toggle');
+  if (btn) {
+    btn.textContent = `🎨 ${PALETTE_LABEL[pal]}`;
+    btn.title = `Palette: ${PALETTE_LABEL[pal]} (click to cycle)`;
+  }
 }
 
-function initActivityResizer() {
-  const saved = parseInt(localStorage.getItem('agentbus-activity-w') || '380', 10);
-  applyActivityWidth(isFinite(saved) ? saved : 380);
+function initPalette() {
+  const raw = localStorage.getItem('agentbus-palette');
+  applyPalette(PALETTE_CYCLE.includes(raw) ? raw : 'default');
+  const btn = document.getElementById('palette-toggle');
+  if (btn) btn.onclick = () => {
+    const cur = localStorage.getItem('agentbus-palette') || 'default';
+    const next = PALETTE_CYCLE[(PALETTE_CYCLE.indexOf(cur) + 1) % PALETTE_CYCLE.length];
+    localStorage.setItem('agentbus-palette', next);
+    applyPalette(next);
+  };
+}
 
-  const resizer = document.getElementById('activity-resizer');
+// ── Layout manager: resizable + collapsible panels + responsive ──
+// Both side panels resize via their handles and collapse (button or
+// double-click handle). On every resize the effective widths are
+// recomputed so the chat column never drops below CHAT_MIN — when the
+// window is too narrow the activity panel auto-hides first, then the
+// sidebar, keeping the dashboard usable at any width.
+const SIDEBAR_MIN = 170, SIDEBAR_MAX = 460, SIDEBAR_DEFAULT = 248;
+const ACTIVITY_MIN = 240, ACTIVITY_DEFAULT = 380;
+const CHAT_MIN = 320;
+// .app padding (14*2) + 4 grid gaps (12*4) between the 5 tracks.
+const LAYOUT_GUTTER = 14 * 2 + 12 * 4;
+
+const layout = {
+  sidebarW: parseInt(localStorage.getItem('agentbus-sidebar-w') || SIDEBAR_DEFAULT, 10) || SIDEBAR_DEFAULT,
+  activityW: parseInt(localStorage.getItem('agentbus-activity-w') || ACTIVITY_DEFAULT, 10) || ACTIVITY_DEFAULT,
+  sidebarCollapsed: localStorage.getItem('agentbus-sidebar-collapsed') === '1',
+  activityCollapsed: localStorage.getItem('agentbus-activity-collapsed') === '1',
+};
+
+const clampN = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+function relayout() {
+  const main = document.querySelector('.main');
+  if (!main) return;
+  const avail = window.innerWidth - LAYOUT_GUTTER;
+  const actMax = Math.floor(window.innerWidth * 0.6);
+
+  let sw = layout.sidebarCollapsed ? 0 : clampN(layout.sidebarW, SIDEBAR_MIN, SIDEBAR_MAX);
+  let aw = layout.activityCollapsed ? 0 : clampN(layout.activityW, ACTIVITY_MIN, actMax);
+
+  // Protect the chat: shrink/hide activity first, then the sidebar.
+  if (avail - sw - aw < CHAT_MIN && aw > 0) {
+    aw = avail - sw - CHAT_MIN;
+    if (aw < ACTIVITY_MIN) aw = 0;
+  }
+  if (avail - sw - aw < CHAT_MIN && sw > 0) {
+    sw = avail - aw - CHAT_MIN;
+    if (sw < SIDEBAR_MIN) sw = 0;
+  }
+
+  const sOff = layout.sidebarCollapsed || sw === 0;
+  const aOff = layout.activityCollapsed || aw === 0;
+  main.classList.toggle('sidebar-off', sOff);
+  main.classList.toggle('activity-off', aOff);
+  if (!sOff) document.documentElement.style.setProperty('--sidebar-w', Math.round(sw) + 'px');
+  if (!aOff) document.documentElement.style.setProperty('--activity-w', Math.round(aw) + 'px');
+
+  const sBtn = document.getElementById('sidebar-collapse');
+  const aBtn = document.getElementById('activity-collapse');
+  if (sBtn) sBtn.classList.toggle('active', layout.sidebarCollapsed);
+  if (aBtn) aBtn.classList.toggle('active', layout.activityCollapsed);
+}
+
+function persistLayout() {
+  localStorage.setItem('agentbus-sidebar-w', layout.sidebarW);
+  localStorage.setItem('agentbus-activity-w', layout.activityW);
+  localStorage.setItem('agentbus-sidebar-collapsed', layout.sidebarCollapsed ? '1' : '0');
+  localStorage.setItem('agentbus-activity-collapsed', layout.activityCollapsed ? '1' : '0');
+}
+
+function initPanelResizer(resizerId, side) {
+  const resizer = document.getElementById(resizerId);
   if (!resizer) return;
   let dragging = false;
 
@@ -838,24 +943,63 @@ function initActivityResizer() {
   });
   resizer.addEventListener('pointermove', e => {
     if (!dragging) return;
-    const w = window.innerWidth - e.clientX - 14; // 14px = .app padding right
-    applyActivityWidth(w);
+    if (side === 'left') {
+      layout.sidebarW = clampN(e.clientX - 14, SIDEBAR_MIN, SIDEBAR_MAX);
+      layout.sidebarCollapsed = false;
+    } else {
+      layout.activityW = clampN(window.innerWidth - e.clientX - 14, ACTIVITY_MIN, Math.floor(window.innerWidth * 0.6));
+      layout.activityCollapsed = false;
+    }
+    relayout();
   });
   const stop = e => {
     if (!dragging) return;
     dragging = false;
     resizer.classList.remove('dragging');
-    try { resizer.releasePointerCapture?.(e.pointerId); } catch(_){}
+    try { resizer.releasePointerCapture?.(e.pointerId); } catch (_) {}
     document.body.style.cursor = '';
     document.body.style.userSelect = '';
-    const cur = getComputedStyle(document.documentElement).getPropertyValue('--activity-w').trim();
-    if (cur) localStorage.setItem('agentbus-activity-w', parseInt(cur, 10));
+    persistLayout();
   };
   resizer.addEventListener('pointerup', stop);
   resizer.addEventListener('pointercancel', stop);
+  // Double-click the handle to collapse / restore that panel.
+  resizer.addEventListener('dblclick', () => {
+    if (side === 'left') layout.sidebarCollapsed = !layout.sidebarCollapsed;
+    else layout.activityCollapsed = !layout.activityCollapsed;
+    persistLayout();
+    relayout();
+  });
+}
+
+function initLayout() {
+  initPanelResizer('sidebar-resizer', 'left');
+  initPanelResizer('activity-resizer', 'right');
+
+  const sBtn = document.getElementById('sidebar-collapse');
+  if (sBtn) sBtn.onclick = () => {
+    layout.sidebarCollapsed = !layout.sidebarCollapsed;
+    persistLayout();
+    relayout();
+  };
+  const aBtn = document.getElementById('activity-collapse');
+  if (aBtn) aBtn.onclick = () => {
+    layout.activityCollapsed = !layout.activityCollapsed;
+    persistLayout();
+    relayout();
+  };
+
+  let raf = 0;
+  window.addEventListener('resize', () => {
+    if (raf) return;
+    raf = requestAnimationFrame(() => { raf = 0; relayout(); });
+  });
+  relayout();
 }
 
 initTheme();
-initActivityResizer();
+initSkin();
+initPalette();
+initLayout();
 loadRooms();
 setInterval(tick, 3000);
