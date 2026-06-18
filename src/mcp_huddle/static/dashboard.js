@@ -1068,10 +1068,13 @@ function relayout() {
   const hasRoom = !!currentRoom;
   if (!hasRoom && layout.drawer === 'activity') layout.drawer = null;
 
+  const sCol = document.querySelector('.sidebar .panel-collapse-btn');
+  const aCol = document.querySelector('.activity .panel-collapse-btn');
+
   if (isOverlay()) {
     // ── Overlay/drawer mode: chat is full-width, panels float over it ──
     main.classList.add('overlay-mode');
-    main.classList.remove('sidebar-off', 'activity-off');
+    main.classList.remove('sidebar-rail', 'activity-rail', 'activity-gone');
     const sOpen = layout.drawer === 'sidebar';
     const aOpen = hasRoom && layout.drawer === 'activity';
     main.classList.toggle('drawer-sidebar-open', sOpen);
@@ -1079,8 +1082,9 @@ function relayout() {
     document.documentElement.style.setProperty(
       '--drawer-w', Math.min(360, Math.round(window.innerWidth * 0.86)) + 'px');
     if (backdrop) backdrop.hidden = !(sOpen || aOpen);
-    // Overlay: panels are off-screen drawers → topbar buttons always available
-    // to summon them; they reflect open state.
+    // In-panel buttons (inside the open drawer) close it; topbar buttons summon.
+    if (sCol) { sCol.textContent = '◧'; sCol.title = t('tip.collapse'); }
+    if (aCol) { aCol.textContent = '◨'; aCol.title = t('tip.collapse'); }
     if (sBtn) { sBtn.style.display = ''; sBtn.classList.toggle('active', sOpen); }
     if (aBtn) { aBtn.style.display = hasRoom ? '' : 'none'; aBtn.classList.toggle('active', aOpen); }
     return;
@@ -1106,26 +1110,43 @@ function relayout() {
     if (sw < SIDEBAR_MIN) sw = 0;
   }
 
-  const sOff = layout.sidebarCollapsed || sw === 0;
-  const aOff = layout.activityCollapsed || aw === 0;
-  main.classList.toggle('sidebar-off', sOff);
-  main.classList.toggle('activity-off', aOff);
-  if (!sOff) document.documentElement.style.setProperty('--sidebar-w', Math.round(sw) + 'px');
-  if (!aOff) document.documentElement.style.setProperty('--activity-w', Math.round(aw) + 'px');
+  const root = document.documentElement;
+  const RAIL = 48;
+  // Sidebar: collapsed (by user) OR auto-shrunk to nothing → narrow rail; never gone.
+  const sidebarRail = layout.sidebarCollapsed || sw === 0;
+  // Activity: gone until a room is open; rail when collapsed/auto-shrunk with a room.
+  const activityGone = !hasRoom;
+  const activityRail = hasRoom && (layout.activityCollapsed || aw === 0);
 
-  // Wide mode: collapsing is done by the in-panel ‹ / › buttons, so the
-  // topbar toggle auto-hides while the panel is visible and only reappears
-  // (as a "restore" control) once the panel is collapsed/auto-hidden.
-  if (sBtn) {
-    sBtn.style.display = sOff ? '' : 'none';
-    sBtn.title = 'Показать список комнат';
+  main.classList.toggle('sidebar-rail', sidebarRail);
+  main.classList.toggle('activity-rail', activityRail);
+  main.classList.toggle('activity-gone', activityGone);
+
+  root.style.setProperty('--sb-track', sidebarRail ? RAIL + 'px' : Math.round(sw) + 'px');
+  root.style.setProperty('--sb-rsz', sidebarRail ? '0px' : '6px');
+  root.style.setProperty('--act-track', activityGone ? '0px' : (activityRail ? RAIL + 'px' : Math.round(aw) + 'px'));
+  root.style.setProperty('--act-rsz', (activityGone || activityRail) ? '0px' : '6px');
+
+  // Resizers only make sense when both sides of them are real panels.
+  const sRes = document.getElementById('sidebar-resizer');
+  const aRes = document.getElementById('activity-resizer');
+  if (sRes) sRes.style.display = sidebarRail ? 'none' : '';
+  if (aRes) aRes.style.display = (activityGone || activityRail) ? 'none' : '';
+
+  // In-panel button is ALWAYS visible: it collapses an open panel and, in the
+  // rail state, becomes the single expand button (arrow points to where the
+  // panel will grow).
+  if (sCol) {
+    sCol.textContent = sidebarRail ? '▸' : '◧';
+    sCol.title = t(sidebarRail ? 'tip.restoreSidebar' : 'tip.collapse');
   }
-  if (aBtn) {
-    // Only offer the "restore activity" button when a room is open AND the
-    // user collapsed it — never when it's hidden simply because no room is open.
-    aBtn.style.display = (hasRoom && aOff) ? '' : 'none';
-    aBtn.title = 'Показать панель активности';
+  if (aCol) {
+    aCol.textContent = activityRail ? '◂' : '◨';
+    aCol.title = t(activityRail ? 'tip.restoreActivity' : 'tip.collapse');
   }
+  // Wide mode: the rails own collapse/expand, so the topbar toggles are hidden.
+  if (sBtn) sBtn.style.display = 'none';
+  if (aBtn) aBtn.style.display = 'none';
 }
 
 function persistLayout() {
