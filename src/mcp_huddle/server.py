@@ -175,6 +175,11 @@ def room_create(
     ~/.mcp-huddle/rooms/<id>/agents/<name>.events.jsonl (Codex --json /
     Antigravity plain text). Live-stream them via SSE at /agents/<id>/<name>/events.
     """
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("room_create requires a non-empty room name")
+    if not isinstance(owner, str) or not owner.strip():
+        raise ValueError("room_create requires a non-empty owner")
+
     room_id = bus.create_room(name, owner, owner_pid, cwd, session_id)
 
     if auto_spawn and cwd:

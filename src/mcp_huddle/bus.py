@@ -32,7 +32,6 @@ DEADLOCK_TIMEOUT_SECS = 600   # 10 minutes of silence → system message
 ZOMBIE_CHECK_SECS = 30        # how often to check owner_pid liveness
 
 VALID_KINDS = {"request", "comment", "ack", "busy", "result", "final", "system", "close"}
-VALID_STATUSES = {"open", "idle", "closing_requested", "closed", "resolved"}
 
 
 # ── Rooms ────────────────────────────────────────────────────────────────────
