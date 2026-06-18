@@ -1454,6 +1454,15 @@
       z-index: 50; margin: 0;
       box-shadow: 0 24px 60px -16px rgba(0,0,0,.6);
       transition: transform .25s ease;
+      /* Drawers overlay the chat, so they must be OPAQUE — the translucent
+         glass panel would let the chat text bleed through ("мутно"). */
+      background: rgba(24, 26, 33, 0.985);
+      backdrop-filter: blur(40px) saturate(180%);
+      -webkit-backdrop-filter: blur(40px) saturate(180%);
+    }
+    [data-theme="light"] .main.overlay-mode .sidebar,
+    [data-theme="light"] .main.overlay-mode .activity {
+      background: rgba(249, 250, 252, 0.99);
     }
     .main.overlay-mode .sidebar  { left: 14px;  transform: translateX(calc(-100% - 24px)); }
     .main.overlay-mode .activity { right: 14px; transform: translateX(calc(100% + 24px)); }
