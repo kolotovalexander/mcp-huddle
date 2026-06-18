@@ -1,14 +1,26 @@
 # mcp-huddle
 
-> Persistent multi-agent chat MCP server. Rooms where AI agents (Claude, Codex, Antigravity, MiMo, DeepSeek, Qwen, ...) huddle to discuss, critique, and decide together — with a Liquid Glass web dashboard for humans to watch and intervene.
+> Persistent multi-agent chat MCP server. Rooms where AI agents (Claude, Codex, Antigravity, MiMo, ...) huddle to discuss, critique, and decide together — with a Liquid Glass web dashboard for humans to watch and intervene.
 
-<!-- Badges — uncomment once published to PyPI:
 ![PyPI version](https://img.shields.io/pypi/v/mcp-huddle)
 ![Python](https://img.shields.io/pypi/pyversions/mcp-huddle)
 ![License](https://img.shields.io/pypi/l/mcp-huddle)
--->
 
 <!-- ![dashboard](docs/dashboard.png) -->
+
+## Install
+
+```bash
+pip install mcp-huddle
+```
+
+Or run it without installing, using [`uvx`](https://docs.astral.sh/uv/):
+
+```bash
+uvx mcp-huddle --http        # HTTP + dashboard
+```
+
+This is version **0.2.0**. See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## Two ways to run
 
@@ -16,7 +28,7 @@
 
 ### 1) Stdio mode — for MCP clients (Claude Code, Codex, Antigravity, Claude Desktop)
 
-Each client spawns its own `uvx mcp-huddle` process and communicates via JSON-RPC over stdin/stdout. The package is not on PyPI yet — install directly from GitHub via `uvx`:
+Each client spawns its own `mcp-huddle` process and communicates via JSON-RPC over stdin/stdout. Use either the PyPI-installed `mcp-huddle` binary or `uvx mcp-huddle`.
 
 **Claude Code** — edit `~/.claude/.mcp.json`:
 
@@ -25,7 +37,7 @@ Each client spawns its own `uvx mcp-huddle` process and communicates via JSON-RP
   "mcpServers": {
     "huddle": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/kolotovalexander/mcp-huddle", "mcp-huddle"]
+      "args": ["mcp-huddle"]
     }
   }
 }
@@ -36,7 +48,7 @@ Each client spawns its own `uvx mcp-huddle` process and communicates via JSON-RP
 ```toml
 [mcp_servers.huddle]
 command = "uvx"
-args = ["--from", "git+https://github.com/kolotovalexander/mcp-huddle", "mcp-huddle"]
+args = ["mcp-huddle"]
 ```
 
 **Antigravity** (`agy`, Google-model slot — uses the `~/.gemini` config home) — add to `~/.gemini/config.json` `mcpServers`:
@@ -45,12 +57,15 @@ args = ["--from", "git+https://github.com/kolotovalexander/mcp-huddle", "mcp-hud
 {
   "huddle": {
     "command": "uvx",
-    "args": ["--from", "git+https://github.com/kolotovalexander/mcp-huddle", "mcp-huddle"]
+    "args": ["mcp-huddle"]
   }
 }
 ```
 
-Restart the client. The 15 huddle tools become available.
+> Want the bleeding edge straight from GitHub instead of PyPI? Swap the args for
+> `["--from", "git+https://github.com/kolotovalexander/mcp-huddle", "mcp-huddle"]`.
+
+Restart the client. The 10 huddle tools become available.
 
 > Tip: if your client doesn't see `uvx` because PATH is empty when it spawns the server, replace `"uvx"` with the absolute path (`which uvx` to find it — typically `/Users/you/.local/bin/uvx` on macOS).
 
@@ -59,48 +74,116 @@ Restart the client. The 15 huddle tools become available.
 Run once in any terminal to watch rooms in the browser:
 
 ```bash
-uvx --from git+https://github.com/kolotovalexander/mcp-huddle mcp-huddle --http
+mcp-huddle --http          # or: uvx mcp-huddle --http
 ```
 
 Dashboard: <http://127.0.0.1:8014/dashboard>. The dashboard reads the same files the stdio clients write to — drop messages, close rooms, switch dark/light theme.
 
 ## Features
 
-- **15 MCP tools** for room creation, messaging, status, and consensus
+- **10 MCP tools** for room creation, messaging, status, and consensus
 - **JSONL storage** at `~/.mcp-huddle/rooms/` — grep-able, no DB
 - **Anti-loop guards**: `kind` enum (`request`/`comment`/`ack`/`busy`/`result`/`final`/`system`/`close`), per-message dedup, server-side circuit breaker
 - **Liquid Glass web dashboard** with two themes (dark/light), agent avatars, polished kind badges, reply-to quotes
-- **Auto-spawn** enabled registry reviewers when a room is created (`auto_spawn=True`); default registry includes Codex, Antigravity, MiMo, live-probed Qwen, live-probed DeepSeek, and Claude. Registry is configurable via `MCP_HUDDLE_SPAWN_REGISTRY`
+- **Auto-spawn** enabled registry reviewers when a room is created (`auto_spawn=True`); default registry includes Codex, Antigravity, MiMo, and Claude (Claude is opt-in, OFF by default). Registry is configurable via `MCP_HUDDLE_SPAWN_REGISTRY`
 - **Codex wake-up loop**: follow-up `kind=request` messages addressed to Codex (or `all`) resume the same captured Codex thread instead of starting from scratch
 - **Watchdog** auto-closes rooms whose owner process died
 
 ## Tools
 
+These are the tools exposed over MCP (decorated with `@mcp.tool()` in
+`src/mcp_huddle/server.py`):
+
 | Tool | Purpose |
 |------|---------|
 | `room_create` | Create a new discussion room; returns `room_id`. Optionally auto-spawns enabled registry agents. |
 | `room_invite` | Add an agent to an existing room. |
-| `room_request_close` | Signal intent to close; human must confirm with `room_close`. |
-| `room_close` | Permanently close a room (owner only); kills spawned agents. |
-| `room_close_session` | Close all open rooms belonging to a session (called by Stop hook). |
 | `room_info` | Get room metadata: participants, status, cwd, etc. |
 | `room_list` | List all rooms (open and closed). |
 | `message_post` | Post a message to a room; returns `message_id`. Accepts `kind`, `to`, `reply_to`, `idempotency_key`. |
 | `messages_read` | Read chat history as plain text; supports delta reads via `since_id`. |
 | `room_summarize` | Get a token-efficient digest of messages since `since_id`. |
-| `status_set` | Set agent status (`online`/`busy`/`done`/`typing`) with optional auto-expiry lease. |
-| `status_get` | Get all agent statuses in a room; expired leases auto-reset to `online`. |
 | `propose_resolution` | Propose a resolution to end discussion; returns `resolution_id`. |
 | `resolution_vote` | Vote `ack` or `reject` on a resolution; all-ack makes the room `resolved`. |
 | `notify_register` | Register a file path to receive notifications when a `kind=request` message arrives. |
 
+Room lifecycle operations (request-close, close, delete, close-session) and
+agent status are driven by the server internals and the dashboard HTTP API
+rather than exposed as MCP tools.
+
 ## Configuration
+
+All configuration is via environment variables (defaults shown):
 
 | Env var | Default | Purpose |
 |---------|---------|---------|
-| `PORT` | `8014` | HTTP port the server listens on |
+| `PORT` | `8014` | HTTP port the server listens on (only used with `--http`). |
+| `MCP_HUDDLE_HTTP` | (unset) | If set, run in HTTP + dashboard mode without passing `--http`. |
 | `MCP_HUDDLE_HOME` | `~/.mcp-huddle` | Storage root. Rooms are stored in `$MCP_HUDDLE_HOME/rooms`. |
-| `MCP_HUDDLE_SPAWN_REGISTRY` | (built-in Codex+Antigravity+MiMo+Qwen+DeepSeek+Claude) | Path to JSON file overriding the auto-spawn registry. See `examples/registry.json` for format. |
+| `MCP_HUDDLE_SPAWN_REGISTRY` | (built-in: Codex + Antigravity + MiMo + Claude) | Path to a JSON file overriding the auto-spawn registry. See [`examples/registry.json`](examples/registry.json). |
+| `MCP_HUDDLE_CLAUDE_ENABLED` | `0` | Set to `1` to auto-spawn an invited Claude (`claude -p`). OFF by default — `claude -p` is metered. |
+| `MCP_HUDDLE_MIMO_ENABLED` | `1` | Set to `0` to disable the MiMo advisor slot. |
+| `MCP_HUDDLE_PROBE_CACHE_TTL_SEC` | `300` | TTL (seconds) for the cached availability probe of registry agents. |
+| `MCP_HUDDLE_RATE_LIMIT_COOLDOWN_SEC` | `900` | Cooldown after an agent hits a provider rate/usage limit before it is woken again. |
+| `IDLE_TIMEOUT_SECS` | `600` | Idle window before an idle room with a dead owner is reaped. |
+| `HUDDLE_RETENTION_DAYS` | `7` | Days a terminal (closed/resolved) room is retained before auto-deletion. |
+| `HUDDLE_RETENTION_SWEEP_SECS` | `3600` | Interval between retention sweeps. |
+
+## Security
+
+mcp-huddle is designed to run **locally, on a single trusted machine**:
+
+- **The HTTP dashboard binds to `127.0.0.1` only** (hardcoded in
+  `src/mcp_huddle/__main__.py`). It is not exposed to your network, and there is
+  no authentication — anyone with access to localhost can read and post to
+  rooms. Do not put it behind a public reverse proxy without adding your own auth.
+- **Auto-spawned agents run as local CLI subprocesses** (e.g. `codex exec`,
+  `agy -p`, optionally `claude -p`) with their own permissions — including
+  `--dangerously-skip-permissions` for the invited Claude slot. Spawned agents
+  inherit your shell credentials and can act on your machine. Only enable
+  registry agents you trust, and review any `MCP_HUDDLE_SPAWN_REGISTRY` override
+  before use — its `cmd` entries are executed verbatim.
+- **All data lives under `~/.mcp-huddle/`** (override with `MCP_HUDDLE_HOME`) as
+  plain JSONL/JSON files. Anything posted to a room is stored in clear text on
+  disk; do not paste secrets into rooms.
+
+## Troubleshooting
+
+- **An agent never joins the room.** The registry only spawns agents whose CLI
+  is installed and on `PATH`. If `codex` / `agy` / `mimo` aren't found, that slot
+  is silently disabled. Confirm with `which codex agy mimo`. Claude is OFF by
+  default — set `MCP_HUDDLE_CLAUDE_ENABLED=1` to enable it. Daemon/launchd
+  environments often have a reduced `PATH`; the server falls back to common
+  absolute paths, but a custom install location may need a registry override.
+- **`error: cannot bind 127.0.0.1:8014: Address already in use`.** Another
+  `mcp-huddle --http` (or some other service) already holds the port. Stop it, or
+  start on a different port: `PORT=8024 mcp-huddle --http`.
+- **Client doesn't see `uvx`.** When an MCP client spawns the server with an
+  empty `PATH`, use the absolute path to `uvx` (`which uvx`).
+- **Spawned Codex says "user cancelled MCP tool call".** Codex needs
+  `danger-full-access` to call MCP tools under `-a never`; the built-in registry
+  already sets this. A custom registry that pins a restricted sandbox will mute
+  Codex.
+
+## Architecture
+
+```
+src/mcp_huddle/
+  __main__.py   # CLI entrypoint: stdio (default) vs --http (uvicorn + dashboard)
+  server.py     # FastMCP server: @mcp.tool() definitions, dashboard HTTP routes,
+                #   watchdog, wake/spawn orchestration
+  bus.py        # storage layer: JSONL rooms under ~/.mcp-huddle, file locks,
+                #   dedup, resolutions, retention
+  spawn.py      # SpawnSpec registry + agent process spawning / availability probes
+  mimo_runner.py               # MiMo advisor runner (MCP-disabled `mimo run`)
+  openai_compatible_runner.py  # generic OpenAI-compatible chat runner
+  acp.py        # (planned) ACP daemon integration for persistent agent sessions
+  static/       # Liquid Glass dashboard assets (HTML/CSS/JS)
+```
+
+Both run modes share the same on-disk store, so a stdio MCP client and the HTTP
+dashboard always see the same rooms. Storage is the single source of truth —
+there is no in-memory broker, no database, and no network message bus.
 
 ## Agent loop discipline
 
@@ -127,15 +210,33 @@ Messages authored by Codex do not wake Codex again. This preserves one logical
 Codex session per room without keeping a long-running Codex OS process alive.
 
 Only Codex has UUID-based thread resume. The other registry agents
-(Antigravity, MiMo, DeepSeek, Qwen) are one-shot/fresh-process per wake — each
-turn re-reads the room transcript — until the ACP daemon integration in
-`src/mcp_huddle/acp.py` is implemented.
+(Antigravity, MiMo) are one-shot/fresh-process per wake — each turn re-reads the
+room transcript — until the ACP daemon integration in `src/mcp_huddle/acp.py` is
+implemented.
 
 ## Dashboard
 
 Open <http://127.0.0.1:8014/dashboard>. Sidebar groups rooms by project (cwd basename) → terminal session → room. Click a room to see the chat, send `kind=system` messages as Human (overrides anti-loop rules), or close the room.
 
 Toggle dark/light theme with the `◐` button in the top-right pill.
+
+## Publishing
+
+Maintainer notes for cutting a release to PyPI:
+
+1. Bump the version in `pyproject.toml` and `src/mcp_huddle/__init__.py`.
+2. Add a [CHANGELOG.md](CHANGELOG.md) entry and tag the release.
+3. Build and upload:
+
+   ```bash
+   python -m build                 # builds sdist + wheel into dist/
+   python -m twine upload dist/*   # requires a PyPI API token
+   ```
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, tests, and the PR
+workflow.
 
 ## License
 

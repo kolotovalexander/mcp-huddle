@@ -7,6 +7,8 @@ HTTP mode (`--http`): uvicorn + Liquid Glass dashboard on :8014.
 import asyncio
 import json
 import os
+import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -98,16 +100,49 @@ that bypass anti-loop rules.
 """
 
 mcp = FastMCP("mcp-huddle", instructions=_AGENT_INSTRUCTIONS)
-IDLE_TIMEOUT_SECS = int(os.environ.get("IDLE_TIMEOUT_SECS", "600"))
+
+
+def _env_num(name: str, default, cast):
+    """Read a numeric env var, falling back to `default` on missing/garbage.
+
+    A malformed value (e.g. IDLE_TIMEOUT_SECS="abc") must not crash startup —
+    we warn to stderr and use the documented default instead.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return cast(raw)
+    except (TypeError, ValueError):
+        print(
+            f"[mcp-huddle] WARNING: env {name}={raw!r} is not a valid "
+            f"{cast.__name__}; using default {default!r}",
+            file=sys.stderr,
+        )
+        return default
+
+
+IDLE_TIMEOUT_SECS = _env_num("IDLE_TIMEOUT_SECS", 600, int)
 # Retention: terminal rooms (closed/resolved) older than this are purged by the
 # background sweep. 0 disables. Sweep runs at most once per RETENTION_SWEEP_SECS
 # (not every zombie-check tick) — deletion is cheap but no need to scan hourly.
-RETENTION_DAYS = float(os.environ.get("HUDDLE_RETENTION_DAYS", "7"))
-RETENTION_SWEEP_SECS = int(os.environ.get("HUDDLE_RETENTION_SWEEP_SECS", "3600"))
+RETENTION_DAYS = _env_num("HUDDLE_RETENTION_DAYS", 7.0, float)
+RETENTION_SWEEP_SECS = _env_num("HUDDLE_RETENTION_SWEEP_SECS", 3600, int)
 # When a spawned agent exits because it hit its provider usage/rate-limit, do
 # not re-spawn it for this many seconds — a fresh spawn would instantly fail
 # again, post nothing, and burn a wake. 0 disables the cooldown gate.
-RATE_LIMIT_COOLDOWN_SECS = int(os.environ.get("MCP_HUDDLE_RATE_LIMIT_COOLDOWN_SEC", "900"))
+RATE_LIMIT_COOLDOWN_SECS = _env_num("MCP_HUDDLE_RATE_LIMIT_COOLDOWN_SEC", 900, int)
+
+
+# Agents whose CLI sessions can be resumed by a stable thread/session id
+# (vs. re-spawned fresh each turn). Only Codex currently exposes a UUID-based
+# `exec resume`; Antigravity and the rest have no resumable thread handle.
+_THREAD_RESUMABLE_AGENTS = frozenset({"Codex"})
+
+
+def _is_thread_resumable(agent_name: str) -> bool:
+    """True if the agent supports id-based session resume (vs. fresh spawn)."""
+    return agent_name in _THREAD_RESUMABLE_AGENTS
 
 
 # ── Room tools ────────────────────────────────────────────────────────────────
@@ -301,7 +336,7 @@ def respond_via_agent(
         info = {}
         agent_meta[agent_name] = info
 
-    if agent_name == "Codex":
+    if _is_thread_resumable(agent_name):
         thread_id = info.get("thread_id")
         if not thread_id:
             raise ValueError(
@@ -741,15 +776,21 @@ def _spawn_agents(
       dict          — spawn only listed agents; each gets its custom brief.
 
     Side effects:
-      * Builds a default brief and writes it to /tmp/room-<id>-brief.md so users
-        can `cat` it for debugging (always written, also when dict is used).
+      * Builds a default brief and writes it to a secure temp file
+        (huddle-room-<id>-*-brief.md in the system temp dir) so users can
+        `cat` it for debugging (always written, also when dict is used).
       * Creates ~/.mcp-huddle/rooms/<id>/agents/ for log files.
       * Updates meta.json: spawned_pids + agent_meta {name: {log_path, last_message_path}}.
       * Adds each spawned agent to participants.
     """
     default_brief = _build_default_brief(room_id, name, goal, cwd)
-    brief_path = f"/tmp/room-{room_id}-brief.md"
-    Path(brief_path).write_text(default_brief)
+    # Secure unique temp file instead of a predictable /tmp/room-<id>-brief.md
+    # (guessable + symlink/TOCTOU-attackable in a shared /tmp). mkstemp creates
+    # the file atomically with 0600 perms.
+    fd, brief_path = tempfile.mkstemp(
+        prefix=f"huddle-room-{room_id}-", suffix="-brief.md")
+    with os.fdopen(fd, "w") as fh:
+        fh.write(default_brief)
 
     log_dir = bus._room_dir(room_id) / "agents"
 
@@ -813,7 +854,7 @@ def _spawn_agents(
     # Run blocking parse in a thread to avoid stalling room_create — but small
     # timeout so it usually returns within ~1s.
     for agent_name, info in agent_meta.items():
-        if agent_name != "Codex":
+        if not _is_thread_resumable(agent_name):
             continue  # Only Codex has UUID-based resume; Antigravity has none.
         log_path = info.get("log_path")
         if log_path:
@@ -823,9 +864,19 @@ def _spawn_agents(
 
     # Save PIDs + log paths for dashboard / zombie cleanup — locked
     # read-modify-write so a concurrent meta.json update isn't clobbered.
+    # Merge (don't overwrite): extend any pre-existing spawned_pids and
+    # deep-merge per-agent meta so a concurrent wake-thread update survives.
     def _save_spawn_meta(m: dict) -> dict:
-        m["spawned_pids"] = pids
-        m["agent_meta"] = agent_meta
+        existing_pids = m.get("spawned_pids") or []
+        m["spawned_pids"] = existing_pids + [p for p in pids if p not in existing_pids]
+        merged = m.get("agent_meta") or {}
+        for name_, info_ in agent_meta.items():
+            slot = merged.get(name_)
+            if isinstance(slot, dict):
+                slot.update(info_)
+            else:
+                merged[name_] = dict(info_)
+        m["agent_meta"] = merged
         return m
     bus._update_meta_locked(room_id, _save_spawn_meta)
 
@@ -1112,7 +1163,7 @@ def _wake_agents_for_request(
             last_seen = int(info.get("last_seen_id", 0) or 0)
             wake_id = uuid.uuid4().hex[:12]
 
-            if agent_name == "Codex":
+            if _is_thread_resumable(agent_name):
                 thread_id = info.get("thread_id")
                 if not log_path:
                     continue

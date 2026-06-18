@@ -14,6 +14,7 @@ import argparse
 import os
 import re
 import subprocess
+import tempfile
 import time
 
 from . import bus
@@ -30,7 +31,7 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|\x1b\].*?(?:\x07|\x1b\\)|\[0m")
 # (racy deadlock, MiMo Code 0.1.0 / 0.1.1-preview.1, verified 2026-06-13).
 # MIMOCODE_CONFIG_DIR points at an empty dir so the user's
 # ~/.config/mimocode/mimocode.json (which may enable MCP) is never loaded.
-_ISOLATED_CONFIG_DIR = "/private/tmp/mimo-runner-home"
+_ISOLATED_CONFIG_DIR = os.path.join(tempfile.gettempdir(), "mimo-runner-home")
 _MCP_KILL_SWITCHES = {
     "MIMOCODE_CONFIG_DIR": _ISOLATED_CONFIG_DIR,
     "MIMOCODE_DISABLE_CLAUDE_CODE_MCP": "1",

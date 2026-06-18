@@ -404,9 +404,19 @@ def load_registry() -> list[SpawnSpec]:
     path = os.environ.get("MCP_HUDDLE_SPAWN_REGISTRY")
     if path and Path(path).is_file():
         with open(path) as f:
-            data = json.load(f)
+            raw = f.read()
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"MCP_HUDDLE_SPAWN_REGISTRY points to malformed JSON "
+                f"({path}): {exc}. Expected a JSON array of SpawnSpec objects."
+            ) from exc
         if not isinstance(data, list):
-            raise ValueError(f"{path}: expected JSON array of SpawnSpec")
+            raise ValueError(
+                f"MCP_HUDDLE_SPAWN_REGISTRY ({path}): expected a JSON array "
+                f"of SpawnSpec objects, got {type(data).__name__}."
+            )
         return [spec for spec in data if _spawn_spec_available(spec)]
     return [spec for spec in DEFAULT_REGISTRY if _spawn_spec_available(spec)]
 
@@ -551,8 +561,14 @@ def parse_codex_thread_id(log_path: str, timeout: float = 10.0) -> str | None:
                             obj = json.loads(line)
                         except json.JSONDecodeError:
                             continue
-                        if obj.get("type") == "thread.started" and "thread_id" in obj:
-                            return obj["thread_id"]
+                        # A changed/non-Codex log format may yield a non-dict
+                        # (list, str, number) — skip it rather than crash.
+                        if not isinstance(obj, dict):
+                            continue
+                        if obj.get("type") == "thread.started":
+                            thread_id = obj.get("thread_id")
+                            if thread_id is not None:
+                                return thread_id
             except OSError:
                 pass
         time.sleep(0.1)

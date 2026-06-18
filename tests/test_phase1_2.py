@@ -94,11 +94,12 @@ def test_spawn_all_skip_names_excludes_owner(tmp_path: Path, monkeypatch) -> Non
     assert "Codex" not in names
 
 
-def test_default_registry_includes_claude_codex_antigravity_qwen_deepseek() -> None:
-    """All six canonical agents must be in DEFAULT_REGISTRY (enabled depends
-    on which binaries the test host has installed)."""
+def test_default_registry_roster() -> None:
+    """The current canonical agent roster must be in DEFAULT_REGISTRY (enabled
+    depends on which binaries the test host has installed). Qwen and DeepSeek
+    were retired; the active roster is Claude / Codex / Antigravity / MiMo."""
     spec_names = {s["name"] for s in spawn.DEFAULT_REGISTRY}
-    assert spec_names == {"Codex", "Antigravity", "MiMo", "Qwen", "DeepSeek", "Claude"}
+    assert spec_names == {"Codex", "Antigravity", "MiMo", "Claude"}
 
 
 def test_mimo_spec_uses_runner() -> None:
@@ -128,18 +129,6 @@ def test_claude_slot_is_opt_in_off_by_default() -> None:
     assert spec["enabled"] == expected
     if "MCP_HUDDLE_CLAUDE_ENABLED" not in os.environ:
         assert spec["enabled"] is False
-
-
-def test_deepseek_spec_uses_max_local_model() -> None:
-    """DeepSeek huddle slot should use the strongest real FreeDeepseekAPI alias.
-    `deepseek-reasoner` (V4-Flash thinking mode) is the strongest supported id;
-    the old `deepseek-v4-pro` alias does not exist on the bridge → probe failed."""
-    spec = next(s for s in spawn.DEFAULT_REGISTRY if s["name"] == "DeepSeek")
-    assert spec["requires_model"] == "deepseek-reasoner"
-    assert spec["probe_url"] == "http://127.0.0.1:9655/v1/models"
-    assert spec["probe_chat_url"] == "http://127.0.0.1:9655/v1/chat/completions"
-    assert "--model" in spec["cmd"]
-    assert "deepseek-reasoner" in spec["cmd"]
 
 
 def test_qwen_probe_requires_exact_model(monkeypatch: pytest.MonkeyPatch) -> None:

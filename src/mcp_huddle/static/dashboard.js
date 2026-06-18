@@ -174,81 +174,83 @@ function renderAgentTotalsBadge(agent) {
   tag.textContent = parts.join(' · ') || '·';
 }
 
-// ── Theme: auto (follows OS) | dark | light ────────────────
-// Cycle order: auto → dark → light → auto. Click the moon icon to advance.
-// 'auto' listens to prefers-color-scheme so theme switches when OS does.
-const THEME_CYCLE = ['auto', 'dark', 'light'];
-const THEME_GLYPH = {auto: '🌓', dark: '🌙', light: '☀️'};
-const THEME_LABEL = {auto: 'Auto', dark: 'Dark', light: 'Light'};
+// ── Appearance settings: Theme × Skin × Palette in one popover ──
+// Three orthogonal axes, each persisted in localStorage and reflected on
+// <html> as data-theme / data-skin / data-palette. The ⚙️ topbar button
+// opens a popover with a segmented control per axis (no more cycle buttons).
+const THEME_OPTS = [
+  {v: 'auto', label: '🌓 Auto'}, {v: 'dark', label: '🌙 Dark'}, {v: 'light', label: '☀️ Light'},
+];
+const SKIN_OPTS = [
+  {v: 'glass', label: '🪟 Glass'}, {v: 'web', label: '💬 Web'}, {v: 'code', label: '⌨️ Code'},
+];
+const PALETTE_OPTS = [
+  {v: 'default', label: 'Default'}, {v: 'dracula', label: 'Dracula'}, {v: 'nord', label: 'Nord'},
+  {v: 'tokyonight', label: 'Tokyo Night'}, {v: 'catppuccin', label: 'Catppuccin'}, {v: 'gruvbox', label: 'Gruvbox'},
+];
 
 function applyTheme(mode) {
-  const html = document.documentElement;
-  if (mode === 'auto') {
-    const dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-    html.setAttribute('data-theme', dark ? 'dark' : 'light');
-  } else {
-    html.setAttribute('data-theme', mode);
-  }
-  const btn = document.getElementById('theme-toggle');
-  if (btn) {
-    btn.textContent = THEME_GLYPH[mode];
-    btn.title = `Theme: ${THEME_LABEL[mode]} (click to cycle)`;
-  }
+  if (!['auto', 'dark', 'light'].includes(mode)) mode = 'auto';
+  const resolved = mode === 'auto'
+    ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+    : mode;
+  document.documentElement.setAttribute('data-theme', resolved);
+  document.documentElement.setAttribute('data-theme-mode', mode);
+}
+function applySkin(skin) {
+  if (!SKIN_OPTS.some(o => o.v === skin)) skin = 'glass';
+  document.documentElement.setAttribute('data-skin', skin);
+}
+function applyPalette(pal) {
+  if (!PALETTE_OPTS.some(o => o.v === pal)) pal = 'default';
+  document.documentElement.setAttribute('data-palette', pal);
 }
 
-function initTheme() {
-  // Migrate legacy values: only 'dark'/'light' were stored before; treat them
-  // as explicit choices. Anything else (or unset) defaults to 'auto'.
-  const raw = localStorage.getItem('agentbus-theme');
-  let mode = THEME_CYCLE.includes(raw) ? raw : 'auto';
-  applyTheme(mode);
+function buildSettingsRow(title, opts, storeKey, getCur, apply) {
+  const seg = el('div', {class: 'set-seg'});
+  const refresh = () => {
+    const cur = getCur();
+    [...seg.children].forEach(b => b.classList.toggle('active', b.dataset.v === cur));
+  };
+  opts.forEach(o => {
+    const b = el('button', {class: 'set-opt', dataset: {v: o.v}, text: o.label});
+    b.onclick = () => { localStorage.setItem(storeKey, o.v); apply(o.v); refresh(); };
+    seg.appendChild(b);
+  });
+  refresh();
+  return el('div', {class: 'set-row'}, [el('div', {class: 'set-label', text: title}), seg]);
+}
+
+function initSettings() {
+  // Apply saved values (head script already set them pre-paint; re-assert).
+  applyTheme(localStorage.getItem('agentbus-theme') || 'auto');
+  applySkin(localStorage.getItem('agentbus-skin') || 'glass');
+  applyPalette(localStorage.getItem('agentbus-palette') || 'default');
 
   // Re-apply on OS theme change while in 'auto' mode.
   const mq = window.matchMedia('(prefers-color-scheme: dark)');
-  const onSysChange = () => {
-    if ((localStorage.getItem('agentbus-theme') || 'auto') === 'auto') {
-      applyTheme('auto');
-    }
-  };
-  if (mq.addEventListener) mq.addEventListener('change', onSysChange);
-  else if (mq.addListener) mq.addListener(onSysChange);  // legacy Safari
+  const onSys = () => { if ((localStorage.getItem('agentbus-theme') || 'auto') === 'auto') applyTheme('auto'); };
+  if (mq.addEventListener) mq.addEventListener('change', onSys);
+  else if (mq.addListener) mq.addListener(onSys);
 
-  document.getElementById('theme-toggle').onclick = () => {
-    const cur = localStorage.getItem('agentbus-theme') || 'auto';
-    const idx = THEME_CYCLE.indexOf(cur);
-    const next = THEME_CYCLE[(idx + 1) % THEME_CYCLE.length];
-    localStorage.setItem('agentbus-theme', next);
-    applyTheme(next);
-  };
-}
+  const pop = document.getElementById('settings-popover');
+  const btn = document.getElementById('settings-btn');
+  if (!pop || !btn) return;
+  pop.appendChild(el('div', {class: 'set-title', text: 'Оформление'}));
+  pop.appendChild(buildSettingsRow('Тема', THEME_OPTS, 'agentbus-theme',
+    () => localStorage.getItem('agentbus-theme') || 'auto', applyTheme));
+  pop.appendChild(buildSettingsRow('Дизайн', SKIN_OPTS, 'agentbus-skin',
+    () => localStorage.getItem('agentbus-skin') || 'glass', applySkin));
+  pop.appendChild(buildSettingsRow('Палитра', PALETTE_OPTS, 'agentbus-palette',
+    () => localStorage.getItem('agentbus-palette') || 'default', applyPalette));
 
-// ── Skin: selectable visual identity (orthogonal to theme) ──
-// Cycle order: glass → web → code → glass. Persisted in localStorage.
-// 'glass' = default Liquid Glass. 'web' = claude.ai look. 'code' = IDE look.
-const SKIN_CYCLE = ['glass', 'web', 'code'];
-const SKIN_LABEL = {glass: '🪟 Glass', web: '💬 Web', code: '⌨️ Code'};
-const SKIN_NAME  = {glass: 'Glass', web: 'Web', code: 'Code'};
-
-function applySkin(skin) {
-  if (!SKIN_CYCLE.includes(skin)) skin = 'glass';
-  document.documentElement.setAttribute('data-skin', skin);
-  const btn = document.getElementById('skin-toggle');
-  if (btn) {
-    btn.textContent = SKIN_LABEL[skin];
-    btn.title = `Design: ${SKIN_NAME[skin]} (click to cycle)`;
-  }
-}
-
-function initSkin() {
-  const raw = localStorage.getItem('agentbus-skin');
-  applySkin(SKIN_CYCLE.includes(raw) ? raw : 'glass');
-  const btn = document.getElementById('skin-toggle');
-  if (btn) btn.onclick = () => {
-    const cur = localStorage.getItem('agentbus-skin') || 'glass';
-    const next = SKIN_CYCLE[(SKIN_CYCLE.indexOf(cur) + 1) % SKIN_CYCLE.length];
-    localStorage.setItem('agentbus-skin', next);
-    applySkin(next);
-  };
+  const close = () => { pop.hidden = true; btn.setAttribute('aria-expanded', 'false'); };
+  const open  = () => { pop.hidden = false; btn.setAttribute('aria-expanded', 'true'); };
+  btn.onclick = (e) => { e.stopPropagation(); pop.hidden ? open() : close(); };
+  document.addEventListener('click', (e) => {
+    if (!pop.hidden && !pop.contains(e.target) && e.target !== btn) close();
+  });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
 }
 
 // ── Rooms ─────────────────────────────────────────────────
@@ -259,6 +261,17 @@ async function loadRooms() {
     document.getElementById('room-count').textContent = rooms.length;
     renderRooms();
   } catch(e) {}
+}
+
+// Collapsible tree state (which project/session groups are folded).
+let treeCollapsed = {};
+try { treeCollapsed = JSON.parse(localStorage.getItem('agentbus-tree-collapsed') || '{}') || {}; } catch (_) {}
+function treeFolded(key) { return !!treeCollapsed[key]; }
+function toggleTree(key) {
+  if (treeCollapsed[key]) delete treeCollapsed[key];
+  else treeCollapsed[key] = true;
+  localStorage.setItem('agentbus-tree-collapsed', JSON.stringify(treeCollapsed));
+  renderRooms();
 }
 
 function renderRooms() {
@@ -282,20 +295,33 @@ function renderRooms() {
   }
 
   for (const [proj, sessions] of projects) {
-    const block = el('div', {class: 'proj-block'});
+    const pKey = 'proj:' + proj;
+    const pFolded = treeFolded(pKey);
+    const block = el('div', {class: 'proj-block' + (pFolded ? ' collapsed' : '')});
     const total = [...sessions.values()].reduce((sum, rs) => sum + rs.length, 0);
-    block.appendChild(el('div', {class: 'proj-header'}, [
-      el('span', {text: proj}),
+    const ph = el('div', {class: 'proj-header'}, [
+      el('span', {class: 'tree-arrow', text: '▾'}),
+      el('span', {class: 'tree-label', text: proj}),
       el('span', {class: 'count', text: String(total)}),
-    ]));
+    ]);
+    ph.onclick = () => toggleTree(pKey);
+    block.appendChild(ph);
 
+    const projBody = el('div', {class: 'proj-body'});
     for (const [sess, rs] of sessions) {
+      const sKey = 'sess:' + proj + '/' + sess;
+      const sFolded = treeFolded(sKey);
       const sessLabel = sess.length > 14 ? sess.slice(0, 14) + '…' : sess;
-      block.appendChild(el('div', {class: 'sess-header'}, [
-        el('span', {class: 'arrow', text: '›'}),
-        el('span', {text: sessLabel}),
-      ]));
+      const group = el('div', {class: 'sess-group' + (sFolded ? ' collapsed' : '')});
+      const sh = el('div', {class: 'sess-header'}, [
+        el('span', {class: 'tree-arrow', text: '▾'}),
+        el('span', {class: 'tree-label', text: sessLabel}),
+        el('span', {class: 'count', text: String(rs.length)}),
+      ]);
+      sh.onclick = () => toggleTree(sKey);
+      group.appendChild(sh);
 
+      const sessRooms = el('div', {class: 'sess-rooms'});
       for (const r of rs) {
         const active = r.id === currentRoom;
         const item = el('div', {
@@ -308,9 +334,12 @@ function renderRooms() {
           ]),
           el('div', {class: 'room-meta', text: `${(r.participants || []).length}·${fmtTime(r.last_activity || r.created_at)}`}),
         ]);
-        block.appendChild(item);
+        sessRooms.appendChild(item);
       }
+      group.appendChild(sessRooms);
+      projBody.appendChild(group);
     }
+    block.appendChild(projBody);
     sidebar.appendChild(block);
   }
 }
@@ -839,36 +868,6 @@ async function tick() {
   if (currentRoom) await fetchMessages(false);
 }
 
-// ── Palette: terminal/Ghostty colour schemes (orthogonal axis) ──
-// Cycle: default → dracula → nord → tokyonight → catppuccin → gruvbox.
-const PALETTE_CYCLE = ['default', 'dracula', 'nord', 'tokyonight', 'catppuccin', 'gruvbox'];
-const PALETTE_LABEL = {
-  default: 'Default', dracula: 'Dracula', nord: 'Nord',
-  tokyonight: 'Tokyo Night', catppuccin: 'Catppuccin', gruvbox: 'Gruvbox',
-};
-
-function applyPalette(pal) {
-  if (!PALETTE_CYCLE.includes(pal)) pal = 'default';
-  document.documentElement.setAttribute('data-palette', pal);
-  const btn = document.getElementById('palette-toggle');
-  if (btn) {
-    btn.textContent = `🎨 ${PALETTE_LABEL[pal]}`;
-    btn.title = `Palette: ${PALETTE_LABEL[pal]} (click to cycle)`;
-  }
-}
-
-function initPalette() {
-  const raw = localStorage.getItem('agentbus-palette');
-  applyPalette(PALETTE_CYCLE.includes(raw) ? raw : 'default');
-  const btn = document.getElementById('palette-toggle');
-  if (btn) btn.onclick = () => {
-    const cur = localStorage.getItem('agentbus-palette') || 'default';
-    const next = PALETTE_CYCLE[(PALETTE_CYCLE.indexOf(cur) + 1) % PALETTE_CYCLE.length];
-    localStorage.setItem('agentbus-palette', next);
-    applyPalette(next);
-  };
-}
-
 // ── Layout manager: resizable + collapsible panels + responsive ──
 // Both side panels resize via their handles and collapse (button or
 // double-click handle). On every resize the effective widths are
@@ -878,6 +877,9 @@ function initPalette() {
 const SIDEBAR_MIN = 170, SIDEBAR_MAX = 460, SIDEBAR_DEFAULT = 248;
 const ACTIVITY_MIN = 240, ACTIVITY_DEFAULT = 380;
 const CHAT_MIN = 320;
+// Below this viewport width the side panels stop taking layout space and
+// become overlay drawers that slide over the chat (chat = full width).
+const OVERLAY_BREAKPOINT = 820;
 // .app padding (14*2) + 4 grid gaps (12*4) between the 5 tracks.
 const LAYOUT_GUTTER = 14 * 2 + 12 * 4;
 
@@ -886,16 +888,42 @@ const layout = {
   activityW: parseInt(localStorage.getItem('agentbus-activity-w') || ACTIVITY_DEFAULT, 10) || ACTIVITY_DEFAULT,
   sidebarCollapsed: localStorage.getItem('agentbus-sidebar-collapsed') === '1',
   activityCollapsed: localStorage.getItem('agentbus-activity-collapsed') === '1',
+  drawer: null, // overlay mode only: null | 'sidebar' | 'activity'
 };
 
 const clampN = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const isOverlay = () => window.innerWidth < OVERLAY_BREAKPOINT;
 
 function relayout() {
   const main = document.querySelector('.main');
   if (!main) return;
+  const backdrop = document.getElementById('drawer-backdrop');
+  const sBtn = document.getElementById('sidebar-collapse');
+  const aBtn = document.getElementById('activity-collapse');
+
+  if (isOverlay()) {
+    // ── Overlay/drawer mode: chat is full-width, panels float over it ──
+    main.classList.add('overlay-mode');
+    main.classList.remove('sidebar-off', 'activity-off');
+    const sOpen = layout.drawer === 'sidebar';
+    const aOpen = layout.drawer === 'activity';
+    main.classList.toggle('drawer-sidebar-open', sOpen);
+    main.classList.toggle('drawer-activity-open', aOpen);
+    document.documentElement.style.setProperty(
+      '--drawer-w', Math.min(360, Math.round(window.innerWidth * 0.86)) + 'px');
+    if (backdrop) backdrop.hidden = !(sOpen || aOpen);
+    if (sBtn) sBtn.classList.toggle('active', sOpen);
+    if (aBtn) aBtn.classList.toggle('active', aOpen);
+    return;
+  }
+
+  // ── Wide mode: resizable side-by-side panels, chat protected ──
+  main.classList.remove('overlay-mode', 'drawer-sidebar-open', 'drawer-activity-open');
+  layout.drawer = null;
+  if (backdrop) backdrop.hidden = true;
+
   const avail = window.innerWidth - LAYOUT_GUTTER;
   const actMax = Math.floor(window.innerWidth * 0.6);
-
   let sw = layout.sidebarCollapsed ? 0 : clampN(layout.sidebarW, SIDEBAR_MIN, SIDEBAR_MAX);
   let aw = layout.activityCollapsed ? 0 : clampN(layout.activityW, ACTIVITY_MIN, actMax);
 
@@ -916,8 +944,6 @@ function relayout() {
   if (!sOff) document.documentElement.style.setProperty('--sidebar-w', Math.round(sw) + 'px');
   if (!aOff) document.documentElement.style.setProperty('--activity-w', Math.round(aw) + 'px');
 
-  const sBtn = document.getElementById('sidebar-collapse');
-  const aBtn = document.getElementById('activity-collapse');
   if (sBtn) sBtn.classList.toggle('active', layout.sidebarCollapsed);
   if (aBtn) aBtn.classList.toggle('active', layout.activityCollapsed);
 }
@@ -935,11 +961,12 @@ function initPanelResizer(resizerId, side) {
   let dragging = false;
 
   resizer.addEventListener('pointerdown', e => {
+    if (isOverlay()) return; // no resizing in drawer mode
+    e.preventDefault();
     dragging = true;
     resizer.classList.add('dragging');
+    document.body.classList.add('resizing'); // global user-select:none (no text selection while dragging)
     resizer.setPointerCapture?.(e.pointerId);
-    document.body.style.cursor = 'col-resize';
-    document.body.style.userSelect = 'none';
   });
   resizer.addEventListener('pointermove', e => {
     if (!dragging) return;
@@ -956,9 +983,8 @@ function initPanelResizer(resizerId, side) {
     if (!dragging) return;
     dragging = false;
     resizer.classList.remove('dragging');
+    document.body.classList.remove('resizing');
     try { resizer.releasePointerCapture?.(e.pointerId); } catch (_) {}
-    document.body.style.cursor = '';
-    document.body.style.userSelect = '';
     persistLayout();
   };
   resizer.addEventListener('pointerup', stop);
@@ -972,22 +998,31 @@ function initPanelResizer(resizerId, side) {
   });
 }
 
+// Topbar ◧/◨ buttons: collapse panels in wide mode, toggle drawers in overlay.
+function togglePanel(which) {
+  if (isOverlay()) {
+    layout.drawer = layout.drawer === which ? null : which;
+  } else if (which === 'sidebar') {
+    layout.sidebarCollapsed = !layout.sidebarCollapsed;
+    persistLayout();
+  } else {
+    layout.activityCollapsed = !layout.activityCollapsed;
+    persistLayout();
+  }
+  relayout();
+}
+
 function initLayout() {
   initPanelResizer('sidebar-resizer', 'left');
   initPanelResizer('activity-resizer', 'right');
 
   const sBtn = document.getElementById('sidebar-collapse');
-  if (sBtn) sBtn.onclick = () => {
-    layout.sidebarCollapsed = !layout.sidebarCollapsed;
-    persistLayout();
-    relayout();
-  };
+  if (sBtn) sBtn.onclick = () => togglePanel('sidebar');
   const aBtn = document.getElementById('activity-collapse');
-  if (aBtn) aBtn.onclick = () => {
-    layout.activityCollapsed = !layout.activityCollapsed;
-    persistLayout();
-    relayout();
-  };
+  if (aBtn) aBtn.onclick = () => togglePanel('activity');
+
+  const backdrop = document.getElementById('drawer-backdrop');
+  if (backdrop) backdrop.onclick = () => { layout.drawer = null; relayout(); };
 
   let raf = 0;
   window.addEventListener('resize', () => {
@@ -997,9 +1032,7 @@ function initLayout() {
   relayout();
 }
 
-initTheme();
-initSkin();
-initPalette();
+initSettings();
 initLayout();
 loadRooms();
 setInterval(tick, 3000);

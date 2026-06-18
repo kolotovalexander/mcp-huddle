@@ -1308,3 +1308,92 @@
   --c-claude: #83a598; --c-codex: #b8bb26; --c-antigravity: #d3869b; --c-qwen: #fb4934;
   --c-mimo: #fabd2f; --c-deepseek: #8ec07c; --c-gemini: #d3869b; --c-human: #fe8019; --c-system: #928374;
 }
+
+    /* ════════════════════════════════════════════════════════════════
+       UI v2 — settings popover, collapsible room tree, drawer/overlay
+       responsive mode, resize-without-text-selection.
+       ════════════════════════════════════════════════════════════════ */
+
+    /* ── No text selection while dragging a resizer ──────────────── */
+    .panel-resizer { user-select: none; -webkit-user-select: none; }
+    body.resizing { cursor: col-resize !important; }
+    body.resizing * { user-select: none !important; -webkit-user-select: none !important; }
+
+    /* ── Fully hide a collapsed/auto-hidden side panel (no sliver) ─ */
+    .main.sidebar-off  > .sidebar  { display: none; }
+    .main.activity-off > .activity { display: none; }
+
+    /* ── Collapsible room tree (project / session groups) ────────── */
+    .proj-header, .sess-header { cursor: pointer; user-select: none; }
+    .proj-header { justify-content: flex-start; gap: 6px; }
+    .proj-header:hover .tree-label,
+    .sess-header:hover .tree-label { color: var(--text); }
+    .proj-header .count, .sess-header .count { margin-left: auto; opacity: .7; font-weight: 600; }
+    .tree-arrow {
+      display: inline-block; width: 10px; flex-shrink: 0;
+      font-size: 9px; opacity: .55; text-align: center;
+      transition: transform .15s ease;
+    }
+    .tree-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .proj-block.collapsed > .proj-header .tree-arrow,
+    .sess-group.collapsed > .sess-header .tree-arrow { transform: rotate(-90deg); }
+    .proj-block.collapsed > .proj-body { display: none; }
+    .sess-group.collapsed > .sess-rooms { display: none; }
+
+    /* ── Settings popover (single ⚙️ control for theme/skin/palette) ─ */
+    .settings-wrap { position: relative; display: inline-flex; }
+    .settings-popover {
+      position: absolute; top: calc(100% + 8px); right: 0; z-index: 60;
+      width: 280px; max-width: calc(100vw - 28px); padding: 12px;
+      background: var(--panel-bg);
+      backdrop-filter: blur(40px) saturate(180%);
+      -webkit-backdrop-filter: blur(40px) saturate(180%);
+      border: 1px solid var(--panel-border);
+      border-radius: 16px;
+      box-shadow: var(--shadow-card);
+      display: flex; flex-direction: column; gap: 12px;
+    }
+    .settings-popover[hidden] { display: none; }
+    .set-title {
+      font-size: 11px; font-weight: 700; text-transform: uppercase;
+      letter-spacing: .8px; color: var(--text-sub);
+    }
+    .set-row { display: flex; flex-direction: column; gap: 6px; }
+    .set-label { font-size: 11px; font-weight: 600; color: var(--text-muted); }
+    .set-seg { display: flex; flex-wrap: wrap; gap: 4px; }
+    .set-opt {
+      flex: 1 1 auto; min-width: 0;
+      padding: 6px 10px; border-radius: 9px;
+      background: var(--bubble-bg); border: 1px solid var(--bubble-border);
+      color: var(--text-muted); font: inherit; font-size: 11px; font-weight: 500;
+      cursor: pointer; white-space: nowrap;
+      transition: background .12s ease, color .12s ease, border-color .12s ease;
+    }
+    .set-opt:hover { color: var(--text); }
+    .set-opt.active {
+      color: var(--text); background: var(--active-bg);
+      border-color: var(--active-border); font-weight: 600;
+    }
+
+    /* ── Overlay / drawer mode for narrow viewports ──────────────── */
+    .drawer-backdrop {
+      position: fixed; inset: 0; z-index: 40;
+      background: rgba(0,0,0,.45);
+      backdrop-filter: blur(2px); -webkit-backdrop-filter: blur(2px);
+    }
+    .drawer-backdrop[hidden] { display: none; }
+    .main.overlay-mode { grid-template-columns: 1fr; }
+    .main.overlay-mode .panel-resizer { display: none; }
+    .main.overlay-mode .sidebar,
+    .main.overlay-mode .activity {
+      position: fixed;
+      top: var(--drawer-top, 80px); bottom: 14px;
+      width: var(--drawer-w, 320px);
+      z-index: 50; margin: 0;
+      box-shadow: 0 24px 60px -16px rgba(0,0,0,.6);
+      transition: transform .25s ease;
+    }
+    .main.overlay-mode .sidebar  { left: 14px;  transform: translateX(calc(-100% - 24px)); }
+    .main.overlay-mode .activity { right: 14px; transform: translateX(calc(100% + 24px)); }
+    .main.overlay-mode.drawer-sidebar-open  .sidebar  { transform: translateX(0); }
+    .main.overlay-mode.drawer-activity-open .activity { transform: translateX(0); }
