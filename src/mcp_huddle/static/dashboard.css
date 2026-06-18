@@ -1440,8 +1440,7 @@
     /* ── Overlay / drawer mode for narrow viewports ──────────────── */
     .drawer-backdrop {
       position: fixed; inset: 0; z-index: 40;
-      background: rgba(0,0,0,.45);
-      backdrop-filter: blur(2px); -webkit-backdrop-filter: blur(2px);
+      background: rgba(0,0,0,.30);  /* light dim for click-to-close; no blur */
     }
     .drawer-backdrop[hidden] { display: none; }
     .main.overlay-mode { grid-template-columns: 1fr; }
