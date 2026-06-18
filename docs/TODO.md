@@ -1,6 +1,6 @@
 # mcp-huddle — TODO / roadmap
 
-Open items, roughly by priority. See `docs/RELEASE_AUDIT.md` for the full audit.
+Open items, roughly by priority.
 
 ## Spawn / agents
 - [ ] **Interactive agent sessions (option).** Today every turn is a fresh

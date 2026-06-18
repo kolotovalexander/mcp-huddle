@@ -25,7 +25,7 @@ Or run it without installing, using [`uvx`](https://docs.astral.sh/uv/):
 uvx mcp-huddle --http        # HTTP + dashboard
 ```
 
-This is version **0.2.0**. See [CHANGELOG.md](CHANGELOG.md) for release notes.
+This is version **0.3.0**. See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## Two ways to run
 
