@@ -1,9 +1,37 @@
 <!DOCTYPE html>
-<html data-theme="dark">
+<html>
 <head>
   <meta charset="utf-8">
-  <title>Agent Bus</title>
+  <title>🤖 Agent Bus</title>
+  <meta name="color-scheme" content="dark light">
+  <link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🤖</text></svg>">
   <link rel="stylesheet" href="/static/dashboard.css">
+  <script>
+    // Apply saved/auto theme synchronously BEFORE first paint to avoid FOUC
+    // (white flash on dark theme during dashboard.js load).
+    (function() {
+      try {
+        var raw = localStorage.getItem('agentbus-theme');
+        var mode = (raw === 'dark' || raw === 'light' || raw === 'auto') ? raw : 'auto';
+        if (mode === 'auto') {
+          mode = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+        }
+        var skin = localStorage.getItem('agentbus-skin');
+        skin = (skin === 'web' || skin === 'code' || skin === 'glass') ? skin : 'glass';
+        document.documentElement.setAttribute('data-skin', skin);
+        var PALETTES = ['default','dracula','nord','tokyonight','catppuccin','gruvbox'];
+        var pal = localStorage.getItem('agentbus-palette');
+        pal = PALETTES.indexOf(pal) >= 0 ? pal : 'default';
+        document.documentElement.setAttribute('data-palette', pal);
+        // Non-default palettes are dark schemes → force dark structure pre-paint.
+        document.documentElement.setAttribute('data-theme', pal !== 'default' ? 'dark' : mode);
+      } catch (e) {
+        document.documentElement.setAttribute('data-theme', 'dark');
+        document.documentElement.setAttribute('data-skin', 'glass');
+        document.documentElement.setAttribute('data-palette', 'default');
+      }
+    })();
+  </script>
 </head>
 <body>
 <div class="bg-decor"></div>
@@ -14,25 +42,50 @@
       <div class="logo"><span>AB</span></div>
       <div class="brand-text">
         <div class="title">Agent Bus</div>
-        <div class="subtitle"><span id="room-count">0</span> rooms &middot; multi-agent discussion</div>
+        <div class="subtitle"><span id="room-count">0</span> <span data-i18n="app.subtitle">rooms &middot; multi-agent discussion</span></div>
       </div>
     </div>
     <div class="topbar-actions">
-      <button class="lq-btn" id="theme-toggle" title="Toggle theme">&#9680;</button>
-      <button class="lq-btn"><span class="dot dot-open pulse" style="color: var(--c-codex)"></span> live</button>
+      <button class="lq-btn" id="sidebar-collapse" title="Свернуть/развернуть список комнат">◧</button>
+      <button class="lq-btn" id="activity-collapse" title="Свернуть/развернуть панель активности">◨</button>
+      <button class="lq-btn" id="bulk-close-all" data-i18n="btn.closeAll" data-i18n-title="tip.closeAll">Close all</button>
+      <button class="lq-btn" id="bulk-delete-closed" data-i18n="btn.deleteClosed" data-i18n-title="tip.deleteClosed">Delete closed</button>
+      <button class="lq-btn danger" id="bulk-nuke" data-i18n-title="tip.nukeAll">🔥 <span data-i18n="btn.nukeAll">Nuke all</span></button>
+      <button class="lq-btn" id="settings-btn" data-i18n-title="tip.view" aria-haspopup="true" aria-expanded="false">⚙️ <span data-i18n="btn.view">View</span></button>
+      <button class="lq-btn"><span class="dot dot-open pulse" style="color: var(--c-codex)"></span> <span data-i18n="btn.live">live</span></button>
     </div>
   </header>
 
   <div class="main">
-    <aside class="sidebar lq-panel" id="room-list"></aside>
+    <aside class="sidebar lq-panel">
+      <div class="panel-head pc-left">
+        <button class="panel-collapse-btn" data-side="sidebar" data-i18n-title="tip.collapse" aria-label="collapse">◧</button>
+      </div>
+      <div class="sidebar-scroll" id="room-list"></div>
+    </aside>
+    <div class="panel-resizer" id="sidebar-resizer" title="Drag to resize · double-click to collapse"></div>
     <section class="chat lq-panel" id="chat-area">
       <div class="empty">
-        <div class="empty-title">Select a room</div>
-        <div class="empty-hint">Use room_create() from an agent to start a discussion</div>
+        <div class="empty-title" data-i18n="chat.selectRoom">Select a room</div>
+        <div class="empty-hint" data-i18n="chat.selectHint">Use room_create() from an agent to start a discussion</div>
       </div>
     </section>
+    <div class="panel-resizer" id="activity-resizer" title="Drag to resize · double-click to collapse"></div>
+    <aside class="activity lq-panel">
+      <div class="panel-head pc-right">
+        <button class="panel-collapse-btn" data-side="activity" data-i18n-title="tip.collapse" aria-label="collapse">◨</button>
+      </div>
+      <div class="activity-scroll" id="activity-panel">
+        <div class="activity-empty">
+          <div class="activity-empty-title" data-i18n="activity.title">Agent activity</div>
+          <div class="activity-empty-hint" data-i18n="activity.hint">Opens when you select a room with spawned agents</div>
+        </div>
+      </div>
+    </aside>
   </div>
+  <div class="drawer-backdrop" id="drawer-backdrop" hidden></div>
 </div>
+<div class="settings-popover" id="settings-popover" hidden></div>
 <script src="/static/dashboard.js"></script>
 </body>
 </html>

@@ -1,9 +1,9 @@
     /* ── Theme tokens ────────────────────────────────────────────── */
     :root[data-theme="dark"] {
-      --bg:        radial-gradient(ellipse at 20% 0%, #2a1f3a 0%, #0f1019 40%, #050507 100%);
-      --bg-img:    linear-gradient(135deg, #ff6b9d 0%, #c084fc 25%, #60a5fa 50%, #34d399 75%, #fbbf24 100%);
-      --bg-img-op: 0.5;
-      --noise-op:  0.04;
+      --bg:        radial-gradient(ellipse at 30% -10%, #161922 0%, #0c0e13 45%, #07080b 100%);
+      --bg-img:    linear-gradient(140deg, #1e40af 0%, #4338ca 50%, #0e7490 100%);
+      --bg-img-op: 0.18;
+      --noise-op:  0.05;
       --panel-bg:        rgba(20, 22, 32, 0.45);
       --panel-border:    rgba(255, 255, 255, 0.12);
       --text:       #f5f5f7;
@@ -27,14 +27,18 @@
       --avatar-stack-border: rgba(20,22,32,.6);
       --c-claude: #58a6ff;
       --c-codex:  #3fb950;
+      --c-antigravity: #a371f7;
+      --c-qwen:   #db61a2;
+      --c-mimo:   #d4a72c;
+      --c-deepseek: #39c5bb;
       --c-gemini: #bc8cff;
       --c-human:  #f78166;
       --c-system: #8b949e;
     }
     :root[data-theme="light"] {
-      --bg:        radial-gradient(ellipse at 20% 0%, #ffd6e8 0%, #f0f4ff 40%, #fafbff 100%);
-      --bg-img:    linear-gradient(135deg, #ff8fa3 0%, #b794f6 25%, #7dd3fc 50%, #6ee7b7 75%, #fde68a 100%);
-      --bg-img-op: 0.7;
+      --bg:        radial-gradient(ellipse at 30% -10%, #eef1f6 0%, #f6f8fb 45%, #fbfcfe 100%);
+      --bg-img:    linear-gradient(140deg, #3b82f6 0%, #6366f1 50%, #0891b2 100%);
+      --bg-img-op: 0.12;
       --noise-op:  0.03;
       --panel-bg:        rgba(255, 255, 255, 0.55);
       --panel-border:    rgba(255, 255, 255, 0.70);
@@ -59,6 +63,10 @@
       --avatar-stack-border: rgba(255,255,255,.7);
       --c-claude: #0969da;
       --c-codex:  #1a7f37;
+      --c-antigravity: #6639ba;
+      --c-qwen:   #bf3989;
+      --c-mimo:   #8a6d00;
+      --c-deepseek: #0f766e;
       --c-gemini: #8250df;
       --c-human:  #cf4319;
       --c-system: #57606a;
@@ -98,8 +106,95 @@
       padding: 14px;
       display: flex; flex-direction: column; gap: 12px;
     }
+    /* 5 tracks: sidebar | resizer | chat | resizer | activity.
+       Track widths come from JS-set CSS vars so any combination (expanded /
+       narrow rail / gone) works without a class explosion. A collapsed panel
+       becomes a thin 48px RAIL that still shows its expand button; the
+       activity panel is fully GONE (0) until a room is open. */
     .main {
-      flex: 1; display: flex; gap: 12px; min-height: 0;
+      flex: 1; display: grid;
+      grid-template-columns:
+        var(--sb-track, 248px) var(--sb-rsz, 6px) 1fr var(--act-rsz, 6px) var(--act-track, 380px);
+      gap: 12px;
+      min-height: 0;
+    }
+    .main.activity-gone > .activity { display: none; }
+    .main.sidebar-rail  > .sidebar  .sidebar-scroll,
+    .main.activity-rail > .activity .activity-scroll { display: none; }
+    .main.sidebar-rail  > .sidebar  .panel-head,
+    .main.activity-rail > .activity .panel-head { justify-content: center; }
+    .activity {
+      min-width: 0;
+      position: relative;
+      display: flex; flex-direction: column;
+      padding: 0;
+      overflow: hidden;
+    }
+    .activity-scroll {
+      flex: 1; min-height: 0;
+      display: flex; flex-direction: column;
+      padding: 14px 12px 12px;
+      overflow: hidden;
+    }
+    /* Panel header strip — holds the always-visible collapse/expand button
+       in its own reserved space, so it never overlaps panel content. */
+    .panel-head {
+      display: flex; align-items: center; flex-shrink: 0;
+      padding: 8px 8px 4px;
+    }
+    .panel-head.pc-left  { justify-content: flex-end; }   /* sidebar: toward the chat */
+    .panel-head.pc-right { justify-content: flex-start; } /* activity: toward the chat */
+    .panel-collapse-btn {
+      width: 26px; height: 26px; padding: 0; flex-shrink: 0;
+      display: flex; align-items: center; justify-content: center;
+      border-radius: 8px; line-height: 1; font-size: 14px; font-weight: 600;
+      background: var(--active-bg); color: var(--text-muted);
+      border: 1px solid var(--panel-border);
+      cursor: pointer;
+      transition: color .15s ease, background .15s ease;
+    }
+    .panel-collapse-btn:hover { color: var(--text); }
+    .activity-empty {
+      color: var(--text-muted);
+      padding: 18px 8px;
+      text-align: center;
+      font-size: 12px; line-height: 1.6;
+    }
+    .activity-empty-title {
+      font-weight: 600; color: var(--text-sub);
+      margin-bottom: 4px;
+    }
+    .panel-resizer {
+      cursor: col-resize;
+      background: transparent;
+      position: relative;
+      transition: background .15s ease;
+      touch-action: none;
+    }
+    /* Wider invisible grab zone (±5px) so the whole edge is easy to grab
+       anywhere along its height — the event still targets the resizer. */
+    .panel-resizer::before {
+      content: '';
+      position: absolute;
+      top: 0; bottom: 0; left: -5px; right: -5px;
+    }
+    /* Full-height draggable indicator: a faint hairline always, brighter on
+       hover/drag — makes clear you can grab anywhere along the edge, not just
+       a centre handle. */
+    .panel-resizer::after {
+      content: '';
+      position: absolute;
+      left: 50%; top: 6px; bottom: 6px;
+      transform: translateX(-50%);
+      width: 2px;
+      border-radius: 2px;
+      background: rgba(128,128,128,0.18);
+      transition: background .15s ease, width .15s ease;
+    }
+    .panel-resizer:hover::after,
+    .panel-resizer.dragging::after {
+      background: var(--c-codex, #6aa9ff);
+      width: 3px;
     }
 
     /* ── Liquid panel base ───────────────────────────────────────── */
@@ -123,8 +218,8 @@
     .brand { display: flex; align-items: center; gap: 12px; }
     .logo {
       width: 30px; height: 30px; border-radius: 50%;
-      background: conic-gradient(from 180deg, #ff6b9d, #c084fc, #60a5fa, #34d399, #fbbf24, #ff6b9d);
-      box-shadow: inset 0 0 0 2px rgba(255,255,255,.3), 0 2px 8px rgba(0,0,0,.15);
+      background: linear-gradient(145deg, #3b82f6 0%, #4f46e5 60%, #0e7490 100%);
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,.18), 0 2px 8px rgba(0,0,0,.25);
       display: flex; align-items: center; justify-content: center;
     }
     .logo span {
@@ -163,13 +258,24 @@
     }
     .lq-btn:hover { color: var(--text); }
     .lq-btn.danger { color: var(--c-human); }
+    .lq-btn.active {
+      color: var(--text);
+      background: var(--active-bg);
+      border-color: var(--active-border);
+    }
 
     /* ── Sidebar ─────────────────────────────────────────────────── */
     .sidebar {
-      width: 248px;
+      min-width: 0;
+      padding: 0;
+      overflow: hidden;
+      position: relative;
+      display: flex; flex-direction: column;
+    }
+    .sidebar-scroll {
+      flex: 1; min-height: 0;
+      overflow-y: auto; overflow-x: hidden;
       padding: 14px 0;
-      overflow-y: auto;
-      flex-shrink: 0;
     }
     .empty-sidebar {
       padding: 20px 18px; font-size: 12px;
@@ -276,6 +382,10 @@
     .avatar-md { width: 32px; height: 32px; font-size: 14px; }
     .avatar-claude  { background: radial-gradient(circle at 30% 25%, var(--c-claude) 0%, color-mix(in srgb, var(--c-claude) 80%, transparent) 70%); box-shadow: inset 0 1px 0 rgba(255,255,255,.4), inset 0 -1px 0 rgba(0,0,0,.15), 0 2px 6px -1px color-mix(in srgb, var(--c-claude) 50%, transparent); }
     .avatar-codex   { background: radial-gradient(circle at 30% 25%, var(--c-codex) 0%, color-mix(in srgb, var(--c-codex) 80%, transparent) 70%); box-shadow: inset 0 1px 0 rgba(255,255,255,.4), inset 0 -1px 0 rgba(0,0,0,.15), 0 2px 6px -1px color-mix(in srgb, var(--c-codex) 50%, transparent); }
+    .avatar-antigravity { background: radial-gradient(circle at 30% 25%, var(--c-antigravity) 0%, color-mix(in srgb, var(--c-antigravity) 80%, transparent) 70%); box-shadow: inset 0 1px 0 rgba(255,255,255,.4), inset 0 -1px 0 rgba(0,0,0,.15), 0 2px 6px -1px color-mix(in srgb, var(--c-antigravity) 50%, transparent); }
+    .avatar-qwen    { background: radial-gradient(circle at 30% 25%, var(--c-qwen) 0%, color-mix(in srgb, var(--c-qwen) 80%, transparent) 70%); box-shadow: inset 0 1px 0 rgba(255,255,255,.4), inset 0 -1px 0 rgba(0,0,0,.15), 0 2px 6px -1px color-mix(in srgb, var(--c-qwen) 50%, transparent); }
+    .avatar-mimo    { background: radial-gradient(circle at 30% 25%, var(--c-mimo) 0%, color-mix(in srgb, var(--c-mimo) 80%, transparent) 70%); box-shadow: inset 0 1px 0 rgba(255,255,255,.4), inset 0 -1px 0 rgba(0,0,0,.15), 0 2px 6px -1px color-mix(in srgb, var(--c-mimo) 50%, transparent); }
+    .avatar-deepseek { background: radial-gradient(circle at 30% 25%, var(--c-deepseek) 0%, color-mix(in srgb, var(--c-deepseek) 80%, transparent) 70%); box-shadow: inset 0 1px 0 rgba(255,255,255,.4), inset 0 -1px 0 rgba(0,0,0,.15), 0 2px 6px -1px color-mix(in srgb, var(--c-deepseek) 50%, transparent); }
     .avatar-gemini  { background: radial-gradient(circle at 30% 25%, var(--c-gemini) 0%, color-mix(in srgb, var(--c-gemini) 80%, transparent) 70%); box-shadow: inset 0 1px 0 rgba(255,255,255,.4), inset 0 -1px 0 rgba(0,0,0,.15), 0 2px 6px -1px color-mix(in srgb, var(--c-gemini) 50%, transparent); }
     .avatar-human   { background: radial-gradient(circle at 30% 25%, var(--c-human) 0%, color-mix(in srgb, var(--c-human) 80%, transparent) 70%); box-shadow: inset 0 1px 0 rgba(255,255,255,.4), inset 0 -1px 0 rgba(0,0,0,.15), 0 2px 6px -1px color-mix(in srgb, var(--c-human) 50%, transparent); }
     .avatar-system  { background: radial-gradient(circle at 30% 25%, var(--c-system) 0%, color-mix(in srgb, var(--c-system) 80%, transparent) 70%); }
@@ -314,6 +424,10 @@
     }
     .agent-claude  .msg-name { color: var(--c-claude); }
     .agent-codex   .msg-name { color: var(--c-codex); }
+    .agent-antigravity .msg-name { color: var(--c-antigravity); }
+    .agent-qwen    .msg-name { color: var(--c-qwen); }
+    .agent-mimo    .msg-name { color: var(--c-mimo); }
+    .agent-deepseek .msg-name { color: var(--c-deepseek); }
     .agent-gemini  .msg-name { color: var(--c-gemini); }
     .agent-human   .msg-name { color: var(--c-human); }
     .agent-system  .msg-name { color: var(--c-system); }
@@ -361,6 +475,60 @@
       line-height: 1.55; letter-spacing: -0.1px;
       white-space: pre-wrap; word-break: break-word;
     }
+
+    /* ── Markdown rendering inside message bubbles (Telegram-style) ─── */
+    .msg-body.md { white-space: normal; }
+    .msg-body.md > *:first-child { margin-top: 0; }
+    .msg-body.md > *:last-child  { margin-bottom: 0; }
+    .md-line  { margin: 3px 0; }
+    .md-line:empty { display: none; }
+    .md-h {
+      font-weight: 700; line-height: 1.3;
+      margin: 12px 0 5px;
+    }
+    .md-h1 { font-size: 1.32em; }
+    .md-h2 { font-size: 1.18em; }
+    .md-h3 { font-size: 1.07em; }
+    .md-h4, .md-h5, .md-h6 {
+      font-size: 0.95em; color: var(--text-muted);
+      text-transform: uppercase; letter-spacing: 0.04em;
+    }
+    .md-list { margin: 5px 0 5px 1.35em; padding: 0; }
+    .md-list li { margin: 2px 0; }
+    .md-list li::marker { color: var(--text-sub); }
+    .msg-body.md code {
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 0.86em;
+      background: rgba(128,128,128,0.18);
+      padding: 1px 5px; border-radius: 5px;
+      word-break: break-word;
+    }
+    .md-pre {
+      margin: 7px 0; padding: 10px 12px;
+      background: rgba(128,128,128,0.14);
+      border: 1px solid var(--bubble-border);
+      border-radius: 10px;
+      overflow-x: auto;
+    }
+    .md-pre code {
+      background: none; padding: 0;
+      font-size: 0.84em; line-height: 1.5;
+      white-space: pre;
+    }
+    .md-quote {
+      margin: 5px 0; padding: 2px 0 2px 11px;
+      border-left: 3px solid var(--text-sub);
+      color: var(--text-muted);
+    }
+    .md-hr {
+      border: none; border-top: 1px solid var(--bubble-border);
+      margin: 11px 0;
+    }
+    .msg-body.md a { color: var(--c-claude); text-decoration: none; }
+    .msg-body.md a:hover { text-decoration: underline; }
+    .msg-body.md strong { font-weight: 700; }
+    .msg-body.md em { font-style: italic; }
+    .msg-body.md del { opacity: 0.6; }
 
     /* Reply quote */
     .reply {
@@ -434,13 +602,911 @@
     }
 
     /* ── Scrollbars ──────────────────────────────────────────────── */
-    .sidebar::-webkit-scrollbar,
+    .sidebar-scroll::-webkit-scrollbar,
     .messages::-webkit-scrollbar { width: 6px; }
-    .sidebar::-webkit-scrollbar-thumb,
+    .sidebar-scroll::-webkit-scrollbar-thumb,
     .messages::-webkit-scrollbar-thumb {
       background: rgba(255,255,255,0.08); border-radius: 3px;
     }
-    [data-theme="light"] .sidebar::-webkit-scrollbar-thumb,
+    [data-theme="light"] .sidebar-scroll::-webkit-scrollbar-thumb,
     [data-theme="light"] .messages::-webkit-scrollbar-thumb {
       background: rgba(0,0,0,0.10);
     }
+
+    /* ── Phase 1: Agent activity panels (live event stream) ───────── */
+    .agent-panels {
+      flex: 1; min-height: 0;
+      display: flex; flex-direction: column; gap: 6px;
+    }
+    .agent-panels-header {
+      font-size: 11px; color: var(--text-sub);
+      text-transform: uppercase; letter-spacing: 0.06em;
+      padding: 0 4px 6px;
+      flex-shrink: 0;
+    }
+    /* Scrollable list of agent panels — lets the whole side column be
+       paged through when there are many participants / long event logs. */
+    .agent-panels-scroll {
+      flex: 1; min-height: 0;
+      overflow-y: auto; overscroll-behavior: contain;
+      display: flex; flex-direction: column; gap: 6px;
+      padding-right: 3px;
+    }
+    .agent-panels-scroll::-webkit-scrollbar { width: 6px; }
+    .agent-panels-scroll::-webkit-scrollbar-thumb {
+      background: rgba(255,255,255,0.10); border-radius: 3px;
+    }
+    [data-theme="light"] .agent-panels-scroll::-webkit-scrollbar-thumb {
+      background: rgba(0,0,0,0.12);
+    }
+    .agent-panel {
+      background: rgba(255,255,255,0.02);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+      flex: 0 0 auto;
+      display: flex; flex-direction: column;
+      min-height: 0;
+    }
+    .agent-panel[open] {
+      flex: 0 0 auto;
+      background: rgba(255,255,255,0.03);
+    }
+    [data-theme="light"] .agent-panel {
+      background: rgba(0,0,0,0.02);
+    }
+    [data-theme="light"] .agent-panel[open] {
+      background: rgba(0,0,0,0.03);
+    }
+    .agent-panel-summary {
+      display: flex; align-items: center; gap: 8px;
+      padding: 8px 10px;
+      cursor: pointer;
+      list-style: none;
+      font-size: 12px;
+    }
+    .agent-panel-summary::-webkit-details-marker { display: none; }
+    .agent-panel-name {
+      font-weight: 600;
+      color: var(--text);
+    }
+    .agent-panel-totals {
+      margin-left: auto;
+      font-size: 10px;
+      color: var(--text-muted);
+      font-family: ui-monospace, monospace;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 60%;
+    }
+    .agent-panel-status {
+      font-size: 10px;
+      color: var(--text-sub);
+      font-family: ui-monospace, monospace;
+      flex-shrink: 0;
+    }
+    /* Wake-health badge: stale lease / failed wake (N4 health view). */
+    .agent-panel-health {
+      font-size: 10px;
+      font-family: ui-monospace, monospace;
+      color: var(--text-sub);
+      flex-shrink: 0;
+    }
+    .agent-panel-health.warn {
+      color: #d29922;
+      font-weight: 600;
+    }
+    .msg-meta {
+      font-size: 10px;
+      color: var(--text-muted);
+      font-family: ui-monospace, monospace;
+      padding: 1px 6px;
+      border-radius: 999px;
+      background: rgba(128,128,128,0.10);
+      margin-left: 4px;
+    }
+    .agent-events {
+      max-height: 38vh;
+      min-height: 0;
+      overflow-y: auto; overscroll-behavior: contain;
+      padding: 6px 10px 8px;
+      font-family: ui-monospace, "SF Mono", Consolas, monospace;
+      font-size: 11px;
+      line-height: 1.45;
+      color: var(--text-sub);
+    }
+    .agent-events::-webkit-scrollbar { width: 6px; }
+    .agent-events::-webkit-scrollbar-thumb {
+      background: rgba(255,255,255,0.10); border-radius: 3px;
+    }
+    [data-theme="light"] .agent-events::-webkit-scrollbar-thumb {
+      background: rgba(0,0,0,0.12);
+    }
+    /* Word-wrap event lines to the panel width instead of clipping them. */
+    .agent-event {
+      padding: 2px 0;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      cursor: help;
+    }
+    .agent-event:hover {
+      color: var(--text);
+      background: rgba(255,255,255,0.04);
+    }
+    [data-theme="light"] .agent-event:hover {
+      background: rgba(0,0,0,0.04);
+    }
+
+    /* Static (non-spawned) participant panel — e.g. the room owner Claude,
+       who posts in chat but has no huddle-spawned live event stream. */
+    .agent-panel-hint {
+      padding: 7px 10px 9px;
+      font-size: 11px; line-height: 1.5;
+      color: var(--text-sub);
+    }
+    .agent-status-dot {
+      width: 7px; height: 7px; border-radius: 50%;
+      flex-shrink: 0;
+      background: var(--c-system);
+    }
+    .agent-status-dot.online  { background: var(--c-codex); }
+    .agent-status-dot.busy    { background: #d29922; }
+    .agent-status-dot.offline { background: var(--c-system); opacity: 0.5; }
+
+    /* ════════════════════════════════════════════════════════════════
+       SKINS — selectable visual identities (orthogonal to data-theme).
+       data-skin unset / "glass" = the default Liquid Glass look above.
+       data-skin="web"  = claude.ai web app look (flat, warm dark).
+       data-skin="code" = Claude Code IDE look (compact, neutral dark).
+       Skin rules out-specify the base by carrying the [data-skin=...]
+       attribute selector, so they win without !important.
+       ════════════════════════════════════════════════════════════════ */
+
+/* === SKIN:web START === */
+
+/* ── Dark token overrides ──────────────────────────────────────── */
+:root[data-skin="web"][data-theme="dark"] {
+  --bg:        #1f1e1d;
+  --bg-img:    none;
+  --bg-img-op: 0;
+  --noise-op:  0;
+  --panel-bg:     #2a2927;
+  --panel-border: rgba(255,255,255,0.07);
+  --text:       #f0ede6;
+  --text-muted: rgba(240,237,230,0.55);
+  --text-sub:   rgba(240,237,230,0.34);
+  --active-bg:     #373532;
+  --active-border: rgba(255,255,255,0.09);
+  --bubble-bg:     #323030;
+  --bubble-border: rgba(255,255,255,0.06);
+  --input-bg:      #2e2d2b;
+  --input-border:  rgba(255,255,255,0.08);
+  --reply-bg:      rgba(255,255,255,0.04);
+  --reply-border:  rgba(255,255,255,0.05);
+  --inset-top:          rgba(255,255,255,0.04);
+  --inset-bot:          rgba(0,0,0,0.10);
+  --inset-strong-top:   rgba(255,255,255,0.05);
+  --shadow:        0 2px 12px -4px rgba(0,0,0,0.35);
+  --shadow-card:   0 1px 0 var(--inset-top) inset, var(--shadow);
+  --shadow-bubble: none;
+  --avatar-fg:           #1f1e1d;
+  --avatar-stack-border: rgba(42,41,39,0.9);
+  --c-claude:      #5ba3f5;
+  --c-codex:       #3fb950;
+  --c-antigravity: #a879f5;
+  --c-qwen:        #d96fa8;
+  --c-mimo:        #c99e28;
+  --c-deepseek:    #35bdb4;
+  --c-gemini:      #b88ef8;
+  --c-human:       #d97757;   /* coral — send button accent */
+  --c-system:      #8b8a87;
+}
+
+/* ── Light token overrides ─────────────────────────────────────── */
+:root[data-skin="web"][data-theme="light"] {
+  --bg:        #f5f4ef;
+  --bg-img:    none;
+  --bg-img-op: 0;
+  --noise-op:  0;
+  --panel-bg:     #ffffff;
+  --panel-border: rgba(0,0,0,0.07);
+  --text:       #1a1917;
+  --text-muted: rgba(26,25,23,0.55);
+  --text-sub:   rgba(26,25,23,0.36);
+  --active-bg:     #f0ede6;
+  --active-border: rgba(0,0,0,0.07);
+  --bubble-bg:     #f7f6f1;
+  --bubble-border: rgba(0,0,0,0.06);
+  --input-bg:      #f5f4ef;
+  --input-border:  rgba(0,0,0,0.09);
+  --reply-bg:      rgba(0,0,0,0.04);
+  --reply-border:  rgba(0,0,0,0.05);
+  --inset-top:          rgba(255,255,255,0.80);
+  --inset-bot:          rgba(0,0,0,0.04);
+  --inset-strong-top:   rgba(255,255,255,0.90);
+  --shadow:        0 2px 12px -4px rgba(0,0,0,0.10);
+  --shadow-card:   0 1px 0 var(--inset-top) inset, var(--shadow);
+  --shadow-bubble: none;
+  --avatar-fg:           #ffffff;
+  --avatar-stack-border: rgba(245,244,239,0.9);
+  --c-claude:      #1d6fc4;
+  --c-codex:       #1a7f37;
+  --c-antigravity: #6d3ec8;
+  --c-qwen:        #b33e86;
+  --c-mimo:        #8a6800;
+  --c-deepseek:    #117a74;
+  --c-gemini:      #7c3fc4;
+  --c-human:       #c96442;   /* coral — send button accent */
+  --c-system:      #5a5956;
+}
+
+/* ── Kill decorative blur blobs ────────────────────────────────── */
+[data-skin="web"] .bg-decor,
+[data-skin="web"] .bg-noise { display: none; }
+
+/* ── Flat body background ──────────────────────────────────────── */
+[data-skin="web"] body { background: var(--bg); }
+
+/* ── Panel: no glass, solid fill, gentle radius ────────────────── */
+[data-skin="web"] .lq-panel {
+  background: var(--panel-bg);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  border: 1px solid var(--panel-border);
+  border-radius: 14px;
+  box-shadow: var(--shadow-card);
+}
+
+/* ── Topbar: flat bar, not a pill ──────────────────────────────── */
+[data-skin="web"] .topbar {
+  border-radius: 12px;
+  background: var(--panel-bg);
+  border-color: var(--panel-border);
+  box-shadow: var(--shadow-card);
+}
+
+/* ── Logo: simple solid monogram, no conic rainbow ─────────────── */
+[data-skin="web"] .logo {
+  background: var(--c-human);
+  box-shadow: none;
+}
+[data-skin="web"] .logo span {
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  color: #fff;
+}
+
+/* ── Buttons: flat, no glass ───────────────────────────────────── */
+[data-skin="web"] .lq-btn {
+  border-radius: 9px;
+  background: var(--active-bg);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  border: 1px solid var(--panel-border);
+  box-shadow: none;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+[data-skin="web"] .lq-btn:hover {
+  background: var(--bubble-bg);
+  color: var(--text);
+}
+[data-skin="web"] .lq-btn.danger { color: var(--c-human); }
+:root[data-skin="web"][data-theme="light"] .lq-btn {
+  background: #f0ede6;
+  border-color: rgba(0,0,0,0.08);
+  box-shadow: none;
+}
+
+/* ── Sidebar active item: solid warm highlight, no glow ─────────── */
+[data-skin="web"] .room-item { border-radius: 10px; }
+[data-skin="web"] .room-item:hover { background: var(--active-bg); }
+[data-skin="web"] .room-item.active {
+  background: var(--active-bg);
+  border-color: var(--active-border);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  box-shadow: none;
+}
+
+/* ── Message bubbles: flat, warm fill ──────────────────────────── */
+[data-skin="web"] .msg-bubble {
+  background: var(--bubble-bg);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  border: 1px solid var(--bubble-border);
+  border-radius: 14px;
+  box-shadow: none;
+}
+
+/* ── Kind pills: no backdrop-filter ───────────────────────────── */
+[data-skin="web"] .kind {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  box-shadow: none;
+  border-radius: 6px;
+}
+
+/* ── System message pill ───────────────────────────────────────── */
+[data-skin="web"] .msg.is-system .msg-body { border-radius: 8px; }
+
+/* ── Input row: flat, softer radius ───────────────────────────── */
+[data-skin="web"] .input-row {
+  background: var(--input-bg);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  border: 1px solid var(--input-border);
+  border-radius: 14px;
+  box-shadow: none;
+}
+
+/* ── Send button: solid coral, no glow ────────────────────────── */
+[data-skin="web"] .send-btn {
+  background: var(--c-human);
+  border-radius: 10px;
+  box-shadow: none;
+}
+[data-skin="web"] .send-btn:hover:not(:disabled) { filter: brightness(1.06); }
+
+/* ── Code blocks: dark slate with subtle border ─────────────────── */
+[data-skin="web"] .md-pre {
+  background: rgba(0,0,0,0.18);
+  border: 1px solid rgba(255,255,255,0.07);
+  border-radius: 8px;
+}
+:root[data-skin="web"][data-theme="light"] .md-pre {
+  background: #edeae2;
+  border-color: rgba(0,0,0,0.07);
+}
+[data-skin="web"] .msg-body.md code {
+  background: rgba(0,0,0,0.14);
+  border-radius: 4px;
+}
+:root[data-skin="web"][data-theme="light"] .msg-body.md code {
+  background: rgba(0,0,0,0.07);
+}
+
+/* ── Agent panels: match flat style ───────────────────────────── */
+[data-skin="web"] .agent-panel {
+  background: var(--active-bg);
+  border-color: var(--panel-border);
+  border-radius: 10px;
+}
+[data-skin="web"] .agent-panel[open] { background: var(--active-bg); }
+
+/* ── Scrollbars: warm tint ─────────────────────────────────────── */
+[data-skin="web"] .sidebar-scroll::-webkit-scrollbar-thumb,
+[data-skin="web"] .messages::-webkit-scrollbar-thumb,
+[data-skin="web"] .agent-panels-scroll::-webkit-scrollbar-thumb,
+[data-skin="web"] .agent-events::-webkit-scrollbar-thumb {
+  background: rgba(255,255,255,0.10);
+  border-radius: 3px;
+}
+:root[data-skin="web"][data-theme="light"] .sidebar-scroll::-webkit-scrollbar-thumb,
+:root[data-skin="web"][data-theme="light"] .messages::-webkit-scrollbar-thumb,
+:root[data-skin="web"][data-theme="light"] .agent-panels-scroll::-webkit-scrollbar-thumb,
+:root[data-skin="web"][data-theme="light"] .agent-events::-webkit-scrollbar-thumb {
+  background: rgba(0,0,0,0.12);
+}
+
+/* === SKIN:web END === */
+
+/* === SKIN:code START === */
+
+/* ─── Dark tokens ─────────────────────────────────────────────── */
+:root[data-skin="code"][data-theme="dark"] {
+  --bg:               #0a0a0c;
+  --bg-img:           none;
+  --bg-img-op:        0;
+  --noise-op:         0;
+  --panel-bg:         #141416;
+  --panel-border:     rgba(255,255,255,0.07);
+  --text:             #e6e6e6;
+  --text-muted:       #9a9a9a;
+  --text-sub:         #666670;
+  --active-bg:        rgba(255,255,255,0.06);
+  --active-border:    #4c8ef7;
+  --bubble-bg:        #1c1c1f;
+  --bubble-border:    rgba(255,255,255,0.07);
+  --input-bg:         #0d0d0f;
+  --input-border:     rgba(255,255,255,0.10);
+  --reply-bg:         rgba(255,255,255,0.04);
+  --reply-border:     rgba(255,255,255,0.12);
+  --inset-top:        rgba(255,255,255,0.04);
+  --inset-bot:        rgba(0,0,0,0.30);
+  --inset-strong-top: rgba(255,255,255,0.08);
+  --shadow:           none;
+  --shadow-card:      none;
+  --shadow-bubble:    none;
+  --avatar-fg:        #e6e6e6;
+  --avatar-stack-border: #141416;
+  --c-claude:         #58a6ff;
+  --c-codex:          #3fb950;
+  --c-antigravity:    #b083f8;
+  --c-qwen:           #e06db0;
+  --c-mimo:           #d4a72c;
+  --c-deepseek:       #3dcfca;
+  --c-gemini:         #c39dff;
+  --c-human:          #f78166;
+  --c-system:         #8b949e;
+}
+
+/* ─── Light tokens ─────────────────────────────────────────────── */
+:root[data-skin="code"][data-theme="light"] {
+  --bg:               #f0f0f2;
+  --bg-img:           none;
+  --bg-img-op:        0;
+  --noise-op:         0;
+  --panel-bg:         #ffffff;
+  --panel-border:     rgba(0,0,0,0.08);
+  --text:             #1f1f1f;
+  --text-muted:       #5a5a5a;
+  --text-sub:         #8a8a8a;
+  --active-bg:        rgba(0,0,0,0.06);
+  --active-border:    #e05a42;
+  --bubble-bg:        #f5f5f7;
+  --bubble-border:    rgba(0,0,0,0.07);
+  --input-bg:         #f9f9fb;
+  --input-border:     rgba(0,0,0,0.12);
+  --reply-bg:         rgba(0,0,0,0.03);
+  --reply-border:     rgba(0,0,0,0.12);
+  --inset-top:        rgba(255,255,255,0.70);
+  --inset-bot:        rgba(0,0,0,0.06);
+  --inset-strong-top: rgba(255,255,255,0.90);
+  --shadow:           none;
+  --shadow-card:      none;
+  --shadow-bubble:    none;
+  --avatar-fg:        #1f1f1f;
+  --avatar-stack-border: #ffffff;
+  --c-claude:         #1a6fd4;
+  --c-codex:          #1a7f36;
+  --c-antigravity:    #7c4dcc;
+  --c-qwen:           #b5367e;
+  --c-mimo:           #a07a10;
+  --c-deepseek:       #1a9e99;
+  --c-gemini:         #7c5bcc;
+  --c-human:          #c94b32;
+  --c-system:         #5a6472;
+}
+
+/* ─── Kill decorative layers ───────────────────────────────────── */
+[data-skin="code"] .bg-decor,
+[data-skin="code"] .bg-noise { display: none !important; }
+
+/* ─── App background ───────────────────────────────────────────── */
+[data-skin="code"] body { background: var(--bg); }
+
+/* ─── Panels: flat IDE surfaces ────────────────────────────────── */
+[data-skin="code"] .lq-panel {
+  background:        var(--panel-bg);
+  border:            1px solid var(--panel-border);
+  border-radius:     10px;
+  backdrop-filter:   none;
+  -webkit-backdrop-filter: none;
+  box-shadow:        none;
+}
+
+/* ─── Topbar: flat bar, not pill ───────────────────────────────── */
+[data-skin="code"] .topbar {
+  border-radius: 10px;
+  border-bottom: 1px solid var(--panel-border);
+}
+[data-skin="code"] .brand-text .subtitle {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.70rem;
+  color: var(--text-sub);
+  letter-spacing: 0.02em;
+}
+
+/* ─── Buttons ───────────────────────────────────────────────────── */
+[data-skin="code"] .lq-btn {
+  border-radius:     6px;
+  backdrop-filter:   none;
+  -webkit-backdrop-filter: none;
+  background:        transparent;
+  border:            1px solid var(--panel-border);
+  color:             var(--text-muted);
+  font-size:         0.76rem;
+  transition:        background 0.12s, border-color 0.12s, color 0.12s;
+}
+[data-skin="code"] .lq-btn:hover {
+  background:        var(--active-bg);
+  border-color:      rgba(255,255,255,0.14);
+  color:             var(--text);
+}
+[data-skin="code"] .lq-btn.danger {
+  border-color: rgba(220,80,60,0.30);
+  color: #e05a42;
+}
+[data-skin="code"] .lq-btn.danger:hover { background: rgba(220,80,60,0.10); }
+
+/* ─── Sidebar ───────────────────────────────────────────────────── */
+[data-skin="code"] .sidebar { border-right: 1px solid var(--panel-border); }
+[data-skin="code"] .proj-header {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.68rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-sub);
+}
+[data-skin="code"] .room-item {
+  border-radius: 6px;
+  transition: background 0.10s;
+}
+[data-skin="code"] .room-item:hover { background: var(--active-bg); }
+[data-skin="code"] .room-item.active {
+  background:  var(--active-bg);
+  box-shadow:  inset 2px 0 0 var(--active-border);
+}
+[data-skin="code"] .room-meta {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.65rem;
+  color: var(--text-sub);
+}
+
+/* ─── Chat header ───────────────────────────────────────────────── */
+[data-skin="code"] .chat-title .hash,
+[data-skin="code"] .chat-title {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  letter-spacing: 0.01em;
+}
+[data-skin="code"] .chat-meta {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.70rem;
+  color: var(--text-sub);
+}
+
+/* ─── Messages ──────────────────────────────────────────────────── */
+[data-skin="code"] .msg-bubble {
+  background:      var(--bubble-bg);
+  border:          1px solid var(--bubble-border);
+  border-radius:   8px;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  box-shadow:      none;
+}
+[data-skin="code"] .msg-time {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.64rem;
+  color: var(--text-sub);
+}
+[data-skin="code"] .kind {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size:   0.60rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  border-radius: 4px;
+  padding: 1px 5px;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+/* ─── Reply quote ───────────────────────────────────────────────── */
+[data-skin="code"] .reply {
+  background:   var(--reply-bg);
+  border-left:  2px solid var(--reply-border);
+  border-radius: 0 4px 4px 0;
+}
+
+/* ─── Input row ─────────────────────────────────────────────────── */
+[data-skin="code"] .input-row {
+  background:      var(--input-bg);
+  border:          1px solid var(--input-border);
+  border-radius:   8px;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  box-shadow:      none;
+}
+[data-skin="code"] .send-btn {
+  background:    var(--c-human);
+  border-radius: 6px;
+  border:        none;
+  color:         #fff;
+  font-size:     0.78rem;
+  font-weight:   600;
+  padding:       4px 14px;
+  transition:    opacity 0.12s;
+}
+[data-skin="code"] .send-btn:hover:not(:disabled) { opacity: 0.85; }
+
+/* ─── Code blocks ───────────────────────────────────────────────── */
+[data-skin="code"] .md-pre {
+  background:    var(--input-bg);
+  border:        1px solid var(--panel-border);
+  border-radius: 6px;
+  padding:       10px 14px;
+  box-shadow:    none;
+}
+[data-skin="code"] .md-pre code { font-size: 0.84em; }
+
+/* ─── Activity panel ────────────────────────────────────────────── */
+[data-skin="code"] .agent-panel-name {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.78rem;
+}
+[data-skin="code"] .agent-panel-totals,
+[data-skin="code"] .agent-panel-status {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.65rem;
+  color: var(--text-sub);
+}
+[data-skin="code"] .agent-event {
+  border-bottom: 1px solid var(--panel-border);
+}
+
+/* ─── Avatar stack ──────────────────────────────────────────────── */
+[data-skin="code"] .avatar-stack .avatar { border-color: var(--avatar-stack-border); }
+
+/* ─── Empty state ───────────────────────────────────────────────── */
+[data-skin="code"] .empty-title {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 1rem;
+  color: var(--text-muted);
+}
+[data-skin="code"] .empty-hint {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.76rem;
+  color: var(--text-sub);
+}
+
+/* === SKIN:code END === */
+
+    /* ════════════════════════════════════════════════════════════════
+       PALETTES — popular terminal/Ghostty color schemes (data-palette).
+       "default" = no override (keeps the skin's own colours). The five
+       schemes are flat dark palettes: they zero the gradient (--bg-img)
+       and recolour every token + agent accent. Selectors carry
+       [data-palette][data-theme] (0,3,0) and sit AFTER the skins, so
+       they win over a skin's colour tokens by source order while the
+       skin's STRUCTURE (blur / radius / mono) is preserved. Each scheme
+       is applied in both light & dark mode (terminal themes are dark).
+       ════════════════════════════════════════════════════════════════ */
+
+/* ── Dracula ───────────────────────────────────────────────────── */
+:root[data-palette="dracula"][data-theme="dark"],
+:root[data-palette="dracula"][data-theme="light"] {
+  --bg: #282a36; --bg-img: none; --bg-img-op: 0; --noise-op: 0.04;
+  --panel-bg: rgba(52,55,70,0.72); --panel-border: rgba(255,255,255,0.08);
+  --text: #f8f8f2; --text-muted: rgba(248,248,242,0.60); --text-sub: rgba(248,248,242,0.38);
+  --active-bg: rgba(68,71,90,0.70); --active-border: rgba(189,147,249,0.45);
+  --bubble-bg: rgba(68,71,90,0.35); --bubble-border: rgba(255,255,255,0.07);
+  --input-bg: rgba(40,42,54,0.60); --input-border: rgba(255,255,255,0.10);
+  --reply-bg: rgba(255,255,255,0.04); --reply-border: rgba(255,255,255,0.06);
+  --shadow: 0 16px 40px -22px rgba(0,0,0,0.7);
+  --shadow-card: 0 1px 0 var(--inset-top) inset, var(--shadow); --shadow-bubble: none;
+  --avatar-fg: #282a36; --avatar-stack-border: rgba(40,42,54,0.7);
+  --c-claude: #8be9fd; --c-codex: #50fa7b; --c-antigravity: #bd93f9; --c-qwen: #ff79c6;
+  --c-mimo: #f1fa8c; --c-deepseek: #8be9fd; --c-gemini: #bd93f9; --c-human: #ffb86c; --c-system: #6272a4;
+}
+
+/* ── Nord ──────────────────────────────────────────────────────── */
+:root[data-palette="nord"][data-theme="dark"],
+:root[data-palette="nord"][data-theme="light"] {
+  --bg: #2e3440; --bg-img: none; --bg-img-op: 0; --noise-op: 0.04;
+  --panel-bg: rgba(59,66,82,0.74); --panel-border: rgba(255,255,255,0.08);
+  --text: #eceff4; --text-muted: rgba(216,222,233,0.62); --text-sub: rgba(216,222,233,0.40);
+  --active-bg: rgba(67,76,94,0.72); --active-border: rgba(136,192,208,0.45);
+  --bubble-bg: rgba(67,76,94,0.34); --bubble-border: rgba(255,255,255,0.07);
+  --input-bg: rgba(46,52,64,0.60); --input-border: rgba(255,255,255,0.10);
+  --reply-bg: rgba(255,255,255,0.04); --reply-border: rgba(255,255,255,0.06);
+  --shadow: 0 16px 40px -22px rgba(0,0,0,0.55);
+  --shadow-card: 0 1px 0 var(--inset-top) inset, var(--shadow); --shadow-bubble: none;
+  --avatar-fg: #2e3440; --avatar-stack-border: rgba(46,52,64,0.7);
+  --c-claude: #81a1c1; --c-codex: #a3be8c; --c-antigravity: #b48ead; --c-qwen: #c97f97;
+  --c-mimo: #ebcb8b; --c-deepseek: #8fbcbb; --c-gemini: #88c0d0; --c-human: #d08770; --c-system: #7b88a1;
+}
+
+/* ── Tokyo Night ───────────────────────────────────────────────── */
+:root[data-palette="tokyonight"][data-theme="dark"],
+:root[data-palette="tokyonight"][data-theme="light"] {
+  --bg: #1a1b26; --bg-img: none; --bg-img-op: 0; --noise-op: 0.045;
+  --panel-bg: rgba(41,46,66,0.68); --panel-border: rgba(255,255,255,0.07);
+  --text: #c0caf5; --text-muted: rgba(192,202,245,0.60); --text-sub: rgba(192,202,245,0.40);
+  --active-bg: rgba(41,46,66,0.88); --active-border: rgba(122,162,247,0.48);
+  --bubble-bg: rgba(41,46,66,0.42); --bubble-border: rgba(255,255,255,0.06);
+  --input-bg: rgba(22,22,30,0.62); --input-border: rgba(255,255,255,0.09);
+  --reply-bg: rgba(255,255,255,0.04); --reply-border: rgba(255,255,255,0.06);
+  --shadow: 0 16px 40px -22px rgba(0,0,0,0.7);
+  --shadow-card: 0 1px 0 var(--inset-top) inset, var(--shadow); --shadow-bubble: none;
+  --avatar-fg: #1a1b26; --avatar-stack-border: rgba(22,22,30,0.7);
+  --c-claude: #7aa2f7; --c-codex: #9ece6a; --c-antigravity: #bb9af7; --c-qwen: #f7768e;
+  --c-mimo: #e0af68; --c-deepseek: #7dcfff; --c-gemini: #bb9af7; --c-human: #ff9e64; --c-system: #565f89;
+}
+
+/* ── Catppuccin Mocha ──────────────────────────────────────────── */
+:root[data-palette="catppuccin"][data-theme="dark"],
+:root[data-palette="catppuccin"][data-theme="light"] {
+  --bg: #1e1e2e; --bg-img: none; --bg-img-op: 0; --noise-op: 0.04;
+  --panel-bg: rgba(49,50,68,0.70); --panel-border: rgba(255,255,255,0.07);
+  --text: #cdd6f4; --text-muted: rgba(205,214,244,0.62); --text-sub: rgba(205,214,244,0.40);
+  --active-bg: rgba(69,71,90,0.72); --active-border: rgba(137,180,250,0.48);
+  --bubble-bg: rgba(49,50,68,0.42); --bubble-border: rgba(255,255,255,0.06);
+  --input-bg: rgba(24,24,37,0.62); --input-border: rgba(255,255,255,0.09);
+  --reply-bg: rgba(255,255,255,0.04); --reply-border: rgba(255,255,255,0.06);
+  --shadow: 0 16px 40px -22px rgba(0,0,0,0.6);
+  --shadow-card: 0 1px 0 var(--inset-top) inset, var(--shadow); --shadow-bubble: none;
+  --avatar-fg: #1e1e2e; --avatar-stack-border: rgba(24,24,37,0.7);
+  --c-claude: #89b4fa; --c-codex: #a6e3a1; --c-antigravity: #cba6f7; --c-qwen: #f5c2e7;
+  --c-mimo: #f9e2af; --c-deepseek: #94e2d5; --c-gemini: #b4befe; --c-human: #fab387; --c-system: #6c7086;
+}
+
+/* ── Gruvbox Dark ──────────────────────────────────────────────── */
+:root[data-palette="gruvbox"][data-theme="dark"],
+:root[data-palette="gruvbox"][data-theme="light"] {
+  --bg: #282828; --bg-img: none; --bg-img-op: 0; --noise-op: 0.05;
+  --panel-bg: rgba(60,56,54,0.74); --panel-border: rgba(255,255,255,0.07);
+  --text: #ebdbb2; --text-muted: rgba(235,219,178,0.62); --text-sub: rgba(235,219,178,0.40);
+  --active-bg: rgba(80,73,69,0.72); --active-border: rgba(254,128,25,0.45);
+  --bubble-bg: rgba(60,56,54,0.40); --bubble-border: rgba(255,255,255,0.06);
+  --input-bg: rgba(40,40,40,0.62); --input-border: rgba(255,255,255,0.09);
+  --reply-bg: rgba(255,255,255,0.04); --reply-border: rgba(255,255,255,0.06);
+  --shadow: 0 16px 40px -22px rgba(0,0,0,0.6);
+  --shadow-card: 0 1px 0 var(--inset-top) inset, var(--shadow); --shadow-bubble: none;
+  --avatar-fg: #282828; --avatar-stack-border: rgba(40,40,40,0.7);
+  --c-claude: #83a598; --c-codex: #b8bb26; --c-antigravity: #d3869b; --c-qwen: #fb4934;
+  --c-mimo: #fabd2f; --c-deepseek: #8ec07c; --c-gemini: #d3869b; --c-human: #fe8019; --c-system: #928374;
+}
+
+    /* ════════════════════════════════════════════════════════════════
+       UI v2 — settings popover, collapsible room tree, drawer/overlay
+       responsive mode, resize-without-text-selection.
+       ════════════════════════════════════════════════════════════════ */
+
+    /* ── No text selection while dragging a resizer ──────────────── */
+    .panel-resizer { user-select: none; -webkit-user-select: none; }
+    body.resizing { cursor: col-resize !important; }
+    body.resizing * { user-select: none !important; -webkit-user-select: none !important; }
+
+    /* ── Fully hide a collapsed/auto-hidden side panel (no sliver) ─ */
+
+    /* ── Collapsible room tree (project / session groups) ────────── */
+    /* Collapsible 3-level tree: project → date → organizer → chats */
+    .tree-group-header {
+      display: flex; align-items: center; gap: 6px;
+      cursor: pointer; user-select: none;
+      padding: 4px 10px; font-size: 12px; font-weight: 600;
+      color: var(--text-muted);
+    }
+    .tree-group-header:hover .tree-label { color: var(--text); }
+    .tree-group-header .count { margin-left: auto; opacity: .7; font-weight: 600; }
+    .tree-arrow {
+      display: inline-block; width: 16px; flex-shrink: 0;
+      font-size: 16px; line-height: 1; opacity: .65; text-align: center;
+      transition: transform .15s ease;
+    }
+    .tree-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .tree-group.collapsed > .tree-group-header .tree-arrow { transform: rotate(-90deg); }
+    .tree-group.collapsed > .tree-group-body { display: none; }
+
+    /* ── Settings popover (single ⚙️ control for theme/skin/palette) ─ */
+    .settings-wrap { position: relative; display: inline-flex; }
+    .settings-popover {
+      position: fixed; top: var(--drawer-top, 70px); right: 14px; z-index: 1000;
+      width: 300px; max-width: calc(100vw - 28px); padding: 14px;
+      /* Near-opaque menu surface so it never blends into panels behind it. */
+      background: rgba(26, 28, 36, 0.97);
+      backdrop-filter: blur(40px) saturate(180%);
+      -webkit-backdrop-filter: blur(40px) saturate(180%);
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      border-radius: 16px;
+      box-shadow: 0 24px 60px -16px rgba(0,0,0,0.7);
+      display: flex; flex-direction: column; gap: 12px;
+      max-height: calc(100vh - var(--drawer-top, 70px) - 24px);
+      overflow-y: auto;
+    }
+    [data-theme="light"] .settings-popover {
+      background: rgba(249, 250, 252, 0.98);
+      border-color: rgba(0,0,0,0.12);
+      box-shadow: 0 24px 60px -16px rgba(100,100,150,0.3);
+    }
+    .settings-popover[hidden] { display: none; }
+    .set-sep { height: 1px; background: var(--panel-border); margin: 2px 0; }
+    .set-copy { display: flex; gap: 4px; }
+    .set-copy-input {
+      flex: 1 1 auto; min-width: 0; padding: 6px 8px; border-radius: 8px;
+      background: var(--input-bg); border: 1px solid var(--input-border);
+      color: var(--text); font: inherit; font-size: 10.5px;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    }
+    .set-copy-btn { flex: 0 0 auto; }
+    .set-hint { font-size: 10px; color: var(--text-sub); line-height: 1.4; }
+    .set-title {
+      font-size: 11px; font-weight: 700; text-transform: uppercase;
+      letter-spacing: .8px; color: var(--text-sub);
+    }
+    .set-row { display: flex; flex-direction: column; gap: 6px; }
+    .set-label { font-size: 11px; font-weight: 600; color: var(--text-muted); }
+    .set-seg { display: flex; flex-wrap: wrap; gap: 4px; }
+    .set-opt {
+      flex: 1 1 auto; min-width: 0;
+      padding: 6px 10px; border-radius: 9px;
+      background: var(--bubble-bg); border: 1px solid var(--bubble-border);
+      color: var(--text-muted); font: inherit; font-size: 11px; font-weight: 600;
+      cursor: pointer; white-space: nowrap;
+      transition: background .12s ease, color .12s ease, border-color .12s ease;
+    }
+    .set-opt:hover { color: var(--text); }
+    /* Keep font-weight constant on active — a heavier active button would
+       reflow the flex segment and visibly resize the buttons on each pick. */
+    .set-opt.active {
+      color: var(--text); background: var(--active-bg);
+      border-color: var(--active-border);
+    }
+
+    /* ── Overlay / drawer mode for narrow viewports ──────────────── */
+    .drawer-backdrop {
+      position: fixed; inset: 0; z-index: 40;
+      background: rgba(0,0,0,.30);  /* light dim for click-to-close; no blur */
+    }
+    .drawer-backdrop[hidden] { display: none; }
+    .main.overlay-mode { grid-template-columns: 1fr; }
+    .main.overlay-mode .panel-resizer { display: none; }
+    .main.overlay-mode .sidebar,
+    .main.overlay-mode .activity {
+      position: fixed;
+      top: var(--drawer-top, 80px); bottom: 14px;
+      width: var(--drawer-w, 320px);
+      z-index: 50; margin: 0;
+      box-shadow: 0 24px 60px -16px rgba(0,0,0,.6);
+      transition: transform .25s ease;
+      /* Drawers overlay the chat, so they must be OPAQUE — the translucent
+         glass panel would let the chat text bleed through ("мутно"). */
+      background: rgba(24, 26, 33, 0.985);
+      backdrop-filter: blur(40px) saturate(180%);
+      -webkit-backdrop-filter: blur(40px) saturate(180%);
+    }
+    [data-theme="light"] .main.overlay-mode .sidebar,
+    [data-theme="light"] .main.overlay-mode .activity {
+      background: rgba(249, 250, 252, 0.99);
+    }
+    .main.overlay-mode .sidebar  { left: 14px;  transform: translateX(calc(-100% - 24px)); }
+    .main.overlay-mode .activity { right: 14px; transform: translateX(calc(100% + 24px)); }
+    .main.overlay-mode.drawer-sidebar-open  .sidebar  { transform: translateX(0); }
+    .main.overlay-mode.drawer-activity-open .activity { transform: translateX(0); }
+
+    /* ── Narrow topbar: shed rare/destructive controls so the row fits ─ */
+    [data-narrow] .brand-text .subtitle { display: none; }
+    [data-narrow] #bulk-close-all,
+    [data-narrow] #bulk-delete-closed,
+    [data-narrow] #bulk-nuke { display: none; }
+    /* Keep the settings label compact on very narrow screens. */
+    [data-narrow] #settings-btn { font-size: 0; gap: 0; padding: 7px 10px; }
+    [data-narrow] #settings-btn::before { content: '⚙️'; font-size: 13px; }
+
+    /* ── Help "?" icons (hover tooltips) + i18n niceties ─────────── */
+    .set-label { display: flex; align-items: center; gap: 0; }
+    .help-icon {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 14px; height: 14px; margin-left: 5px; flex-shrink: 0;
+      border-radius: 50%; font-size: 9px; font-weight: 700; line-height: 1;
+      background: var(--bubble-bg); border: 1px solid var(--bubble-border);
+      color: var(--text-sub); cursor: help;
+    }
+    .help-icon:hover { color: var(--text); }
+    [dir="rtl"] .help-icon { margin-left: 0; margin-right: 5px; }
+
+    /* ── Settings: env-var reference rows + copyable agent prompt ─── */
+    .set-var { display: flex; flex-direction: column; gap: 2px; padding: 2px 0; }
+    .set-var-name {
+      align-self: flex-start; max-width: 100%;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 10.5px;
+      color: var(--text); background: var(--input-bg);
+      border: 1px solid var(--input-border); border-radius: 6px;
+      padding: 2px 6px; cursor: pointer;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .set-var-name:hover { border-color: var(--active-border); }
+    .set-var-desc { font-size: 10px; color: var(--text-sub); line-height: 1.4; }
+    .set-prompt-wrap { display: flex; flex-direction: column; gap: 4px; }
+    .set-prompt {
+      width: 100%; resize: vertical; min-height: 88px;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 10.5px;
+      line-height: 1.45; color: var(--text);
+      background: var(--input-bg); border: 1px solid var(--input-border);
+      border-radius: 8px; padding: 8px;
+    }
+    .set-prompt-wrap .set-copy-btn { align-self: flex-end; }

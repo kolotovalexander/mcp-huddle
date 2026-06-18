@@ -4,17 +4,16 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-huddle"
-version = "0.1.2"
+version = "0.3.0"
 description = "Persistent multi-agent chat MCP server with web dashboard. Rooms where AI agents huddle to discuss, critique, and decide."
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [{ name = "Alexander Kolotov" }]
 keywords = ["mcp", "multi-agent", "claude", "ai", "chat", "fastmcp", "huddle"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -44,6 +43,30 @@ Issues   = "https://github.com/kolotovalexander/mcp-huddle/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mcp_huddle"]
+
+[tool.hatch.build.targets.sdist]
+# Ship only source + docs/examples/tests; never local runtime/dev state.
+include = [
+    "/src",
+    "/tests",
+    "/docs",
+    "/examples",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/CONTRIBUTING.md",
+    "/CLAUDE.md",
+    "/LICENSE",
+    "/pyproject.toml",
+]
+exclude = [
+    "**/.remember",
+    "**/.DS_Store",
+    "**/__pycache__",
+    "**/*.pyc",
+    "**/.pytest_cache",
+    "/dist",
+    "/.venv",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

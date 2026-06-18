@@ -1,0 +1,44 @@
+[
+  {
+    "name": "Codex",
+    "cmd": [
+      "codex",
+      "-a", "never",
+      "exec",
+      "--disable", "guardian_approval",
+      "--json",
+      "--output-last-message", "{last_message}",
+      "-c", "model_reasoning_effort=\"medium\"",
+      "-s", "danger-full-access",
+      "{brief}"
+    ],
+    "enabled": true
+  },
+  {
+    "name": "Antigravity",
+    "cmd": [
+      "agy",
+      "--dangerously-skip-permissions",
+      "--print-timeout", "15m",
+      "-p", "{brief}"
+    ],
+    "enabled": true
+  },
+  {
+    "name": "LocalLLM",
+    "cmd": [
+      "python",
+      "-m", "mcp_huddle.openai_compatible_runner",
+      "--agent", "LocalLLM",
+      "--base-url", "http://127.0.0.1:11434/v1",
+      "--model", "qwen2.5-coder",
+      "--brief", "{brief}"
+    ],
+    "enabled": true,
+    "probe_url": "http://127.0.0.1:11434/v1/models",
+    "requires_model": "qwen2.5-coder",
+    "probe_chat_url": "http://127.0.0.1:11434/v1/chat/completions",
+    "probe_chat_model": "qwen2.5-coder",
+    "probe_timeout_sec": 0.8
+  }
+]

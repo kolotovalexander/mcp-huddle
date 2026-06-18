@@ -22,3 +22,6 @@ htmlcov/
 # Env
 .env
 *.env
+
+# Logs (runtime / stray service logs — never belong in the repo)
+*.log
