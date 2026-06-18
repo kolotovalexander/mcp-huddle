@@ -35,6 +35,100 @@ function el(tag, attrs, children) {
   return node;
 }
 
+// ── i18n: UI-chrome localisation across 10 languages ───────────────
+// Only the static chrome is translated (labels, buttons, hints, tooltips);
+// room names / agent messages are live data and stay as authored. Keys are
+// looked up for the current LANG, then fall back to English, then the key.
+const I18N = {
+  en: {
+    'app.subtitle': 'rooms · multi-agent discussion',
+    'btn.closeAll': 'Close all', 'btn.deleteClosed': 'Delete closed', 'btn.nukeAll': 'Nuke all',
+    'btn.view': 'View', 'btn.live': 'live', 'btn.copy': 'Copy', 'btn.send': 'Send',
+    'chat.selectRoom': 'Select a room',
+    'chat.selectHint': 'Use room_create() from an agent to start a discussion',
+    'chat.closed': 'Room closed — read-only',
+    'chat.resolved': 'Room resolved — read-only',
+    'chat.placeholder': 'Message as Human — system priority, bypasses anti-loop…',
+    'chat.closedTitle': 'Room closed',
+    'chat.pickAnother': 'Pick another room from the sidebar',
+    'activity.title': 'Agent activity',
+    'activity.hint': 'Opens when you select a room with spawned agents',
+    'sidebar.empty': 'No rooms yet. Call room_create() from an agent.',
+    'set.appearance': 'Appearance', 'set.theme': 'Theme', 'set.skin': 'Design',
+    'set.palette': 'Palette', 'set.lang': 'Language', 'set.mcp': 'MCP connection',
+    'theme.auto': 'Auto', 'theme.dark': 'Dark', 'theme.light': 'Light',
+    'mcp.endpoint': 'HTTP endpoint', 'mcp.claude': 'Claude Code', 'mcp.codex': 'Codex (config.toml)',
+    'mcp.stdio': 'stdio (any client)',
+    'mcp.hint': 'Dashboard and MCP share one port. Attach agents over HTTP, or run the mcp-huddle binary as a stdio server.',
+    'tip.closeAll': 'Close every open room (kills live spawned agent processes; owners are left alone).',
+    'tip.deleteClosed': 'Permanently delete all closed rooms from disk.',
+    'tip.nukeAll': 'Close AND delete every room. Owner processes are not touched.',
+    'tip.view': 'Appearance (theme, design, palette, language) and MCP connection info.',
+    'tip.theme': 'Light/dark mode. Auto follows your OS setting.',
+    'tip.skin': 'Overall look: Glass (frosted), Web (flat), or Code (IDE).',
+    'tip.palette': 'Colour scheme — popular terminal palettes (Dracula, Nord, …).',
+    'tip.lang': 'Interface language.',
+    'tip.collapse': 'Collapse this panel. Drag the edge to resize; double-click the edge to collapse.',
+    'tip.restoreSidebar': 'Show the rooms list', 'tip.restoreActivity': 'Show the activity panel',
+  },
+  ru: {
+    'app.subtitle': 'комнат · мультиагентное обсуждение',
+    'btn.closeAll': 'Закрыть все', 'btn.deleteClosed': 'Удалить закрытые', 'btn.nukeAll': 'Снести всё',
+    'btn.view': 'Вид', 'btn.live': 'онлайн', 'btn.copy': 'Копировать', 'btn.send': 'Отправить',
+    'chat.selectRoom': 'Выберите комнату',
+    'chat.selectHint': 'Вызовите room_create() из агента, чтобы начать обсуждение',
+    'chat.closed': 'Комната закрыта — только чтение',
+    'chat.resolved': 'Комната решена — только чтение',
+    'chat.placeholder': 'Сообщение от имени Human — system-приоритет, обходит anti-loop…',
+    'chat.closedTitle': 'Комната закрыта',
+    'chat.pickAnother': 'Выберите другую комнату слева',
+    'activity.title': 'Активность агентов',
+    'activity.hint': 'Откроется при выборе комнаты со spawned-агентами',
+    'sidebar.empty': 'Пока нет комнат. Вызовите room_create() из агента.',
+    'set.appearance': 'Оформление', 'set.theme': 'Тема', 'set.skin': 'Дизайн',
+    'set.palette': 'Палитра', 'set.lang': 'Язык', 'set.mcp': 'MCP-подключение',
+    'theme.auto': 'Авто', 'theme.dark': 'Тёмная', 'theme.light': 'Светлая',
+    'mcp.endpoint': 'HTTP endpoint', 'mcp.claude': 'Claude Code', 'mcp.codex': 'Codex (config.toml)',
+    'mcp.stdio': 'stdio (любой клиент)',
+    'mcp.hint': 'Дашборд и MCP на одном порту. Подключайте агентов по HTTP, либо запустите бинарь mcp-huddle как stdio-сервер.',
+    'tip.closeAll': 'Закрыть все открытые комнаты (убивает живые процессы агентов; owner-ов не трогает).',
+    'tip.deleteClosed': 'Навсегда удалить с диска все закрытые комнаты.',
+    'tip.nukeAll': 'Закрыть И удалить все комнаты. Процессы owner-ов не трогаются.',
+    'tip.view': 'Оформление (тема, дизайн, палитра, язык) и данные MCP-подключения.',
+    'tip.theme': 'Светлый/тёмный режим. «Авто» следует за настройкой ОС.',
+    'tip.skin': 'Общий вид: Glass (стекло), Web (плоский) или Code (IDE).',
+    'tip.palette': 'Цветовая схема — популярные терминальные палитры (Dracula, Nord, …).',
+    'tip.lang': 'Язык интерфейса.',
+    'tip.collapse': 'Свернуть панель. Тяните за край для изменения ширины; двойной клик по краю — свернуть.',
+    'tip.restoreSidebar': 'Показать список комнат', 'tip.restoreActivity': 'Показать панель активности',
+  },
+  es: {}, de: {}, fr: {}, pt: {}, zh: {}, ja: {}, ar: {}, hi: {},
+};
+const I18N_LANGS = [
+  {v:'en', label:'English'}, {v:'ru', label:'Русский'}, {v:'es', label:'Español'},
+  {v:'de', label:'Deutsch'}, {v:'fr', label:'Français'}, {v:'pt', label:'Português'},
+  {v:'zh', label:'中文'}, {v:'ja', label:'日本語'}, {v:'ar', label:'العربية'}, {v:'hi', label:'हिन्दी'},
+];
+let LANG = (function () {
+  try {
+    const s = localStorage.getItem('agentbus-lang');
+    if (s && I18N[s]) return s;
+    const n = (navigator.language || 'en').slice(0, 2).toLowerCase();
+    return I18N[n] ? n : 'en';
+  } catch (e) { return 'en'; }
+})();
+function t(key) {
+  const d = I18N[LANG] || {};
+  if (key in d && d[key]) return d[key];
+  return (I18N.en[key] != null) ? I18N.en[key] : key;
+}
+function applyI18n() {
+  document.documentElement.setAttribute('lang', LANG);
+  document.documentElement.setAttribute('dir', LANG === 'ar' ? 'rtl' : 'ltr');
+  document.querySelectorAll('[data-i18n]').forEach(e => { e.textContent = t(e.getAttribute('data-i18n')); });
+  document.querySelectorAll('[data-i18n-title]').forEach(e => { e.title = t(e.getAttribute('data-i18n-title')); });
+}
+
 function avatar(agent, sizeCls) {
   return el('div', {class: `avatar ${sizeCls || 'avatar-md'} ${avatarCls(agent)}`, text: agentLetter(agent)});
 }
@@ -206,7 +300,11 @@ function applyPalette(pal) {
   document.documentElement.setAttribute('data-palette', pal);
 }
 
-function buildSettingsRow(title, opts, storeKey, getCur, apply) {
+function helpIcon(tipKey) {
+  return el('span', {class: 'help-icon', 'data-i18n-title': tipKey, title: t(tipKey), text: '?'});
+}
+
+function buildSettingsRow(titleKey, opts, storeKey, getCur, apply, tipKey) {
   const seg = el('div', {class: 'set-seg'});
   const refresh = () => {
     const cur = getCur();
@@ -218,17 +316,18 @@ function buildSettingsRow(title, opts, storeKey, getCur, apply) {
     seg.appendChild(b);
   });
   refresh();
-  return el('div', {class: 'set-row'}, [el('div', {class: 'set-label', text: title}), seg]);
+  const label = el('div', {class: 'set-label'}, [el('span', {text: t(titleKey)}), tipKey ? helpIcon(tipKey) : null]);
+  return el('div', {class: 'set-row'}, [label, seg]);
 }
 
 function buildCopyRow(label, value) {
   const inp = el('input', {class: 'set-copy-input', value: value, readonly: 'readonly', title: value});
-  const btn = el('button', {class: 'set-opt set-copy-btn', text: 'Copy'});
+  const btn = el('button', {class: 'set-opt set-copy-btn', text: t('btn.copy')});
   btn.onclick = () => {
     try { navigator.clipboard && navigator.clipboard.writeText(value); } catch (_) {}
     inp.focus(); inp.select && inp.select();
     btn.textContent = '✓';
-    setTimeout(() => { btn.textContent = 'Copy'; }, 1200);
+    setTimeout(() => { btn.textContent = t('btn.copy'); }, 1200);
   };
   return el('div', {class: 'set-row'}, [
     el('div', {class: 'set-label', text: label}),
@@ -236,11 +335,50 @@ function buildCopyRow(label, value) {
   ]);
 }
 
+// Theme labels are localised (emoji + word); skin/palette/lang labels are proper nouns.
+function themeOpts() {
+  return [
+    {v: 'auto',  label: '🌓 ' + t('theme.auto')},
+    {v: 'dark',  label: '🌙 ' + t('theme.dark')},
+    {v: 'light', label: '☀️ ' + t('theme.light')},
+  ];
+}
+
+function buildSettingsPopover(pop) {
+  pop.innerHTML = '';
+  const origin = location.origin;
+  pop.appendChild(el('div', {class: 'set-title'}, [el('span', {text: t('set.appearance')}), helpIcon('tip.view')]));
+  pop.appendChild(buildSettingsRow('set.lang', I18N_LANGS, 'agentbus-lang', () => LANG, setLang, 'tip.lang'));
+  pop.appendChild(buildSettingsRow('set.theme', themeOpts(), 'agentbus-theme',
+    () => localStorage.getItem('agentbus-theme') || 'auto', applyTheme, 'tip.theme'));
+  pop.appendChild(buildSettingsRow('set.skin', SKIN_OPTS, 'agentbus-skin',
+    () => localStorage.getItem('agentbus-skin') || 'glass', applySkin, 'tip.skin'));
+  pop.appendChild(buildSettingsRow('set.palette', PALETTE_OPTS, 'agentbus-palette',
+    () => localStorage.getItem('agentbus-palette') || 'default', applyPalette, 'tip.palette'));
+  pop.appendChild(el('div', {class: 'set-sep'}));
+  pop.appendChild(el('div', {class: 'set-title'}, [el('span', {text: t('set.mcp')})]));
+  pop.appendChild(buildCopyRow(t('mcp.endpoint'), origin + '/mcp'));
+  pop.appendChild(buildCopyRow(t('mcp.claude'), `claude mcp add --transport http huddle ${origin}/mcp`));
+  pop.appendChild(buildCopyRow(t('mcp.codex'), `[mcp_servers.huddle]\nurl = "${origin}/mcp"`));
+  pop.appendChild(buildCopyRow(t('mcp.stdio'), 'mcp-huddle'));
+  pop.appendChild(el('div', {class: 'set-hint', text: t('mcp.hint')}));
+}
+
+function setLang(lang) {
+  if (!I18N[lang]) lang = 'en';
+  LANG = lang;
+  try { localStorage.setItem('agentbus-lang', lang); } catch (_) {}
+  applyI18n();
+  const pop = document.getElementById('settings-popover');
+  if (pop) buildSettingsPopover(pop);  // rebuild so the popover's own labels update
+}
+
 function initSettings() {
   // Apply saved values (head script already set them pre-paint; re-assert).
   applyTheme(localStorage.getItem('agentbus-theme') || 'auto');
   applySkin(localStorage.getItem('agentbus-skin') || 'glass');
   applyPalette(localStorage.getItem('agentbus-palette') || 'default');
+  applyI18n();
 
   // Re-apply on OS theme change while in 'auto' mode.
   const mq = window.matchMedia('(prefers-color-scheme: dark)');
@@ -251,25 +389,7 @@ function initSettings() {
   const pop = document.getElementById('settings-popover');
   const btn = document.getElementById('settings-btn');
   if (!pop || !btn) return;
-  pop.appendChild(el('div', {class: 'set-title', text: 'Оформление'}));
-  pop.appendChild(buildSettingsRow('Тема', THEME_OPTS, 'agentbus-theme',
-    () => localStorage.getItem('agentbus-theme') || 'auto', applyTheme));
-  pop.appendChild(buildSettingsRow('Дизайн', SKIN_OPTS, 'agentbus-skin',
-    () => localStorage.getItem('agentbus-skin') || 'glass', applySkin));
-  pop.appendChild(buildSettingsRow('Палитра', PALETTE_OPTS, 'agentbus-palette',
-    () => localStorage.getItem('agentbus-palette') || 'default', applyPalette));
-
-  // ── MCP connection section: copy-paste configs to attach agents ──
-  pop.appendChild(el('div', {class: 'set-sep'}));
-  pop.appendChild(el('div', {class: 'set-title', text: 'MCP-подключение'}));
-  const origin = location.origin;
-  pop.appendChild(buildCopyRow('HTTP endpoint', origin + '/mcp'));
-  pop.appendChild(buildCopyRow('Claude Code', `claude mcp add --transport http huddle ${origin}/mcp`));
-  pop.appendChild(buildCopyRow('Codex (.codex/config.toml)',
-    `[mcp_servers.huddle]\nurl = "${origin}/mcp"`));
-  pop.appendChild(buildCopyRow('stdio (любой клиент)', 'mcp-huddle'));
-  pop.appendChild(el('div', {class: 'set-hint',
-    text: 'Дашборд и MCP на одном порту. Подключите агентов по HTTP, либо запустите бинарь mcp-huddle как stdio-сервер.'}));
+  buildSettingsPopover(pop);
 
   const close = () => { pop.hidden = true; btn.setAttribute('aria-expanded', 'false'); };
   const open  = () => { pop.hidden = false; btn.setAttribute('aria-expanded', 'true'); };
@@ -305,7 +425,7 @@ function renderRooms() {
   const sidebar = document.getElementById('room-list');
   sidebar.innerHTML = '';
   if (!rooms.length) {
-    sidebar.appendChild(el('div', {class: 'empty-sidebar', text: 'No rooms yet. Call room_create() from an agent.'}));
+    sidebar.appendChild(el('div', {class: 'empty-sidebar', text: t('sidebar.empty')}));
     return;
   }
 
@@ -424,13 +544,13 @@ function buildChatShell(room) {
     'data-1p-ignore': '',
     'data-lpignore': 'true',
     placeholder: isReadOnly
-      ? (isClosed ? 'Room closed — read-only' : 'Room resolved — read-only')
-      : 'Сообщение от имени Human — system-приоритет, обходит anti-loop…',
+      ? (isClosed ? t('chat.closed') : t('chat.resolved'))
+      : t('chat.placeholder'),
   };
   if (isReadOnly) inputAttrs.disabled = '';
   const input = el('input', inputAttrs);
 
-  const sendAttrs = {class: 'send-btn', id: 'btn-send', text: 'Send ↵'};
+  const sendAttrs = {class: 'send-btn', id: 'btn-send', text: t('btn.send') + ' ↵'};
   if (isReadOnly) sendAttrs.disabled = '';
   const send = el('button', sendAttrs);
 
@@ -791,9 +911,10 @@ async function closeRoom() {
   const chat = document.getElementById('chat-area');
   chat.innerHTML = '';
   chat.appendChild(el('div', {class: 'empty'}, [
-    el('div', {class: 'empty-title', text: 'Room closed'}),
-    el('div', {class: 'empty-hint', text: 'Pick another room from the sidebar'}),
+    el('div', {class: 'empty-title', text: t('chat.closedTitle')}),
+    el('div', {class: 'empty-hint', text: t('chat.pickAnother')}),
   ]));
+  relayout();  // hide the activity panel now that no room is open
   await loadRooms();
 }
 

@@ -131,6 +131,131 @@ def test_claude_slot_is_opt_in_off_by_default() -> None:
         assert spec["enabled"] is False
 
 
+# ── On-disk registry file (~/.mcp-huddle/registry.json) merge precedence ──────
+
+def _isolate_registry(monkeypatch: pytest.MonkeyPatch, home: Path) -> None:
+    """Point the huddle home at a tmp dir and clear the env override so the
+    on-disk registry file is the only override in play."""
+    monkeypatch.setattr(bus, "HUDDLE_HOME", home)
+    monkeypatch.delenv("MCP_HUDDLE_SPAWN_REGISTRY", raising=False)
+
+
+def test_registry_file_absent_uses_defaults(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No file → _raw_registry is exactly DEFAULT_REGISTRY (unchanged)."""
+    _isolate_registry(monkeypatch, tmp_path)
+    assert spawn._raw_registry() == list(spawn.DEFAULT_REGISTRY)
+
+
+def test_registry_file_appends_new_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file entry with a brand-new name is appended after the defaults."""
+    _isolate_registry(monkeypatch, tmp_path)
+    new_spec = {"name": "MyModel", "cmd": ["mymodel", "-p", "{brief}"], "enabled": True}
+    (tmp_path / "registry.json").write_text(json.dumps([new_spec]))
+
+    merged = spawn._raw_registry()
+    # defaults preserved + new one appended at the end
+    assert [s["name"] for s in merged] == [
+        s["name"] for s in spawn.DEFAULT_REGISTRY
+    ] + ["MyModel"]
+    assert merged[-1] == new_spec
+
+
+def test_registry_file_overrides_existing_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file entry reusing a default name replaces it in place (same position)."""
+    _isolate_registry(monkeypatch, tmp_path)
+    override = {"name": "Codex", "cmd": ["codex", "custom", "{brief}"], "enabled": False}
+    (tmp_path / "registry.json").write_text(json.dumps([override]))
+
+    merged = spawn._raw_registry()
+    # No duplicate Codex, and order/length match the defaults (pure replacement)
+    assert [s["name"] for s in merged] == [s["name"] for s in spawn.DEFAULT_REGISTRY]
+    codex = next(s for s in merged if s["name"] == "Codex")
+    assert codex == override
+
+
+def test_registry_file_malformed_is_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """Malformed file → stderr warning + fall back to defaults, never crash."""
+    _isolate_registry(monkeypatch, tmp_path)
+    (tmp_path / "registry.json").write_text("{ this is not valid json ]")
+
+    merged = spawn._raw_registry()
+    assert merged == list(spawn.DEFAULT_REGISTRY)
+    assert "ignoring registry file" in capsys.readouterr().err
+
+
+def test_registry_file_non_array_is_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """Valid JSON but not an array of named specs → warn + ignore."""
+    _isolate_registry(monkeypatch, tmp_path)
+    (tmp_path / "registry.json").write_text(json.dumps({"name": "Oops"}))
+
+    assert spawn._raw_registry() == list(spawn.DEFAULT_REGISTRY)
+    assert "ignoring registry file" in capsys.readouterr().err
+
+
+def test_env_override_wins_over_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MCP_HUDDLE_SPAWN_REGISTRY (full replacement) beats the on-disk file."""
+    monkeypatch.setattr(bus, "HUDDLE_HOME", tmp_path)
+    file_spec = {"name": "FromFile", "cmd": ["x"], "enabled": True}
+    (tmp_path / "registry.json").write_text(json.dumps([file_spec]))
+    env_spec = {"name": "FromEnv", "cmd": ["y"], "enabled": True}
+    env_path = tmp_path / "env_registry.json"
+    env_path.write_text(json.dumps([env_spec]))
+    monkeypatch.setenv("MCP_HUDDLE_SPAWN_REGISTRY", str(env_path))
+
+    merged = spawn._raw_registry()
+    assert merged == [env_spec]
+
+
+def test_load_registry_merges_file_and_filters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end: a file-added enabled spec with no probe is available, and a
+    disabled one is filtered out by load_registry."""
+    _isolate_registry(monkeypatch, tmp_path)
+    specs = [
+        {"name": "OnModel", "cmd": ["true"], "enabled": True},
+        {"name": "OffModel", "cmd": ["true"], "enabled": False},
+    ]
+    (tmp_path / "registry.json").write_text(json.dumps(specs))
+
+    names = {s["name"] for s in spawn.load_registry()}
+    assert "OnModel" in names
+    assert "OffModel" not in names
+
+
+def test_discovery_summary_reports_reasons(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """discovery_summary yields one line per agent with enabled/disabled+reason."""
+    _isolate_registry(monkeypatch, tmp_path)
+    specs = [
+        {"name": "Ready", "cmd": ["true"], "enabled": True},
+        {"name": "NoBin", "cmd": ["definitely-not-a-real-binary-xyz"], "enabled": False},
+        {"name": "OffFlag", "cmd": ["true"], "enabled": False},
+    ]
+    (tmp_path / "registry.json").write_text(json.dumps(specs))
+
+    summary = {
+        line.split(" -> ", 1)[0]: line.split(" -> ", 1)[1]
+        for line in spawn.discovery_summary()
+    }
+    assert summary["Ready"] == "enabled"
+    assert summary["NoBin"] == "disabled (binary not found)"
+    assert summary["OffFlag"] == "disabled (off by env flag)"
+
+
 def test_qwen_probe_requires_exact_model(monkeypatch: pytest.MonkeyPatch) -> None:
     """Qwen must auto-spawn only when the local bridge exposes the max model."""
 

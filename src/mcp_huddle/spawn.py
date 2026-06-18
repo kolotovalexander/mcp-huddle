@@ -3,8 +3,17 @@
 Default registry uses Codex, Antigravity, MiMo, Qwen, and DeepSeek when available.
 Claude is present but OFF by default (opt-in via MCP_HUDDLE_CLAUDE_ENABLED=1)
 because since 2026-06-15 headless `claude -p` is metered against a separate
-Agent SDK credit pool, not the subscription. Override the whole registry via
-the MCP_HUDDLE_SPAWN_REGISTRY env var pointing to a JSON file.
+Agent SDK credit pool, not the subscription.
+
+Adding / overriding agents (precedence high → low):
+  1. MCP_HUDDLE_SPAWN_REGISTRY env var → JSON file, a FULL replacement of the
+     registry (highest precedence; malformed → hard error).
+  2. ~/.mcp-huddle/registry.json (huddle home; honours $MCP_HUDDLE_HOME) →
+     JSON array of SpawnSpec dicts MERGED onto DEFAULT_REGISTRY by "name": an
+     existing name is overridden in place, a new name is appended. Drop/edit
+     one file to add a model — no env var, no code change. Malformed → stderr
+     warning + ignored (never crashes).
+  3. DEFAULT_REGISTRY (below).
 
 Each registry entry is a SpawnSpec:
   {
@@ -42,6 +51,8 @@ from pathlib import Path
 from typing import NotRequired, TypedDict
 from urllib import error as urlerror
 from urllib import request as urlrequest
+
+from . import bus  # reuse HUDDLE_HOME so the on-disk registry lives next to rooms
 
 
 class SpawnSpec(TypedDict):
@@ -403,26 +414,162 @@ def _reap_in_background(proc: subprocess.Popen, name: str,
     thread.start()
 
 
-def load_registry() -> list[SpawnSpec]:
-    """Return registry from MCP_HUDDLE_SPAWN_REGISTRY (JSON file) or DEFAULT_REGISTRY."""
+def _registry_file_path() -> Path:
+    """Location of the optional on-disk registry file.
+
+    Lives in the huddle home (``~/.mcp-huddle`` by default, or
+    ``$MCP_HUDDLE_HOME``) — the same dir that holds rooms — so a user can add a
+    model by dropping/editing a single JSON file with no env var and no code
+    change. Resolved at call time (via ``bus.HUDDLE_HOME``) so it follows the
+    same home the rest of the server uses, and so tests can repoint the home.
+    """
+    return bus.HUDDLE_HOME / "registry.json"
+
+
+def _load_env_registry() -> list[SpawnSpec] | None:
+    """Parse the MCP_HUDDLE_SPAWN_REGISTRY env override, or None if unset.
+
+    Behaviour preserved verbatim: a set-but-malformed file raises ValueError
+    (callers surface the cause); a JSON array is a FULL replacement of the
+    default registry (highest precedence).
+    """
     path = os.environ.get("MCP_HUDDLE_SPAWN_REGISTRY")
-    if path and Path(path).is_file():
-        with open(path) as f:
-            raw = f.read()
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise ValueError(
-                f"MCP_HUDDLE_SPAWN_REGISTRY points to malformed JSON "
-                f"({path}): {exc}. Expected a JSON array of SpawnSpec objects."
-            ) from exc
-        if not isinstance(data, list):
-            raise ValueError(
-                f"MCP_HUDDLE_SPAWN_REGISTRY ({path}): expected a JSON array "
-                f"of SpawnSpec objects, got {type(data).__name__}."
-            )
-        return [spec for spec in data if _spawn_spec_available(spec)]
-    return [spec for spec in DEFAULT_REGISTRY if _spawn_spec_available(spec)]
+    if not (path and Path(path).is_file()):
+        return None
+    with open(path) as f:
+        raw = f.read()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"MCP_HUDDLE_SPAWN_REGISTRY points to malformed JSON "
+            f"({path}): {exc}. Expected a JSON array of SpawnSpec objects."
+        ) from exc
+    if not isinstance(data, list):
+        raise ValueError(
+            f"MCP_HUDDLE_SPAWN_REGISTRY ({path}): expected a JSON array "
+            f"of SpawnSpec objects, got {type(data).__name__}."
+        )
+    return data
+
+
+def _load_registry_file() -> list[SpawnSpec] | None:
+    """Load the optional ~/.mcp-huddle/registry.json, or None if absent/invalid.
+
+    Unlike the env override (a full replacement that fails loudly), the file is
+    a best-effort convenience layer: anything malformed prints a clear stderr
+    warning and is ignored so the server never crashes on a bad hand-edit.
+    Returns a list of SpawnSpec dicts (each must carry a "name").
+    """
+    path = _registry_file_path()
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        print(
+            f"[mcp-huddle] WARNING: ignoring registry file {path}: {exc}. "
+            f"Expected a JSON array of SpawnSpec objects.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+    if not isinstance(data, list) or not all(
+        isinstance(spec, dict) and isinstance(spec.get("name"), str) for spec in data
+    ):
+        print(
+            f"[mcp-huddle] WARNING: ignoring registry file {path}: expected a "
+            f"JSON array of SpawnSpec objects, each with a string \"name\".",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+    return data
+
+
+def _merge_registry(
+    base: list[SpawnSpec], overrides: list[SpawnSpec]
+) -> list[SpawnSpec]:
+    """Merge `overrides` onto `base` keyed by "name".
+
+    An override whose name matches an existing entry replaces it in place
+    (preserving order); a new name is appended. Inputs are not mutated.
+    """
+    merged: list[SpawnSpec] = [dict(spec) for spec in base]  # type: ignore[misc]
+    index = {spec.get("name"): i for i, spec in enumerate(merged)}
+    for spec in overrides:
+        name = spec.get("name")
+        if name in index:
+            merged[index[name]] = spec
+        else:
+            index[name] = len(merged)
+            merged.append(spec)
+    return merged
+
+
+def _raw_registry() -> list[SpawnSpec]:
+    """Merged registry BEFORE availability filtering.
+
+    Precedence: MCP_HUDDLE_SPAWN_REGISTRY env (full replacement) >
+    ~/.mcp-huddle/registry.json (merged onto defaults) > DEFAULT_REGISTRY.
+    """
+    env_registry = _load_env_registry()
+    if env_registry is not None:
+        return env_registry
+    file_overrides = _load_registry_file()
+    if file_overrides is not None:
+        return _merge_registry(DEFAULT_REGISTRY, file_overrides)
+    return list(DEFAULT_REGISTRY)
+
+
+def load_registry() -> list[SpawnSpec]:
+    """Return the enabled+available registry.
+
+    Sources, in precedence order: MCP_HUDDLE_SPAWN_REGISTRY env >
+    ~/.mcp-huddle/registry.json > DEFAULT_REGISTRY. See _raw_registry.
+    """
+    return [spec for spec in _raw_registry() if _spawn_spec_available(spec)]
+
+
+def _agent_status(spec: SpawnSpec) -> tuple[bool, str]:
+    """Best-effort (available?, reason) for one registry spec.
+
+    Side-effect-light: the only probe it triggers is the same cached
+    `_spawn_spec_available` check load_registry already uses, and only for
+    specs the author left enabled (DEFAULT_REGISTRY specs carry no probe_url
+    after the Qwen/DeepSeek removal, so this stays cheap).
+    """
+    if not spec.get("enabled", False):
+        cmd = spec.get("cmd") or []
+        binary = cmd[0] if cmd else ""
+        if binary and _first_existing_binary([binary]) is None:
+            return False, "binary not found"
+        return False, "off by env flag"
+    if not _spawn_spec_available(spec):
+        return False, "model probe failed"
+    return True, "ready"
+
+
+def discovery_summary() -> list[str]:
+    """One concise line per registry agent: "Name -> enabled" / "... disabled (reason)".
+
+    Reads the merged registry (env/file/defaults) so it reflects exactly what
+    auto_spawn would consider. Reasons are best-effort: "binary not found",
+    "model probe failed", "off by env flag".
+    """
+    lines: list[str] = []
+    for spec in _raw_registry():
+        name = spec.get("name", "?")
+        ok, reason = _agent_status(spec)
+        lines.append(f"{name} -> enabled" if ok else f"{name} -> disabled ({reason})")
+    return lines
+
+
+def log_discovery_summary(file=sys.stderr) -> None:
+    """Print the agent discovery summary once (server/__main__ may call this)."""
+    print("[mcp-huddle] agent discovery:", file=file, flush=True)
+    for line in discovery_summary():
+        print(f"[mcp-huddle]   {line}", file=file, flush=True)
 
 
 def get_enabled_spec(agent_name: str) -> SpawnSpec | None:

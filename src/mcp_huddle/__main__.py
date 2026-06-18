@@ -128,6 +128,15 @@ def main() -> None:
         print(f"mcp-huddle (HTTP + dashboard) on :{port}", flush=True)
         print(f"Dashboard: http://{host}:{port}/dashboard", flush=True)
 
+        # One-line-per-agent discovery summary (which agents are enabled / why
+        # disabled) so the operator can see the roster at a glance.
+        try:
+            from . import spawn
+
+            spawn.log_discovery_summary()
+        except Exception:
+            pass
+
         config = uvicorn.Config(build_app(), log_level="warning")
         server = uvicorn.Server(config)
         server.run(sockets=[sock])

@@ -534,6 +534,46 @@ _NO_CACHE_HDRS = {"Cache-Control": "no-cache, no-store, must-revalidate",
                   "Pragma": "no-cache", "Expires": "0"}
 
 
+# Hosts treated as loopback for the local-only guard below.
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
+def _require_local(request: Request) -> Optional[JSONResponse]:
+    """Guard for mutating / log-streaming HTTP endpoints.
+
+    The server binds 127.0.0.1 and the dashboard is served from loopback, so
+    this is non-breaking for normal local use. Returns a JSONResponse to
+    short-circuit the calling handler when the request must be rejected, or
+    None when the handler may proceed.
+
+    1. Loopback only — reject any non-loopback client with HTTP 403.
+    2. Optional shared secret — if MCP_HUDDLE_TOKEN is set in the environment,
+       additionally require ``Authorization: Bearer <token>`` (or the
+       ``X-Huddle-Token: <token>`` header); HTTP 401 if missing/wrong. When the
+       env var is unset (the default) no token is required, so there is no
+       behavior change.
+
+    NOTE: when MCP_HUDDLE_TOKEN is set, the dashboard's own fetch() calls must
+    send the matching header. That lives in dashboard.js (owned elsewhere); the
+    server side stays correct and tolerant when the token is unset.
+    """
+    client = request.client
+    host = client.host if client else None
+    if host not in _LOOPBACK_HOSTS:
+        return JSONResponse({"error": "forbidden: loopback only"}, status_code=403)
+
+    token = os.environ.get("MCP_HUDDLE_TOKEN")
+    if token:
+        provided = request.headers.get("x-huddle-token")
+        if not provided:
+            auth = request.headers.get("authorization", "")
+            if auth.lower().startswith("bearer "):
+                provided = auth[7:].strip()
+        if provided != token:
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return None
+
+
 @mcp.custom_route("/dashboard", methods=["GET"])
 async def dashboard_handler(request: Request):
     return FileResponse(_STATIC_DIR / "dashboard.html",
@@ -600,6 +640,9 @@ async def api_message_post(request: Request) -> JSONResponse:
 
 @mcp.custom_route("/api/room_close", methods=["POST"])
 async def api_room_close(request: Request) -> JSONResponse:
+    denied = _require_local(request)
+    if denied is not None:
+        return denied
     try:
         data = await request.json()
         bus.close_room(data["room_id"], data["owner"])
@@ -612,6 +655,9 @@ async def api_room_close(request: Request) -> JSONResponse:
 async def api_room_delete(request: Request) -> JSONResponse:
     """Wipe a closed room from disk. Backed by bus.delete_room() — only works
     on status='closed' rooms (raises ValueError otherwise)."""
+    denied = _require_local(request)
+    if denied is not None:
+        return denied
     try:
         data = await request.json()
         bus.delete_room(data["room_id"], data["owner"])
@@ -630,6 +676,9 @@ async def api_room_delete(request: Request) -> JSONResponse:
 async def api_rooms_close_all(request: Request) -> JSONResponse:
     """Bulk close: every non-closed room. Kills alive spawned PIDs only,
     excluding owner PIDs of any room. Dead PIDs skipped."""
+    denied = _require_local(request)
+    if denied is not None:
+        return denied
     try:
         return JSONResponse(bus.close_all_rooms())
     except Exception as e:
@@ -639,6 +688,9 @@ async def api_rooms_close_all(request: Request) -> JSONResponse:
 @mcp.custom_route("/api/rooms_delete_closed", methods=["POST"])
 async def api_rooms_delete_closed(request: Request) -> JSONResponse:
     """Wipe every room with status=closed from disk. Open rooms untouched."""
+    denied = _require_local(request)
+    if denied is not None:
+        return denied
     try:
         return JSONResponse(bus.delete_closed_rooms())
     except Exception as e:
@@ -648,6 +700,9 @@ async def api_rooms_delete_closed(request: Request) -> JSONResponse:
 @mcp.custom_route("/api/rooms_nuke", methods=["POST"])
 async def api_rooms_nuke(request: Request) -> JSONResponse:
     """Hard reset: close all + delete all. Owner PIDs preserved."""
+    denied = _require_local(request)
+    if denied is not None:
+        return denied
     try:
         return JSONResponse(bus.nuke_all_rooms())
     except Exception as e:
@@ -716,6 +771,9 @@ async def api_agent_events(request: Request) -> StreamingResponse:
     Each line in the file becomes one SSE `data:` event.
     Closes when the file is gone (room deleted) or client disconnects.
     """
+    denied = _require_local(request)
+    if denied is not None:
+        return denied
     room_id = request.path_params["room_id"]
     agent_name = request.path_params["agent_name"].lower()
     log_path = bus._room_dir(room_id) / "agents" / f"{agent_name}.events.jsonl"

@@ -1456,3 +1456,15 @@
     /* Keep the settings label compact on very narrow screens. */
     [data-narrow] #settings-btn { font-size: 0; gap: 0; padding: 7px 10px; }
     [data-narrow] #settings-btn::before { content: '⚙️'; font-size: 13px; }
+
+    /* ── Help "?" icons (hover tooltips) + i18n niceties ─────────── */
+    .set-label { display: flex; align-items: center; gap: 0; }
+    .help-icon {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 14px; height: 14px; margin-left: 5px; flex-shrink: 0;
+      border-radius: 50%; font-size: 9px; font-weight: 700; line-height: 1;
+      background: var(--bubble-bg); border: 1px solid var(--bubble-border);
+      color: var(--text-sub); cursor: help;
+    }
+    .help-icon:hover { color: var(--text); }
+    [dir="rtl"] .help-icon { margin-left: 0; margin-right: 5px; }
