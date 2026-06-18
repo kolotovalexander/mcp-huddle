@@ -1470,3 +1470,25 @@
     }
     .help-icon:hover { color: var(--text); }
     [dir="rtl"] .help-icon { margin-left: 0; margin-right: 5px; }
+
+    /* ── Settings: env-var reference rows + copyable agent prompt ─── */
+    .set-var { display: flex; flex-direction: column; gap: 2px; padding: 2px 0; }
+    .set-var-name {
+      align-self: flex-start; max-width: 100%;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 10.5px;
+      color: var(--text); background: var(--input-bg);
+      border: 1px solid var(--input-border); border-radius: 6px;
+      padding: 2px 6px; cursor: pointer;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .set-var-name:hover { border-color: var(--active-border); }
+    .set-var-desc { font-size: 10px; color: var(--text-sub); line-height: 1.4; }
+    .set-prompt-wrap { display: flex; flex-direction: column; gap: 4px; }
+    .set-prompt {
+      width: 100%; resize: vertical; min-height: 88px;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 10.5px;
+      line-height: 1.45; color: var(--text);
+      background: var(--input-bg); border: 1px solid var(--input-border);
+      border-radius: 8px; padding: 8px;
+    }
+    .set-prompt-wrap .set-copy-btn { align-self: flex-end; }

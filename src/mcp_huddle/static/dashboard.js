@@ -70,6 +70,17 @@ const I18N = {
     'tip.lang': 'Interface language.',
     'tip.collapse': 'Collapse this panel. Drag the edge to resize; double-click the edge to collapse.',
     'tip.restoreSidebar': 'Show the rooms list', 'tip.restoreActivity': 'Show the activity panel',
+    'set.spawn': 'Agents & spawn (env)', 'set.agentPrompt': 'Agent setup prompt',
+    'tip.spawn': 'Environment variables that control the server and which agents spawn. Click a name to copy.',
+    'tip.agentPrompt': 'Paste this to an AI agent so it can connect to and use huddle.',
+    'var.registryFile': 'Drop-in JSON to add/override agents (merged with defaults).',
+    'var.registryEnv': 'Path to a registry JSON (highest precedence, overrides the file).',
+    'var.claude': 'Enable the Claude spawn slot (off by default; metered).',
+    'var.mimo': 'Disable the MiMo spawn slot (on by default).',
+    'var.token': 'If set, require this bearer token on mutating HTTP/SSE endpoints.',
+    'var.home': 'Data directory (rooms, logs). Default ~/.mcp-huddle.',
+    'var.port': 'HTTP port for the dashboard/MCP (default 8014).',
+    'agentPrompt.text': 'Connect to the huddle MCP server at {origin}/mcp — e.g. run: claude mcp add --transport http huddle {origin}/mcp\nThen use: room_list (see rooms), room_create (start one), messages_read (catch up), message_post (reply). Reuse an existing room or create a new one.\nOnly answer kind=request addressed to you (to=YourName or to=all); never reply to comment/ack/result/final (anti-loop).',
   },
   ru: {
     'app.subtitle': 'комнат · мультиагентное обсуждение',
@@ -101,6 +112,17 @@ const I18N = {
     'tip.lang': 'Язык интерфейса.',
     'tip.collapse': 'Свернуть панель. Тяните за край для изменения ширины; двойной клик по краю — свернуть.',
     'tip.restoreSidebar': 'Показать список комнат', 'tip.restoreActivity': 'Показать панель активности',
+    'set.spawn': 'Агенты и спавн (env)', 'set.agentPrompt': 'Промпт настройки агента',
+    'tip.spawn': 'Переменные окружения, управляющие сервером и тем, какие агенты спавнятся. Клик по имени — скопировать.',
+    'tip.agentPrompt': 'Вставьте это AI-агенту, чтобы он подключился к huddle и начал им пользоваться.',
+    'var.registryFile': 'Drop-in JSON для добавления/переопределения агентов (мержится с дефолтами).',
+    'var.registryEnv': 'Путь к registry JSON (высший приоритет, перекрывает файл).',
+    'var.claude': 'Включить слот Claude (по умолчанию выкл.; тарифицируется).',
+    'var.mimo': 'Выключить слот MiMo (по умолчанию вкл.).',
+    'var.token': 'Если задан — требовать этот bearer-токен на мутирующих HTTP/SSE-эндпоинтах.',
+    'var.home': 'Каталог данных (комнаты, логи). По умолчанию ~/.mcp-huddle.',
+    'var.port': 'HTTP-порт дашборда/MCP (по умолчанию 8014).',
+    'agentPrompt.text': 'Подключись к huddle MCP по адресу {origin}/mcp — например: claude mcp add --transport http huddle {origin}/mcp\nДалее: room_list (список комнат), room_create (создать), messages_read (прочитать), message_post (ответить). Переиспользуй существующую комнату или создай новую.\nОтвечай только на kind=request, адресованные тебе (to=ТвоёИмя или to=all); никогда не отвечай на comment/ack/result/final (анти-луп).',
   },
   es: {"app.subtitle": "salas · debate multiagente", "btn.closeAll": "Cerrar todo", "btn.deleteClosed": "Eliminar cerradas", "btn.nukeAll": "Borrar todo", "btn.view": "Ver", "btn.live": "en vivo", "btn.copy": "Copiar", "btn.send": "Enviar", "chat.selectRoom": "Selecciona una sala", "chat.selectHint": "Usa room_create() desde un agente para iniciar un debate", "chat.closed": "Sala cerrada — solo lectura", "chat.resolved": "Sala resuelta — solo lectura", "chat.placeholder": "Mensaje como Human — prioridad de sistema, omite anti-loop…", "chat.closedTitle": "Sala cerrada", "chat.pickAnother": "Elige otra sala en la barra lateral", "activity.title": "Actividad de agentes", "activity.hint": "Se abre al seleccionar una sala con agentes generados", "sidebar.empty": "Aún no hay salas. Llama a room_create() desde un agente.", "set.appearance": "Apariencia", "set.theme": "Tema", "set.skin": "Diseño", "set.palette": "Paleta", "set.lang": "Idioma", "set.mcp": "Conexión MCP", "theme.auto": "Auto", "theme.dark": "Oscuro", "theme.light": "Claro", "mcp.endpoint": "HTTP endpoint", "mcp.claude": "Claude Code", "mcp.codex": "Codex (config.toml)", "mcp.stdio": "stdio (cualquier cliente)", "mcp.hint": "El panel y MCP comparten un mismo puerto. Conecta agentes por HTTP, o ejecuta el binario mcp-huddle como servidor stdio.", "tip.closeAll": "Cierra todas las salas abiertas (detiene los procesos de agentes generados en vivo; los owners no se tocan).", "tip.deleteClosed": "Elimina permanentemente del disco todas las salas cerradas.", "tip.nukeAll": "Cierra Y elimina todas las salas. Los procesos owner no se tocan.", "tip.view": "Apariencia (tema, diseño, paleta, idioma) e info de conexión MCP.", "tip.theme": "Modo claro/oscuro. Auto sigue la configuración de tu OS.", "tip.skin": "Aspecto general: Glass (esmerilado), Web (plano) o Code (IDE).", "tip.palette": "Esquema de color — paletas de terminal populares (Dracula, Nord, …).", "tip.lang": "Idioma de la interfaz.", "tip.collapse": "Contrae este panel. Arrastra el borde para redimensionar; haz doble clic en el borde para contraer.", "tip.restoreSidebar": "Mostrar la lista de salas", "tip.restoreActivity": "Mostrar el panel de actividad"},
   de: {"app.subtitle": "Räume · Multi-Agenten-Diskussion", "btn.closeAll": "Alle schließen", "btn.deleteClosed": "Geschlossene löschen", "btn.nukeAll": "Alles löschen", "btn.view": "Ansicht", "btn.live": "live", "btn.copy": "Kopieren", "btn.send": "Senden", "chat.selectRoom": "Raum auswählen", "chat.selectHint": "Nutze room_create() aus einem Agenten, um eine Diskussion zu starten", "chat.closed": "Raum geschlossen — schreibgeschützt", "chat.resolved": "Raum aufgelöst — schreibgeschützt", "chat.placeholder": "Nachricht als Human — Systempriorität, umgeht anti-loop…", "chat.closedTitle": "Raum geschlossen", "chat.pickAnother": "Wähle einen anderen Raum aus der Seitenleiste", "activity.title": "Agenten-Aktivität", "activity.hint": "Öffnet sich, wenn du einen Raum mit gestarteten Agenten auswählst", "sidebar.empty": "Noch keine Räume. Rufe room_create() aus einem Agenten auf.", "set.appearance": "Darstellung", "set.theme": "Theme", "set.skin": "Design", "set.palette": "Palette", "set.lang": "Sprache", "set.mcp": "MCP-Verbindung", "theme.auto": "Auto", "theme.dark": "Dunkel", "theme.light": "Hell", "mcp.endpoint": "HTTP endpoint", "mcp.claude": "Claude Code", "mcp.codex": "Codex (config.toml)", "mcp.stdio": "stdio (beliebiger Client)", "mcp.hint": "Dashboard und MCP teilen sich einen Port. Verbinde Agenten über HTTP oder starte das mcp-huddle-Binary als stdio-Server.", "tip.closeAll": "Jeden offenen Raum schließen (beendet laufende, gestartete Agentenprozesse; Owner bleiben unberührt).", "tip.deleteClosed": "Alle geschlossenen Räume dauerhaft von der Festplatte löschen.", "tip.nukeAll": "Jeden Raum schließen UND löschen. Owner-Prozesse bleiben unberührt.", "tip.view": "Darstellung (Theme, Design, Palette, Sprache) und Infos zur MCP-Verbindung.", "tip.theme": "Heller/dunkler Modus. Auto folgt deiner OS-Einstellung.", "tip.skin": "Gesamtlook: Glass (matt), Web (flach) oder Code (IDE).", "tip.palette": "Farbschema — beliebte Terminal-Paletten (Dracula, Nord, …).", "tip.lang": "Sprache der Oberfläche.", "tip.collapse": "Dieses Panel einklappen. Ziehe am Rand zum Anpassen; Doppelklick auf den Rand zum Einklappen.", "tip.restoreSidebar": "Raumliste anzeigen", "tip.restoreActivity": "Aktivitäts-Panel anzeigen"},
@@ -342,6 +364,31 @@ function buildCopyRow(label, value) {
   ]);
 }
 
+// A reference row: env-var / file name (click to copy) + a short description.
+function buildVarRow(name, desc) {
+  const code = el('code', {class: 'set-var-name', title: t('btn.copy'), text: name});
+  code.onclick = () => {
+    try { navigator.clipboard && navigator.clipboard.writeText(name); } catch (_) {}
+    const old = code.textContent; code.textContent = '✓ ' + name;
+    setTimeout(() => { code.textContent = old; }, 900);
+  };
+  return el('div', {class: 'set-var'}, [code, el('div', {class: 'set-var-desc', text: desc})]);
+}
+
+// A copyable multi-line block (read-only textarea + copy button).
+function buildPromptRow(value) {
+  const ta = el('textarea', {class: 'set-prompt', readonly: 'readonly', rows: '5'});
+  ta.value = value;
+  const btn = el('button', {class: 'set-opt set-copy-btn', text: t('btn.copy')});
+  btn.onclick = () => {
+    try { navigator.clipboard && navigator.clipboard.writeText(value); } catch (_) {}
+    ta.focus(); ta.select && ta.select();
+    btn.textContent = '✓';
+    setTimeout(() => { btn.textContent = t('btn.copy'); }, 1200);
+  };
+  return el('div', {class: 'set-prompt-wrap'}, [ta, btn]);
+}
+
 // Theme labels are localised (emoji + word); skin/palette/lang labels are proper nouns.
 function themeOpts() {
   return [
@@ -369,6 +416,22 @@ function buildSettingsPopover(pop) {
   pop.appendChild(buildCopyRow(t('mcp.codex'), `[mcp_servers.huddle]\nurl = "${origin}/mcp"`));
   pop.appendChild(buildCopyRow(t('mcp.stdio'), 'mcp-huddle'));
   pop.appendChild(el('div', {class: 'set-hint', text: t('mcp.hint')}));
+
+  // ── Environment variables / spawn rules (reference; click a name to copy) ──
+  pop.appendChild(el('div', {class: 'set-sep'}));
+  pop.appendChild(el('div', {class: 'set-title'}, [el('span', {text: t('set.spawn')}), helpIcon('tip.spawn')]));
+  pop.appendChild(buildVarRow('~/.mcp-huddle/registry.json', t('var.registryFile')));
+  pop.appendChild(buildVarRow('MCP_HUDDLE_SPAWN_REGISTRY', t('var.registryEnv')));
+  pop.appendChild(buildVarRow('MCP_HUDDLE_CLAUDE_ENABLED=1', t('var.claude')));
+  pop.appendChild(buildVarRow('MCP_HUDDLE_MIMO_ENABLED=0', t('var.mimo')));
+  pop.appendChild(buildVarRow('MCP_HUDDLE_TOKEN', t('var.token')));
+  pop.appendChild(buildVarRow('MCP_HUDDLE_HOME', t('var.home')));
+  pop.appendChild(buildVarRow('PORT', t('var.port')));
+
+  // ── Copy-paste prompt to onboard an agent into huddle ──
+  pop.appendChild(el('div', {class: 'set-sep'}));
+  pop.appendChild(el('div', {class: 'set-title'}, [el('span', {text: t('set.agentPrompt')}), helpIcon('tip.agentPrompt')]));
+  pop.appendChild(buildPromptRow(t('agentPrompt.text').split('{origin}').join(location.origin)));
 }
 
 function setLang(lang) {
