@@ -265,9 +265,14 @@ def test_idempotency_key_reuses_message_id(isolated_bus) -> None:
 def test_http_message_post_honors_idempotency_key(isolated_bus) -> None:
     from mcp_huddle.server import api_message_post
 
+    class _Client:
+        host = "127.0.0.1"  # loopback so _require_local allows the request
+
     class RequestStub:
         def __init__(self, data: dict):
             self._data = data
+            self.client = _Client()
+            self.headers: dict = {}
 
         async def json(self) -> dict:
             return self._data
@@ -288,6 +293,26 @@ def test_http_message_post_honors_idempotency_key(isolated_bus) -> None:
     assert second.status_code == 200
     assert json.loads(first.body)["id"] == json.loads(second.body)["id"]
     assert len(isolated_bus._load_messages(room_id)) == 1
+
+
+def test_http_message_post_rejects_non_loopback(isolated_bus) -> None:
+    """The mutating /api/message_post route must enforce _require_local, like the
+    other write endpoints — a non-loopback client gets 403 (regression guard)."""
+    from mcp_huddle.server import api_message_post
+
+    class _RemoteClient:
+        host = "203.0.113.7"  # non-loopback
+
+    class RequestStub:
+        client = _RemoteClient()
+        headers: dict = {}
+
+        async def json(self) -> dict:
+            return {"room_id": _create_room(isolated_bus), "agent": "X",
+                    "body": "hi", "kind": "comment"}
+
+    resp = asyncio.run(api_message_post(RequestStub()))
+    assert resp.status_code == 403
 
 
 def test_messages_read_applies_since_id_and_limit(isolated_bus) -> None:

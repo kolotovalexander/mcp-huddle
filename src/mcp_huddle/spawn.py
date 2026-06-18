@@ -912,17 +912,22 @@ def codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str,
     flag (before `exec`). The model is left to ~/.codex/config.toml (SoT).
     """
     cwd, prompt = _codex_safe_cwd_and_brief(cwd, prompt)
+    # Read-only by default (matches the initial-spawn transform): pin
+    # sandbox_mode=read-only and auto-approve the huddle MCP tools so the
+    # resumed turn can still post without the restricted-sandbox approval that
+    # `-a never` would otherwise cancel. MCP_HUDDLE_READONLY=0 → full access.
+    readonly = _readonly_enabled()
+    sandbox = "read-only" if readonly else _CODEX_SANDBOX
     argv = [
         _CODEX_BIN or "codex", "-a", "never",            # top-level: never auto-approve tool calls
         "exec", "resume", thread_id,                     # subcommand
         "--json",                                        # JSONL events to stdout
         "-c", 'model_reasoning_effort="medium"',
-        # Full access (resume has no -s flag, so pin via -c). A restricted
-        # sandbox makes Codex's huddle MCP calls approval-requiring, which
-        # `-a never` auto-cancels — so the resumed turn would post nothing.
-        "-c", f'sandbox_mode="{_CODEX_SANDBOX}"',
+        "-c", f'sandbox_mode="{sandbox}"',               # resume has no -s flag; pin via -c
         "-c", "features.guardian_approval=false",
     ]
+    if readonly:
+        argv += ["-c", 'mcp_servers.huddle.default_tools_approval_mode="approve"']
     if last_msg_path:
         argv += ["-o", last_msg_path]                    # short form of --output-last-message
     argv.append(prompt)

@@ -617,6 +617,9 @@ async def api_messages_json(request: Request) -> JSONResponse:
 
 @mcp.custom_route("/api/message_post", methods=["POST"])
 async def api_message_post(request: Request) -> JSONResponse:
+    denied = _require_local(request)
+    if denied is not None:
+        return denied
     try:
         data = await request.json()
         msg_id = _post_message_checked(

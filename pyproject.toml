@@ -44,5 +44,29 @@ Issues   = "https://github.com/kolotovalexander/mcp-huddle/issues"
 [tool.hatch.build.targets.wheel]
 packages = ["src/mcp_huddle"]
 
+[tool.hatch.build.targets.sdist]
+# Ship only source + docs/examples/tests; never local runtime/dev state.
+include = [
+    "/src",
+    "/tests",
+    "/docs",
+    "/examples",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/CONTRIBUTING.md",
+    "/CLAUDE.md",
+    "/LICENSE",
+    "/pyproject.toml",
+]
+exclude = [
+    "**/.remember",
+    "**/.DS_Store",
+    "**/__pycache__",
+    "**/*.pyc",
+    "**/.pytest_cache",
+    "/dist",
+    "/.venv",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
