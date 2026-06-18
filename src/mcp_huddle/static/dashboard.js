@@ -469,6 +469,7 @@ async function openRoom(id, owner) {
   await attachAgentPanels(id);  // Phase 1: live agent event stream (Codex / runner agents)
   // Re-paint totals badges after panels rebuilt
   Object.keys(agentMetaTotals).forEach(renderAgentTotalsBadge);
+  relayout();  // reveal the activity panel now that a room is open
 }
 
 // ── Phase 1: agent live event panels ─────────────────────────────────────────
@@ -935,12 +936,16 @@ function relayout() {
     '--drawer-top', Math.round(tb.getBoundingClientRect().bottom + 8) + 'px');
   document.documentElement.toggleAttribute('data-narrow', isOverlay());
 
+  // Activity panel only exists once a room is open (nothing to show otherwise).
+  const hasRoom = !!currentRoom;
+  if (!hasRoom && layout.drawer === 'activity') layout.drawer = null;
+
   if (isOverlay()) {
     // ── Overlay/drawer mode: chat is full-width, panels float over it ──
     main.classList.add('overlay-mode');
     main.classList.remove('sidebar-off', 'activity-off');
     const sOpen = layout.drawer === 'sidebar';
-    const aOpen = layout.drawer === 'activity';
+    const aOpen = hasRoom && layout.drawer === 'activity';
     main.classList.toggle('drawer-sidebar-open', sOpen);
     main.classList.toggle('drawer-activity-open', aOpen);
     document.documentElement.style.setProperty(
@@ -949,7 +954,7 @@ function relayout() {
     // Overlay: panels are off-screen drawers → topbar buttons always available
     // to summon them; they reflect open state.
     if (sBtn) { sBtn.style.display = ''; sBtn.classList.toggle('active', sOpen); }
-    if (aBtn) { aBtn.style.display = ''; aBtn.classList.toggle('active', aOpen); }
+    if (aBtn) { aBtn.style.display = hasRoom ? '' : 'none'; aBtn.classList.toggle('active', aOpen); }
     return;
   }
 
@@ -961,7 +966,7 @@ function relayout() {
   const avail = window.innerWidth - LAYOUT_GUTTER;
   const actMax = Math.floor(window.innerWidth * 0.6);
   let sw = layout.sidebarCollapsed ? 0 : clampN(layout.sidebarW, SIDEBAR_MIN, SIDEBAR_MAX);
-  let aw = layout.activityCollapsed ? 0 : clampN(layout.activityW, ACTIVITY_MIN, actMax);
+  let aw = (layout.activityCollapsed || !hasRoom) ? 0 : clampN(layout.activityW, ACTIVITY_MIN, actMax);
 
   // Protect the chat: shrink/hide activity first, then the sidebar.
   if (avail - sw - aw < CHAT_MIN && aw > 0) {
@@ -988,7 +993,9 @@ function relayout() {
     sBtn.title = 'Показать список комнат';
   }
   if (aBtn) {
-    aBtn.style.display = aOff ? '' : 'none';
+    // Only offer the "restore activity" button when a room is open AND the
+    // user collapsed it — never when it's hidden simply because no room is open.
+    aBtn.style.display = (hasRoom && aOff) ? '' : 'none';
     aBtn.title = 'Показать панель активности';
   }
 }

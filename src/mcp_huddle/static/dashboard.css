@@ -1361,10 +1361,11 @@
     .sess-header:hover .tree-label { color: var(--text); }
     .proj-header .count, .sess-header .count { margin-left: auto; opacity: .7; font-weight: 600; }
     .tree-arrow {
-      display: inline-block; width: 10px; flex-shrink: 0;
-      font-size: 9px; opacity: .55; text-align: center;
+      display: inline-block; width: 14px; flex-shrink: 0;
+      font-size: 13px; opacity: .6; text-align: center;
       transition: transform .15s ease;
     }
+    .sess-header .tree-arrow { font-size: 12px; }
     .tree-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .proj-block.collapsed > .proj-header .tree-arrow,
     .sess-group.collapsed > .sess-header .tree-arrow { transform: rotate(-90deg); }
