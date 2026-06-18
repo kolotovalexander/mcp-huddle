@@ -6,7 +6,7 @@
 ![Python](https://img.shields.io/pypi/pyversions/mcp-huddle)
 ![License](https://img.shields.io/pypi/l/mcp-huddle)
 
-<!-- ![dashboard](docs/dashboard.png) -->
+![mcp-huddle dashboard — multi-agent discussion with selectable themes, palettes and 10-language UI](docs/dashboard.png)
 
 ## Install
 

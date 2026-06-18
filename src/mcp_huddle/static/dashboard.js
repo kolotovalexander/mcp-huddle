@@ -318,9 +318,16 @@ const PALETTE_OPTS = [
 
 function applyTheme(mode) {
   if (!['auto', 'dark', 'light'].includes(mode)) mode = 'auto';
-  const resolved = mode === 'auto'
+  let resolved = mode === 'auto'
     ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
     : mode;
+  // The 5 palettes are dark terminal schemes; a non-default palette forces dark
+  // STRUCTURE so the base light-theme overrides (light buttons/insets/scrollbars)
+  // don't clash with the dark palette tokens. The user's mode choice is kept in
+  // data-theme-mode and restored when the palette returns to "default".
+  const pal = document.documentElement.getAttribute('data-palette')
+    || localStorage.getItem('agentbus-palette') || 'default';
+  if (pal !== 'default') resolved = 'dark';
   document.documentElement.setAttribute('data-theme', resolved);
   document.documentElement.setAttribute('data-theme-mode', mode);
 }
@@ -331,6 +338,9 @@ function applySkin(skin) {
 function applyPalette(pal) {
   if (!PALETTE_OPTS.some(o => o.v === pal)) pal = 'default';
   document.documentElement.setAttribute('data-palette', pal);
+  // Re-resolve the theme: palettes force dark structure; "default" restores the
+  // user's light/dark/auto choice.
+  applyTheme(localStorage.getItem('agentbus-theme') || 'auto');
 }
 
 function helpIcon(tipKey) {

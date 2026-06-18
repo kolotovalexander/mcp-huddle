@@ -16,13 +16,15 @@
         if (mode === 'auto') {
           mode = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
         }
-        document.documentElement.setAttribute('data-theme', mode);
         var skin = localStorage.getItem('agentbus-skin');
         skin = (skin === 'web' || skin === 'code' || skin === 'glass') ? skin : 'glass';
         document.documentElement.setAttribute('data-skin', skin);
         var PALETTES = ['default','dracula','nord','tokyonight','catppuccin','gruvbox'];
         var pal = localStorage.getItem('agentbus-palette');
-        document.documentElement.setAttribute('data-palette', PALETTES.indexOf(pal) >= 0 ? pal : 'default');
+        pal = PALETTES.indexOf(pal) >= 0 ? pal : 'default';
+        document.documentElement.setAttribute('data-palette', pal);
+        // Non-default palettes are dark schemes → force dark structure pre-paint.
+        document.documentElement.setAttribute('data-theme', pal !== 'default' ? 'dark' : mode);
       } catch (e) {
         document.documentElement.setAttribute('data-theme', 'dark');
         document.documentElement.setAttribute('data-skin', 'glass');
