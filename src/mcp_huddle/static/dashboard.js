@@ -901,6 +901,13 @@ function relayout() {
   const sBtn = document.getElementById('sidebar-collapse');
   const aBtn = document.getElementById('activity-collapse');
 
+  // Anchor the settings popover + drawers just under the (possibly wrapped)
+  // topbar, and flag narrow mode so the topbar can shed rare controls.
+  const tb = document.querySelector('.topbar');
+  if (tb) document.documentElement.style.setProperty(
+    '--drawer-top', Math.round(tb.getBoundingClientRect().bottom + 8) + 'px');
+  document.documentElement.toggleAttribute('data-narrow', isOverlay());
+
   if (isOverlay()) {
     // ── Overlay/drawer mode: chat is full-width, panels float over it ──
     main.classList.add('overlay-mode');

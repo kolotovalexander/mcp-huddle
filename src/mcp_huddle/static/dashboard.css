@@ -1343,7 +1343,7 @@
     /* ── Settings popover (single ⚙️ control for theme/skin/palette) ─ */
     .settings-wrap { position: relative; display: inline-flex; }
     .settings-popover {
-      position: absolute; top: calc(100% + 8px); right: 0; z-index: 60;
+      position: fixed; top: var(--drawer-top, 70px); right: 14px; z-index: 60;
       width: 280px; max-width: calc(100vw - 28px); padding: 12px;
       background: var(--panel-bg);
       backdrop-filter: blur(40px) saturate(180%);
@@ -1397,3 +1397,12 @@
     .main.overlay-mode .activity { right: 14px; transform: translateX(calc(100% + 24px)); }
     .main.overlay-mode.drawer-sidebar-open  .sidebar  { transform: translateX(0); }
     .main.overlay-mode.drawer-activity-open .activity { transform: translateX(0); }
+
+    /* ── Narrow topbar: shed rare/destructive controls so the row fits ─ */
+    [data-narrow] .brand-text .subtitle { display: none; }
+    [data-narrow] #bulk-close-all,
+    [data-narrow] #bulk-delete-closed,
+    [data-narrow] #bulk-nuke { display: none; }
+    /* Keep the settings label compact on very narrow screens. */
+    [data-narrow] #settings-btn { font-size: 0; gap: 0; padding: 7px 10px; }
+    [data-narrow] #settings-btn::before { content: '⚙️'; font-size: 13px; }
