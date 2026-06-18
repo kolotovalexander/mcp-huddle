@@ -76,6 +76,36 @@ def _port_arg(value: str) -> int:
     return port
 
 
+def _install_hooks(dest: "str | None") -> None:
+    """Copy the bundled example hooks (Claude Code PostToolUse / Stop) to a
+    directory and print how to wire them in. pip can't run post-install code
+    safely, so this is the explicit opt-in step a user runs after installing.
+    """
+    import shutil
+    from pathlib import Path
+
+    src_dir = Path(__file__).parent / "hooks"
+    target = Path(dest).expanduser() if dest else (Path.home() / ".mcp-huddle" / "hooks")
+    target.mkdir(parents=True, exist_ok=True)
+    copied = []
+    for sh in sorted(src_dir.glob("*.sh")):
+        out = target / sh.name
+        shutil.copyfile(sh, out)
+        out.chmod(0o755)
+        copied.append(out)
+    print(f"Installed {len(copied)} hook(s) to {target}:")
+    for c in copied:
+        print(f"  {c}")
+    example = """
+Wire them into Claude Code (~/.claude/settings.json), e.g.:
+  "hooks": {
+    "PostToolUse": [{"hooks": [{"type":"command","command":"__T__/claude-check.sh"}]}],
+    "Stop":        [{"hooks": [{"type":"command","command":"__T__/session-end.sh"}]}]
+  }
+claude-check.sh surfaces pending huddle requests; session-end.sh closes this session's rooms on exit."""
+    print(example.replace("__T__", str(target)))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="mcp-huddle",
@@ -96,12 +126,24 @@ def main() -> None:
         help="run the HTTP server + dashboard instead of stdio transport",
     )
     parser.add_argument(
+        "--install-hooks",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="DIR",
+        help="copy the bundled Claude Code hooks to DIR (default ~/.mcp-huddle/hooks) and exit",
+    )
+    parser.add_argument(
         "--port",
         type=_port_arg,
         default=None,
         help=f"HTTP port (default: $PORT or {DEFAULT_PORT}); only used with --http",
     )
     args = parser.parse_args()
+
+    if args.install_hooks is not None:
+        _install_hooks(args.install_hooks or None)
+        return
 
     use_http = args.http or bool(os.environ.get("MCP_HUDDLE_HTTP"))
 
