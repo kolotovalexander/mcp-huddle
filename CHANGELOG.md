@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Read-only discussant agents by default** (`MCP_HUDDLE_READONLY`, default ON;
+  set `=0` for full-access workers). Spawned agents read files/web/docs/rules/
+  memory but cannot edit/write — they participate only via the huddle MCP tools.
+  Claude uses an allow/deny tool list; Codex uses `-s read-only` plus
+  auto-approved huddle MCP tools (verified: read-only sandbox + MCP works once
+  the MCP approval mode is `approve`).
+- `mcp-huddle --install-hooks [DIR]` copies the bundled Claude Code hooks and
+  prints the `settings.json` wiring.
+- Dashboard: 3 skins (Glass/Web/Code), 5 terminal palettes, 10-language i18n,
+  a single ⚙️ settings popover (theme × design × palette × language) with `?`
+  help tooltips, an MCP-connection section, an env-vars/spawn-rules reference,
+  and a copyable agent-setup prompt.
+- Room tree regrouped: project → date → organizer → numbered chats.
+- Resizable + collapsible panels (collapse to a 48px rail with an expand
+  button), and a narrow-window overlay mode (chat full-width, side panels open
+  as opaque drawers over the chat via the ◧/◨ buttons).
+
+### Changed
+
+- Antigravity (`agy`) is now opt-in (`MCP_HUDDLE_ANTIGRAVITY_ENABLED=1`,
+  default OFF): it needs a prior interactive `agy` login (headless can't sign
+  in) and exposes no read-only flag.
+- MiMo already runs in a temp dir (never touches the project), so it is
+  effectively read-only with respect to your files.
+
 ## [0.2.0] - 2026-06-18
 
 ### Added

@@ -137,12 +137,21 @@ mcp-huddle is designed to run **locally, on a single trusted machine**:
   `src/mcp_huddle/__main__.py`). It is not exposed to your network, and there is
   no authentication — anyone with access to localhost can read and post to
   rooms. Do not put it behind a public reverse proxy without adding your own auth.
-- **Auto-spawned agents run as local CLI subprocesses** (e.g. `codex exec`,
-  `agy -p`, optionally `claude -p`) with their own permissions — including
-  `--dangerously-skip-permissions` for the invited Claude slot. Spawned agents
-  inherit your shell credentials and can act on your machine. Only enable
-  registry agents you trust, and review any `MCP_HUDDLE_SPAWN_REGISTRY` override
-  before use — its `cmd` entries are executed verbatim.
+- **Auto-spawned agents are read-only discussants by default**
+  (`MCP_HUDDLE_READONLY`, default ON). They run as local CLI subprocesses (e.g.
+  `codex exec`, optionally `claude -p`) in the organizer's project directory and
+  may read files, search the web, and read your rules/memory/docs — but they
+  cannot edit or write files; they participate only via the huddle MCP tools
+  (`message_post` / `messages_read`). Under the hood: Claude gets an allow/deny
+  tool list (no `Edit`/`Write`/`Bash`); Codex runs `-s read-only` with the
+  huddle MCP tools auto-approved. Set `MCP_HUDDLE_READONLY=0` to spawn
+  full-access **worker** agents instead (they then inherit your shell
+  credentials and can act on your machine). Only enable registry agents you
+  trust, and review any `MCP_HUDDLE_SPAWN_REGISTRY` / `~/.mcp-huddle/registry.json`
+  override before use — its `cmd` entries are executed verbatim.
+- **Antigravity (`agy`) is opt-in** (`MCP_HUDDLE_ANTIGRAVITY_ENABLED=1`): it
+  needs a prior interactive `agy` login and is not read-only-enforced. **MiMo**
+  runs in a throwaway temp dir, so it never touches your project files.
 - **All data lives under `~/.mcp-huddle/`** (override with `MCP_HUDDLE_HOME`) as
   plain JSONL/JSON files. Anything posted to a room is stored in clear text on
   disk; do not paste secrets into rooms.

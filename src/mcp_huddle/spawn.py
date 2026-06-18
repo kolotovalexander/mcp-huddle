@@ -126,9 +126,17 @@ def _google_advisor_spec() -> SpawnSpec:
     """Build the Google-model advisor slot for the spawn registry.
 
     Runs on Antigravity CLI (`agy`) only — the Gemini CLI was removed (EOL
-    2026-06-18). `agy` has no `-m`/`-o`/`-y` flags, so it prints plain text
-    instead of a JSON event stream. Disabled if `agy` is not installed.
+    2026-06-18). Opt-in (default OFF) for two reasons: (1) `agy` needs an
+    interactive Google OAuth login that headless spawns can't complete — you
+    must run `agy` once and sign in first; (2) `agy` exposes no read-only flag,
+    so even under MCP_HUDDLE_READONLY it would run with full access in the
+    project dir (we can't constrain it like Claude/Codex). Enable deliberately
+    via MCP_HUDDLE_ANTIGRAVITY_ENABLED=1 once you've logged in and accept that.
     """
+    enabled = (
+        _ANTIGRAVITY_BIN is not None
+        and os.environ.get("MCP_HUDDLE_ANTIGRAVITY_ENABLED", "0") != "0"
+    )
     if _ANTIGRAVITY_BIN:
         return {
             "name": "Antigravity",
@@ -138,7 +146,7 @@ def _google_advisor_spec() -> SpawnSpec:
                 "--print-timeout", "15m",
                 "-p", "{brief}",
             ],
-            "enabled": True,
+            "enabled": enabled,
         }
     return {"name": "Antigravity", "cmd": ["agy", "-p", "{brief}"], "enabled": False}
 

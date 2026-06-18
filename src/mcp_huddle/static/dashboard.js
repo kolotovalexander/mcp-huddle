@@ -77,7 +77,8 @@ const I18N = {
     'var.registryFile': 'Drop-in JSON to add/override agents (merged with defaults).',
     'var.registryEnv': 'Path to a registry JSON (highest precedence, overrides the file).',
     'var.claude': 'Enable the Claude spawn slot (off by default; metered).',
-    'var.mimo': 'Disable the MiMo spawn slot (on by default).',
+    'var.antigravity': 'Enable the Antigravity (agy) slot (off by default; needs a prior interactive `agy` login; not read-only-enforced).',
+    'var.mimo': 'Disable the MiMo spawn slot (on by default; runs in a temp dir, never touches the project).',
     'var.token': 'If set, require this bearer token on mutating HTTP/SSE endpoints.',
     'var.home': 'Data directory (rooms, logs). Default ~/.mcp-huddle.',
     'var.port': 'HTTP port for the dashboard/MCP (default 8014).',
@@ -120,7 +121,8 @@ const I18N = {
     'var.registryFile': 'Drop-in JSON для добавления/переопределения агентов (мержится с дефолтами).',
     'var.registryEnv': 'Путь к registry JSON (высший приоритет, перекрывает файл).',
     'var.claude': 'Включить слот Claude (по умолчанию выкл.; тарифицируется).',
-    'var.mimo': 'Выключить слот MiMo (по умолчанию вкл.).',
+    'var.antigravity': 'Включить слот Antigravity (agy) (по умолчанию выкл.; нужен предварительный интерактивный вход `agy`; read-only не гарантируется).',
+    'var.mimo': 'Выключить слот MiMo (по умолчанию вкл.; работает в temp-папке, проект не трогает).',
     'var.token': 'Если задан — требовать этот bearer-токен на мутирующих HTTP/SSE-эндпоинтах.',
     'var.home': 'Каталог данных (комнаты, логи). По умолчанию ~/.mcp-huddle.',
     'var.port': 'HTTP-порт дашборда/MCP (по умолчанию 8014).',
@@ -426,6 +428,7 @@ function buildSettingsPopover(pop) {
   pop.appendChild(buildVarRow('~/.mcp-huddle/registry.json', t('var.registryFile')));
   pop.appendChild(buildVarRow('MCP_HUDDLE_SPAWN_REGISTRY', t('var.registryEnv')));
   pop.appendChild(buildVarRow('MCP_HUDDLE_CLAUDE_ENABLED=1', t('var.claude')));
+  pop.appendChild(buildVarRow('MCP_HUDDLE_ANTIGRAVITY_ENABLED=1', t('var.antigravity')));
   pop.appendChild(buildVarRow('MCP_HUDDLE_MIMO_ENABLED=0', t('var.mimo')));
   pop.appendChild(buildVarRow('MCP_HUDDLE_TOKEN', t('var.token')));
   pop.appendChild(buildVarRow('MCP_HUDDLE_HOME', t('var.home')));
