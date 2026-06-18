@@ -11,9 +11,15 @@ Open items, roughly by priority. See `docs/RELEASE_AUDIT.md` for the full audit.
   memory vs. PTY lifecycle management, output capture, process-leak/crash
   isolation. Should be opt-in, not the default (one-shot is simpler + crash-safe).
 - [ ] **Read-only for `agy` / MiMo.** Read-only is enforced for Claude + Codex.
-  `agy` has no read-only flag and needs interactive login (now opt-in, default
-  off). MiMo already runs in a temp dir (no project writes). Revisit if `agy`
-  gains a read-only/permission flag.
+  `agy` has no read-only flag (now opt-in, logged-in + huddle-MCP-wired here).
+  MiMo runs in a temp dir (no project writes).
+- [ ] **MiMo: give it project read access?** Tested 2026-06-19 on MiMo
+  `0.1.1-preview.1`: running `mimo run` in the project dir did NOT hang (the old
+  0.1.x project-scan hang did not reproduce), so the temp-cwd workaround may be
+  removable — BUT MiMo's free provider currently returns `403 Illegal access`
+  (same in temp and project cwd), so MiMo is non-functional regardless right
+  now. Revisit (and consider letting MiMo read the project read-only) once the
+  free provider works; consider defaulting MiMo OFF until then.
 
 ## From the release audit (selected, not yet done)
 - [ ] Rate-limit `message_post` beyond the existing circuit breaker.

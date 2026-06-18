@@ -10,6 +10,11 @@
 
 ## Install
 
+> **One-paste setup:** instead of wiring this up by hand, see
+> [`docs/ONBOARDING.md`](docs/ONBOARDING.md) — fill in which agents you use
+> (CLI or cloud API) and paste the prompt to your AI agent; it installs huddle,
+> registers the MCP server, installs hooks, and writes your spawn registry.
+
 ```bash
 pip install mcp-huddle
 ```

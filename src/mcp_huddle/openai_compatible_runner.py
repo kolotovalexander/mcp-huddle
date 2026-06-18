@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -113,6 +114,7 @@ def call_openai_compatible(
     messages: list[dict],
     reasoning: str,
     timeout: float,
+    api_key: str = "dummy-key",
 ) -> tuple[str, dict]:
     url = f"{base_url.rstrip('/')}/chat/completions"
     last_error: Exception | None = None
@@ -123,7 +125,7 @@ def call_openai_compatible(
             data=json.dumps(payload).encode("utf-8"),
             headers={
                 "content-type": "application/json",
-                "authorization": "Bearer dummy-key",
+                "authorization": f"Bearer {api_key}",
             },
             method="POST",
         )
@@ -160,7 +162,13 @@ def run(argv: list[str] | None = None) -> int:
     parser.add_argument("--reasoning", default="max")
     parser.add_argument("--brief", required=True)
     parser.add_argument("--timeout-sec", type=float, default=120.0)
+    parser.add_argument(
+        "--api-key-env", default=None,
+        help="env var holding the API key (for cloud OpenAI-compatible APIs). "
+             "If unset, a dummy key is sent (for local keyless bridges).")
     args = parser.parse_args(argv)
+
+    api_key = os.environ.get(args.api_key_env or "", "") or "dummy-key"
 
     room_id = extract_room_id(args.brief)
     if not room_id:
@@ -178,7 +186,7 @@ def run(argv: list[str] | None = None) -> int:
     messages = build_messages(args.agent, transcript, request_msg, args.reasoning)
     try:
         answer, meta = call_openai_compatible(
-            args.base_url, args.model, messages, args.reasoning, args.timeout_sec)
+            args.base_url, args.model, messages, args.reasoning, args.timeout_sec, api_key)
         msg_id = bus.post_message(
             room_id,
             args.agent,
