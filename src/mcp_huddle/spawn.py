@@ -507,19 +507,77 @@ def _merge_registry(
     return merged
 
 
+# Read-only discussant mode (MCP_HUDDLE_READONLY): spawned agents may READ
+# (files, web, docs, rules, memory) but must not EDIT/WRITE anything — they
+# participate only through the huddle MCP tools (message_post / messages_read),
+# never by changing files. Agents communicate via the bus, not file edits, so
+# this does not hamper participation.
+_CLAUDE_RO_FLAGS = [
+    "--allowedTools", "Read,Glob,WebFetch,WebSearch,mcp__huddle__*",
+    "--disallowedTools", "Edit,Write,NotebookEdit,MultiEdit,Bash",
+    "--permission-mode", "default",
+]
+
+
+def _readonly_enabled() -> bool:
+    # Default ON: huddle agents are read-only discussants, not workers. They
+    # read freely and talk via the bus, but never edit files. Set
+    # MCP_HUDDLE_READONLY=0 to spawn full-access agents instead.
+    return os.environ.get("MCP_HUDDLE_READONLY", "1").lower() not in ("0", "false", "no")
+
+
+def _apply_readonly(spec: SpawnSpec) -> SpawnSpec:
+    """Rewrite a spec so the agent reads freely but cannot edit/write files.
+
+    - Claude: swap `--dangerously-skip-permissions` for an allow/deny tool list
+      (read + web + huddle MCP only; Edit/Write/Bash denied). The allowlist
+      auto-denies the rest in headless `-p`, so it never hangs on a prompt.
+    - Codex: switch the sandbox to `read-only` and auto-approve the huddle MCP
+      tools (a restricted sandbox otherwise routes MCP calls through approval,
+      which `-a never` would cancel). Cross-model council, 2026-06-19.
+    Other agents are returned unchanged (no confirmed read-only flag yet).
+    """
+    name = spec.get("name")
+    cmd = list(spec.get("cmd") or [])
+    if name == "Claude":
+        cmd = [c for c in cmd if c != "--dangerously-skip-permissions"]
+        if cmd:
+            cmd = [cmd[0], *_CLAUDE_RO_FLAGS, *cmd[1:]]
+    elif name == "Codex":
+        out: list[str] = []
+        i = 0
+        while i < len(cmd):
+            out.append(cmd[i])
+            if cmd[i] == "-s" and i + 1 < len(cmd):
+                out.append("read-only")  # replace the sandbox value
+                i += 2
+                continue
+            i += 1
+        # Auto-approve huddle MCP tools so read-only doesn't cancel them;
+        # insert before the trailing positional ({brief}).
+        approve = ["-c", 'mcp_servers.huddle.default_tools_approval_mode="approve"']
+        out = [*out[:-1], *approve, out[-1]] if out else out
+        cmd = out
+    return {**spec, "cmd": cmd}
+
+
 def _raw_registry() -> list[SpawnSpec]:
     """Merged registry BEFORE availability filtering.
 
     Precedence: MCP_HUDDLE_SPAWN_REGISTRY env (full replacement) >
     ~/.mcp-huddle/registry.json (merged onto defaults) > DEFAULT_REGISTRY.
+    When MCP_HUDDLE_READONLY is set, every spec is rewritten to read-only.
     """
     env_registry = _load_env_registry()
     if env_registry is not None:
-        return env_registry
-    file_overrides = _load_registry_file()
-    if file_overrides is not None:
-        return _merge_registry(DEFAULT_REGISTRY, file_overrides)
-    return list(DEFAULT_REGISTRY)
+        reg = env_registry
+    else:
+        file_overrides = _load_registry_file()
+        reg = (_merge_registry(DEFAULT_REGISTRY, file_overrides)
+               if file_overrides is not None else list(DEFAULT_REGISTRY))
+    if _readonly_enabled():
+        reg = [_apply_readonly(s) for s in reg]
+    return reg
 
 
 def load_registry() -> list[SpawnSpec]:

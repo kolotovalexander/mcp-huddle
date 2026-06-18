@@ -73,6 +73,7 @@ const I18N = {
     'set.spawn': 'Agents & spawn (env)', 'set.agentPrompt': 'Agent setup prompt',
     'tip.spawn': 'Environment variables that control the server and which agents spawn. Click a name to copy.',
     'tip.agentPrompt': 'Paste this to an AI agent so it can connect to and use huddle.',
+    'var.readonly': 'Read-only agents are the DEFAULT (read files/web/docs, edit nothing, talk only via MCP). Set =0 for full-access worker agents.',
     'var.registryFile': 'Drop-in JSON to add/override agents (merged with defaults).',
     'var.registryEnv': 'Path to a registry JSON (highest precedence, overrides the file).',
     'var.claude': 'Enable the Claude spawn slot (off by default; metered).',
@@ -115,6 +116,7 @@ const I18N = {
     'set.spawn': 'Агенты и спавн (env)', 'set.agentPrompt': 'Промпт настройки агента',
     'tip.spawn': 'Переменные окружения, управляющие сервером и тем, какие агенты спавнятся. Клик по имени — скопировать.',
     'tip.agentPrompt': 'Вставьте это AI-агенту, чтобы он подключился к huddle и начал им пользоваться.',
+    'var.readonly': 'Read-only агенты — ПО УМОЛЧАНИЮ (читают файлы/веб/доки, ничего не редактируют, общаются только через MCP). =0 — полнодоступные агенты-работники.',
     'var.registryFile': 'Drop-in JSON для добавления/переопределения агентов (мержится с дефолтами).',
     'var.registryEnv': 'Путь к registry JSON (высший приоритет, перекрывает файл).',
     'var.claude': 'Включить слот Claude (по умолчанию выкл.; тарифицируется).',
@@ -420,6 +422,7 @@ function buildSettingsPopover(pop) {
   // ── Environment variables / spawn rules (reference; click a name to copy) ──
   pop.appendChild(el('div', {class: 'set-sep'}));
   pop.appendChild(el('div', {class: 'set-title'}, [el('span', {text: t('set.spawn')}), helpIcon('tip.spawn')]));
+  pop.appendChild(buildVarRow('MCP_HUDDLE_READONLY=0', t('var.readonly')));
   pop.appendChild(buildVarRow('~/.mcp-huddle/registry.json', t('var.registryFile')));
   pop.appendChild(buildVarRow('MCP_HUDDLE_SPAWN_REGISTRY', t('var.registryEnv')));
   pop.appendChild(buildVarRow('MCP_HUDDLE_CLAUDE_ENABLED=1', t('var.claude')));

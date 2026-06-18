@@ -135,9 +135,12 @@ def test_claude_slot_is_opt_in_off_by_default() -> None:
 
 def _isolate_registry(monkeypatch: pytest.MonkeyPatch, home: Path) -> None:
     """Point the huddle home at a tmp dir and clear the env override so the
-    on-disk registry file is the only override in play."""
+    on-disk registry file is the only override in play. Disable read-only mode
+    here so these merge-precedence tests see raw specs (read-only has its own
+    tests)."""
     monkeypatch.setattr(bus, "HUDDLE_HOME", home)
     monkeypatch.delenv("MCP_HUDDLE_SPAWN_REGISTRY", raising=False)
+    monkeypatch.setenv("MCP_HUDDLE_READONLY", "0")
 
 
 def test_registry_file_absent_uses_defaults(
@@ -1094,3 +1097,35 @@ def test_clean_turn_clears_rate_limit_cooldown(tmp_path: Path, monkeypatch: pyte
 
     info = isolated_bus.get_room_info(room_id)["agent_meta"]["Codex"]
     assert int(info.get("rate_limited_until", 0)) == 0
+
+
+# ── Read-only discussant mode (MCP_HUDDLE_READONLY) ───────────────────────────
+
+def test_readonly_default_on_codex_and_claude(monkeypatch: pytest.MonkeyPatch) -> None:
+    """By default (no env), agents spawn read-only: Codex uses -s read-only +
+    auto-approved huddle MCP; Claude drops --dangerously-skip-permissions for an
+    allow/deny tool list. They still talk via MCP, just can't edit files."""
+    monkeypatch.delenv("MCP_HUDDLE_READONLY", raising=False)
+    monkeypatch.delenv("MCP_HUDDLE_SPAWN_REGISTRY", raising=False)
+    reg = {s["name"]: s for s in spawn._raw_registry()}
+
+    codex = " ".join(reg["Codex"]["cmd"])
+    assert "-s read-only" in codex
+    assert "danger-full-access" not in codex
+    assert 'mcp_servers.huddle.default_tools_approval_mode="approve"' in codex
+
+    claude = reg["Claude"]["cmd"]
+    assert "--dangerously-skip-permissions" not in claude
+    assert "--allowedTools" in claude and "mcp__huddle__*" in " ".join(claude)
+    assert "--disallowedTools" in claude
+    di = claude.index("--disallowedTools")
+    assert "Edit" in claude[di + 1] and "Write" in claude[di + 1] and "Bash" in claude[di + 1]
+
+
+def test_readonly_opt_out_restores_full_access(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MCP_HUDDLE_READONLY=0 restores the full-access spawn (worker mode)."""
+    monkeypatch.setenv("MCP_HUDDLE_READONLY", "0")
+    monkeypatch.delenv("MCP_HUDDLE_SPAWN_REGISTRY", raising=False)
+    reg = {s["name"]: s for s in spawn._raw_registry()}
+    assert "danger-full-access" in " ".join(reg["Codex"]["cmd"])
+    assert "--dangerously-skip-permissions" in reg["Claude"]["cmd"]
