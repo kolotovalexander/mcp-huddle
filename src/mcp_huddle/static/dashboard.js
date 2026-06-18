@@ -436,65 +436,81 @@ function renderRooms() {
     return;
   }
 
-  // Hierarchy: project basename → session_id → rooms
-  const projects = new Map();
+  // Hierarchy: project → date → organizer (owner) → chats.
+  // Chats keep the agent-chosen name; if an organizer has more than one on a
+  // given day they are numbered (number first), e.g. "1. design review".
+  const projects = new Map();  // proj → date → org → [rooms]
   for (const r of rooms) {
     const parts = (r.cwd || '').replace(/[/]+$/, '').split('/').filter(Boolean);
     const proj = parts.length ? parts[parts.length - 1] : '—';
-    const sess = r.session_id || 'default';
+    const d = new Date((r.created_at || 0) * 1000);
+    const dateKey = isFinite(d.getTime()) ? d.toISOString().slice(0, 10) : '0000-00-00';
+    const org = r.owner || '—';
     if (!projects.has(proj)) projects.set(proj, new Map());
-    const sessions = projects.get(proj);
-    if (!sessions.has(sess)) sessions.set(sess, []);
-    sessions.get(sess).push(r);
+    const dates = projects.get(proj);
+    if (!dates.has(dateKey)) dates.set(dateKey, new Map());
+    const orgs = dates.get(dateKey);
+    if (!orgs.has(org)) orgs.set(org, []);
+    orgs.get(org).push(r);
   }
 
-  for (const [proj, sessions] of projects) {
-    const pKey = 'proj:' + proj;
-    const pFolded = treeFolded(pKey);
-    const block = el('div', {class: 'proj-block' + (pFolded ? ' collapsed' : '')});
-    const total = [...sessions.values()].reduce((sum, rs) => sum + rs.length, 0);
-    const ph = el('div', {class: 'proj-header'}, [
+  const dateLabel = (key) => {
+    const d = new Date(key + 'T00:00:00');
+    return isFinite(d.getTime())
+      ? d.toLocaleDateString(LANG, {day: '2-digit', month: 'short', year: 'numeric'})
+      : key;
+  };
+  const sortDesc = (a, b) => (a < b ? 1 : a > b ? -1 : 0);  // newest dates first
+  const countRooms = (orgs) => [...orgs.values()].reduce((s, rs) => s + rs.length, 0);
+
+  // group(key, label, count, depth) → {group, body}; clicking the header folds it.
+  const group = (key, label, count, depth) => {
+    const folded = treeFolded(key);
+    const g = el('div', {class: 'tree-group' + (folded ? ' collapsed' : '')});
+    const head = el('div', {class: 'tree-group-header', style: `padding-left:${10 + depth * 12}px`}, [
       el('span', {class: 'tree-arrow', text: '▾'}),
-      el('span', {class: 'tree-label', text: proj}),
-      el('span', {class: 'count', text: String(total)}),
+      el('span', {class: 'tree-label', text: label}),
+      el('span', {class: 'count', text: String(count)}),
     ]);
-    ph.onclick = () => toggleTree(pKey);
-    block.appendChild(ph);
+    head.onclick = () => toggleTree(key);
+    const body = el('div', {class: 'tree-group-body'});
+    g.appendChild(head); g.appendChild(body);
+    return {g, body};
+  };
 
-    const projBody = el('div', {class: 'proj-body'});
-    for (const [sess, rs] of sessions) {
-      const sKey = 'sess:' + proj + '/' + sess;
-      const sFolded = treeFolded(sKey);
-      const sessLabel = sess.length > 14 ? sess.slice(0, 14) + '…' : sess;
-      const group = el('div', {class: 'sess-group' + (sFolded ? ' collapsed' : '')});
-      const sh = el('div', {class: 'sess-header'}, [
-        el('span', {class: 'tree-arrow', text: '▾'}),
-        el('span', {class: 'tree-label', text: sessLabel}),
-        el('span', {class: 'count', text: String(rs.length)}),
-      ]);
-      sh.onclick = () => toggleTree(sKey);
-      group.appendChild(sh);
+  for (const proj of [...projects.keys()].sort()) {
+    const dates = projects.get(proj);
+    const pTotal = [...dates.values()].reduce((s, orgs) => s + countRooms(orgs), 0);
+    const {g: pg, body: pb} = group('proj:' + proj, proj, pTotal, 0);
+    sidebar.appendChild(pg);
 
-      const sessRooms = el('div', {class: 'sess-rooms'});
-      for (const r of rs) {
-        const active = r.id === currentRoom;
-        const item = el('div', {
-          class: 'room-item' + (active ? ' active' : ''),
-          dataset: {id: r.id, owner: r.owner},
-        }, [
-          el('div', {class: 'room-name'}, [
-            el('span', {class: `dot dot-${r.status}` + (r.status === 'open' ? ' pulse' : '')}),
-            el('span', {text: r.name}),
-          ]),
-          el('div', {class: 'room-meta', text: `${(r.participants || []).length}·${fmtTime(r.last_activity || r.created_at)}`}),
-        ]);
-        sessRooms.appendChild(item);
+    for (const dateKey of [...dates.keys()].sort(sortDesc)) {
+      const orgs = dates.get(dateKey);
+      const {g: dg, body: db} = group('date:' + proj + '/' + dateKey, dateLabel(dateKey), countRooms(orgs), 1);
+      pb.appendChild(dg);
+
+      for (const org of [...orgs.keys()].sort()) {
+        const rs = orgs.get(org).slice().sort((a, b) => (a.created_at || 0) - (b.created_at || 0));
+        const {g: og, body: ob} = group('org:' + proj + '/' + dateKey + '/' + org, org, rs.length, 2);
+        db.appendChild(og);
+
+        rs.forEach((r, i) => {
+          const active = r.id === currentRoom;
+          const label = rs.length > 1 ? `${i + 1}. ${r.name}` : r.name;
+          ob.appendChild(el('div', {
+            class: 'room-item' + (active ? ' active' : ''),
+            dataset: {id: r.id, owner: r.owner},
+            style: 'padding-left:46px',
+          }, [
+            el('div', {class: 'room-name'}, [
+              el('span', {class: `dot dot-${r.status}` + (r.status === 'open' ? ' pulse' : '')}),
+              el('span', {text: label}),
+            ]),
+            el('div', {class: 'room-meta', text: `${(r.participants || []).length}·${fmtTime(r.last_activity || r.created_at)}`}),
+          ]));
+        });
       }
-      group.appendChild(sessRooms);
-      projBody.appendChild(group);
     }
-    block.appendChild(projBody);
-    sidebar.appendChild(block);
   }
 }
 
