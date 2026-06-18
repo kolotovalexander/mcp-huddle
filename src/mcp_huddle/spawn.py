@@ -391,6 +391,10 @@ def _reap_in_background(proc: subprocess.Popen, name: str,
             except Exception:
                 pass
 
+    # daemon=True so these reaper threads never block interpreter exit. There is
+    # no process-wide shutdown/cleanup hook to join them against; each thread
+    # only blocks on proc.wait() and is harmless to abandon at exit (any pending
+    # on_exit cleanup is best-effort and bounded by the child's lifetime).
     thread = threading.Thread(
         target=wait_for_exit,
         name=f"mcp-huddle-reap-{name}-{proc.pid}",

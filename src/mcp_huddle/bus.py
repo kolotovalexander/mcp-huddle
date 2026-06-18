@@ -8,6 +8,7 @@ import fcntl
 import json
 import os
 import signal
+import sys
 import threading
 import time
 import uuid
@@ -16,6 +17,15 @@ from typing import Optional
 
 HUDDLE_HOME = Path(os.environ.get("MCP_HUDDLE_HOME", Path.home() / ".mcp-huddle"))
 BUS_DIR = HUDDLE_HOME / "rooms"
+
+
+def _secure_dir(path: Path) -> None:
+    """Best-effort tighten dir perms to 0o700 so room contents aren't
+    world-readable on shared machines. Never crashes on exotic filesystems."""
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
 CIRCUIT_BREAKER_WINDOW = 10   # last N messages to check
 CIRCUIT_BREAKER_LIMIT = 5     # max consecutive from same agent (non-request kinds)
 DEADLOCK_TIMEOUT_SECS = 600   # 10 minutes of silence → system message
@@ -35,7 +45,12 @@ def create_room(name: str, owner: str, owner_pid: int, cwd: str = "",
                 session_id: str = "") -> str:
     room_id = f"room_{uuid.uuid4().hex[:8]}"
     rdir = _room_dir(room_id)
-    rdir.mkdir(parents=True, exist_ok=True)
+    rdir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # parents=True creates HUDDLE_HOME / BUS_DIR with the default umask mode, so
+    # tighten the root data dirs explicitly (best-effort).
+    _secure_dir(HUDDLE_HOME)
+    _secure_dir(BUS_DIR)
+    _secure_dir(rdir)
 
     now = int(time.time())
     meta = {
@@ -76,7 +91,7 @@ def register_external_agent(room_id: str, agent_name: str) -> dict:
     pick it up. Returns {log_path, last_message_path}."""
     rdir = _room_dir(room_id)
     agents_dir = rdir / "agents"
-    agents_dir.mkdir(parents=True, exist_ok=True)
+    agents_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     log_path = agents_dir / f"{agent_name.lower()}.events.jsonl"
     last_path = agents_dir / f"{agent_name.lower()}.last_message.txt"
     log_path.touch(exist_ok=True)
@@ -100,7 +115,7 @@ def append_agent_event(room_id: str, agent_name: str, event: dict) -> None:
     """Append a JSONL event line that the SSE handler tails into the dashboard's
     Agent-activity panel. Persists, so re-opening a closed room replays history."""
     log_path = _room_dir(room_id) / "agents" / f"{agent_name.lower()}.events.jsonl"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     payload = json.dumps(event, ensure_ascii=False)
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(payload + "\n")
@@ -551,7 +566,13 @@ def _read_meta(room_id: str) -> dict:
     p = _room_dir(room_id) / "meta.json"
     if not p.exists():
         raise ValueError(f"Room '{room_id}' not found")
-    return json.loads(p.read_text())
+    try:
+        return json.loads(p.read_text())
+    except (json.JSONDecodeError, ValueError, OSError) as e:
+        # One truncated/corrupt meta.json must not crash the whole request/server.
+        print(f"[huddle] WARN: corrupt/unreadable meta.json for "
+              f"'{room_id}': {e}", file=sys.stderr)
+        return {}
 
 
 def _write_json(path: Path, data: dict) -> None:
@@ -566,7 +587,15 @@ def _update_meta_locked(room_id: str, update_fn) -> dict:
     with _lock(rdir / "meta.lock"):
         if not meta_path.exists():
             raise ValueError(f"Room '{room_id}' not found")
-        meta = json.loads(meta_path.read_text())
+        try:
+            meta = json.loads(meta_path.read_text())
+        except (json.JSONDecodeError, ValueError, OSError) as e:
+            # Corrupt/truncated meta under lock: don't crash. Start from an empty
+            # base so the update function can repair-by-overwrite rather than
+            # propagating a parse exception out of every writer.
+            print(f"[huddle] WARN: corrupt/unreadable meta.json (locked) for "
+                  f"'{room_id}': {e}", file=sys.stderr)
+            meta = {}
         updated = update_fn(meta)
         _write_json(meta_path, updated)
         return updated
@@ -596,6 +625,9 @@ def _patch_status(room_id: str, agent: str, status: str, expires_at: int, sessio
 # treated read-only by every caller (internal `_`-prefixed contract).
 _msg_cache: dict[str, tuple] = {}
 _msg_cache_lock = threading.Lock()
+# Cap the cache so it can't grow unbounded across many rooms. Oldest entries are
+# evicted FIFO/LRU-ish on insert (room deletion also evicts via _evict_msg_cache).
+_MSG_CACHE_MAX = 256
 
 
 def _parse_messages_text(raw: str) -> list[dict]:
@@ -637,7 +669,12 @@ def _load_messages(room_id: str) -> list[dict]:
         return []
     msgs = _parse_messages_text(raw)
     with _msg_cache_lock:
+        # Re-insert at the tail (LRU-ish) then evict the oldest while over cap.
+        _msg_cache.pop(pstr, None)
         _msg_cache[pstr] = (key, msgs)
+        while len(_msg_cache) > _MSG_CACHE_MAX:
+            oldest = next(iter(_msg_cache))
+            _msg_cache.pop(oldest, None)
     return msgs
 
 
