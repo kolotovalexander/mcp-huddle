@@ -1114,7 +1114,9 @@ const ACTIVITY_MIN = 240, ACTIVITY_DEFAULT = 380;
 const CHAT_MIN = 320;
 // Below this viewport width the side panels stop taking layout space and
 // become overlay drawers that slide over the chat (chat = full width).
-const OVERLAY_BREAKPOINT = 820;
+// Below this width there isn't room for sidebar+activity+chat inline, so the
+// side panels become overlay drawers and the chat gets the whole width.
+const OVERLAY_BREAKPOINT = 900;
 // .app padding (14*2) + 4 grid gaps (12*4) between the 5 tracks.
 const LAYOUT_GUTTER = 14 * 2 + 12 * 4;
 
@@ -1124,6 +1126,9 @@ const layout = {
   sidebarCollapsed: localStorage.getItem('agentbus-sidebar-collapsed') === '1',
   activityCollapsed: localStorage.getItem('agentbus-activity-collapsed') === '1',
   drawer: null, // overlay mode only: null | 'sidebar' | 'activity'
+  // Which panel the user expanded most recently — it wins the fight for space
+  // (the OTHER panel is shrunk/railed first), so an explicit expand always works.
+  lastExpanded: 'sidebar',
 };
 
 const clampN = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
@@ -1179,15 +1184,25 @@ function relayout() {
   let sw = layout.sidebarCollapsed ? 0 : clampN(layout.sidebarW, SIDEBAR_MIN, SIDEBAR_MAX);
   let aw = (layout.activityCollapsed || !hasRoom) ? 0 : clampN(layout.activityW, ACTIVITY_MIN, actMax);
 
-  // Protect the chat: shrink/hide activity first, then the sidebar.
-  if (avail - sw - aw < CHAT_MIN && aw > 0) {
-    aw = avail - sw - CHAT_MIN;
-    if (aw < ACTIVITY_MIN) aw = 0;
-  }
-  if (avail - sw - aw < CHAT_MIN && sw > 0) {
-    sw = avail - aw - CHAT_MIN;
-    if (sw < SIDEBAR_MIN) sw = 0;
-  }
+  // Protect the chat (min width) by shrinking/railing the side panels. The
+  // panel the user expanded MOST RECENTLY is protected — the OTHER one is
+  // shrunk first — so an explicit "expand" always succeeds (fixes: expanding
+  // the activity panel while the sidebar is wide used to snap it back to rail).
+  const shrinkSidebarFirst = layout.lastExpanded === 'activity';
+  const shrinkSidebar = () => {
+    if (avail - sw - aw < CHAT_MIN && sw > 0) {
+      sw = avail - aw - CHAT_MIN;
+      if (sw < SIDEBAR_MIN) sw = 0;
+    }
+  };
+  const shrinkActivity = () => {
+    if (avail - sw - aw < CHAT_MIN && aw > 0) {
+      aw = avail - sw - CHAT_MIN;
+      if (aw < ACTIVITY_MIN) aw = 0;
+    }
+  };
+  if (shrinkSidebarFirst) { shrinkSidebar(); shrinkActivity(); }
+  else { shrinkActivity(); shrinkSidebar(); }
 
   const root = document.documentElement;
   const RAIL = 48;
@@ -1253,8 +1268,10 @@ function initPanelResizer(resizerId, side) {
     if (side === 'left') {
       layout.sidebarW = clampN(e.clientX - 14, SIDEBAR_MIN, SIDEBAR_MAX);
       layout.sidebarCollapsed = false;
+      layout.lastExpanded = 'sidebar';
     } else {
       layout.activityW = clampN(window.innerWidth - e.clientX - 14, ACTIVITY_MIN, Math.floor(window.innerWidth * 0.6));
+      layout.lastExpanded = 'activity';
       layout.activityCollapsed = false;
     }
     relayout();
@@ -1284,9 +1301,11 @@ function togglePanel(which) {
     layout.drawer = layout.drawer === which ? null : which;
   } else if (which === 'sidebar') {
     layout.sidebarCollapsed = !layout.sidebarCollapsed;
+    if (!layout.sidebarCollapsed) layout.lastExpanded = 'sidebar';  // expanding → this panel wins space
     persistLayout();
   } else {
     layout.activityCollapsed = !layout.activityCollapsed;
+    if (!layout.activityCollapsed) layout.lastExpanded = 'activity';
     persistLayout();
   }
   relayout();
