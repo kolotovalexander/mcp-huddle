@@ -60,6 +60,29 @@ def build_prompt(agent: str, transcript: str, request_msg: dict) -> str:
     )
 
 
+# Signatures of a failed `mimo run` whose error text landed in stdout despite a
+# 0 exit code. Kept specific to the provider/CLI error shape so a normal
+# discussion reply that merely mentions "error" or "403" is not flagged.
+_MIMO_ERROR_SIGNS = (
+    "mimo-free bootstrap failed",
+    "bootstrap failed:",
+    "illegal_access",
+    '"illegal access"',
+    "\"type\": \"illegal_access\"",
+)
+
+
+def _is_error_output(text: str) -> bool:
+    if not text:
+        return False
+    low = text.lower()
+    if any(sign in low for sign in _MIMO_ERROR_SIGNS):
+        return True
+    # A bare CLI error line with no real content (e.g. "Error: ...") and short.
+    stripped = text.strip()
+    return stripped.startswith("Error:") and len(stripped) < 400
+
+
 def call_mimo(mimo_bin: str, prompt: str, timeout: float, model: str | None = None) -> tuple[str, dict]:
     argv = [mimo_bin, "run", "--dangerously-skip-permissions"]
     if model:
@@ -87,6 +110,13 @@ def call_mimo(mimo_bin: str, prompt: str, timeout: float, model: str | None = No
     answer = "\n".join(lines).strip()
     if not answer:
         raise RuntimeError("mimo run produced empty output")
+    # Output validator ("checker"): `mimo run` exits 0 even when the free
+    # provider rejects the request (e.g. "mimo-free bootstrap failed: 403
+    # Illegal access"), printing the error to stdout. Without this, that error
+    # text would be posted as MiMo's reply. Treat error-shaped output as a
+    # failure so the runner posts nothing instead of garbage.
+    if _is_error_output(answer) or _is_error_output(_strip_ansi(proc.stderr)):
+        raise RuntimeError(f"mimo provider error: {answer[:200] or proc.stderr.strip()[:200]}")
     return answer, {
         "model": model or "mimo-auto",
         "duration_ms": int((time.time() - started) * 1000),
