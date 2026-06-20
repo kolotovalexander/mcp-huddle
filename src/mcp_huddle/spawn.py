@@ -64,6 +64,8 @@ class SpawnSpec(TypedDict):
     probe_chat_url: NotRequired[str]
     probe_chat_model: NotRequired[str]
     probe_timeout_sec: NotRequired[float]
+    mode: NotRequired[str]        # "headless" (default) | "interactive_runner"
+    runner_dir: NotRequired[str]  # override ~/.mcp-huddle/runners/<name>
 
 
 class AgentSpawnError(RuntimeError):
@@ -86,6 +88,32 @@ def _first_existing_binary(candidates: list[str]) -> str | None:
         if resolved:
             return resolved
     return None
+
+
+def _default_runner_dir(name: str) -> Path:
+    """Default home for the named interactive runner: ~/.mcp-huddle/runners/<name>."""
+    return bus.HUDDLE_HOME / "runners" / name.lower()
+
+
+def _runner_pid_alive(runner_dir: Path) -> tuple[bool, int]:
+    """Return (alive, pid) for the interactive runner whose home is runner_dir.
+
+    Reads runner_dir/pid and probes the process with signal 0. Returns
+    (False, 0) if the PID file is missing/unreadable or the process is gone.
+    """
+    pid_file = runner_dir / "pid"
+    try:
+        pid = int(pid_file.read_text().strip())
+    except (OSError, ValueError):
+        return False, 0
+    try:
+        os.kill(pid, 0)
+        return True, pid
+    except ProcessLookupError:
+        return False, pid
+    except PermissionError:
+        # Process exists but we can't signal it — treat as alive.
+        return True, pid
 
 
 _CODEX_BIN = _first_existing_binary([
@@ -147,6 +175,10 @@ def _google_advisor_spec() -> SpawnSpec:
                 "-p", "{brief}",
             ],
             "enabled": enabled,
+            # agy requires interactive OAuth — run via the interactive runner
+            # daemon so auth prompts reach a real terminal. Availability is
+            # determined by whether the runner process is alive (not binary probe).
+            "mode": "interactive_runner",
         }
     return {"name": "Antigravity", "cmd": ["agy", "-p", "{brief}"], "enabled": False}
 
@@ -244,6 +276,10 @@ def _chat_probe_available(url: str, model: str, timeout: float) -> bool:
 def _spawn_spec_available(spec: SpawnSpec) -> bool:
     if not spec.get("enabled"):
         return False
+    if spec.get("mode") == "interactive_runner":
+        runner_dir = Path(spec.get("runner_dir") or _default_runner_dir(spec["name"]))
+        alive, _ = _runner_pid_alive(runner_dir)
+        return alive
     probe_url = spec.get("probe_url")
     required_model = spec.get("requires_model")
     chat_url = spec.get("probe_chat_url")
@@ -543,8 +579,12 @@ def _apply_readonly(spec: SpawnSpec) -> SpawnSpec:
     - Codex: switch the sandbox to `read-only` and auto-approve the huddle MCP
       tools (a restricted sandbox otherwise routes MCP calls through approval,
       which `-a never` would cancel). Cross-model council, 2026-06-19.
+    - interactive_runner: returned unchanged — the runner controls permissions;
+      agy has no read-only flag anyway.
     Other agents are returned unchanged (no confirmed read-only flag yet).
     """
+    if spec.get("mode") == "interactive_runner":
+        return spec
     name = spec.get("name")
     cmd = list(spec.get("cmd") or [])
     if name == "Claude":
@@ -612,6 +652,8 @@ def _agent_status(spec: SpawnSpec) -> tuple[bool, str]:
             return False, "binary not found"
         return False, "off by env flag"
     if not _spawn_spec_available(spec):
+        if spec.get("mode") == "interactive_runner":
+            return False, "runner not running (start: python -m mcp_huddle.interactive_runner)"
         return False, "model probe failed"
     return True, "ready"
 
@@ -646,6 +688,51 @@ def get_enabled_spec(agent_name: str) -> SpawnSpec | None:
     return None
 
 
+def spawn_via_runner(
+    spec: SpawnSpec,
+    brief: str,
+    cwd: str,
+    log_dir: Path,
+) -> tuple[int, str, None]:
+    """Submit a task to an already-running interactive_runner daemon.
+
+    Returns (runner_pid, log_path, None) — same shape as spawn_agent so
+    callers can treat both paths uniformly.  The log file is in the runner's
+    own tasks/ directory (not log_dir) so the daemon can append to it live.
+
+    Raises AgentSpawnError if the runner is not alive or the tasks dir is
+    not writable.
+    """
+    name = spec["name"]
+    runner_dir = Path(spec.get("runner_dir") or _default_runner_dir(name))
+    alive, pid = _runner_pid_alive(runner_dir)
+    if not alive:
+        raise AgentSpawnError(
+            f"{name} interactive runner is not running — "
+            f"start it with: python -m mcp_huddle.interactive_runner --agent {name}"
+        )
+
+    tasks_dir = runner_dir / "tasks"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+
+    import uuid as _uuid
+    task_id = _uuid.uuid4().hex[:12]
+    log_path = runner_dir / "logs" / f"{task_id}.log"
+    (runner_dir / "logs").mkdir(parents=True, exist_ok=True)
+
+    task = {
+        "id": task_id,
+        "brief": brief,
+        "cwd": cwd,
+        "log": str(log_path),
+    }
+    task_file = tasks_dir / f"{task_id}.json"
+    import json as _json
+    task_file.write_text(_json.dumps(task))
+
+    return pid, str(log_path), None
+
+
 def spawn_agent(
     spec: SpawnSpec,
     brief: str,
@@ -663,6 +750,9 @@ def spawn_agent(
 
     Side effects: creates log_dir, opens log file, redirects stdout+stderr to it.
     """
+    if spec.get("mode") == "interactive_runner":
+        return spawn_via_runner(spec, brief, cwd, log_dir)
+
     log_dir.mkdir(parents=True, exist_ok=True)
     name = spec["name"]
     log_path = log_dir / f"{name.lower()}.events.jsonl"

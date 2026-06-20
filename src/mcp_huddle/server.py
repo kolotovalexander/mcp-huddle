@@ -7,6 +7,7 @@ HTTP mode (`--http`): uvicorn + Liquid Glass dashboard on :8014.
 import asyncio
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -1455,12 +1456,37 @@ Do not answer requests that already have reply_to set. Do not send thanks/ack-on
 """
 
 
+def _worktree_note(cwd: str) -> str:
+    """Return a worktree instruction line if cwd is a git worktree, else empty string."""
+    if not cwd:
+        return ""
+    git_path = os.path.join(cwd, ".git")
+    if not os.path.isfile(git_path):
+        # Not a worktree (.git is a directory = main checkout, or not a repo at all)
+        return ""
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=3,
+        )
+        branch = result.stdout.strip() if result.returncode == 0 else ""
+    except Exception:
+        branch = ""
+    branch_part = f" (branch `{branch}`)" if branch else ""
+    return (
+        f"\n**Git worktree{branch_part}:** you are already in an isolated worktree at"
+        f" `{cwd}`. Work here as-is — do NOT run `git worktree add` or switch"
+        " branches; creating a second worktree inside this one will corrupt the repo."
+    )
+
+
 def _build_default_brief(room_id: str, name: str, goal: str, cwd: str) -> str:
+    worktree_line = _worktree_note(cwd)
     return f"""# mcp-huddle — Room: {name}
 
 **Room ID:** {room_id}
 **Goal:** {goal}
-**Project:** {cwd}
+**Project:** {cwd}{worktree_line}
 **MCP server:** http://127.0.0.1:8014/mcp (HTTP) or stdio binary direct
 
 ## Your role

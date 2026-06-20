@@ -1129,3 +1129,40 @@ def test_readonly_opt_out_restores_full_access(monkeypatch: pytest.MonkeyPatch) 
     reg = {s["name"]: s for s in spawn._raw_registry()}
     assert "danger-full-access" in " ".join(reg["Codex"]["cmd"])
     assert "--dangerously-skip-permissions" in reg["Claude"]["cmd"]
+
+
+# ── Worktree cwd propagation ──────────────────────────────────────────────────
+
+def test_worktree_note_absent_for_non_worktree(tmp_path: Path) -> None:
+    """_worktree_note returns '' when cwd has no .git file (not a worktree)."""
+    assert server._worktree_note(str(tmp_path)) == ""
+    assert server._worktree_note("") == ""
+
+
+def test_worktree_note_absent_for_main_checkout(tmp_path: Path) -> None:
+    """_worktree_note returns '' when .git is a directory (main checkout)."""
+    (tmp_path / ".git").mkdir()
+    assert server._worktree_note(str(tmp_path)) == ""
+
+
+def test_worktree_note_present_for_worktree(tmp_path: Path) -> None:
+    """_worktree_note returns a non-empty note when .git is a file (worktree)."""
+    (tmp_path / ".git").write_text("gitdir: ../../.git/worktrees/feat-x\n")
+    note = server._worktree_note(str(tmp_path))
+    assert "worktree" in note.lower()
+    assert "git worktree add" in note
+    assert str(tmp_path) in note
+
+
+def test_build_default_brief_includes_worktree_note(tmp_path: Path) -> None:
+    """Brief includes worktree note when cwd is a git worktree."""
+    (tmp_path / ".git").write_text("gitdir: ../../.git/worktrees/feat-x\n")
+    brief = server._build_default_brief("rid", "room", "goal", str(tmp_path))
+    assert "git worktree add" in brief
+    assert str(tmp_path) in brief
+
+
+def test_build_default_brief_no_worktree_note_for_regular_dir(tmp_path: Path) -> None:
+    """Brief has no worktree note for a regular (non-worktree) directory."""
+    brief = server._build_default_brief("rid", "room", "goal", str(tmp_path))
+    assert "git worktree add" not in brief
