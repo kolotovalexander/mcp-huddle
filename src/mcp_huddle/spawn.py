@@ -704,8 +704,10 @@ def spawn_via_runner(
     it must never land in a room's spawned_pids (close_room would SIGTERM it and
     break all other rooms). Instead the daemon registers the ACTUAL per-room
     agent child pid into the room's meta itself (bus.runner_register_child), and
-    that child is what close_room kills. The log file lives in the runner's own
-    logs/ dir (not log_dir) so the daemon can append to it live.
+    that child is what close_room kills. The agent's stdout is logged to the
+    room-local file the dashboard already streams (log_dir/<name>.events.jsonl),
+    so interactive agents show up in the dashboard pane like headless ones; with
+    no room it falls back to the runner's own logs/ dir.
 
     room_id/wake_id are threaded into the task so the daemon can do per-room
     bookkeeping and skip a task whose room closed while it sat queued.
@@ -727,8 +729,18 @@ def spawn_via_runner(
 
     import uuid as _uuid
     task_id = _uuid.uuid4().hex[:12]
-    log_path = runner_dir / "logs" / f"{task_id}.log"
-    (runner_dir / "logs").mkdir(parents=True, exist_ok=True)
+    # Log to the SAME room-local file headless agents use
+    # (rooms/<id>/agents/<name>.events.jsonl) so the dashboard's existing SSE
+    # pane (/agents/<room>/<name>/events) streams interactive agents too, with
+    # no endpoint change, and output accumulates across turns (append mode). Only
+    # when there is no room (a runner used standalone) do we fall back to a
+    # per-task file under the runner's own logs/ dir.
+    if room_id:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"{name.lower()}.events.jsonl"
+    else:
+        (runner_dir / "logs").mkdir(parents=True, exist_ok=True)
+        log_path = runner_dir / "logs" / f"{task_id}.log"
 
     task = {
         "id": task_id,

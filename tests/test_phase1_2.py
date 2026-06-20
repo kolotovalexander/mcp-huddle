@@ -1419,3 +1419,39 @@ def test_fresh_spawn_upgrades_interactive_busy_ttl(tmp_path: Path, monkeypatch) 
                                    msg_id=1, wake_id="wk")
     # last busy TTL written must be the interactive one, not 300
     assert ttls[-1] == 9999
+
+
+def test_spawn_via_runner_logs_to_room_file_for_dashboard(tmp_path: Path, monkeypatch) -> None:
+    """With a room_id the task log path is the room-local events.jsonl the
+    dashboard SSE pane streams — so interactive agents are visible like headless
+    ones (no endpoint change), accumulating across turns."""
+    monkeypatch.setattr(bus, "HUDDLE_HOME", tmp_path)
+    runner_dir = tmp_path / "runners" / "antigravity"
+    runner_dir.mkdir(parents=True)
+    (runner_dir / "pid").write_text(str(os.getpid()))
+    spec: spawn.SpawnSpec = {
+        "name": "Antigravity", "cmd": ["agy", "-p", "{brief}"],
+        "enabled": True, "mode": "interactive_runner",
+    }
+    agents_dir = tmp_path / "rooms" / "room_x" / "agents"
+    pid, log_path, _ = spawn.spawn_via_runner(
+        spec, "brief", "/proj", agents_dir, room_id="room_x", wake_id="w")
+    assert pid == 0
+    assert log_path == str(agents_dir / "antigravity.events.jsonl")
+    task = json.loads(next((runner_dir / "tasks").glob("*.json")).read_text())
+    assert task["log"] == str(agents_dir / "antigravity.events.jsonl")
+
+
+def test_spawn_via_runner_falls_back_to_runner_logs_without_room(tmp_path: Path, monkeypatch) -> None:
+    """No room_id (standalone runner) → per-task file under the runner's logs/."""
+    monkeypatch.setattr(bus, "HUDDLE_HOME", tmp_path)
+    runner_dir = tmp_path / "runners" / "antigravity"
+    runner_dir.mkdir(parents=True)
+    (runner_dir / "pid").write_text(str(os.getpid()))
+    spec: spawn.SpawnSpec = {
+        "name": "Antigravity", "cmd": ["agy"], "enabled": True,
+        "mode": "interactive_runner",
+    }
+    pid, log_path, _ = spawn.spawn_via_runner(
+        spec, "brief", "/proj", tmp_path / "agents", room_id="", wake_id="")
+    assert str(runner_dir / "logs") in log_path
