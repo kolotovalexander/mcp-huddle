@@ -693,19 +693,29 @@ def spawn_via_runner(
     brief: str,
     cwd: str,
     log_dir: Path,
+    room_id: str = "",
+    wake_id: str = "",
+    session_id: str = "",
 ) -> tuple[int, str, None]:
     """Submit a task to an already-running interactive_runner daemon.
 
-    Returns (runner_pid, log_path, None) — same shape as spawn_agent so
-    callers can treat both paths uniformly.  The log file is in the runner's
-    own tasks/ directory (not log_dir) so the daemon can append to it live.
+    Returns (0, log_path, None). The PID is a deliberate **sentinel 0**, NOT
+    the daemon's pid: the daemon is long-lived and shared across every room, so
+    it must never land in a room's spawned_pids (close_room would SIGTERM it and
+    break all other rooms). Instead the daemon registers the ACTUAL per-room
+    agent child pid into the room's meta itself (bus.runner_register_child), and
+    that child is what close_room kills. The log file lives in the runner's own
+    logs/ dir (not log_dir) so the daemon can append to it live.
+
+    room_id/wake_id are threaded into the task so the daemon can do per-room
+    bookkeeping and skip a task whose room closed while it sat queued.
 
     Raises AgentSpawnError if the runner is not alive or the tasks dir is
     not writable.
     """
     name = spec["name"]
     runner_dir = Path(spec.get("runner_dir") or _default_runner_dir(name))
-    alive, pid = _runner_pid_alive(runner_dir)
+    alive, _pid = _runner_pid_alive(runner_dir)
     if not alive:
         raise AgentSpawnError(
             f"{name} interactive runner is not running — "
@@ -725,12 +735,19 @@ def spawn_via_runner(
         "brief": brief,
         "cwd": cwd,
         "log": str(log_path),
+        "room_id": room_id,
+        "agent": name,
+        "wake_id": wake_id,
+        "session_id": session_id,
     }
-    task_file = tasks_dir / f"{task_id}.json"
+    # Write atomically (tmp → rename) so the daemon never reads a half-written
+    # task file mid-poll.
     import json as _json
-    task_file.write_text(_json.dumps(task))
+    tmp_file = tasks_dir / f".{task_id}.json.tmp"
+    tmp_file.write_text(_json.dumps(task))
+    tmp_file.rename(tasks_dir / f"{task_id}.json")
 
-    return pid, str(log_path), None
+    return 0, str(log_path), None
 
 
 def spawn_agent(
@@ -740,18 +757,26 @@ def spawn_agent(
     log_dir: Path,
     verify_alive_sec: float = 0.0,
     on_exit=None,
+    room_id: str = "",
+    wake_id: str = "",
+    session_id: str = "",
 ) -> tuple[int, str, str | None]:
     """Spawn one agent.
 
     Returns (pid, log_path, last_message_path).
     last_message_path is None for agents whose argv doesn't reference {last_message}.
+    For interactive_runner agents the returned pid is the sentinel 0 — the
+    real per-room child pid is registered by the daemon (see spawn_via_runner).
 
     on_exit: optional callable(returncode) fired when the process exits.
 
     Side effects: creates log_dir, opens log file, redirects stdout+stderr to it.
     """
     if spec.get("mode") == "interactive_runner":
-        return spawn_via_runner(spec, brief, cwd, log_dir)
+        return spawn_via_runner(
+            spec, brief, cwd, log_dir,
+            room_id=room_id, wake_id=wake_id, session_id=session_id,
+        )
 
     log_dir.mkdir(parents=True, exist_ok=True)
     name = spec["name"]
@@ -794,6 +819,8 @@ def spawn_all(
     verify_alive_sec: float = 0.0,
     on_exit_factory=None,
     skip_names: set[str] | None = None,
+    room_id: str = "",
+    session_id: str = "",
 ) -> tuple[list[str], list[int], dict[str, dict[str, str | None]]]:
     """Spawn every enabled agent in the registry.
 
@@ -825,6 +852,7 @@ def spawn_all(
                 spec, agent_brief, cwd, log_dir,
                 verify_alive_sec=verify_alive_sec,
                 on_exit=on_exit_factory(spec["name"]) if on_exit_factory else None,
+                room_id=room_id, session_id=session_id,
             )
             pids.append(pid)
             names.append(spec["name"])

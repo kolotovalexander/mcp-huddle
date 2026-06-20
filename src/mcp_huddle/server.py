@@ -851,6 +851,7 @@ def _spawn_agents(
       * Adds each spawned agent to participants.
     """
     default_brief = _build_default_brief(room_id, name, goal, cwd)
+    session_id = (bus.get_room_info(room_id) or {}).get("session_id", "") or ""
     # Secure unique temp file instead of a predictable /tmp/room-<id>-brief.md
     # (guessable + symlink/TOCTOU-attackable in a shared /tmp). mkstemp creates
     # the file atomically with 0600 perms.
@@ -893,7 +894,8 @@ def _spawn_agents(
             try:
                 pid, log_path, last_msg = spawn.spawn_agent(
                     spec, agent_brief, cwd, log_dir,
-                    on_exit=_make_initial_spawn_callback(room_id, spec["name"]))
+                    on_exit=_make_initial_spawn_callback(room_id, spec["name"]),
+                    room_id=room_id, session_id=session_id)
                 pids.append(pid)
                 names.append(spec["name"])
                 agent_meta[spec["name"]] = {
@@ -911,7 +913,7 @@ def _spawn_agents(
         names, pids, agent_meta = spawn.spawn_all(
             default_brief, cwd, log_dir,
             on_exit_factory=lambda n: _make_initial_spawn_callback(room_id, n),
-            skip_names=skip_owner)
+            skip_names=skip_owner, room_id=room_id, session_id=session_id)
 
     for n in names:
         bus.invite_agent(room_id, n)
@@ -935,7 +937,12 @@ def _spawn_agents(
     # deep-merge per-agent meta so a concurrent wake-thread update survives.
     def _save_spawn_meta(m: dict) -> dict:
         existing_pids = m.get("spawned_pids") or []
-        m["spawned_pids"] = existing_pids + [p for p in pids if p not in existing_pids]
+        # p > 0 skips the interactive_runner sentinel (0): the real per-room
+        # agent child pid is registered by the daemon, not here. Recording 0
+        # would later make _kill_spawned call os.kill(0, …) = signal the whole
+        # server process group.
+        m["spawned_pids"] = existing_pids + [
+            p for p in pids if p > 0 and p not in existing_pids]
         merged = m.get("agent_meta") or {}
         for name_, info_ in agent_meta.items():
             slot = merged.get(name_)
@@ -989,9 +996,18 @@ def _merge_agent_meta(room_id: str, agent_name: str, fields: dict) -> None:
 def _wake_in_progress(info: dict, status: Optional[str]) -> bool:
     """True if the agent has a LIVE wake process — do not wake it again. A
     'busy' status whose last_wake_pid is dead is a stale lease (the process
-    already exited) and must NOT block a fresh wake."""
+    already exited) and must NOT block a fresh wake.
+
+    interactive_runner agents are special: between enqueue and the daemon
+    actually starting the child there is no pid to probe, and the child runs in
+    a separate process the server never reaped — so the pid-liveness test would
+    spuriously re-wake and pile up duplicate tasks. The daemon reliably flips
+    status busy→online (and the busy lease auto-expires after its TTL as a
+    fallback), so for these agents we trust the 'busy' status itself."""
     if status != "busy":
         return False
+    if info.get("mode") == "interactive_runner":
+        return True
     pid = info.get("last_wake_pid")
     return bool(pid) and bus._pid_alive(pid)
 
@@ -1347,6 +1363,7 @@ def _spawn_fresh_room_agent(
             meta.get("cwd", "") or "",
             bus._room_dir(room_id) / "agents",
             on_exit=_make_wake_done_callback(room_id, agent_name, wake_id),
+            room_id=room_id, wake_id=wake_id, session_id=session_id,
         )
     except Exception:
         bus.set_status(room_id, agent_name, "online", 0, session_id)
@@ -1359,6 +1376,11 @@ def _spawn_fresh_room_agent(
         "last_wake_at": int(time.time()),
         "wake_id": wake_id,
     }
+    # interactive_runner: pid is the sentinel 0 (real child pid is registered by
+    # the daemon). Stamp mode now so _wake_in_progress trusts the busy lease
+    # during the enqueue→child-start window instead of re-waking on dead pid 0.
+    if spec.get("mode") == "interactive_runner":
+        fields["mode"] = "interactive_runner"
     if msg_id is not None:
         fields["last_wake_msg_id"] = msg_id
         fields["last_seen_id"] = msg_id

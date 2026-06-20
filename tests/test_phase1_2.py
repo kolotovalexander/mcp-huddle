@@ -675,7 +675,7 @@ def test_respond_via_agent_fresh_spawns_non_codex_with_transcript(
 
     calls: list[dict] = []
 
-    def fake_spawn_agent(spec, brief, cwd, log_dir, verify_alive_sec=0.0, on_exit=None):
+    def fake_spawn_agent(spec, brief, cwd, log_dir, verify_alive_sec=0.0, on_exit=None, **kwargs):
         calls.append({"spec": spec, "brief": brief, "cwd": cwd, "log_dir": log_dir})
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / "gemini.events.jsonl"
@@ -725,7 +725,7 @@ def test_request_message_wakes_registry_agent_without_uuid_resume(
 
     calls: list[dict] = []
 
-    def fake_spawn_agent(spec, brief, cwd, log_dir, verify_alive_sec=0.0, on_exit=None):
+    def fake_spawn_agent(spec, brief, cwd, log_dir, verify_alive_sec=0.0, on_exit=None, **kwargs):
         calls.append({"spec": spec, "brief": brief, "cwd": cwd})
         log_dir.mkdir(parents=True, exist_ok=True)
         return 6161, str(log_dir / "gemini.events.jsonl"), None
@@ -1166,3 +1166,144 @@ def test_build_default_brief_no_worktree_note_for_regular_dir(tmp_path: Path) ->
     """Brief has no worktree note for a regular (non-worktree) directory."""
     brief = server._build_default_brief("rid", "room", "goal", str(tmp_path))
     assert "git worktree add" not in brief
+
+
+# ── Per-room interactive-runner lifecycle (spawn per room, kill on close) ──────
+
+def test_terminate_pid_skips_nonpositive(monkeypatch) -> None:
+    """_terminate_pid must NEVER call os.kill/os.killpg with pid<=0 — that would
+    signal the server's own process group. Sentinel 0 must be a no-op."""
+    calls = []
+    monkeypatch.setattr(bus.os, "kill", lambda *a: calls.append(a))
+    monkeypatch.setattr(bus.os, "killpg", lambda *a: calls.append(a))
+    assert bus._terminate_pid(0) is False
+    assert bus._terminate_pid(-5) is False
+    assert bus._terminate_pid("nan") is False
+    assert calls == []
+
+
+def test_terminate_pid_group_leader_uses_killpg(monkeypatch) -> None:
+    """A pid that is its own process-group leader → killpg (kills the subtree)."""
+    sent = {}
+    monkeypatch.setattr(bus.os, "getpgid", lambda pid: pid)  # leader: pgid == pid
+    monkeypatch.setattr(bus.os, "killpg", lambda pid, sig: sent.setdefault("pg", (pid, sig)))
+    monkeypatch.setattr(bus.os, "kill", lambda pid, sig: sent.setdefault("plain", (pid, sig)))
+    assert bus._terminate_pid(4242) is True
+    assert sent == {"pg": (4242, bus.signal.SIGTERM)}
+
+
+def test_terminate_pid_non_leader_uses_plain_kill(monkeypatch) -> None:
+    """A pid sharing our group (headless agent) → plain kill, never killpg."""
+    sent = {}
+    monkeypatch.setattr(bus.os, "getpgid", lambda pid: pid + 1)  # not a leader
+    monkeypatch.setattr(bus.os, "killpg", lambda pid, sig: sent.setdefault("pg", (pid, sig)))
+    monkeypatch.setattr(bus.os, "kill", lambda pid, sig: sent.setdefault("plain", (pid, sig)))
+    assert bus._terminate_pid(4242) is True
+    assert sent == {"plain": (4242, bus.signal.SIGTERM)}
+
+
+def test_kill_spawned_ignores_zero_sentinel(monkeypatch) -> None:
+    """close_room → _kill_spawned must skip the interactive sentinel 0."""
+    killed = []
+    monkeypatch.setattr(bus, "_terminate_pid", lambda pid: killed.append(pid) or True)
+    bus._kill_spawned({"spawned_pids": [0, 111, 222]})
+    assert killed == [0, 111, 222]  # passed through; _terminate_pid itself guards 0
+
+
+def test_spawn_via_runner_returns_sentinel_and_writes_room(tmp_path: Path, monkeypatch) -> None:
+    """spawn_via_runner returns pid 0 (not the daemon pid) and records room_id /
+    agent / wake_id in the task JSON so the daemon can do per-room bookkeeping."""
+    monkeypatch.setattr(bus, "HUDDLE_HOME", tmp_path)
+    runner_dir = tmp_path / "runners" / "antigravity"
+    (runner_dir).mkdir(parents=True)
+    (runner_dir / "pid").write_text(str(os.getpid()))  # pretend the daemon is alive
+    spec: spawn.SpawnSpec = {
+        "name": "Antigravity",
+        "cmd": ["agy", "-p", "{brief}"],
+        "enabled": True,
+        "mode": "interactive_runner",
+    }
+    pid, log_path, last = spawn.spawn_via_runner(
+        spec, "do the thing", "/proj", tmp_path / "agents",
+        room_id="room_x", wake_id="wk1", session_id="sess1")
+    assert pid == 0 and last is None
+    tasks = list((runner_dir / "tasks").glob("*.json"))
+    assert len(tasks) == 1
+    task = json.loads(tasks[0].read_text())
+    assert task["room_id"] == "room_x"
+    assert task["agent"] == "Antigravity"
+    assert task["wake_id"] == "wk1"
+    assert task["brief"] == "do the thing"
+
+
+def test_spawn_via_runner_raises_when_daemon_dead(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(bus, "HUDDLE_HOME", tmp_path)
+    spec: spawn.SpawnSpec = {
+        "name": "Antigravity", "cmd": ["agy"], "enabled": True,
+        "mode": "interactive_runner",
+    }
+    with pytest.raises(spawn.AgentSpawnError):
+        spawn.spawn_via_runner(spec, "x", "/proj", tmp_path / "agents",
+                               room_id="r", wake_id="w")
+
+
+def test_runner_register_and_unregister_child(tmp_path: Path, monkeypatch) -> None:
+    """The daemon registers the REAL child pid into the room (so close kills it)
+    and clears it on exit. The shared daemon pid never enters spawned_pids."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    monkeypatch.setattr(bus, "HUDDLE_HOME", tmp_path)
+    rid = bus.create_room("r", "Owner", os.getpid(), "/proj", "sess1")
+
+    assert bus.runner_register_child(rid, "Antigravity", 54321, "sess1") is True
+    meta = bus.get_room_info(rid)
+    assert 54321 in meta["spawned_pids"]
+    assert meta["agent_meta"]["Antigravity"]["mode"] == "interactive_runner"
+    assert meta["agent_meta"]["Antigravity"]["last_wake_pid"] == 54321
+    assert bus.get_status(rid)["Antigravity"] == "busy"
+
+    assert bus.runner_unregister_child(rid, "Antigravity", 54321, "sess1") is True
+    meta = bus.get_room_info(rid)
+    assert 54321 not in meta["spawned_pids"]
+    assert bus.get_status(rid)["Antigravity"] == "online"
+
+
+def test_runner_register_child_missing_room_is_safe(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    monkeypatch.setattr(bus, "HUDDLE_HOME", tmp_path)
+    assert bus.runner_register_child("nope", "Antigravity", 1, "s") is False
+    assert bus.runner_unregister_child("nope", "Antigravity", 1, "s") is False
+
+
+def test_room_is_active(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    monkeypatch.setattr(bus, "HUDDLE_HOME", tmp_path)
+    rid = bus.create_room("r", "Owner", os.getpid(), "/proj", "sess1")
+    assert bus.room_is_active(rid) is True
+    bus.close_room(rid, "Owner")
+    assert bus.room_is_active(rid) is False
+    assert bus.room_is_active("ghost") is False
+
+
+def test_close_room_kills_registered_interactive_child(tmp_path: Path, monkeypatch) -> None:
+    """End-to-end: a registered interactive child is SIGTERM'd on room close."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    monkeypatch.setattr(bus, "HUDDLE_HOME", tmp_path)
+    rid = bus.create_room("r", "Owner", os.getpid(), "/proj", "sess1")
+    bus.runner_register_child(rid, "Antigravity", 99999, "sess1")
+    terminated = []
+    monkeypatch.setattr(bus, "_terminate_pid", lambda pid: terminated.append(pid) or True)
+    bus.close_room(rid, "Owner")
+    assert 99999 in terminated
+
+
+def test_wake_in_progress_trusts_busy_for_interactive() -> None:
+    """interactive_runner agents: trust the busy status (no live pid to probe in
+    the enqueue→child-start window); headless still requires a live pid."""
+    # interactive: busy with no/zero pid → still in progress (don't re-wake).
+    assert server._wake_in_progress(
+        {"mode": "interactive_runner", "last_wake_pid": 0}, "busy") is True
+    # interactive: not busy → free to wake.
+    assert server._wake_in_progress(
+        {"mode": "interactive_runner", "last_wake_pid": 0}, "online") is False
+    # headless: busy but dead pid → stale lease, free to wake.
+    assert server._wake_in_progress({"last_wake_pid": 0}, "busy") is False

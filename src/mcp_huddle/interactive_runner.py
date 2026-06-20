@@ -13,8 +13,16 @@ The daemon:
 - Moves finished task files to <runner_dir>/done/.
 - Removes the PID file on clean exit (SIGTERM / SIGINT / normal return).
 
+Per-room lifecycle: each agent child is spawned in its own process group
+(start_new_session=True). The daemon registers the child's pid into the task's
+room (bus.runner_register_child) so close_room can SIGTERM the whole subtree and
+free its RAM the moment the room closes — the long-lived daemon itself is never
+killed. A task whose room closed while it sat queued is skipped.
+
 Task JSON schema (written by spawn_via_runner):
-    {"id": "<hex12>", "brief": "<prompt>", "cwd": "<path>", "log": "<log path>"}
+    {"id": "<hex12>", "brief": "<prompt>", "cwd": "<path>", "log": "<log path>",
+     "room_id": "<room>", "agent": "<name>", "wake_id": "<id>",
+     "session_id": "<id>"}
 """
 
 from __future__ import annotations
@@ -58,30 +66,52 @@ def _tee(src, *dsts) -> None:
 
 
 def run_task(task: dict, spec: spawn.SpawnSpec) -> None:
-    """Run one task synchronously — blocks until the agent exits."""
+    """Run one task synchronously — blocks until the agent exits.
+
+    Per-room lifecycle: the child is spawned in its OWN process group
+    (start_new_session=True) so close_room can SIGTERM the whole agy subtree
+    (it spawns helpers) without touching this long-lived daemon. The child pid
+    is registered into the room's meta on start and removed on exit, so the
+    server's close/kill path frees the RAM the moment the room closes. A task
+    whose room already closed while it sat queued is skipped.
+    """
     brief = task.get("brief", "")
     cwd = task.get("cwd") or None
+    room_id = task.get("room_id") or ""
+    agent = task.get("agent") or spec.get("name") or ""
+    session_id = task.get("session_id") or ""
     log_path = Path(task["log"])
     log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if room_id and not bus.room_is_active(room_id):
+        print(f"[interactive_runner] skip task {task['id']}: room {room_id} "
+              "closed/gone before start", flush=True)
+        return
 
     cmd = [part.replace("{brief}", brief) for part in spec["cmd"]]
 
     print(f"\n[interactive_runner] starting task {task['id']}: {cmd[0]} …", flush=True)
 
     log_file = open(log_path, "ab", buffering=0)
+    proc = None
     try:
         proc = subprocess.Popen(
             cmd,
             cwd=cwd,
-            stdin=None,          # inherit terminal — allows OAuth prompts
+            stdin=None,            # inherit terminal — allows OAuth prompts
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            start_new_session=True,  # own process group → killpg kills the subtree
         )
+        if room_id:
+            bus.runner_register_child(room_id, agent, proc.pid, session_id)
         assert proc.stdout is not None
         _tee(proc.stdout, sys.stdout.buffer, log_file)
         proc.wait()
     finally:
         log_file.close()
+        if room_id and proc is not None:
+            bus.runner_unregister_child(room_id, agent, proc.pid, session_id)
 
     print(f"[interactive_runner] task {task['id']} exited (rc={proc.returncode})", flush=True)
 

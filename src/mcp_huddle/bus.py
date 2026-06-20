@@ -804,12 +804,109 @@ def _notify_agents(room_id: str, participants: list[str], sender: str,
             pass
 
 
+def _terminate_pid(pid: int) -> bool:
+    """SIGTERM one spawned PID, group-aware. Returns True if a signal was sent.
+
+    A pid that is its own process-group leader (the interactive runner spawns
+    each agent child with start_new_session=True, so child pid == pgid) is
+    killed with killpg so the WHOLE subtree dies — agy spawns helper processes
+    that would otherwise leak and keep eating RAM. A pid that merely shares our
+    own group (headless agents inherit the server's group) is killed with a
+    plain kill — never killpg a group we belong to, or we'd signal the server.
+
+    Hardened against os.kill(0, …) — pid 0/negative would broadcast to the
+    caller's own process group, killing the server. Such sentinels are skipped.
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        is_group_leader = os.getpgid(pid) == pid
+    except (ProcessLookupError, PermissionError, OSError):
+        is_group_leader = False
+    try:
+        if is_group_leader:
+            os.killpg(pid, signal.SIGTERM)
+        else:
+            os.kill(pid, signal.SIGTERM)
+        return True
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+
+
 def _kill_spawned(meta: dict) -> None:
     for pid in meta.get("spawned_pids", []):
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
+        _terminate_pid(pid)
+
+
+def runner_register_child(room_id: str, agent: str, pid: int,
+                          session_id: str = "") -> bool:
+    """Record an interactive-runner child process against a room.
+
+    Called by the interactive_runner daemon when it starts an agent child for a
+    room: the child's pid (a process-group leader) is added to the room's
+    spawned_pids so close_room/_kill_spawned can SIGTERM it — the daemon itself
+    is long-lived and must NOT be killed, only its per-room child. Also marks
+    the agent busy (drives _wake_in_progress) and stamps agent_meta.mode so the
+    server trusts status over pid-liveness for interactive agents.
+
+    Returns False (no raise) if the room vanished between enqueue and start.
+    """
+    try:
+        def _update(meta: dict) -> dict:
+            pids = meta.get("spawned_pids") or []
+            if pid > 0 and pid not in pids:
+                pids = pids + [pid]
+            meta["spawned_pids"] = pids
+            am = meta.get("agent_meta") or {}
+            slot = am.get(agent) if isinstance(am.get(agent), dict) else {}
+            slot = {**slot, "last_wake_pid": pid, "mode": "interactive_runner"}
+            am[agent] = slot
+            meta["agent_meta"] = am
+            return meta
+        _update_meta_locked(room_id, _update)
+        set_status(room_id, agent, "busy", 300, session_id)
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def runner_unregister_child(room_id: str, agent: str, pid: int,
+                            session_id: str = "") -> bool:
+    """Drop an interactive-runner child after it exits.
+
+    Removes the child's pid from spawned_pids (it's already dead — leaving it
+    would be a stale entry a later close_room would try to kill) and flips the
+    agent back to online so the next pending request can wake it. Returns False
+    (no raise) if the room is gone.
+    """
+    try:
+        def _update(meta: dict) -> dict:
+            pids = [p for p in (meta.get("spawned_pids") or []) if p != pid]
+            meta["spawned_pids"] = pids
+            am = meta.get("agent_meta") or {}
+            if isinstance(am.get(agent), dict):
+                am[agent] = {**am[agent], "last_wake_pid": 0}
+                meta["agent_meta"] = am
+            return meta
+        _update_meta_locked(room_id, _update)
+        set_status(room_id, agent, "online", 0, session_id)
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def room_is_active(room_id: str) -> bool:
+    """True if the room exists and is not closed — the daemon checks this before
+    spawning a queued task so a room closed while the task waited is skipped."""
+    try:
+        meta = _read_meta(room_id)
+    except (ValueError, OSError):
+        return False
+    return bool(meta) and meta.get("status") != "closed"
 
 
 def _pid_alive(pid: int) -> bool:
@@ -852,10 +949,9 @@ def _kill_spawned_safe(meta: dict, protected: set[int]) -> dict:
         if pid_int in protected:
             counts["skipped_owner"] += 1
             continue
-        try:
-            os.kill(pid_int, signal.SIGTERM)
+        if _terminate_pid(pid_int):
             counts["killed"] += 1
-        except (ProcessLookupError, PermissionError):
+        else:
             counts["skipped_dead"] += 1
     return counts
 
