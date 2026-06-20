@@ -954,6 +954,19 @@ def _spawn_agents(
         return m
     bus._update_meta_locked(room_id, _save_spawn_meta)
 
+    # interactive_runner agents are enqueued (pid sentinel 0); the daemon starts
+    # the real child and refreshes the lease. Mark them busy + stamp mode now so
+    # a request arriving in the brief enqueue→child-start window doesn't trigger
+    # a duplicate wake task (_wake_in_progress trusts busy for interactive).
+    interactive_names = {
+        s["name"] for s in spawn.load_registry()
+        if s.get("mode") == "interactive_runner"
+    }
+    for n in names:
+        if n in interactive_names:
+            bus.set_status(room_id, n, "busy", bus.INTERACTIVE_BUSY_TTL_SEC, session_id)
+            _merge_agent_meta(room_id, n, {"mode": "interactive_runner"})
+
 
 # ── Wake lease helpers ────────────────────────────────────────────────────────
 #
@@ -1017,13 +1030,19 @@ def _agent_wake_health(info: dict, status: Optional[str]) -> dict:
     wakes for the dashboard health view."""
     pid = info.get("last_wake_pid")
     pid_alive = bool(pid) and bus._pid_alive(pid)
+    # interactive_runner agents run their child in a separate process the server
+    # never holds a live handle to (last_wake_pid is the sentinel 0 until the
+    # daemon registers the real child). Their busy lease is trusted via status,
+    # not pid-liveness (see _wake_in_progress), so the pid-based stale-lease test
+    # would raise a permanent false alarm on the dashboard for every agy turn.
+    is_interactive = info.get("mode") == "interactive_runner"
     rc = info.get("last_wake_rc")
     return {
         "status": status or "offline",
         "wake_id": info.get("wake_id"),
         "last_wake_pid": pid,
         "pid_alive": pid_alive,
-        "stale_lease": status == "busy" and not pid_alive,
+        "stale_lease": status == "busy" and not pid_alive and not is_interactive,
         "last_wake_msg_id": info.get("last_wake_msg_id"),
         "last_wake_at": info.get("last_wake_at"),
         "last_wake_rc": rc,
@@ -1368,6 +1387,22 @@ def _spawn_fresh_room_agent(
     except Exception:
         bus.set_status(room_id, agent_name, "online", 0, session_id)
         raise
+
+    if spec.get("mode") == "interactive_runner":
+        # Upgrade the just-set 300s lease to the interactive TTL: the agy turn is
+        # queued behind the daemon's serial queue and may not even START for
+        # minutes, so a 300s lease could expire while the task still waits — the
+        # watchdog would then enqueue a DUPLICATE task and the agent would post
+        # twice. The daemon refreshes this same lease again on child start.
+        #
+        # NOTE: the on_exit drain callback above is a no-op for interactive
+        # agents (the child runs in the daemon, a separate process the server
+        # never reaps). When the daemon flips status busy→online on child exit,
+        # the next queued request is drained by the watchdog (_wake_pending_agents,
+        # ~ZOMBIE_CHECK_SECS), not instantly. This is a bounded latency, not a
+        # correctness gap — accepted because interactive turns are human-paced.
+        bus.set_status(room_id, agent_name, "busy",
+                       bus.INTERACTIVE_BUSY_TTL_SEC, session_id)
 
     fields = {
         "log_path": log_path,

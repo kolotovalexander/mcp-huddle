@@ -65,6 +65,25 @@ def _tee(src, *dsts) -> None:
                 pass
 
 
+# The child currently running under run_task, so the daemon's signal handler can
+# tear it down on shutdown instead of orphaning a live agy subtree.
+_CURRENT_CHILD: subprocess.Popen | None = None
+
+
+def _kill_child_group(proc: subprocess.Popen) -> None:
+    """SIGTERM the child's whole process group (it was started with
+    start_new_session=True, so its pid is the group leader). Best-effort."""
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+
+
 def run_task(task: dict, spec: spawn.SpawnSpec) -> None:
     """Run one task synchronously — blocks until the agent exits.
 
@@ -92,6 +111,7 @@ def run_task(task: dict, spec: spawn.SpawnSpec) -> None:
 
     print(f"\n[interactive_runner] starting task {task['id']}: {cmd[0]} …", flush=True)
 
+    global _CURRENT_CHILD
     log_file = open(log_path, "ab", buffering=0)
     proc = None
     try:
@@ -103,8 +123,20 @@ def run_task(task: dict, spec: spawn.SpawnSpec) -> None:
             stderr=subprocess.STDOUT,
             start_new_session=True,  # own process group → killpg kills the subtree
         )
+        _CURRENT_CHILD = proc
         if room_id:
-            bus.runner_register_child(room_id, agent, proc.pid, session_id)
+            registered = bus.runner_register_child(
+                room_id, agent, proc.pid, session_id)
+            if not registered:
+                # Room closed in the tiny window between our room_is_active check
+                # and Popen — registration was refused under the close lock. Kill
+                # the child we just started so it can't become an orphan eating
+                # RAM, and skip the turn entirely.
+                print(f"[interactive_runner] room {room_id} closed during start "
+                      f"of task {task['id']} — killing child {proc.pid}",
+                      flush=True)
+                _kill_child_group(proc)
+                return
         assert proc.stdout is not None
         _tee(proc.stdout, sys.stdout.buffer, log_file)
         proc.wait()
@@ -112,6 +144,8 @@ def run_task(task: dict, spec: spawn.SpawnSpec) -> None:
         log_file.close()
         if room_id and proc is not None:
             bus.runner_unregister_child(room_id, agent, proc.pid, session_id)
+        if _CURRENT_CHILD is proc:
+            _CURRENT_CHILD = None
 
     print(f"[interactive_runner] task {task['id']} exited (rc={proc.returncode})", flush=True)
 
@@ -142,6 +176,9 @@ def run_daemon(agent_name: str, runner_dir: Path) -> None:
 
     def _cleanup(signum=None, frame=None):
         print("\n[interactive_runner] shutting down", flush=True)
+        # Don't orphan a live agy subtree when the daemon itself is stopped.
+        if _CURRENT_CHILD is not None:
+            _kill_child_group(_CURRENT_CHILD)
         _remove_pid(pid_file)
         sys.exit(0)
 

@@ -30,6 +30,13 @@ CIRCUIT_BREAKER_WINDOW = 10   # last N messages to check
 CIRCUIT_BREAKER_LIMIT = 5     # max consecutive from same agent (non-request kinds)
 DEADLOCK_TIMEOUT_SECS = 600   # 10 minutes of silence → system message
 ZOMBIE_CHECK_SECS = 30        # how often to check owner_pid liveness
+# Busy-lease TTL for interactive-runner agents. Longer than the 300s used for
+# headless one-shot turns: an agy/Antigravity turn can include a human OAuth
+# step and run for minutes, and the daemon processes its queue serially. A
+# too-short lease would expire mid-turn, let the watchdog enqueue a duplicate
+# task, and pile work behind the still-running child. Env-overridable.
+INTERACTIVE_BUSY_TTL_SEC = int(
+    os.environ.get("MCP_HUDDLE_INTERACTIVE_BUSY_TTL_SEC", "1800"))
 
 VALID_KINDS = {"request", "comment", "ack", "busy", "result", "final", "system", "close"}
 
@@ -183,10 +190,27 @@ def close_room(room_id: str, owner: str) -> None:
         # перезаписывать meta.json лишний раз. Дашборд / агенты могут безопасно
         # дёрнуть room_close ещё раз без побочных эффектов.
         return
-    _kill_spawned(meta)
+    # System message first, while the room is still open (post_message rejects a
+    # closed room even for kind=system).
     _append_system(room_id, "Чат закрыт.")
-    # Locked flip preserves any agent_meta a wake thread wrote concurrently.
-    _update_meta_locked(room_id, lambda m: {**m, "status": "closed"})
+    # Flip to closed and capture the kill-list ATOMICALLY under the meta lock,
+    # so an interactive runner that registers its child concurrently is handled
+    # race-free: a child registered before the flip is in `to_kill` (killed
+    # below); a register that arrives after the flip sees status=closed and is
+    # refused (runner_register_child returns False → the daemon kills the child
+    # it just started). Either way no agy process is orphaned. The old code
+    # killed from an unlocked pre-flip snapshot and missed late registrations.
+    to_kill: list[int] = []
+
+    def _flip(m: dict) -> dict:
+        if m.get("status") == "closed":
+            return m
+        to_kill.extend(m.get("spawned_pids") or [])
+        return {**m, "status": "closed"}
+
+    _update_meta_locked(room_id, _flip)
+    for pid in to_kill:
+        _terminate_pid(pid)
 
 
 def close_session_rooms(session_id: str) -> list[str]:
@@ -853,10 +877,19 @@ def runner_register_child(room_id: str, agent: str, pid: int,
     the agent busy (drives _wake_in_progress) and stamps agent_meta.mode so the
     server trusts status over pid-liveness for interactive agents.
 
-    Returns False (no raise) if the room vanished between enqueue and start.
+    Returns False (no raise) if the room vanished between enqueue and start, OR
+    if the room is already closed (registration refused under the meta lock —
+    the daemon must then kill the child it just started, see run_task). This
+    refusal is what makes the close/register handoff race-free: close_room flips
+    status under the SAME lock, so exactly one of {register-before-flip,
+    refuse-after-flip} happens.
     """
+    refused = {"v": False}
     try:
         def _update(meta: dict) -> dict:
+            if meta.get("status") == "closed":
+                refused["v"] = True
+                return meta  # do not adopt a child into a closed room
             pids = meta.get("spawned_pids") or []
             if pid > 0 and pid not in pids:
                 pids = pids + [pid]
@@ -868,10 +901,12 @@ def runner_register_child(room_id: str, agent: str, pid: int,
             meta["agent_meta"] = am
             return meta
         _update_meta_locked(room_id, _update)
-        set_status(room_id, agent, "busy", 300, session_id)
-        return True
     except (ValueError, OSError):
         return False
+    if refused["v"]:
+        return False
+    set_status(room_id, agent, "busy", INTERACTIVE_BUSY_TTL_SEC, session_id)
+    return True
 
 
 def runner_unregister_child(room_id: str, agent: str, pid: int,

@@ -1307,3 +1307,115 @@ def test_wake_in_progress_trusts_busy_for_interactive() -> None:
         {"mode": "interactive_runner", "last_wake_pid": 0}, "online") is False
     # headless: busy but dead pid → stale lease, free to wake.
     assert server._wake_in_progress({"last_wake_pid": 0}, "busy") is False
+
+
+# ── Close/register race handoff (no orphaned agy child on close) ───────────────
+
+def test_register_refused_when_room_closed(tmp_path: Path, monkeypatch) -> None:
+    """A child whose room closed before registration must be REFUSED (the daemon
+    then kills it). Refusal must not adopt the pid nor flip status to busy."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    monkeypatch.setattr(bus, "HUDDLE_HOME", tmp_path)
+    rid = bus.create_room("r", "Owner", os.getpid(), "/proj", "sess1")
+    bus.close_room(rid, "Owner")
+    assert bus.runner_register_child(rid, "Antigravity", 7777, "sess1") is False
+    meta = bus.get_room_info(rid)
+    assert 7777 not in (meta.get("spawned_pids") or [])
+    # status must NOT have been flipped to busy by a refused registration
+    assert bus.get_status(rid).get("Antigravity", "online") != "busy"
+
+
+def test_close_room_captures_late_registration_atomically(tmp_path: Path, monkeypatch) -> None:
+    """close_room must kill a child that registered just before the close flip —
+    it captures spawned_pids under the same lock, not from a stale pre-snapshot."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    monkeypatch.setattr(bus, "HUDDLE_HOME", tmp_path)
+    rid = bus.create_room("r", "Owner", os.getpid(), "/proj", "sess1")
+    bus.runner_register_child(rid, "Antigravity", 8888, "sess1")
+    terminated = []
+    monkeypatch.setattr(bus, "_terminate_pid", lambda pid: terminated.append(pid) or True)
+    bus.close_room(rid, "Owner")
+    assert 8888 in terminated
+    assert bus.get_room_info(rid)["status"] == "closed"
+
+
+def test_close_room_still_posts_system_message(tmp_path: Path, monkeypatch) -> None:
+    """Reordered close (system message before the locked flip) must still post
+    the 'Чат закрыт.' system message — post_message rejects a closed room."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    monkeypatch.setattr(bus, "HUDDLE_HOME", tmp_path)
+    rid = bus.create_room("r", "Owner", os.getpid(), "/proj", "sess1")
+    bus.close_room(rid, "Owner")
+    msgs = bus._load_messages(rid)
+    assert any("закрыт" in m.get("body", "").lower() for m in msgs)
+
+
+def test_runner_register_child_uses_interactive_ttl(tmp_path: Path, monkeypatch) -> None:
+    """The interactive busy lease uses the longer INTERACTIVE_BUSY_TTL_SEC, not
+    the 300s headless default (agy turns can include human OAuth)."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    monkeypatch.setattr(bus, "HUDDLE_HOME", tmp_path)
+    monkeypatch.setattr(bus, "INTERACTIVE_BUSY_TTL_SEC", 12345)
+    captured = {}
+    real = bus.set_status
+    def spy(room_id, agent, status, ttl=0, sid=""):
+        captured[(agent, status)] = ttl
+        return real(room_id, agent, status, ttl, sid)
+    monkeypatch.setattr(bus, "set_status", spy)
+    rid = bus.create_room("r", "Owner", os.getpid(), "/proj", "sess1")
+    bus.runner_register_child(rid, "Antigravity", 4242, "sess1")
+    assert captured[("Antigravity", "busy")] == 12345
+
+
+def test_kill_child_group_skips_dead_child(monkeypatch) -> None:
+    """_kill_child_group is a no-op for a child that already exited."""
+    from mcp_huddle import interactive_runner as ir
+    class FakeProc:
+        pid = 999
+        def poll(self): return 0  # already exited
+    sent = []
+    monkeypatch.setattr(ir.os, "killpg", lambda *a: sent.append(a))
+    ir._kill_child_group(FakeProc())
+    assert sent == []
+
+
+# ── Dashboard health + wake-lease TTL for interactive agents ──────────────────
+
+def test_agent_wake_health_no_stale_lease_for_interactive() -> None:
+    """An interactive agent that is busy with the sentinel pid 0 must NOT be
+    flagged stale_lease (its lease is trusted via status, not pid-liveness)."""
+    health = server._agent_wake_health(
+        {"mode": "interactive_runner", "last_wake_pid": 0}, "busy")
+    assert health["stale_lease"] is False
+    # headless busy + dead pid is still a real stale lease
+    headless = server._agent_wake_health({"last_wake_pid": 0}, "busy")
+    assert headless["stale_lease"] is True
+
+
+def test_fresh_spawn_upgrades_interactive_busy_ttl(tmp_path: Path, monkeypatch) -> None:
+    """_spawn_fresh_room_agent must upgrade the 300s lease to the interactive TTL
+    so a backed-up daemon queue can't let the lease expire → duplicate task."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    monkeypatch.setattr(bus, "HUDDLE_HOME", tmp_path)
+    monkeypatch.setattr(bus, "INTERACTIVE_BUSY_TTL_SEC", 9999)
+    rid = bus.create_room("r", "Owner", os.getpid(), "/proj", "sess1")
+
+    spec = {"name": "Antigravity", "cmd": ["agy"], "enabled": True,
+            "mode": "interactive_runner"}
+    monkeypatch.setattr(server.spawn, "get_enabled_spec", lambda n: spec)
+    monkeypatch.setattr(server.spawn, "spawn_agent",
+                        lambda *a, **k: (0, str(tmp_path / "log"), None))
+
+    ttls = []
+    real = bus.set_status
+    def spy(room_id, agent, status, ttl=0, sid=""):
+        if status == "busy":
+            ttls.append(ttl)
+        return real(room_id, agent, status, ttl, sid)
+    monkeypatch.setattr(bus, "set_status", spy)
+
+    meta = bus.get_room_info(rid)
+    server._spawn_fresh_room_agent(rid, "Antigravity", "prompt", meta,
+                                   msg_id=1, wake_id="wk")
+    # last busy TTL written must be the interactive one, not 300
+    assert ttls[-1] == 9999
