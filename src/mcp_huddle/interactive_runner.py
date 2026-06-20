@@ -4,6 +4,22 @@ Usage:
     python -m mcp_huddle.interactive_runner --agent Antigravity
     python -m mcp_huddle.interactive_runner --agent Antigravity --runner-dir /tmp/my-runner
 
+ANY agent — not just Antigravity — can run through this TTY daemon. Antigravity
+defaults to it (OAuth needs a terminal); flip any other with the env flag
+`MCP_HUDDLE_<NAME>_INTERACTIVE=1` (e.g. MCP_HUDDLE_CODEX_INTERACTIVE=1,
+MCP_HUDDLE_CLAUDE_INTERACTIVE=1), then start a runner for that agent name. Once
+flipped, the agent shows unavailable until its runner is alive — exactly like
+Antigravity.
+
+Operator caveats:
+- One runner per agent NAME. Start it in a terminal you keep open; that terminal
+  is where you watch raw output and complete any auth prompt.
+- The runner resolves its spec ONCE at startup (env flags + registry.json). After
+  changing MCP_HUDDLE_*_INTERACTIVE or registry.json, RESTART the runner.
+- Codex via the runner runs `codex exec` with `-a never` so it never blocks on an
+  approval prompt; if a future Codex adds a non-approval stdin prompt it could
+  stall (SIGTTIN, own process group). That surfaces as a hung task, not a crash.
+
 The daemon:
 - Writes its PID to <runner_dir>/pid on start so spawn.py can detect liveness.
 - Polls <runner_dir>/tasks/ every 0.5 s for JSON task files written by spawn_via_runner().
@@ -95,7 +111,7 @@ def run_task(task: dict, spec: spawn.SpawnSpec) -> None:
     whose room already closed while it sat queued is skipped.
     """
     brief = task.get("brief", "")
-    cwd = task.get("cwd") or None
+    cwd = task.get("cwd") or ""
     room_id = task.get("room_id") or ""
     agent = task.get("agent") or spec.get("name") or ""
     session_id = task.get("session_id") or ""
@@ -107,7 +123,14 @@ def run_task(task: dict, spec: spawn.SpawnSpec) -> None:
               "closed/gone before start", flush=True)
         return
 
-    cmd = [part.replace("{brief}", brief) for part in spec["cmd"]]
+    # Resolve argv exactly like the headless path: substitute {brief} AND
+    # {last_message} (Codex captures its final reply there), and apply Codex's
+    # non-ASCII-cwd workaround. This lets ANY agent (Codex/Claude/…) run via the
+    # TTY runner, not just agy whose cmd had only {brief}.
+    if agent == "Codex":
+        cwd, brief = spawn._codex_safe_cwd_and_brief(cwd, brief)
+    cmd, _last_msg = spawn._resolve_spawn_args(spec, brief, log_path.parent)
+    cwd = cwd or None
 
     print(f"\n[interactive_runner] starting task {task['id']}: {cmd[0]} …", flush=True)
 

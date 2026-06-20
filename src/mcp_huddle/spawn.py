@@ -579,12 +579,14 @@ def _apply_readonly(spec: SpawnSpec) -> SpawnSpec:
     - Codex: switch the sandbox to `read-only` and auto-approve the huddle MCP
       tools (a restricted sandbox otherwise routes MCP calls through approval,
       which `-a never` would cancel). Cross-model council, 2026-06-19.
-    - interactive_runner: returned unchanged — the runner controls permissions;
-      agy has no read-only flag anyway.
-    Other agents are returned unchanged (no confirmed read-only flag yet).
+    - Other agents (e.g. Antigravity/agy) are returned unchanged — no confirmed
+      read-only flag.
+
+    The read-only transform is applied REGARDLESS of mode: an agent flipped to
+    interactive_runner still has the same CLI flags, only its stdin/auth changes
+    (TTY via the daemon). So Claude/Codex stay read-only discussants even when
+    interactive; agy has no RO flag and falls through unchanged either way.
     """
-    if spec.get("mode") == "interactive_runner":
-        return spec
     name = spec.get("name")
     cmd = list(spec.get("cmd") or [])
     if name == "Claude":
@@ -609,12 +611,41 @@ def _apply_readonly(spec: SpawnSpec) -> SpawnSpec:
     return {**spec, "cmd": cmd}
 
 
+def _interactive_flag_set(name: str) -> bool:
+    """True if MCP_HUDDLE_<NAME>_INTERACTIVE opts this agent into the TTY runner.
+
+    Lets ANY agent (not just Antigravity) be spawned via the interactive_runner
+    daemon — useful for agents whose auth occasionally needs a real terminal
+    (OAuth / device-login / re-consent). e.g. MCP_HUDDLE_CLAUDE_INTERACTIVE=1.
+    """
+    if not name:
+        return False
+    key = f"MCP_HUDDLE_{name.upper()}_INTERACTIVE"
+    return os.environ.get(key, "0").lower() not in ("0", "false", "no", "")
+
+
+def _apply_interactive_flag(spec: SpawnSpec) -> SpawnSpec:
+    """Flip a spec to interactive_runner mode when its env flag is set.
+
+    A spec already in interactive_runner mode (e.g. Antigravity's default) is
+    left as-is. The agent then needs its own runner daemon
+    (`python -m mcp_huddle.interactive_runner --agent <name>`); until it's alive
+    the agent shows as unavailable (runner not running), same as Antigravity.
+    """
+    if spec.get("mode") == "interactive_runner":
+        return spec
+    if _interactive_flag_set(spec.get("name", "")):
+        return {**spec, "mode": "interactive_runner"}
+    return spec
+
+
 def _raw_registry() -> list[SpawnSpec]:
     """Merged registry BEFORE availability filtering.
 
     Precedence: MCP_HUDDLE_SPAWN_REGISTRY env (full replacement) >
     ~/.mcp-huddle/registry.json (merged onto defaults) > DEFAULT_REGISTRY.
-    When MCP_HUDDLE_READONLY is set, every spec is rewritten to read-only.
+    Then MCP_HUDDLE_<NAME>_INTERACTIVE flips an agent to the TTY runner, and
+    MCP_HUDDLE_READONLY rewrites every spec to read-only.
     """
     env_registry = _load_env_registry()
     if env_registry is not None:
@@ -623,6 +654,7 @@ def _raw_registry() -> list[SpawnSpec]:
         file_overrides = _load_registry_file()
         reg = (_merge_registry(DEFAULT_REGISTRY, file_overrides)
                if file_overrides is not None else list(DEFAULT_REGISTRY))
+    reg = [_apply_interactive_flag(s) for s in reg]
     if _readonly_enabled():
         reg = [_apply_readonly(s) for s in reg]
     return reg

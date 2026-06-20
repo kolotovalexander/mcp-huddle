@@ -1455,3 +1455,61 @@ def test_spawn_via_runner_falls_back_to_runner_logs_without_room(tmp_path: Path,
     pid, log_path, _ = spawn.spawn_via_runner(
         spec, "brief", "/proj", tmp_path / "agents", room_id="", wake_id="")
     assert str(runner_dir / "logs") in log_path
+
+
+# ── Generalized interactive mode (any agent, not just Antigravity) ─────────────
+
+def test_interactive_env_flag_flips_any_agent(monkeypatch) -> None:
+    """MCP_HUDDLE_<NAME>_INTERACTIVE flips a normally-headless agent to the TTY
+    runner; agents without the flag stay headless."""
+    monkeypatch.delenv("MCP_HUDDLE_SPAWN_REGISTRY", raising=False)
+    monkeypatch.setenv("MCP_HUDDLE_CLAUDE_INTERACTIVE", "1")
+    reg = {s["name"]: s for s in spawn._raw_registry()}
+    assert reg["Claude"].get("mode") == "interactive_runner"
+    # Codex untouched (no flag) → still headless
+    assert reg["Codex"].get("mode") != "interactive_runner"
+
+
+def test_interactive_claude_still_readonly(monkeypatch) -> None:
+    """A Claude flipped to interactive must KEEP the read-only transform — it has
+    RO flags, unlike agy. --dangerously-skip-permissions must be gone."""
+    monkeypatch.delenv("MCP_HUDDLE_SPAWN_REGISTRY", raising=False)
+    monkeypatch.setenv("MCP_HUDDLE_READONLY", "1")
+    monkeypatch.setenv("MCP_HUDDLE_CLAUDE_INTERACTIVE", "1")
+    reg = {s["name"]: s for s in spawn._raw_registry()}
+    claude = reg["Claude"]
+    assert claude.get("mode") == "interactive_runner"
+    assert "--dangerously-skip-permissions" not in claude["cmd"]
+    assert "--allowedTools" in claude["cmd"]
+
+
+def test_interactive_codex_not_thread_resumable(monkeypatch) -> None:
+    """Interactive Codex must NOT be treated as resumable — else its wake would
+    take the headless codex_resume path and bypass the TTY runner."""
+    monkeypatch.delenv("MCP_HUDDLE_SPAWN_REGISTRY", raising=False)
+    assert server._is_thread_resumable("Codex") is True  # default headless
+    monkeypatch.setenv("MCP_HUDDLE_CODEX_INTERACTIVE", "1")
+    assert server._is_thread_resumable("Codex") is False
+
+
+def test_daemon_resolves_last_message_placeholder(tmp_path: Path) -> None:
+    """The runner must substitute {last_message} (not just {brief}) so Codex-style
+    cmds work via the TTY runner, mirroring the headless path."""
+    from mcp_huddle import interactive_runner as ir
+    spec = {
+        "name": "Codex",
+        "cmd": ["echo", "--output-last-message", "{last_message}", "{brief}"],
+        "enabled": True, "mode": "interactive_runner",
+    }
+    log_file = tmp_path / "agents" / "codex.events.jsonl"
+    task = {"id": "t1", "brief": "hello", "cwd": str(tmp_path),
+            "log": str(log_file), "room_id": "", "agent": "Codex",
+            "wake_id": "", "session_id": ""}
+    ir.run_task(task, spec)
+    out = log_file.read_text()
+    # echo printed the resolved args: the literal placeholder must be gone and a
+    # real last_message path under the log dir present.
+    assert "{last_message}" not in out
+    assert "{brief}" not in out
+    assert "hello" in out
+    assert "codex.last_message.txt" in out

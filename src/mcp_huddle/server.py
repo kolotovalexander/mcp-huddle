@@ -142,8 +142,19 @@ _THREAD_RESUMABLE_AGENTS = frozenset({"Codex"})
 
 
 def _is_thread_resumable(agent_name: str) -> bool:
-    """True if the agent supports id-based session resume (vs. fresh spawn)."""
-    return agent_name in _THREAD_RESUMABLE_AGENTS
+    """True if the agent supports id-based session resume (vs. fresh spawn).
+
+    An agent flipped to interactive_runner mode (MCP_HUDDLE_<NAME>_INTERACTIVE)
+    is spawned through the TTY daemon fresh every turn — it has no headless
+    `codex exec resume` thread — so it is NOT resumable even if it normally
+    would be (Codex). Without this guard, interactive Codex would be woken via
+    codex_resume (a headless spawn), bypassing the runner entirely."""
+    if agent_name not in _THREAD_RESUMABLE_AGENTS:
+        return False
+    for s in spawn._raw_registry():
+        if s.get("name") == agent_name:
+            return s.get("mode") != "interactive_runner"
+    return True
 
 
 # ── Room tools ────────────────────────────────────────────────────────────────
