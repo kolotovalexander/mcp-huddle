@@ -258,6 +258,20 @@ def room_reclaim(room_id: str, owner: str, owner_pid: int,
 
 
 @mcp.tool()
+def room_round_advance(room_id: str, owner: str, label: str = "") -> str:
+    """Open a new discussion round (owner-only).
+
+    Bumps the room's round counter, posts a visible "Round N" divider so every
+    agent sees the boundary, and stamps subsequent messages with the new round.
+    Read just that round later with messages_read(round=N) / summarize(round=N).
+    Drive rounds by: advance → dispatch fresh workers seeded with round N-1 state
+    → collect their kind=result posts → advance again.
+    """
+    n = bus.advance_round(room_id, owner, label)
+    return f"round {n} opened"
+
+
+@mcp.tool()
 def room_list() -> list:
     """List all rooms (open and closed)."""
     return bus.list_rooms()
@@ -301,30 +315,35 @@ def message_post(
 
 @mcp.tool()
 def messages_read(room_id: str, since_id: int = 0, limit: int = 20,
-                  until_id: int = 0, max_chars: int = bus.MAX_BODY_CHARS) -> str:
+                  until_id: int = 0, max_chars: int = bus.MAX_BODY_CHARS,
+                  round: int = 0, kind: str = "") -> str:
     """Read chat history as plain text (token-efficient for LLMs).
 
     since_id: only return messages with id > since_id (delta read).
     until_id: only return messages with id <= until_id (0 = up to newest).
               since_id+until_id give a fixed window for paging a large room.
     limit: max messages to return (default 20 = fresh context window).
-    max_chars: truncate each message body to this many chars (0 = full bodies).
-               Default caps fat agent summaries so a room read can't overflow you;
-               re-read one message with since_id=<id-1>&limit=1&max_chars=0 for full.
+    max_chars: truncate each body to this many chars (0 = full). Default caps fat
+               summaries so a read can't overflow you; truncation is head+tail
+               (keeps the conclusion). Re-read one msg with limit=1&max_chars=0.
+    round: 0 = ignore rounds, N = only round N, -1 = current round.
+    kind: comma-separated kinds to keep (e.g. "result,final") — grab just deliverables.
 
     Store last seen id locally and pass it on next call to avoid re-reading history.
     """
-    return bus.read_messages(room_id, since_id, limit, until_id, max_chars)
+    return bus.read_messages(room_id, since_id, limit, until_id, max_chars,
+                             round, kind)
 
 
 @mcp.tool()
-def room_summarize(room_id: str, since_id: int = 0) -> str:
-    """Get a digest of messages since since_id.
+def room_summarize(room_id: str, since_id: int = 0, round: int = 0) -> str:
+    """Get a cheap (no-LLM) digest: counts, open requests, and each agent's
+    LATEST position — the "where does everyone stand" view between rounds.
 
-    Use instead of messages_read when you've been absent for a long time
-    and want to catch up cheaply (fewer tokens than reading everything).
+    Scope: round=N → that round, round=-1 → current round, else since_id (0=all).
+    Use instead of messages_read to catch up without re-reading everything.
     """
-    return bus.summarize_messages(room_id, since_id)
+    return bus.summarize_messages(room_id, since_id, round)
 
 
 def respond_via_agent(

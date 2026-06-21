@@ -287,6 +287,9 @@ def post_message(room_id: str, agent: str, body: str, kind: str,
             "timestamp": int(time.time()),
             "body": body,
         }
+        cur_round = int(cur.get("current_round", 0) or 0)
+        if cur_round:
+            entry["round"] = cur_round
         if to:
             entry["to"] = to
         if reply_to is not None:
@@ -349,17 +352,41 @@ def _validate_reply_to_locked(room_id: str, target_id: int, agent: str) -> None:
         raise ValueError(f"{agent} already answered request #{target_id}")
 
 
+def _truncate_body(body: str, max_chars: int, msg_id: int) -> str:
+    """Head+tail truncation: keep the opening AND the end of a long message —
+    agent conclusions usually sit at the END, so head-only truncation drops the
+    actionable part. Marker says how to fetch the full body."""
+    if max_chars <= 0 or len(body) <= max_chars:
+        return body
+    head = (max_chars * 3) // 5          # 60% opening
+    tail = max_chars - head              # 40% closing (where conclusions live)
+    dropped = len(body) - max_chars
+    return (body[:head] +
+            f"\n…[{dropped} chars cut — read since_id={msg_id - 1}&limit=1&max_chars=0 for full]…\n" +
+            body[-tail:])
+
+
 def read_messages(room_id: str, since_id: int = 0, limit: int = 20,
-                  until_id: int = 0, max_chars: int = MAX_BODY_CHARS) -> str:
+                  until_id: int = 0, max_chars: int = MAX_BODY_CHARS,
+                  round: int = 0, kind: str = "") -> str:
     """Return plain-text chat log for LLM consumption.
 
     since_id / until_id bound the window (id in (since_id, until_id]); until_id<=0
-    means "up to newest". Bodies longer than max_chars (0 = unlimited) are
-    truncated with a marker so one huge message can't overflow the reader.
+    means "up to newest". round>0 returns only that round's messages, round=-1
+    the current round, round=0 (default) ignores rounds. kind (comma-separated,
+    e.g. "result,final") keeps only those kinds — handy to grab just the workers'
+    deliverables. Bodies longer than max_chars (0 = unlimited) are head+tail
+    truncated so one huge message can't overflow the reader.
     """
     meta = _read_meta(room_id)
     msgs = _load_messages(room_id)
 
+    if round != 0:
+        target = int(meta.get("current_round", 0) or 0) if round < 0 else round
+        msgs = [m for m in msgs if int(m.get("round", 0) or 0) == target]
+    if kind:
+        wanted = {k.strip() for k in kind.split(",") if k.strip()}
+        msgs = [m for m in msgs if m["kind"] in wanted]
     if since_id > 0:
         msgs = [m for m in msgs if m["id"] > since_id]
     if until_id > 0:
@@ -374,11 +401,7 @@ def read_messages(room_id: str, since_id: int = 0, limit: int = 20,
         knd = f"[{m['kind']}]" if m["kind"] not in ("comment",) else ""
         re_tag = f" (re:#{m['reply_to']})" if m.get("reply_to") else ""
         ts = time.strftime("%H:%M", time.localtime(m["timestamp"]))
-        body = m["body"]
-        if max_chars > 0 and len(body) > max_chars:
-            body = (body[:max_chars] +
-                    f"… [+{len(body) - max_chars} chars truncated; "
-                    f"read with since_id={m['id'] - 1}&limit=1&max_chars=0 for full]")
+        body = _truncate_body(m["body"], max_chars, m["id"])
         lines.append(f"[{m['id']:03d}] {m['agent']}{addr} {knd}  {body}{re_tag}  [{ts}]")
 
     if not msgs:
@@ -386,30 +409,48 @@ def read_messages(room_id: str, since_id: int = 0, limit: int = 20,
     return "\n".join(lines)
 
 
-def summarize_messages(room_id: str, since_id: int = 0) -> str:
-    """Digest of recent messages — for agents catching up after a long absence."""
+def summarize_messages(room_id: str, since_id: int = 0, round: int = 0) -> str:
+    """Digest of recent messages — for catching up cheaply (no LLM call).
+
+    Scope: round>0 → that round, round=-1 → current round, else since_id (0=all).
+    Reports message counts per agent, still-open requests, and each agent's
+    LATEST position (their most recent message) — the "where does everyone stand"
+    view an orchestrator wants between rounds.
+    """
+    meta = _read_meta(room_id)
     msgs = _load_messages(room_id)
-    if since_id > 0:
-        msgs = [m for m in msgs if m["id"] > since_id]
+
+    if round != 0:
+        target = int(meta.get("current_round", 0) or 0) if round < 0 else round
+        msgs = [m for m in msgs if int(m.get("round", 0) or 0) == target]
+        scope = f"round {target}"
+    else:
+        if since_id > 0:
+            msgs = [m for m in msgs if m["id"] > since_id]
+        scope = f"since #{since_id}" if since_id else "whole room"
     if not msgs:
-        return "No messages since that point."
+        return f"No messages ({scope})."
 
     total = len(msgs)
-    agents_seen = {}
+    agents_seen: dict[str, int] = {}
+    latest: dict[str, dict] = {}
     requests_open = []
+    answered = {m.get("reply_to") for m in msgs if m.get("reply_to")}
     for m in msgs:
         agents_seen[m["agent"]] = agents_seen.get(m["agent"], 0) + 1
-        if m["kind"] == "request" and not m.get("reply_to"):
-            requests_open.append(f"#{m['id']}: {m['body'][:80]}")
+        if m["agent"] != "System":
+            latest[m["agent"]] = m  # last write wins → most recent per agent
+        if m["kind"] == "request" and not m.get("reply_to") and m["id"] not in answered:
+            requests_open.append(f"#{m['id']} {m['agent']}→{m.get('to', 'all')}: {m['body'][:80]}")
 
-    summary = f"[Digest: {total} messages]\n"
-    summary += "Participants: " + ", ".join(f"{a}({c})" for a, c in agents_seen.items()) + "\n"
+    summary = f"[Digest: {total} messages | {scope}]\n"
+    summary += "Counts: " + ", ".join(f"{a}({c})" for a, c in agents_seen.items()) + "\n"
     if requests_open:
         summary += "Open requests:\n" + "\n".join(f"  {r}" for r in requests_open[-5:]) + "\n"
-    # Last 3 messages verbatim
-    summary += "\nLast messages:\n"
-    for m in msgs[-3:]:
-        summary += f"  [{m['id']}] {m['agent']}: {m['body'][:120]}\n"
+    summary += "Latest per agent:\n"
+    for a, m in latest.items():
+        body = m["body"].replace("\n", " ")
+        summary += f"  {a} [{m['kind']}]: {body[:200]}\n"
     return summary
 
 
@@ -584,6 +625,27 @@ def reclaim_room(room_id: str, owner: str, owner_pid: int,
         return meta
 
     return _update_meta_locked(room_id, _update)
+
+
+def advance_round(room_id: str, owner: str, label: str = "") -> int:
+    """Open a new round (owner-only). Increments meta.current_round, posts a
+    visible divider so every agent sees the boundary, and stamps subsequent
+    messages with the new round number. Returns the new round number."""
+    info = get_room_info(room_id)
+    if not info:
+        raise ValueError(f"unknown room {room_id}")
+    if info.get("owner") != owner:
+        raise ValueError(f"{owner!r} is not the owner of {room_id}")
+
+    def _update(meta: dict) -> dict:
+        meta["current_round"] = int(meta.get("current_round", 0) or 0) + 1
+        return meta
+
+    meta = _update_meta_locked(room_id, _update)
+    n = int(meta["current_round"])
+    divider = f"━━━ Round {n}" + (f": {label}" if label else "") + " ━━━"
+    _append_system(room_id, divider)
+    return n
 
 
 def check_deadlock_rooms() -> list[str]:
