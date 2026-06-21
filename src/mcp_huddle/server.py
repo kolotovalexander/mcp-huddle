@@ -245,6 +245,19 @@ def room_info(room_id: str) -> dict:
 
 
 @mcp.tool()
+def room_reclaim(room_id: str, owner: str, owner_pid: int,
+                 session_id: str = "") -> str:
+    """Re-stamp the room's owner_pid after your session resumed with a new PID.
+
+    On session resume the OS PID changes; the zombie-watchdog would otherwise
+    auto-close the room once the old owner_pid no longer exists. Call this with
+    your current PID (and session_id) to keep ownership. Owner-only.
+    """
+    bus.reclaim_room(room_id, owner, owner_pid, session_id)
+    return f"reclaimed {room_id} → owner_pid={owner_pid}"
+
+
+@mcp.tool()
 def room_list() -> list:
     """List all rooms (open and closed)."""
     return bus.list_rooms()
@@ -287,15 +300,21 @@ def message_post(
 
 
 @mcp.tool()
-def messages_read(room_id: str, since_id: int = 0, limit: int = 20) -> str:
+def messages_read(room_id: str, since_id: int = 0, limit: int = 20,
+                  until_id: int = 0, max_chars: int = bus.MAX_BODY_CHARS) -> str:
     """Read chat history as plain text (token-efficient for LLMs).
 
     since_id: only return messages with id > since_id (delta read).
+    until_id: only return messages with id <= until_id (0 = up to newest).
+              since_id+until_id give a fixed window for paging a large room.
     limit: max messages to return (default 20 = fresh context window).
+    max_chars: truncate each message body to this many chars (0 = full bodies).
+               Default caps fat agent summaries so a room read can't overflow you;
+               re-read one message with since_id=<id-1>&limit=1&max_chars=0 for full.
 
     Store last seen id locally and pass it on next call to avoid re-reading history.
     """
-    return bus.read_messages(room_id, since_id, limit)
+    return bus.read_messages(room_id, since_id, limit, until_id, max_chars)
 
 
 @mcp.tool()

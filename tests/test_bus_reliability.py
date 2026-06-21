@@ -423,3 +423,66 @@ def test_zombie_check_reaps_idle_room_with_dead_owner(isolated_bus) -> None:
 
     assert room_id in closed
     assert isolated_bus._read_meta(room_id)["status"] == "closed"
+
+
+def test_messages_read_until_id_windows(isolated_bus) -> None:
+    room_id = _create_room(isolated_bus)
+    for index in range(6):
+        isolated_bus.post_message(room_id, "Codex", f"message-{index + 1}", "request")
+
+    output = isolated_bus.read_messages(room_id, since_id=1, until_id=3)
+
+    assert "message-2" in output
+    assert "message-3" in output
+    assert "message-1" not in output  # excluded by since_id
+    assert "message-4" not in output  # excluded by until_id
+
+
+def test_messages_read_truncates_long_body(isolated_bus) -> None:
+    room_id = _create_room(isolated_bus)
+    isolated_bus.post_message(room_id, "Codex", "X" * 5000, "comment")
+
+    capped = isolated_bus.read_messages(room_id, max_chars=100)
+    assert "truncated" in capped
+    assert len(capped) < 5000
+
+    full = isolated_bus.read_messages(room_id, max_chars=0)
+    assert "X" * 5000 in full
+
+
+def test_zombie_grace_spares_active_room_with_dead_pid(isolated_bus) -> None:
+    # open room, dead owner_pid, but fresh activity → a resumed session, not a
+    # zombie: must NOT be reaped.
+    room_id = isolated_bus.create_room("Active", "Codex", 999_999_999, "/tmp", "s")
+
+    closed = isolated_bus.check_zombie_rooms()
+
+    assert room_id not in closed
+    assert isolated_bus._read_meta(room_id)["status"] == "open"
+
+
+def test_zombie_reaps_open_room_after_grace(isolated_bus) -> None:
+    room_id = isolated_bus.create_room("Stale", "Codex", 999_999_999, "/tmp", "s")
+    old = int(time.time()) - isolated_bus.ZOMBIE_GRACE_SECS - 10
+    isolated_bus._update_meta_locked(room_id, lambda m: {**m, "last_activity": old})
+
+    closed = isolated_bus.check_zombie_rooms()
+
+    assert room_id in closed
+
+
+def test_reclaim_room_restamps_owner_pid(isolated_bus) -> None:
+    room_id = isolated_bus.create_room("Resumed", "Codex", 111, "/tmp", "old")
+
+    isolated_bus.reclaim_room(room_id, "Codex", 222, "new")
+
+    meta = isolated_bus._read_meta(room_id)
+    assert meta["owner_pid"] == 222
+    assert meta["session_id"] == "new"
+
+
+def test_reclaim_room_rejects_non_owner(isolated_bus) -> None:
+    room_id = isolated_bus.create_room("Resumed", "Codex", 111, "/tmp", "old")
+
+    with pytest.raises(ValueError):
+        isolated_bus.reclaim_room(room_id, "Mallory", 222)

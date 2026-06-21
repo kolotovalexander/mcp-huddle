@@ -30,6 +30,11 @@ CIRCUIT_BREAKER_WINDOW = 10   # last N messages to check
 CIRCUIT_BREAKER_LIMIT = 5     # max consecutive from same agent (non-request kinds)
 DEADLOCK_TIMEOUT_SECS = 600   # 10 minutes of silence → system message
 ZOMBIE_CHECK_SECS = 30        # how often to check owner_pid liveness
+ZOMBIE_GRACE_SECS = 300       # dead owner_pid alone isn't enough — a resumed
+                              # session gets a NEW pid; require silence too before
+                              # reaping, so room_reclaim / fresh posts spare it
+MAX_BODY_CHARS = 2000         # per-message body cap in read_messages — one fat
+                              # agent summary must not blow the reader's context
 
 VALID_KINDS = {"request", "comment", "ack", "busy", "result", "final", "system", "close"}
 
@@ -344,13 +349,21 @@ def _validate_reply_to_locked(room_id: str, target_id: int, agent: str) -> None:
         raise ValueError(f"{agent} already answered request #{target_id}")
 
 
-def read_messages(room_id: str, since_id: int = 0, limit: int = 20) -> str:
-    """Return plain-text chat log for LLM consumption."""
+def read_messages(room_id: str, since_id: int = 0, limit: int = 20,
+                  until_id: int = 0, max_chars: int = MAX_BODY_CHARS) -> str:
+    """Return plain-text chat log for LLM consumption.
+
+    since_id / until_id bound the window (id in (since_id, until_id]); until_id<=0
+    means "up to newest". Bodies longer than max_chars (0 = unlimited) are
+    truncated with a marker so one huge message can't overflow the reader.
+    """
     meta = _read_meta(room_id)
     msgs = _load_messages(room_id)
 
     if since_id > 0:
         msgs = [m for m in msgs if m["id"] > since_id]
+    if until_id > 0:
+        msgs = [m for m in msgs if m["id"] <= until_id]
     if len(msgs) > limit:
         msgs = msgs[-limit:]
 
@@ -361,7 +374,12 @@ def read_messages(room_id: str, since_id: int = 0, limit: int = 20) -> str:
         knd = f"[{m['kind']}]" if m["kind"] not in ("comment",) else ""
         re_tag = f" (re:#{m['reply_to']})" if m.get("reply_to") else ""
         ts = time.strftime("%H:%M", time.localtime(m["timestamp"]))
-        lines.append(f"[{m['id']:03d}] {m['agent']}{addr} {knd}  {m['body']}{re_tag}  [{ts}]")
+        body = m["body"]
+        if max_chars > 0 and len(body) > max_chars:
+            body = (body[:max_chars] +
+                    f"… [+{len(body) - max_chars} chars truncated; "
+                    f"read with since_id={m['id'] - 1}&limit=1&max_chars=0 for full]")
+        lines.append(f"[{m['id']:03d}] {m['agent']}{addr} {knd}  {body}{re_tag}  [{ts}]")
 
     if not msgs:
         lines.append("(no new messages)")
@@ -521,6 +539,7 @@ def register_notify(room_id: str, agent: str, notify_file: str) -> None:
 def check_zombie_rooms() -> list[str]:
     """Return list of room_ids that were auto-closed due to dead owner."""
     closed = []
+    now = int(time.time())
     for meta in list_rooms():
         # idle rooms whose owner has died are dead weight — reap them too, so
         # they don't pile up forever (idle has no auto-close transition otherwise).
@@ -532,11 +551,39 @@ def check_zombie_rooms() -> list[str]:
         try:
             os.kill(pid, 0)  # raises if dead
         except ProcessLookupError:
+            # A resumed owner session gets a NEW pid, so the old one looks dead
+            # while the room is still actively used. Spare an open/closing room
+            # until it has ALSO been silent past the grace window — a live/resumed
+            # session keeps last_activity fresh (or calls room_reclaim). Idle
+            # rooms are already stale → reap immediately to avoid pileup.
+            last = int(meta.get("last_activity") or meta.get("created_at") or 0)
+            if meta["status"] != "idle" and now - last <= ZOMBIE_GRACE_SECS:
+                continue
             close_room(meta["id"], meta["owner"])
             closed.append(meta["id"])
         except PermissionError:
             pass  # process exists, we just can't signal it
     return closed
+
+
+def reclaim_room(room_id: str, owner: str, owner_pid: int,
+                 session_id: str = "") -> dict:
+    """Re-stamp owner_pid (+ session_id) after the owner's session resumed with a
+    new PID, so the zombie-watchdog won't reap a live room. Only the recorded
+    owner may reclaim."""
+    info = get_room_info(room_id)
+    if not info:
+        raise ValueError(f"unknown room {room_id}")
+    if info.get("owner") != owner:
+        raise ValueError(f"{owner!r} is not the owner of {room_id}")
+
+    def _update(meta: dict) -> dict:
+        meta["owner_pid"] = int(owner_pid)
+        if session_id:
+            meta["session_id"] = session_id
+        return meta
+
+    return _update_meta_locked(room_id, _update)
 
 
 def check_deadlock_rooms() -> list[str]:
