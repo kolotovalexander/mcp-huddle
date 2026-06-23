@@ -161,6 +161,10 @@ def _mimo_advisor_spec() -> SpawnSpec:
     Qwen/DeepSeek it goes through a runner (mimo_runner) that reads the room
     from disk, generates via `mimo run` with MCP hard-disabled, and posts the
     result through the bus. Disabled if the `mimo` binary is not installed.
+
+    Default OFF: headless `mimo run` proved unreliable in multi-round sessions
+    (empty output / silent wake-fails), so the advisor slot is opt-in. Set
+    MCP_HUDDLE_MIMO_ENABLED=1 to re-enable once upstream is fixed.
     """
     if _MIMO_BIN:
         return {
@@ -172,7 +176,7 @@ def _mimo_advisor_spec() -> SpawnSpec:
                 "--mimo-bin", _MIMO_BIN,
                 "--brief", "{brief}",
             ],
-            "enabled": os.environ.get("MCP_HUDDLE_MIMO_ENABLED", "1") != "0",
+            "enabled": os.environ.get("MCP_HUDDLE_MIMO_ENABLED", "0") == "1",
         }
     return {
         "name": "MiMo",

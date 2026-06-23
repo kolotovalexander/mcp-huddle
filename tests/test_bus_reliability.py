@@ -423,3 +423,113 @@ def test_zombie_check_reaps_idle_room_with_dead_owner(isolated_bus) -> None:
 
     assert room_id in closed
     assert isolated_bus._read_meta(room_id)["status"] == "closed"
+
+
+def test_messages_read_until_id_windows(isolated_bus) -> None:
+    room_id = _create_room(isolated_bus)
+    for index in range(6):
+        isolated_bus.post_message(room_id, "Codex", f"message-{index + 1}", "request")
+
+    output = isolated_bus.read_messages(room_id, since_id=1, until_id=3)
+
+    assert "message-2" in output
+    assert "message-3" in output
+    assert "message-1" not in output  # excluded by since_id
+    assert "message-4" not in output  # excluded by until_id
+
+
+def test_messages_read_truncates_long_body(isolated_bus) -> None:
+    room_id = _create_room(isolated_bus)
+    isolated_bus.post_message(room_id, "Codex", "X" * 5000, "comment")
+
+    capped = isolated_bus.read_messages(room_id, max_chars=100)
+    assert "cut" in capped  # elision marker
+    assert len(capped) < 5000
+
+    full = isolated_bus.read_messages(room_id, max_chars=0)
+    assert "X" * 5000 in full
+
+
+def test_zombie_grace_spares_active_room_with_dead_pid(isolated_bus) -> None:
+    # open room, dead owner_pid, but fresh activity → a resumed session, not a
+    # zombie: must NOT be reaped.
+    room_id = isolated_bus.create_room("Active", "Codex", 999_999_999, "/tmp", "s")
+
+    closed = isolated_bus.check_zombie_rooms()
+
+    assert room_id not in closed
+    assert isolated_bus._read_meta(room_id)["status"] == "open"
+
+
+def test_zombie_reaps_open_room_after_grace(isolated_bus) -> None:
+    room_id = isolated_bus.create_room("Stale", "Codex", 999_999_999, "/tmp", "s")
+    old = int(time.time()) - isolated_bus.ZOMBIE_GRACE_SECS - 10
+    isolated_bus._update_meta_locked(room_id, lambda m: {**m, "last_activity": old})
+
+    closed = isolated_bus.check_zombie_rooms()
+
+    assert room_id in closed
+
+
+def test_reclaim_room_restamps_owner_pid(isolated_bus) -> None:
+    room_id = isolated_bus.create_room("Resumed", "Codex", 111, "/tmp", "old")
+
+    isolated_bus.reclaim_room(room_id, "Codex", 222, "new")
+
+    meta = isolated_bus._read_meta(room_id)
+    assert meta["owner_pid"] == 222
+    assert meta["session_id"] == "new"
+
+
+def test_reclaim_room_rejects_non_owner(isolated_bus) -> None:
+    room_id = isolated_bus.create_room("Resumed", "Codex", 111, "/tmp", "old")
+
+    with pytest.raises(ValueError):
+        isolated_bus.reclaim_room(room_id, "Mallory", 222)
+
+
+def test_advance_round_stamps_and_filters(isolated_bus) -> None:
+    room_id = isolated_bus.create_room("Debate", "Codex", 0, "/tmp", "s")
+    isolated_bus.post_message(room_id, "A", "pre-round", "comment")  # round 0
+
+    assert isolated_bus.advance_round(room_id, "Codex", "opening") == 1
+    isolated_bus.post_message(room_id, "A", "r1-msg", "comment")
+    assert isolated_bus.advance_round(room_id, "Codex") == 2
+    isolated_bus.post_message(room_id, "B", "r2-msg", "comment")
+
+    r1 = isolated_bus.read_messages(room_id, round=1)
+    assert "r1-msg" in r1
+    assert "Round 1: opening" in r1  # visible divider
+    assert "r2-msg" not in r1
+    assert "pre-round" not in r1
+
+    # current round (-1) == round 2
+    assert "r2-msg" in isolated_bus.read_messages(room_id, round=-1)
+
+
+def test_advance_round_owner_only(isolated_bus) -> None:
+    room_id = isolated_bus.create_room("Debate", "Codex", 0, "/tmp", "s")
+    with pytest.raises(ValueError):
+        isolated_bus.advance_round(room_id, "Mallory")
+
+
+def test_read_messages_kind_filter(isolated_bus) -> None:
+    room_id = isolated_bus.create_room("Mix", "Codex", 0, "/tmp", "s")
+    isolated_bus.post_message(room_id, "A", "chatter", "comment")
+    isolated_bus.post_message(room_id, "A", "the-deliverable", "result")
+
+    out = isolated_bus.read_messages(room_id, kind="result")
+    assert "the-deliverable" in out
+    assert "chatter" not in out
+
+
+def test_head_tail_truncation_preserves_conclusion(isolated_bus) -> None:
+    room_id = isolated_bus.create_room("Long", "Codex", 0, "/tmp", "s")
+    body = "OPENING_MARK" + ("." * 5000) + "CONCLUSION_MARK"
+    isolated_bus.post_message(room_id, "A", body, "comment")
+
+    out = isolated_bus.read_messages(room_id, max_chars=300)
+    assert "OPENING_MARK" in out       # head kept
+    assert "CONCLUSION_MARK" in out    # tail kept (head-only would drop this)
+    assert "cut" in out                # elision marker present
+    assert len(out) < 5000

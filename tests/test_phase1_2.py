@@ -104,15 +104,15 @@ def test_default_registry_roster() -> None:
 
 def test_mimo_spec_uses_runner() -> None:
     """MiMo huddle slot goes through mimo_runner (MCP hangs upstream in `mimo
-    run` 0.1.x, so MiMo cannot call huddle MCP tools itself) and is gated by
-    env flag."""
+    run` 0.1.x, so MiMo cannot call huddle MCP tools itself) and is opt-in:
+    default OFF after unreliable headless output, gated by env flag."""
     spec = next(s for s in spawn.DEFAULT_REGISTRY if s["name"] == "MiMo")
     assert "mcp_huddle.mimo_runner" in spec["cmd"]
     assert "{brief}" in spec["cmd"][-1]
     if spawn._MIMO_BIN is None:
         assert spec["enabled"] is False
     else:
-        expected = os.environ.get("MCP_HUDDLE_MIMO_ENABLED", "1") != "0"
+        expected = os.environ.get("MCP_HUDDLE_MIMO_ENABLED", "0") == "1"
         assert spec["enabled"] == expected
 
 
