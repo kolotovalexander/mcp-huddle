@@ -106,7 +106,46 @@ claude-check.sh surfaces pending huddle requests; session-end.sh closes this ses
     print(example.replace("__T__", str(target)))
 
 
-def main() -> None:
+def _cmd_post(args: argparse.Namespace) -> None:
+    """Post one message to a room from any headless process.
+
+    Calls bus.post_message directly, so it inherits kind validation, the
+    closed/resolved guards, and the circuit breaker for free. It does NOT
+    auto-wake addressed agents (that lives in the HTTP/MCP server layer) —
+    this is for orchestrator-driven loops, not a replacement for auto-spawn.
+    """
+    from . import bus
+
+    try:
+        msg_id = bus.post_message(args.room, args.agent, args.body, args.kind, to=args.to)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr, flush=True)
+        sys.exit(1)
+    print(msg_id)
+
+
+def _cmd_read(args: argparse.Namespace) -> None:
+    from . import bus
+
+    try:
+        print(bus.read_messages(args.room, since_id=args.since_id, limit=args.limit))
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr, flush=True)
+        sys.exit(1)
+
+
+def _cmd_rooms(args: argparse.Namespace) -> None:
+    from . import bus
+
+    rooms = bus.list_rooms()
+    if not rooms:
+        print("(no rooms)")
+        return
+    for r in rooms:
+        print(f"{r.get('id', '?')}  {r.get('status', '?'):8}  {r.get('name', '')}")
+
+
+def main(argv: "list[str] | None" = None) -> None:
     parser = argparse.ArgumentParser(
         prog="mcp-huddle",
         description=(
@@ -139,7 +178,35 @@ def main() -> None:
         default=None,
         help=f"HTTP port (default: $PORT or {DEFAULT_PORT}); only used with --http",
     )
-    args = parser.parse_args()
+
+    # Optional subcommands let any headless process talk to a room without MCP
+    # or a running HTTP server — they hit bus.py (file locks) directly. No
+    # subcommand keeps the legacy behaviour (stdio MCP, or --http), so MCP
+    # clients that exec `mcp-huddle` bare are untouched.
+    sub = parser.add_subparsers(dest="command")
+
+    p_post = sub.add_parser("post", help="post one message to a room")
+    p_post.add_argument("--room", required=True)
+    p_post.add_argument("--agent", required=True)
+    p_post.add_argument("--body", required=True)
+    p_post.add_argument("--kind", default="comment", help="message kind (default: comment)")
+    p_post.add_argument("--to", default=None, help="addressee agent name, or 'all'")
+    p_post.set_defaults(func=_cmd_post)
+
+    p_read = sub.add_parser("read", help="print a room's chat log")
+    p_read.add_argument("--room", required=True)
+    p_read.add_argument("--since-id", type=int, default=0, dest="since_id")
+    p_read.add_argument("--limit", type=int, default=20)
+    p_read.set_defaults(func=_cmd_read)
+
+    p_rooms = sub.add_parser("rooms", help="list rooms (id / status / name)")
+    p_rooms.set_defaults(func=_cmd_rooms)
+
+    args = parser.parse_args(argv)
+
+    if getattr(args, "func", None) is not None:
+        args.func(args)
+        return
 
     if args.install_hooks is not None:
         _install_hooks(args.install_hooks or None)

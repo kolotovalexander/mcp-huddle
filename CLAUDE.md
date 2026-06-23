@@ -22,7 +22,12 @@ a web dashboard lets humans watch/intervene. Two run modes (one binary):
   agents that don't speak MCP (cloud APIs / MiMo): read the room, call the
   model, post via the bus. Both validate output before posting.
 - `src/mcp_huddle/__main__.py` — CLI (argparse): `--http`, `--port`,
-  `--version`, `--install-hooks`.
+  `--version`, `--install-hooks`, plus subcommands `post`/`read`/`rooms` that
+  hit `bus.py` directly so a headless process (`claude -p`, `codex exec`, a
+  shell hook) can join a room without MCP or a running HTTP server. No
+  subcommand keeps the legacy stdio-MCP / `--http` behaviour. Note: CLI `post`
+  does **not** auto-wake addressed agents (that's the server layer) — it's for
+  orchestrator-driven loops, not a replacement for auto-spawn.
 - `src/mcp_huddle/static/{dashboard.html,css,js}` — the dashboard (vanilla JS,
   no build step). Themes axis `data-theme`, skin axis `data-skin`, palette axis
   `data-palette`, language `data-lang`; settings popover + i18n live in
