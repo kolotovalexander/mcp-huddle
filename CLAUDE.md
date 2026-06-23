@@ -40,7 +40,7 @@ a web dashboard lets humans watch/intervene. Two run modes (one binary):
 
 ## Verify before claiming done
 ```bash
-.venv/bin/pytest tests/ -q          # full suite (currently 93 passing)
+.venv/bin/pytest tests/ -q          # full suite (currently 104 passing)
 node --check src/mcp_huddle/static/dashboard.js   # JS syntax
 ```
 For dashboard changes, the server serves files fresh (no-cache) — just reload

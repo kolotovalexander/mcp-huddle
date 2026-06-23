@@ -70,7 +70,7 @@ args = ["mcp-huddle"]
 > Want the bleeding edge straight from GitHub instead of PyPI? Swap the args for
 > `["--from", "git+https://github.com/kolotovalexander/mcp-huddle", "mcp-huddle"]`.
 
-Restart the client. The 10 huddle tools become available.
+Restart the client. The 12 huddle tools become available.
 
 > Tip: if your client doesn't see `uvx` because PATH is empty when it spawns the server, replace `"uvx"` with the absolute path (`which uvx` to find it — typically `/Users/you/.local/bin/uvx` on macOS).
 
@@ -86,13 +86,15 @@ Dashboard: <http://127.0.0.1:8014/dashboard>. The dashboard reads the same files
 
 ## Features
 
-- **10 MCP tools** for room creation, messaging, status, and consensus
+- **12 MCP tools** for room creation, messaging, rounds, status, and consensus
 - **JSONL storage** at `~/.mcp-huddle/rooms/` — grep-able, no DB
 - **Anti-loop guards**: `kind` enum (`request`/`comment`/`ack`/`busy`/`result`/`final`/`system`/`close`), per-message dedup, server-side circuit breaker
+- **Bounded reads**: `messages_read` head+tail truncates long bodies (`max_chars`), windows by `until_id`, and filters by `kind` — a fat agent summary can't overflow the reader
+- **Rounds**: `room_round_advance` opens an orchestrator-controlled round (visible divider + per-message round stamp); read a single round with `messages_read(round=N)` / `room_summarize(round=N)`
 - **Liquid Glass web dashboard** with two themes (dark/light), agent avatars, polished kind badges, reply-to quotes
-- **Auto-spawn** enabled registry reviewers when a room is created (`auto_spawn=True`); default registry includes Codex, Antigravity, MiMo, and Claude (Claude is opt-in, OFF by default). Registry is configurable via `MCP_HUDDLE_SPAWN_REGISTRY`
+- **Auto-spawn** enabled registry reviewers when a room is created (`auto_spawn=True`); default registry includes Codex, Antigravity, MiMo, and Claude (Claude and MiMo are opt-in, OFF by default). Registry is configurable via `MCP_HUDDLE_SPAWN_REGISTRY`
 - **Codex wake-up loop**: follow-up `kind=request` messages addressed to Codex (or `all`) resume the same captured Codex thread instead of starting from scratch
-- **Watchdog** auto-closes rooms whose owner process died
+- **Watchdog** auto-closes rooms whose owner process died — after a grace window, so a resumed session (new PID) can keep its room by activity or `room_reclaim`
 
 ## Tools
 
@@ -106,8 +108,10 @@ These are the tools exposed over MCP (decorated with `@mcp.tool()` in
 | `room_info` | Get room metadata: participants, status, cwd, etc. |
 | `room_list` | List all rooms (open and closed). |
 | `message_post` | Post a message to a room; returns `message_id`. Accepts `kind`, `to`, `reply_to`, `idempotency_key`. |
-| `messages_read` | Read chat history as plain text; supports delta reads via `since_id`. |
-| `room_summarize` | Get a token-efficient digest of messages since `since_id`. |
+| `messages_read` | Read chat history as plain text. Delta reads via `since_id`; `until_id` window; `round` filter; `kind` filter (e.g. just `result`); long bodies head+tail truncated to `max_chars`. |
+| `room_summarize` | No-LLM digest: counts, open requests, and each agent's latest position. Scoped by `round` or `since_id`. |
+| `room_round_advance` | Open a new discussion round (owner-only): bumps the round counter, stamps messages, posts a visible divider. |
+| `room_reclaim` | Re-stamp a room's `owner_pid` after the owner's session resumed with a new PID, so the watchdog won't reap a live room (owner-only). |
 | `propose_resolution` | Propose a resolution to end discussion; returns `resolution_id`. |
 | `resolution_vote` | Vote `ack` or `reject` on a resolution; all-ack makes the room `resolved`. |
 | `notify_register` | Register a file path to receive notifications when a `kind=request` message arrives. |
