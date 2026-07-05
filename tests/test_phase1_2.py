@@ -863,6 +863,80 @@ def test_room_invite_requires_owner(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert "Bob" in info["participants"]
 
 
+def test_room_invite_seeds_agent_meta_for_registry_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bug: room_invite only appended to participants; _wake_agents_for_request
+    iterates agent_meta (populated only by auto_spawn at room_create). A
+    registry agent invited into an existing room was never woken by a later
+    addressed request. Fix: room_invite seeds agent_meta for enabled registry
+    agents, so the wake path picks it up without an immediate spawn."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    fake_spec: spawn.SpawnSpec = {"name": "Antigravity", "cmd": ["echo"], "enabled": True}
+    monkeypatch.setattr(
+        server.spawn, "get_enabled_spec",
+        lambda name: fake_spec if name == "Antigravity" else None,
+    )
+
+    room_id = isolated_bus.create_room(
+        "no-auto-spawn", "Claude", 1, "/tmp/project", "session-1")
+    # No auto_spawn → agent_meta starts empty (reproduces the bug precondition).
+    assert isolated_bus.get_room_info(room_id).get("agent_meta", {}) == {}
+
+    assert server.room_invite(room_id, "Antigravity", by="Claude") == "ok"
+
+    info = isolated_bus.get_room_info(room_id)
+    assert "Antigravity" in info["participants"]
+    assert "Antigravity" in info.get("agent_meta", {}), (
+        "room_invite must seed agent_meta for registry-backed agents so "
+        "_wake_agents_for_request's iteration (`for agent_name in agent_meta`) "
+        "sees them"
+    )
+
+    # Not spawned yet — invite is lazy, spawn happens on the first addressed
+    # request.
+    spawn_calls: list[dict] = []
+    monkeypatch.setattr(
+        server.spawn, "spawn_agent",
+        lambda *args, **kwargs: spawn_calls.append({"args": args, "kwargs": kwargs})
+        or (4242, str(tmp_path / "antigravity.events.jsonl"), None),
+    )
+    assert spawn_calls == []
+
+    msg_id = server.message_post(
+        room_id, "Claude", "Antigravity, please weigh in.", "request",
+        to="Antigravity",
+    )
+
+    assert len(spawn_calls) == 1, "invited registry agent must be fresh-spawned on addressed request"
+    updated = isolated_bus.get_room_info(room_id)["agent_meta"]["Antigravity"]
+    assert updated["last_wake_msg_id"] == msg_id
+    assert updated["last_wake_pid"] == 4242
+
+
+def test_room_invite_non_registry_agent_seeds_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Inviting a non-registry (external/human) agent must keep prior
+    behavior: participants only, no agent_meta entry, no error."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+    monkeypatch.setattr(server.spawn, "get_enabled_spec", lambda name: None)
+
+    room_id = isolated_bus.create_room(
+        "no-auto-spawn-2", "Claude", 1, "/tmp/project", "session-1")
+
+    assert server.room_invite(room_id, "SomeHuman", by="Claude") == "ok"
+
+    info = isolated_bus.get_room_info(room_id)
+    assert "SomeHuman" in info["participants"]
+    assert "SomeHuman" not in info.get("agent_meta", {})
+
+
 def test_no_dropped_tool_references_in_agent_facing_prompts() -> None:
     """Generated agent prompts and MCP server instructions must not advertise
     tools that were dropped from the agent surface (room_c216d6e8 consensus).

@@ -53,6 +53,10 @@ INVITING OTHER AGENTS:
    `room_invite(room_id, "Codex", by="<owner>")` / `..., by="<owner>"` so
    they appear in participants.
 3. Prefer auto_spawn unless you specifically need a non-default agent.
+4. `room_invite` of a registry-backed agent NOT already spawned in this room
+   does not spawn it immediately — it just reserves the wake slot. The agent
+   is spawned fresh the first time a `kind=request` addressed to it (or
+   `to=all`) is posted.
 
 ANTI-LOOP PROTOCOL (CRITICAL — without this rooms turn into infinite chat):
 - Reply ONLY to `kind=request` addressed to you (`to=YourName` or `to=all`).
@@ -194,6 +198,13 @@ def room_invite(room_id: str, agent_name: str, by: str = "") -> str:
 
     Requires `by` to equal the room's owner. Regular participants must not
     expand the roster; orchestration is the owner's responsibility.
+
+    If `agent_name` matches an enabled spawn-registry entry, this also seeds
+    its `agent_meta` (via `bus.register_external_agent`) so a later
+    `kind=request` addressed to it is picked up by `_wake_agents_for_request`
+    and triggers a fresh spawn. It is NOT spawned immediately — invite only
+    reserves the wake slot. Non-registry (external/human) names are added to
+    `participants` only, unchanged from prior behavior.
     """
     info = bus.get_room_info(room_id)
     if not info:
@@ -204,6 +215,8 @@ def room_invite(room_id: str, agent_name: str, by: str = "") -> str:
             f"room_invite is owner-only. by={by!r} does not match owner={owner!r}"
         )
     bus.invite_agent(room_id, agent_name)
+    if spawn.get_enabled_spec(agent_name):
+        bus.register_external_agent(room_id, agent_name)
     return "ok"
 
 
