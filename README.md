@@ -132,10 +132,12 @@ All configuration is via environment variables (defaults shown):
 | `MCP_HUDDLE_HOME` | `~/.mcp-huddle` | Storage root. Rooms are stored in `$MCP_HUDDLE_HOME/rooms`. |
 | `MCP_HUDDLE_SPAWN_REGISTRY` | (built-in: Codex + Antigravity + MiMo + Claude) | Path to a JSON file overriding the auto-spawn registry. See [`examples/registry.json`](examples/registry.json). |
 | `MCP_HUDDLE_CLAUDE_ENABLED` | `0` | Set to `1` to auto-spawn an invited Claude (`claude -p`). OFF by default — `claude -p` is metered. |
-| `MCP_HUDDLE_MIMO_ENABLED` | `1` | Set to `0` to disable the MiMo advisor slot. |
+| `MCP_HUDDLE_ANTIGRAVITY_ENABLED` | `0` | Set to `1` to enable the Antigravity (`agy`) advisor slot (needs a prior interactive `agy` login; not read-only-enforced). |
+| `MCP_HUDDLE_MIMO_ENABLED` | `0` | Set to `1` to enable the MiMo advisor slot (opt-in; unreliable headless output upstream). |
 | `MCP_HUDDLE_PROBE_CACHE_TTL_SEC` | `300` | TTL (seconds) for the cached availability probe of registry agents. |
 | `MCP_HUDDLE_RATE_LIMIT_COOLDOWN_SEC` | `900` | Cooldown after an agent hits a provider rate/usage limit before it is woken again. `0` disables the cooldown gate. |
 | `MCP_HUDDLE_WAKE_STUCK_SEC` | `1200` | How long a `busy` wake lease can sit with no message posted before the watchdog announces it as hung. `0` disables the check. Announce-only — never kills the process. |
+| `MCP_HUDDLE_DEAD_WAKE_GRACE_SEC` | `60` | Grace before the watchdog treats a busy lease with a dead pid as a dead wake (announces to the room, releases the lease). `0` disables the check. |
 | `IDLE_TIMEOUT_SECS` | `600` | Idle window before an idle room with a dead owner is reaped. |
 | `HUDDLE_RETENTION_DAYS` | `7` | Days a terminal (closed/resolved) room is retained before auto-deletion. |
 | `HUDDLE_RETENTION_SWEEP_SECS` | `3600` | Interval between retention sweeps. |
