@@ -925,10 +925,16 @@ def detect_rate_limit(log_path: str) -> str | None:
                 continue
             etype = obj.get("type")
             if etype == "error":
-                candidate = obj.get("message", "") or ""
+                # Codex --json uses "message"; the MiMo/openai-compatible
+                # runners write their own error events under "error".
+                candidate = obj.get("message") or obj.get("error") or ""
             elif etype == "turn.failed":
-                candidate = (obj.get("error") or {}).get("message", "") or ""
+                err = obj.get("error")
+                candidate = (err.get("message", "") if isinstance(err, dict)
+                             else err or "")
             else:
+                continue
+            if not isinstance(candidate, str):
                 continue
             if candidate and _looks_like_rate_limit(candidate, require_hint=False):
                 reason = candidate.strip()

@@ -1063,6 +1063,20 @@ def test_detect_rate_limit_from_codex_error_event(tmp_path: Path) -> None:
     assert spawn.detect_rate_limit(str(log)) is not None
 
 
+def test_detect_rate_limit_from_runner_error_key(tmp_path: Path) -> None:
+    """MiMo/openai-compatible runners write {"type": "error", "error": "..."}
+    (verified against a real room_8c89ae96 log) — the "error" key must be
+    inspected too, and a non-string "error" payload must not crash."""
+    log = tmp_path / "mimo.events.jsonl"
+    log.write_text(
+        '{"type": "error", "error": "provider quota exceeded, try again later"}\n'
+        '{"type": "error", "error": {"unexpected": "shape"}}\n'
+    )
+    reason = spawn.detect_rate_limit(str(log))
+    assert reason is not None
+    assert "quota" in reason.lower()
+
+
 def test_detect_rate_limit_ignores_message_body_false_positive(tmp_path: Path) -> None:
     """An agent that POSTS about rate limits must not be flagged as limited."""
     log = tmp_path / "codex.events.jsonl"
