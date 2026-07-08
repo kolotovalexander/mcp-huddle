@@ -865,6 +865,32 @@ async def api_agent_events(request: Request) -> StreamingResponse:
 
 # ── Spawn helpers ─────────────────────────────────────────────────────────────
 
+def _announce_spawn_failure(room_id: str, agent_name: str, exc: BaseException,
+                            context_id: str) -> None:
+    """Best-effort room notice for an outright spawn/resume failure (the
+    process never started or the spawn attempt raised) — as opposed to a
+    detected provider rate-limit, which _handle_rate_limit_on_exit announces
+    separately. Without this, a spawn exception was only `print(...)`ed to
+    the daemon's own stdout and the room saw silence with no explanation.
+
+    Idempotent per (room, agent, context_id) so a repeated wake/retry for the
+    same event doesn't spam the room with duplicate notices.
+    """
+    short = f"{type(exc).__name__}: {exc}"
+    if len(short) > 200:
+        short = short[:197] + "..."
+    try:
+        _post_message_checked(
+            room_id, agent_name,
+            f"⚠️ {agent_name} не заспавнился: {short}",
+            kind="comment",
+            idempotency_key=f"spawnfail:{room_id}:{agent_name}:{context_id}",
+        )
+    except Exception as post_exc:
+        print(f"[huddle] spawn-fail notice post failed "
+              f"({agent_name}@{room_id}): {post_exc}", flush=True)
+
+
 def _spawn_agents(
     room_id: str,
     name: str,
@@ -939,16 +965,19 @@ def _spawn_agents(
                 }
             except (FileNotFoundError, PermissionError) as exc:
                 spawn.log_spawn_failure(spec, agent_brief, cwd, log_dir, exc)
-            except spawn.AgentSpawnError:
-                pass
+                _announce_spawn_failure(room_id, spec["name"], exc, "init")
+            except spawn.AgentSpawnError as exc:
+                _announce_spawn_failure(room_id, spec["name"], exc, "init")
             except OSError as exc:
                 spawn.log_spawn_failure(spec, agent_brief, cwd, log_dir, exc)
+                _announce_spawn_failure(room_id, spec["name"], exc, "init")
                 raise
     else:
         names, pids, agent_meta = spawn.spawn_all(
             default_brief, cwd, log_dir,
             on_exit_factory=lambda n: _make_initial_spawn_callback(room_id, n),
-            skip_names=skip_owner)
+            skip_names=skip_owner,
+            on_spawn_fail=lambda n, exc: _announce_spawn_failure(room_id, n, exc, "init"))
 
     for n in names:
         bus.invite_agent(room_id, n)
@@ -1291,6 +1320,7 @@ def _wake_agents_for_request(
                     bus.set_status(room_id, agent_name, "online", 0, session_id)
                     print(f"[huddle] codex_resume failed ({room_id}): {exc}",
                           flush=True)
+                    _announce_spawn_failure(room_id, agent_name, exc, str(msg_id))
                     continue
                 _merge_agent_meta(room_id, agent_name, {
                     "last_wake_msg_id": msg_id, "last_seen_id": msg_id,
@@ -1313,6 +1343,7 @@ def _wake_agents_for_request(
             except Exception as exc:
                 print(f"[huddle] fresh spawn failed for {agent_name} "
                       f"({room_id}): {exc}", flush=True)
+                _announce_spawn_failure(room_id, agent_name, exc, str(msg_id))
                 continue
             wakes.append({"agent": agent_name, "pid": pid, "thread_id": ""})
 

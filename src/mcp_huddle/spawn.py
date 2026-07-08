@@ -41,6 +41,7 @@ Phase 1 changes (2026-04-30):
 from __future__ import annotations
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -700,6 +701,16 @@ def spawn_agent(
     return proc.pid, str(log_path), last_msg_path
 
 
+def _safe_notify_spawn_fail(on_spawn_fail, name: str, exc: BaseException) -> None:
+    """Best-effort: a broken caller callback must never break the spawn loop."""
+    if on_spawn_fail is None:
+        return
+    try:
+        on_spawn_fail(name, exc)
+    except Exception:
+        pass
+
+
 def spawn_all(
     brief: str,
     cwd: str,
@@ -708,6 +719,7 @@ def spawn_all(
     verify_alive_sec: float = 0.0,
     on_exit_factory=None,
     skip_names: set[str] | None = None,
+    on_spawn_fail=None,
 ) -> tuple[list[str], list[int], dict[str, dict[str, str | None]]]:
     """Spawn every enabled agent in the registry.
 
@@ -718,6 +730,9 @@ def spawn_all(
       briefs: optional {AgentName: brief} for per-agent customization.
       skip_names: registry names to NOT spawn (e.g. the room owner — already
         present as the calling session, would otherwise spawn a duplicate).
+      on_spawn_fail: optional callable(name, exc) invoked (best-effort) for
+        every agent that fails to spawn, so the caller can surface it (e.g.
+        post a room notice) without changing control flow here.
 
     Returns:
       (names, pids, agent_meta) where agent_meta is
@@ -749,11 +764,13 @@ def spawn_all(
         except (FileNotFoundError, PermissionError) as exc:
             # Tolerate races (binary disappears between check and spawn).
             log_spawn_failure(spec, agent_brief, cwd, log_dir, exc)
-        except AgentSpawnError:
+            _safe_notify_spawn_fail(on_spawn_fail, spec["name"], exc)
+        except AgentSpawnError as exc:
             # spawn_agent already logged the concrete early-exit status.
-            pass
+            _safe_notify_spawn_fail(on_spawn_fail, spec["name"], exc)
         except OSError as exc:
             log_spawn_failure(spec, agent_brief, cwd, log_dir, exc)
+            _safe_notify_spawn_fail(on_spawn_fail, spec["name"], exc)
             raise
     return names, pids, agent_meta
 
@@ -842,7 +859,25 @@ _RATE_LIMIT_PLAINTEXT_HINTS = (
     "resets at",
     "reset at",
     "429",
+    # OpenRouter free-tier / OpenCode phrasing, e.g. "Rate limit exceeded:
+    # free-models-per-day. Add 10 credits to unlock 1000 free model requests
+    # per day." Still conservative: each of these is a specific quota/credit
+    # phrase, not a bare word an agent could use while merely discussing limits.
+    "free-models-per-day",
+    "add credits",
+    "credits to unlock",
+    "requests per day",
 )
+
+# ANSI/SGR escape sequences (colors, cursor moves) — OpenCode's plain-text
+# `opencode run` output is styled (e.g. "\x1b[0m⚙ \x1b[0mhuddle_room_list"),
+# which would otherwise hide marker/hint substrings mid-escape-code or split
+# across them. Strip before matching.
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_ESCAPE_RE.sub("", text)
 
 
 def _looks_like_rate_limit(text: str, *, require_hint: bool) -> bool:
@@ -863,8 +898,11 @@ def detect_rate_limit(log_path: str) -> str | None:
       * Codex `--json` logs — trust only `error` / `turn.failed` event types
         (an agent that *posts about* rate limits does so via `item.*` events,
         which are ignored here).
-      * Plain-text logs (e.g. Antigravity `agy -p`) — a line must contain both
-        a limit marker AND a recovery hint ("try again", "upgrade", ...).
+      * Plain-text logs (e.g. Antigravity `agy -p`, OpenCode `opencode run`)
+        — a line must contain both a limit marker AND a recovery hint
+        ("try again", "upgrade", "free-models-per-day", ...). ANSI/SGR escape
+        codes (OpenCode styles its plain-text output) are stripped first so
+        they can't split or hide a marker/hint substring.
     """
     p = Path(log_path)
     if not p.exists():
@@ -877,7 +915,7 @@ def detect_rate_limit(log_path: str) -> str | None:
 
     reason: str | None = None
     for raw in text.splitlines():
-        line = raw.strip()
+        line = _strip_ansi(raw).strip()
         if not line:
             continue
         if line.startswith("{"):
