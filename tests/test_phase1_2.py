@@ -1203,3 +1203,170 @@ def test_readonly_opt_out_restores_full_access(monkeypatch: pytest.MonkeyPatch) 
     reg = {s["name"]: s for s in spawn._raw_registry()}
     assert "danger-full-access" in " ".join(reg["Codex"]["cmd"])
     assert "--dangerously-skip-permissions" in reg["Claude"]["cmd"]
+
+
+# ── Rate-limit detection: ANSI stripping + OpenRouter/OpenCode phrasing ───────
+
+def test_detect_rate_limit_strips_ansi_and_matches_openrouter_free_tier(
+    tmp_path: Path,
+) -> None:
+    """OpenCode's `opencode run` writes styled plain text; the OpenRouter
+    free-tier 429 must still be recognized once ANSI/SGR codes are stripped."""
+    log = tmp_path / "opencode.events.jsonl"
+    log.write_bytes(
+        "\x1b[0m⚙ \x1b[0mhuddle_room_list\n"
+        "\x1b[31mError: Rate limit exceeded: free-models-per-day. "
+        "Add 10 credits to unlock 1000 free model requests per day.\x1b[0m\n"
+        .encode("utf-8")
+    )
+    reason = spawn.detect_rate_limit(str(log))
+    assert reason is not None
+    assert "free-models-per-day" in reason.lower()
+    # The stripped reason must not retain raw escape bytes.
+    assert "\x1b" not in reason
+
+
+def test_detect_rate_limit_openrouter_prose_without_hint_not_flagged(
+    tmp_path: Path,
+) -> None:
+    """Bare mention of 'rate limit' with no recovery/quota hint (e.g. an
+    agent's own commentary) must stay unflagged — same conservative contract
+    as the pre-existing plaintext-requires-hint behavior."""
+    log = tmp_path / "opencode-prose.events.jsonl"
+    log.write_text(
+        "\x1b[0mI think the OpenRouter rate limit policy is reasonable.\x1b[0m\n"
+    )
+    assert spawn.detect_rate_limit(str(log)) is None
+
+
+def test_strip_ansi_removes_sgr_sequences() -> None:
+    assert spawn._strip_ansi("\x1b[0m⚙ \x1b[0mfoo\x1b[31mbar\x1b[0m") == "⚙ foobar"
+
+
+# ── Spawn-failure visibility in the room ──────────────────────────────────────
+
+def test_spawn_agents_dict_branch_announces_failure_to_room(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A per-agent spawn exception in the room_create auto_spawn={...} path
+    must post one room comment instead of only printing to stdout."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path / "huddle"))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    fake_registry: list[spawn.SpawnSpec] = [
+        {"name": "Codex", "cmd": ["codex", "exec", "{brief}"], "enabled": True},
+    ]
+    monkeypatch.setattr(server.spawn, "load_registry", lambda: fake_registry)
+
+    def broken_spawn_agent(spec, brief, cwd, log_dir, verify_alive_sec=0.0, on_exit=None):
+        raise FileNotFoundError("codex binary not found")
+
+    monkeypatch.setattr(server.spawn, "spawn_agent", broken_spawn_agent)
+    monkeypatch.setattr(server.spawn, "log_spawn_failure", lambda *a, **k: None)
+
+    room_id = isolated_bus.create_room("Fail", "Claude", os.getpid(), str(tmp_path), "sess-1")
+    server._spawn_agents(
+        room_id=room_id, name="Fail", goal="g",
+        cwd=str(tmp_path), owner="Claude",
+        auto_spawn={"Codex": "review this"},
+    )
+
+    messages = isolated_bus._load_messages(room_id)
+    comments = [m for m in messages if m.get("kind") == "comment"]
+    assert len(comments) == 1
+    assert "Codex" in comments[0]["body"]
+    assert "не заспавнился" in comments[0]["body"]
+    assert "FileNotFoundError" in comments[0]["body"]
+
+
+def test_spawn_agents_bool_branch_announces_failure_to_room(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same as above but through the auto_spawn=True path (spawn.spawn_all),
+    which needs the on_spawn_fail callback threaded through."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path / "huddle"))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    fake_registry: list[spawn.SpawnSpec] = [
+        {"name": "Codex", "cmd": ["codex", "exec", "{brief}"], "enabled": True},
+    ]
+    monkeypatch.setattr(server.spawn, "load_registry", lambda: fake_registry)
+
+    def broken_spawn_agent(spec, brief, cwd, log_dir, verify_alive_sec=0.0, on_exit=None):
+        raise FileNotFoundError("codex binary not found")
+
+    monkeypatch.setattr(server.spawn, "spawn_agent", broken_spawn_agent)
+    monkeypatch.setattr(server.spawn, "log_spawn_failure", lambda *a, **k: None)
+
+    room_id = isolated_bus.create_room("Fail2", "Claude", os.getpid(), str(tmp_path), "sess-1")
+    server._spawn_agents(
+        room_id=room_id, name="Fail2", goal="g",
+        cwd=str(tmp_path), owner="Claude", auto_spawn=True,
+    )
+
+    messages = isolated_bus._load_messages(room_id)
+    comments = [m for m in messages if m.get("kind") == "comment"]
+    assert len(comments) == 1
+    assert "Codex" in comments[0]["body"]
+    assert "не заспавнился" in comments[0]["body"]
+
+
+def test_fresh_spawn_failure_announces_once_and_is_idempotent_on_repeat_wake(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A raise inside _spawn_fresh_room_agent (registry-agent wake path) must
+    post exactly one room comment, and re-waking for the same request must
+    not duplicate it (idempotency_key keyed on msg_id)."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    fake_spec: spawn.SpawnSpec = {
+        "name": "Gemini",
+        "cmd": ["gemini", "-p", "{brief}"],
+        "enabled": True,
+    }
+    monkeypatch.setattr(server.spawn, "get_enabled_spec", lambda name: fake_spec if name == "Gemini" else None)
+
+    def broken_spawn_fresh(*args, **kwargs):
+        raise RuntimeError("gemini binary crashed on launch")
+
+    monkeypatch.setattr(server, "_spawn_fresh_room_agent", broken_spawn_fresh)
+
+    room_id = isolated_bus.create_room("WakeFail", "CodexMain", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Gemini")
+    # agent_meta must exist for Gemini or the wake loop skips it entirely
+    # (invite_agent alone only adds it to participants).
+    log_path = isolated_bus._room_dir(room_id) / "agents" / "gemini.events.jsonl"
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {
+        "Gemini": {
+            "log_path": str(log_path),
+            "last_message_path": None,
+            "last_seen_id": 0,
+        }
+    }
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+
+    msg_id = server.message_post(
+        room_id, "CodexMain", "Gemini, please review.", "request", to="Gemini",
+        idempotency_key="request-gemini-fail-1",
+    )
+
+    messages = isolated_bus._load_messages(room_id)
+    comments = [m for m in messages if m.get("kind") == "comment"]
+    assert len(comments) == 1
+    assert "Gemini" in comments[0]["body"]
+    assert "не заспавнился" in comments[0]["body"]
+    assert "RuntimeError" in comments[0]["body"]
+
+    # Simulate a second wake attempt for the SAME request (e.g. the watchdog
+    # fallback retry) — must not post a second comment.
+    server._wake_agents_for_request(
+        room_id, "CodexMain", "Gemini, please review.", "Gemini", None, msg_id)
+
+    messages_after = isolated_bus._load_messages(room_id)
+    comments_after = [m for m in messages_after if m.get("kind") == "comment"]
+    assert len(comments_after) == 1
