@@ -140,6 +140,11 @@ RATE_LIMIT_COOLDOWN_SECS = _env_num("MCP_HUDDLE_RATE_LIMIT_COOLDOWN_SEC", 900, i
 # agent is presumed hung — the watchdog announces it once so the organizer
 # stops waiting. 0 disables the check. Does not kill the process.
 WAKE_STUCK_SECS = _env_num("MCP_HUDDLE_WAKE_STUCK_SEC", 1200, int)
+# A 'busy' lease whose last_wake_pid has DIED (a certain fact, unlike a hang)
+# is announced fast instead of waiting out WAKE_STUCK_SECS — but only after
+# this grace window, so the sweep doesn't race a reaper on_exit callback that
+# is about to fire and clear the lease on its own. 0 disables the check.
+DEAD_WAKE_GRACE_SECS = _env_num("MCP_HUDDLE_DEAD_WAKE_GRACE_SEC", 60, int)
 
 
 # Agents whose CLI sessions can be resumed by a stable thread/session id
@@ -565,6 +570,13 @@ async def _background_watchdog():
                 print(f"[watchdog] Agent wake-ups: {wakes}", flush=True)
         except Exception as e:
             print(f"[watchdog] agent wake-up error: {e}", flush=True)
+
+        try:
+            dead = _check_dead_wakes()
+            if dead:
+                print(f"[watchdog] Dead-wake notices: {dead}", flush=True)
+        except Exception as e:
+            print(f"[watchdog] dead-wake check error: {e}", flush=True)
 
         try:
             stuck = _check_stuck_wakes()
@@ -1260,7 +1272,15 @@ def _announce_noreply_on_exit(room_id: str, agent_name: str, msg_id: int,
 
 
 def _on_wake_exit(room_id: str, agent_name: str, wake_id: str,
-                  returncode) -> None:
+                  returncode, already_announced: bool = False) -> None:
+    """Release a wake's busy lease and drain the next queued request.
+
+    already_announced: True when the caller (currently only the dead-wake
+    watchdog check, _check_dead_wakes) already posted the room notice
+    explaining the silence — skips the rate-limit/noreply announcement paths
+    below so the room doesn't get a second, redundant comment for the same
+    wake_id.
+    """
     try:
         meta = bus.get_room_info(room_id)
     except Exception:
@@ -1282,8 +1302,8 @@ def _on_wake_exit(room_id: str, agent_name: str, wake_id: str,
         # woken again immediately.
         updates["rate_limited_until"] = 0
     _merge_agent_meta(room_id, agent_name, updates)
-    rate_limit_announced = False
-    if rc != 0:
+    rate_limit_announced = already_announced
+    if not already_announced and rc != 0:
         try:
             rate_limit_announced = _handle_rate_limit_on_exit(room_id, agent_name)
         except Exception as exc:
@@ -1483,6 +1503,77 @@ def _wake_pending_agents() -> list[dict]:
                 room_id, pending.get("agent", ""), pending.get("body", ""),
                 pending.get("to"), None, pending["id"]))
     return wakes
+
+
+def _check_dead_wakes() -> list[str]:
+    """Watchdog sweep: fast-path for a 'busy' lease whose last_wake_pid has
+    already DIED without its reaper on_exit callback ever running (e.g. a
+    server restart killed the reaper thread, or the callback raised before
+    reaching bus.set_status). A dead pid is a certain fact — unlike a hang,
+    there is no need to wait out WAKE_STUCK_SECS to know no reply is coming.
+
+    Runs before _check_stuck_wakes in the sweep so a dead pid is announced
+    here, fast, instead of by the slow stuck-wake path; _check_stuck_wakes
+    only ever considers leases with a LIVE pid (_wake_in_progress requires
+    it), so the two checks never double-announce the same wake.
+
+    Returns the list of (agent, room) leases this sweep released — a lease
+    is always released once its pid is confirmed dead, even when the agent
+    had already posted something before dying (then no notice is posted,
+    since the room already has an explanation, but the lease still must not
+    leak forever).
+    """
+    if DEAD_WAKE_GRACE_SECS <= 0:
+        return []
+    announced: list[str] = []
+    now = int(time.time())
+    for meta in bus.list_rooms():
+        if meta.get("status") not in ("open", "idle"):
+            continue
+        room_id = meta["id"]
+        agent_meta = meta.get("agent_meta", {})
+        if not agent_meta:
+            continue
+        statuses = bus.get_status(room_id)
+        for agent_name, info in agent_meta.items():
+            if statuses.get(agent_name) != "busy":
+                continue
+            pid = info.get("last_wake_pid")
+            if not pid or bus._pid_alive(pid):
+                continue  # alive, or nothing to check — not this sweep's job
+            last_wake_at = int(info.get("last_wake_at", 0) or 0)
+            if not last_wake_at or now - last_wake_at < DEAD_WAKE_GRACE_SECS:
+                continue  # give the reaper callback a chance to fire first
+            wake_id = info.get("wake_id")
+            if not wake_id:
+                continue
+            # A dead pid is a certain fact and the lease must be cleared
+            # regardless — an agent that posted something before dying (e.g.
+            # a reply that raced its own crash) already explained the
+            # silence, so skip only the redundant notice, not the release.
+            msg_id = int(info.get("last_wake_msg_id", 0) or 0)
+            already_explained = bool(msg_id) and _agent_posted_after(
+                room_id, agent_name, msg_id)
+            if not already_explained:
+                try:
+                    _post_message_checked(
+                        room_id, agent_name,
+                        f"⚠️ {agent_name}: процесс {pid} умер, не ответив — "
+                        f"ответа не будет.",
+                        kind="comment",
+                        idempotency_key=f"deadwake:{room_id}:{agent_name}:{wake_id}",
+                    )
+                except Exception as exc:
+                    print(f"[huddle] dead-wake notice post failed "
+                          f"({agent_name}@{room_id}): {exc}", flush=True)
+            try:
+                _on_wake_exit(room_id, agent_name, wake_id, None,
+                               already_announced=True)
+            except Exception as exc:
+                print(f"[huddle] dead-wake lease-clear error "
+                      f"({agent_name}@{room_id}): {exc}", flush=True)
+            announced.append(f"{agent_name}@{room_id}")
+    return announced
 
 
 def _check_stuck_wakes() -> list[str]:

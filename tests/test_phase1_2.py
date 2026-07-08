@@ -1586,3 +1586,171 @@ def test_check_stuck_wakes_disabled_by_zero(
     isolated_bus.set_status(room_id, "Codex", "busy", 300, "session-1")
 
     assert server._check_stuck_wakes() == []
+
+
+# ── Dead-wake watchdog check (_check_dead_wakes) ────────────────────────────
+
+_DEAD_PID = 999_999_999  # convention used across the suite: no such process
+
+
+def test_check_dead_wakes_announces_and_clears_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 'busy' lease whose pid is dead, past the grace window, with no
+    reply posted, gets exactly one deadwake notice and its lease is cleared
+    (status back to online) — a repeat sweep does not duplicate it."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    monkeypatch.setattr(server, "DEAD_WAKE_GRACE_SECS", 60)
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    room_id = isolated_bus.create_room("Wake", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Codex")
+
+    wake_id = "wake-dead"
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {"Codex": {
+        "wake_id": wake_id,
+        "last_wake_pid": _DEAD_PID,
+        "last_wake_at": int(time.time()) - 3600,
+        "last_wake_msg_id": 4,
+    }}
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+    isolated_bus.set_status(room_id, "Codex", "busy", 300, "session-1")
+
+    announced = server._check_dead_wakes()
+    assert announced == [f"Codex@{room_id}"]
+
+    messages = isolated_bus._load_messages(room_id)
+    comments = [m for m in messages if m.get("kind") == "comment"]
+    assert len(comments) == 1
+    assert "умер" in comments[0]["body"]
+    assert str(_DEAD_PID) in comments[0]["body"]
+
+    statuses = isolated_bus.get_status(room_id)
+    assert statuses.get("Codex") == "online"
+
+    # Repeat sweep: lease already cleared (status no longer 'busy') — no
+    # second comment.
+    announced_again = server._check_dead_wakes()
+    assert announced_again == []
+    messages_after = isolated_bus._load_messages(room_id)
+    comments_after = [m for m in messages_after if m.get("kind") == "comment"]
+    assert len(comments_after) == 1
+
+
+def test_check_dead_wakes_respects_grace_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dead pid whose wake started less than DEAD_WAKE_GRACE_SECS ago is
+    left alone — gives the normal reaper callback a chance to fire first."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    monkeypatch.setattr(server, "DEAD_WAKE_GRACE_SECS", 3600)
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    room_id = isolated_bus.create_room("Wake", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Codex")
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {"Codex": {
+        "wake_id": "wake-fresh",
+        "last_wake_pid": _DEAD_PID,
+        "last_wake_at": int(time.time()) - 5,  # just started
+        "last_wake_msg_id": 1,
+    }}
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+    isolated_bus.set_status(room_id, "Codex", "busy", 300, "session-1")
+
+    assert server._check_dead_wakes() == []
+    statuses = isolated_bus.get_status(room_id)
+    assert statuses.get("Codex") == "busy"  # lease untouched
+
+
+def test_check_dead_wakes_skips_notice_but_still_clears_lease_if_agent_replied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The agent posted after the wake started (e.g. its final message raced
+    a crash of the wrapper process) — not a dead-man wake, so no extra
+    notice, but the lease must still be released: skipping the release would
+    leak the busy status forever (a dead pid is never eligible for the
+    stuck-wake path, which requires a LIVE pid)."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    monkeypatch.setattr(server, "DEAD_WAKE_GRACE_SECS", 60)
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    room_id = isolated_bus.create_room("Wake", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Codex")
+    msg_id = isolated_bus.post_message(room_id, "Claude", "go", "request")
+    reply_id = isolated_bus.post_message(room_id, "Codex", "done", "ack")
+
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {"Codex": {
+        "wake_id": "wake-replied",
+        "last_wake_pid": _DEAD_PID,
+        "last_wake_at": int(time.time()) - 3600,
+        "last_wake_msg_id": msg_id,
+    }}
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+    isolated_bus.set_status(room_id, "Codex", "busy", 300, "session-1")
+
+    announced = server._check_dead_wakes()
+    assert announced == [f"Codex@{room_id}"]  # lease released, no notice needed
+
+    messages = isolated_bus._load_messages(room_id)
+    assert not any(m.get("kind") == "comment" for m in messages)
+    assert reply_id  # sanity: the reply itself was recorded
+
+    statuses = isolated_bus.get_status(room_id)
+    assert statuses.get("Codex") == "online"  # lease actually released
+
+
+def test_check_dead_wakes_ignores_alive_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A live pid is left for _check_stuck_wakes (the slow path) — the
+    dead-wake sweep never touches it."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    monkeypatch.setattr(server, "DEAD_WAKE_GRACE_SECS", 60)
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    room_id = isolated_bus.create_room("Wake", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Codex")
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {"Codex": {
+        "wake_id": "wake-alive",
+        "last_wake_pid": os.getpid(),  # alive — this test process itself
+        "last_wake_at": int(time.time()) - 3600,
+        "last_wake_msg_id": 1,
+    }}
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+    isolated_bus.set_status(room_id, "Codex", "busy", 300, "session-1")
+
+    assert server._check_dead_wakes() == []
+    statuses = isolated_bus.get_status(room_id)
+    assert statuses.get("Codex") == "busy"  # untouched, still eligible for stuck-check
+
+
+def test_check_dead_wakes_disabled_by_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MCP_HUDDLE_DEAD_WAKE_GRACE_SEC=0 disables the check entirely."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    monkeypatch.setattr(server, "DEAD_WAKE_GRACE_SECS", 0)
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    room_id = isolated_bus.create_room("Wake", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Codex")
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {"Codex": {
+        "wake_id": "wake-x",
+        "last_wake_pid": _DEAD_PID,
+        "last_wake_at": int(time.time()) - 100_000,
+        "last_wake_msg_id": 1,
+    }}
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+    isolated_bus.set_status(room_id, "Codex", "busy", 300, "session-1")
+
+    assert server._check_dead_wakes() == []
