@@ -136,6 +136,10 @@ RETENTION_SWEEP_SECS = _env_num("HUDDLE_RETENTION_SWEEP_SECS", 3600, int)
 # not re-spawn it for this many seconds — a fresh spawn would instantly fail
 # again, post nothing, and burn a wake. 0 disables the cooldown gate.
 RATE_LIMIT_COOLDOWN_SECS = _env_num("MCP_HUDDLE_RATE_LIMIT_COOLDOWN_SEC", 900, int)
+# A wake ('busy' lease) held longer than this with no message posted by that
+# agent is presumed hung — the watchdog announces it once so the organizer
+# stops waiting. 0 disables the check. Does not kill the process.
+WAKE_STUCK_SECS = _env_num("MCP_HUDDLE_WAKE_STUCK_SEC", 1200, int)
 
 
 # Agents whose CLI sessions can be resumed by a stable thread/session id
@@ -561,6 +565,13 @@ async def _background_watchdog():
                 print(f"[watchdog] Agent wake-ups: {wakes}", flush=True)
         except Exception as e:
             print(f"[watchdog] agent wake-up error: {e}", flush=True)
+
+        try:
+            stuck = _check_stuck_wakes()
+            if stuck:
+                print(f"[watchdog] Stuck-wake notices: {stuck}", flush=True)
+        except Exception as e:
+            print(f"[watchdog] stuck-wake check error: {e}", flush=True)
 
 
 def _mark_idle_rooms() -> list[str]:
@@ -1181,6 +1192,73 @@ def _handle_rate_limit_on_exit(room_id: str, agent_name: str) -> bool:
     return True
 
 
+def _agent_posted_after(room_id: str, agent_name: str, msg_id: int) -> bool:
+    """True if the agent posted ANY message (reply, comment, ack, ...) with an
+    id greater than msg_id. Broader than _agent_replied_to_request (which only
+    matches a direct reply_to): a woken agent that posts a plain comment/ack
+    instead of a formal reply should NOT be flagged as silent."""
+    for msg in bus._load_messages(room_id):
+        if msg.get("agent") == agent_name and msg.get("id", 0) > msg_id:
+            return True
+    return False
+
+
+def _log_tail(log_path: Optional[str], max_len: int = 200) -> str:
+    """Short ANSI-stripped tail of an agent log, for a failure notice."""
+    if not log_path:
+        return ""
+    try:
+        p = Path(log_path)
+        if not p.exists():
+            return ""
+        with open(p, "rb") as f:
+            text = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+    lines = [spawn._strip_ansi(line).strip() for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    tail = " ".join(lines[-3:])
+    if len(tail) > max_len:
+        tail = tail[: max_len - 3] + "..."
+    return tail
+
+
+def _announce_noreply_on_exit(room_id: str, agent_name: str, msg_id: int,
+                              rc: int, log_path: Optional[str]) -> None:
+    """Best-effort room notice when a woken agent's turn ended without it
+    posting anything back to the room — without this the organizer just sees
+    silence with no explanation. Only called when the exit was NOT already
+    explained by a detected rate-limit (that path posts its own notice).
+
+    msg_id is the request that triggered this wake (last_wake_msg_id); if
+    falsy there is nothing to check a reply against, so this is a no-op.
+    Idempotent per (room, agent, msg_id) — a duplicate exit callback for the
+    same wake will not double-post (see _post_message_checked's
+    idempotency_key handling in bus.post_message).
+    """
+    if not msg_id:
+        return
+    if _agent_posted_after(room_id, agent_name, msg_id):
+        return
+    if rc == 0:
+        body = (f"⚠️ {agent_name} завершился без ответа в комнату "
+                 f"(exit 0) — не ждите ответа.")
+    else:
+        tail = _log_tail(log_path)
+        suffix = f" {tail}" if tail else ""
+        body = (f"⚠️ {agent_name} завершился с ошибкой (exit {rc}) и не "
+                 f"ответил — не ждите ответа.{suffix}")
+    try:
+        _post_message_checked(
+            room_id, agent_name, body,
+            kind="comment",
+            idempotency_key=f"noreply:{room_id}:{agent_name}:{msg_id}",
+        )
+    except Exception as exc:
+        print(f"[huddle] noreply notice post failed "
+              f"({agent_name}@{room_id}): {exc}", flush=True)
+
+
 def _on_wake_exit(room_id: str, agent_name: str, wake_id: str,
                   returncode) -> None:
     try:
@@ -1204,13 +1282,23 @@ def _on_wake_exit(room_id: str, agent_name: str, wake_id: str,
         # woken again immediately.
         updates["rate_limited_until"] = 0
     _merge_agent_meta(room_id, agent_name, updates)
+    rate_limit_announced = False
     if rc != 0:
         try:
-            _handle_rate_limit_on_exit(room_id, agent_name)
+            rate_limit_announced = _handle_rate_limit_on_exit(room_id, agent_name)
         except Exception as exc:
             print(f"[huddle] rate-limit check error "
                   f"({agent_name}@{room_id}): {exc}", flush=True)
     bus.set_status(room_id, agent_name, "online", 0, meta.get("session_id", ""))
+    if not rate_limit_announced:
+        try:
+            _announce_noreply_on_exit(
+                room_id, agent_name,
+                int(info.get("last_wake_msg_id", 0) or 0),
+                rc, info.get("log_path"))
+        except Exception as exc:
+            print(f"[huddle] noreply check error "
+                  f"({agent_name}@{room_id}): {exc}", flush=True)
     try:
         _drain_pending_wakes(room_id, agent_name)
     except Exception as exc:
@@ -1395,6 +1483,60 @@ def _wake_pending_agents() -> list[dict]:
                 room_id, pending.get("agent", ""), pending.get("body", ""),
                 pending.get("to"), None, pending["id"]))
     return wakes
+
+
+def _check_stuck_wakes() -> list[str]:
+    """Watchdog sweep: announce (once per wake) a 'busy' lease held longer
+    than WAKE_STUCK_SECS with no message posted by that agent since the wake
+    started — a live-but-silent (or hung) agent process. This is the third
+    silent-exit path: unlike _on_wake_exit / _handle_rate_limit_on_exit
+    (which fire when the process exits), a genuinely hung process never
+    exits, so nothing else in this file will ever tell the organizer to stop
+    waiting on it. Announce-only — never kills the process.
+    """
+    if WAKE_STUCK_SECS <= 0:
+        return []
+    announced: list[str] = []
+    now = int(time.time())
+    for meta in bus.list_rooms():
+        if meta.get("status") not in ("open", "idle"):
+            continue
+        room_id = meta["id"]
+        agent_meta = meta.get("agent_meta", {})
+        if not agent_meta:
+            continue
+        statuses = bus.get_status(room_id)
+        for agent_name, info in agent_meta.items():
+            if not _wake_in_progress(info, statuses.get(agent_name)):
+                continue
+            last_wake_at = int(info.get("last_wake_at", 0) or 0)
+            if not last_wake_at or now - last_wake_at < WAKE_STUCK_SECS:
+                continue
+            wake_id = info.get("wake_id")
+            if not wake_id or info.get("stuck_announced_wake_id") == wake_id:
+                continue  # already announced for this exact wake
+            msg_id = int(info.get("last_wake_msg_id", 0) or 0)
+            if msg_id and _agent_posted_after(room_id, agent_name, msg_id):
+                continue  # it has been talking — a slow lease release, not a hang
+            pid = info.get("last_wake_pid")
+            alive = bool(pid) and bus._pid_alive(pid)
+            mins = max(1, (now - last_wake_at) // 60)
+            body = (f"⏳ {agent_name} не отвечает уже ~{mins} мин "
+                    f"(процесс {pid} {'жив' if alive else 'мёртв'}) — "
+                    f"возможно завис; не ждите ответа.")
+            try:
+                _post_message_checked(
+                    room_id, agent_name, body,
+                    kind="comment",
+                    idempotency_key=f"stuck:{room_id}:{agent_name}:{wake_id}",
+                )
+                _merge_agent_meta(room_id, agent_name,
+                                   {"stuck_announced_wake_id": wake_id})
+                announced.append(f"{agent_name}@{room_id}")
+            except Exception as exc:
+                print(f"[huddle] stuck-wake notice post failed "
+                      f"({agent_name}@{room_id}): {exc}", flush=True)
+    return announced
 
 
 def _spawn_fresh_room_agent(

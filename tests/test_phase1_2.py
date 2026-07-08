@@ -1370,3 +1370,205 @@ def test_fresh_spawn_failure_announces_once_and_is_idempotent_on_repeat_wake(
     messages_after = isolated_bus._load_messages(room_id)
     comments_after = [m for m in messages_after if m.get("kind") == "comment"]
     assert len(comments_after) == 1
+
+
+# ── No-reply notices: exit without a posted reply / hung wake ────────────────
+
+def test_on_wake_exit_nonlimit_error_posts_noreply_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-zero exit that is NOT a detected rate-limit, and where the agent
+    posted nothing back, must get exactly one noreply comment — and a repeat
+    exit callback for the same wake must not duplicate it."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    room_id = isolated_bus.create_room("Wake", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Codex")
+    log_path = isolated_bus._room_dir(room_id) / "agents" / "codex.events.jsonl"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(
+        '{"type":"turn.failed","error":{"message":"boom, unrelated crash"}}\n'
+    )
+
+    wake_id = "wake-err"
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {"Codex": {
+        "wake_id": wake_id,
+        "log_path": str(log_path),
+        "last_wake_msg_id": 5,
+    }}
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+    isolated_bus.set_status(room_id, "Codex", "busy", 300, "session-1")
+
+    server._on_wake_exit(room_id, "Codex", wake_id, 1)
+
+    messages = isolated_bus._load_messages(room_id)
+    comments = [m for m in messages if m.get("kind") == "comment"]
+    assert len(comments) == 1
+    assert "не ответил" in comments[0]["body"]
+    assert "exit 1" in comments[0]["body"]
+
+    # Repeat exit callback for the SAME wake — idempotent, no duplicate.
+    isolated_bus.set_status(room_id, "Codex", "busy", 300, "session-1")
+    server._on_wake_exit(room_id, "Codex", wake_id, 1)
+    messages_after = isolated_bus._load_messages(room_id)
+    comments_after = [m for m in messages_after if m.get("kind") == "comment"]
+    assert len(comments_after) == 1
+
+
+def test_on_wake_exit_clean_exit_no_message_posts_noreply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """rc==0 but the agent posted nothing back must still get a noreply
+    comment (silent success is still silence from the organizer's view)."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    room_id = isolated_bus.create_room("Wake", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Codex")
+    wake_id = "wake-silent"
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {"Codex": {"wake_id": wake_id, "last_wake_msg_id": 3}}
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+    isolated_bus.set_status(room_id, "Codex", "busy", 300, "session-1")
+
+    server._on_wake_exit(room_id, "Codex", wake_id, 0)
+
+    messages = isolated_bus._load_messages(room_id)
+    comments = [m for m in messages if m.get("kind") == "comment"]
+    assert len(comments) == 1
+    assert "без ответа" in comments[0]["body"]
+    assert "exit 0" in comments[0]["body"]
+
+
+def test_on_wake_exit_clean_exit_with_reply_no_noreply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """rc==0 and the agent DID post something (any message, not necessarily a
+    formal reply_to) after the wake must NOT get a noreply notice."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    room_id = isolated_bus.create_room("Wake", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Codex")
+    req_id = isolated_bus.post_message(room_id, "Claude", "please review", "request", to="Codex")
+    isolated_bus.post_message(room_id, "Codex", "looks good", "result", reply_to=req_id)
+
+    wake_id = "wake-replied"
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {"Codex": {"wake_id": wake_id, "last_wake_msg_id": req_id}}
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+    isolated_bus.set_status(room_id, "Codex", "busy", 300, "session-1")
+
+    server._on_wake_exit(room_id, "Codex", wake_id, 0)
+
+    messages = isolated_bus._load_messages(room_id)
+    comments = [m for m in messages if m.get("kind") == "comment"]
+    assert comments == []
+
+
+def test_on_wake_exit_rate_limit_suppresses_noreply_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A detected rate-limit exit already explains the silence via its own
+    notice — the noreply path must not pile on a second, redundant comment."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    monkeypatch.setattr(server, "RATE_LIMIT_COOLDOWN_SECS", 900)
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    room_id = isolated_bus.create_room("Wake", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Codex")
+    log_path = isolated_bus._room_dir(room_id) / "agents" / "codex.events.jsonl"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(
+        '{"type":"turn.failed","error":{"message":"You\'ve hit your usage limit. Try again later."}}\n'
+    )
+    wake_id = "wake-limited"
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {"Codex": {
+        "wake_id": wake_id,
+        "log_path": str(log_path),
+        "last_wake_msg_id": 7,
+    }}
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+    isolated_bus.set_status(room_id, "Codex", "busy", 300, "session-1")
+
+    server._on_wake_exit(room_id, "Codex", wake_id, 1)
+
+    messages = isolated_bus._load_messages(room_id)
+    comments = [m for m in messages if m.get("kind") == "comment"]
+    assert len(comments) == 1
+    assert "лимит" in comments[0]["body"]
+    assert "не ответил" not in comments[0]["body"]
+    assert "без ответа" not in comments[0]["body"]
+
+
+def test_check_stuck_wakes_announces_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A wake held 'busy' well past WAKE_STUCK_SECS with a live pid and no
+    posted message gets exactly one stuck notice; a repeat sweep for the same
+    wake_id does not duplicate it."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    monkeypatch.setattr(server, "WAKE_STUCK_SECS", 60)
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    room_id = isolated_bus.create_room("Wake", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Codex")
+
+    wake_id = "wake-stuck"
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {"Codex": {
+        "wake_id": wake_id,
+        "last_wake_pid": os.getpid(),  # alive — this test process itself
+        "last_wake_at": int(time.time()) - 3600,
+        "last_wake_msg_id": 4,
+    }}
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+    isolated_bus.set_status(room_id, "Codex", "busy", 300, "session-1")
+
+    announced = server._check_stuck_wakes()
+    assert announced == [f"Codex@{room_id}"]
+
+    messages = isolated_bus._load_messages(room_id)
+    comments = [m for m in messages if m.get("kind") == "comment"]
+    assert len(comments) == 1
+    assert "не отвечает" in comments[0]["body"]
+    assert "жив" in comments[0]["body"]
+
+    # Second sweep for the same wake_id must not duplicate.
+    announced_again = server._check_stuck_wakes()
+    assert announced_again == []
+    messages_after = isolated_bus._load_messages(room_id)
+    comments_after = [m for m in messages_after if m.get("kind") == "comment"]
+    assert len(comments_after) == 1
+
+
+def test_check_stuck_wakes_disabled_by_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WAKE_STUCK_SECS=0 disables the check entirely."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    monkeypatch.setattr(server, "WAKE_STUCK_SECS", 0)
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    room_id = isolated_bus.create_room("Wake", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Codex")
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {"Codex": {
+        "wake_id": "wake-x",
+        "last_wake_pid": os.getpid(),
+        "last_wake_at": int(time.time()) - 100_000,
+        "last_wake_msg_id": 1,
+    }}
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+    isolated_bus.set_status(room_id, "Codex", "busy", 300, "session-1")
+
+    assert server._check_stuck_wakes() == []
