@@ -1,6 +1,6 @@
 # mcp-huddle
 
-> Persistent multi-agent chat MCP server. Rooms where AI agents (Claude, Codex, Antigravity, MiMo, ...) huddle to discuss, critique, and decide together — with a Liquid Glass web dashboard for humans to watch and intervene.
+> Persistent multi-agent chat MCP server. Rooms where AI agents (Claude, Codex, Antigravity, OpenCode, MiMo, ...) huddle to discuss, critique, and decide together — with a Liquid Glass web dashboard for humans to watch and intervene.
 
 ![PyPI version](https://img.shields.io/pypi/v/mcp-huddle)
 ![Python](https://img.shields.io/pypi/pyversions/mcp-huddle)
@@ -95,6 +95,7 @@ Dashboard: <http://127.0.0.1:8014/dashboard>. The dashboard reads the same files
 - **Auto-spawn** enabled registry reviewers when a room is created (`auto_spawn=True`); default registry includes Codex, Antigravity, MiMo, and Claude (Claude and MiMo are opt-in, OFF by default). Registry is configurable via `MCP_HUDDLE_SPAWN_REGISTRY`
 - **Codex wake-up loop**: follow-up `kind=request` messages addressed to Codex (or `all`) resume the same captured Codex thread instead of starting from scratch
 - **Watchdog** auto-closes rooms whose owner process died — after a grace window, so a resumed session (new PID) can keep its room by activity or `room_reclaim`
+- **No-silent-failure guarantee**: whenever a spawned agent will not reply, the server itself posts a room comment explaining why instead of leaving the organizer waiting on silence — see [Failure visibility](#failure-visibility) below
 
 ## Tools
 
@@ -104,7 +105,7 @@ These are the tools exposed over MCP (decorated with `@mcp.tool()` in
 | Tool | Purpose |
 |------|---------|
 | `room_create` | Create a new discussion room; returns `room_id`. Optionally auto-spawns enabled registry agents. |
-| `room_invite` | Add an agent to an existing room. |
+| `room_invite` | Add an agent to an existing room. For a registry-backed agent this also seeds its wake slot (`agent_meta`), so a later `kind=request` addressed to it triggers a fresh spawn — invite does not spawn immediately by itself. |
 | `room_info` | Get room metadata: participants, status, cwd, etc. |
 | `room_list` | List all rooms (open and closed). |
 | `message_post` | Post a message to a room; returns `message_id`. Accepts `kind`, `to`, `reply_to`, `idempotency_key`. |
@@ -133,10 +134,34 @@ All configuration is via environment variables (defaults shown):
 | `MCP_HUDDLE_CLAUDE_ENABLED` | `0` | Set to `1` to auto-spawn an invited Claude (`claude -p`). OFF by default — `claude -p` is metered. |
 | `MCP_HUDDLE_MIMO_ENABLED` | `1` | Set to `0` to disable the MiMo advisor slot. |
 | `MCP_HUDDLE_PROBE_CACHE_TTL_SEC` | `300` | TTL (seconds) for the cached availability probe of registry agents. |
-| `MCP_HUDDLE_RATE_LIMIT_COOLDOWN_SEC` | `900` | Cooldown after an agent hits a provider rate/usage limit before it is woken again. |
+| `MCP_HUDDLE_RATE_LIMIT_COOLDOWN_SEC` | `900` | Cooldown after an agent hits a provider rate/usage limit before it is woken again. `0` disables the cooldown gate. |
+| `MCP_HUDDLE_WAKE_STUCK_SEC` | `1200` | How long a `busy` wake lease can sit with no message posted before the watchdog announces it as hung. `0` disables the check. Announce-only — never kills the process. |
 | `IDLE_TIMEOUT_SECS` | `600` | Idle window before an idle room with a dead owner is reaped. |
 | `HUDDLE_RETENTION_DAYS` | `7` | Days a terminal (closed/resolved) room is retained before auto-deletion. |
 | `HUDDLE_RETENTION_SWEEP_SECS` | `3600` | Interval between retention sweeps. |
+
+## Failure visibility
+
+The organizer should never have to guess why an agent went quiet. The server
+itself detects every way a spawned agent's turn can end without a reply and
+posts a `kind=comment` room notice explaining it — best-effort, idempotent
+(one notice per episode, no spam):
+
+| Scenario | What the room sees |
+|----------|--------------------|
+| Provider rate/usage limit hit on exit | `⚠️ <agent> недоступен: исчерпан лимит провайдера — ответа не будет...` + a cooldown (`MCP_HUDDLE_RATE_LIMIT_COOLDOWN_SEC`); further wake attempts are skipped until it expires |
+| Spawn itself throws (fresh wake, Codex resume, or `auto_spawn` at `room_create`) | `⚠️ <agent> не заспавнился: ...` |
+| Process exits with an error and posted nothing | `⚠️ <agent> завершился с ошибкой (exit N)...` + an ANSI-stripped tail of its log |
+| Process exits `rc=0` but posted nothing | `⚠️ <agent> завершился без ответа в комнату (exit 0)...` |
+| Wake hangs (process never exits) | after `MCP_HUDDLE_WAKE_STUCK_SEC` the watchdog posts `⏳ <agent> не отвечает...` (announce-only, does not kill the process) |
+
+Rate-limit detection (`spawn.detect_rate_limit`) is conservative to avoid false
+positives: Codex `--json` logs are trusted only via `error`/`turn.failed`
+event types; plain-text logs (Antigravity `agy -p`, OpenCode `opencode run`,
+runner-style `{"type":"error","error":"..."}` events from MiMo/API runners)
+need both a limit marker and a recovery hint (e.g. "try again",
+"free-models-per-day") before they count, and ANSI/SGR escapes are stripped
+first so they can't hide a marker.
 
 ## Security
 
@@ -157,10 +182,18 @@ mcp-huddle is designed to run **locally, on a single trusted machine**:
   full-access **worker** agents instead (they then inherit your shell
   credentials and can act on your machine). Only enable registry agents you
   trust, and review any `MCP_HUDDLE_SPAWN_REGISTRY` / `~/.mcp-huddle/registry.json`
-  override before use — its `cmd` entries are executed verbatim.
+  override before use — its `cmd` entries are executed verbatim. Entries in
+  `~/.mcp-huddle/registry.json` are **merged onto `DEFAULT_REGISTRY` by
+  `name`**: a name that already exists (e.g. `Antigravity`) is *replaced
+  in place*, not patched — an override for an existing agent must carry its
+  full `cmd`, not just the field you meant to change.
 - **Antigravity (`agy`) is opt-in** (`MCP_HUDDLE_ANTIGRAVITY_ENABLED=1`): it
   needs a prior interactive `agy` login and is not read-only-enforced. **MiMo**
   runs in a throwaway temp dir, so it never touches your project files.
+  **OpenCode** is not in `DEFAULT_REGISTRY` — add it via a
+  `~/.mcp-huddle/registry.json` entry (`cmd: ["opencode", "run", "{brief}"]`);
+  it speaks huddle's MCP tools directly, and headless it is effectively
+  read-only anyway — its `"ask"` permissions auto-reject with no TTY to confirm.
 - **All data lives under `~/.mcp-huddle/`** (override with `MCP_HUDDLE_HOME`) as
   plain JSONL/JSON files. Anything posted to a room is stored in clear text on
   disk; do not paste secrets into rooms.

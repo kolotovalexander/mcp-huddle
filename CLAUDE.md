@@ -35,12 +35,19 @@ a web dashboard lets humans watch/intervene. Two run modes (one binary):
   read but never edit files and talk only via huddle MCP / the bus.
 - New agent slots: prefer a `~/.mcp-huddle/registry.json` entry or the
   `openai_compatible_runner` over hard-coding; cloud APIs use `--api-key-env`.
+  Note: merging in `registry.json` is by `name` and REPLACES the whole entry —
+  an override for an existing default agent must carry its full `cmd`.
+- The server itself announces every way a woken agent can fail to reply
+  (rate-limit, spawn exception, error exit, silent exit, hung wake — see
+  `server.py::_handle_rate_limit_on_exit` / `_announce_spawn_failure` /
+  `_announce_noreply_on_exit` / `_check_stuck_wakes`). Don't build
+  orchestrator-side polling/timeout logic for this — read the room instead.
 - Dashboard JS: no framework, no bundler — edit the files directly. UI strings
   go through `t()` / `data-i18n`.
 
 ## Verify before claiming done
 ```bash
-.venv/bin/pytest tests/ -q          # full suite (currently 104 passing)
+.venv/bin/pytest tests/ -q          # full suite (currently 119 passing)
 node --check src/mcp_huddle/static/dashboard.js   # JS syntax
 ```
 For dashboard changes, the server serves files fresh (no-cache) — just reload
