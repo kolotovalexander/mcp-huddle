@@ -2473,3 +2473,128 @@ def test_spawn_agents_dict_branch_wires_noreply_callback_on_exit(
     assert "не ответил" in comments[0]["body"]
 
     assert server._check_dead_wakes() == []
+
+
+# ── Cold-spawn brief protocol discipline (room_31d32c82) ────────────────────
+# Root cause: the default auto_spawn=True brief was one shared generic blob
+# with no concrete "you are X" — small models spawned cold answered on
+# stdout instead of calling message_post, or posted under another agent's
+# name. The wake-up prompt never had this problem (explicit room_id, own
+# name, exact tool call). These tests lock the cold-spawn briefs to the same
+# discipline.
+
+
+def test_default_brief_contains_room_id_own_name_and_goal() -> None:
+    brief = server._build_default_brief(
+        "room_xyz", "room-name", "review the diff", "/tmp/proj",
+        agent_name="OpenCode")
+    assert "room_xyz" in brief
+    assert "OpenCode" in brief
+    assert "message_post" in brief
+    assert "review the diff" in brief
+    # Own-identity instruction, not just a bare mention of the name.
+    assert 'You are: OpenCode' in brief
+    assert 'agent="OpenCode"' in brief
+
+
+def test_auto_spawn_true_gives_each_agent_its_own_name_in_the_brief(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two agents spawned via auto_spawn=True must NOT receive the exact same
+    brief text — each one's brief must carry its OWN name, not a neighbor's
+    (this is what let a model post as "Claude" while actually being spawned
+    as a different registry agent)."""
+    fake_registry: list[spawn.SpawnSpec] = [
+        {"name": "First",  "cmd": ["echo", "first={brief}"],  "enabled": True},
+        {"name": "Second", "cmd": ["echo", "second={brief}"], "enabled": True},
+    ]
+    monkeypatch.setattr(spawn, "load_registry", lambda: fake_registry)
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path / "huddle"))
+    monkeypatch.setattr(bus, "HUDDLE_HOME", tmp_path / "huddle")
+    monkeypatch.setenv("MCP_HUDDLE_SAME_BIN_STAGGER_SEC", "0")  # both use "echo"
+
+    captured: dict[str, str] = {}
+    real_spawn_agent = spawn.spawn_agent
+
+    def capture(spec, brief, *a, **kw):
+        captured[spec["name"]] = brief
+        return real_spawn_agent(spec, brief, *a, **kw)
+
+    monkeypatch.setattr(spawn, "spawn_agent", capture)
+
+    room_id = bus.create_room("test-room", "Human", os.getpid(), str(tmp_path), "sess-1")
+    server._spawn_agents(
+        room_id=room_id, name="test-room", goal="g", cwd=str(tmp_path),
+        owner="Human", auto_spawn=True,
+    )
+
+    assert set(captured) == {"First", "Second"}
+    assert 'You are: First' in captured["First"]
+    assert 'agent="First"' in captured["First"]
+    assert 'You are: Second' in captured["Second"]
+    assert 'agent="Second"' in captured["Second"]
+    # Cross-check: First's own-identity line never claims to be Second.
+    assert 'You are: Second' not in captured["First"]
+    assert 'You are: First' not in captured["Second"]
+
+
+def test_dict_auto_spawn_wraps_user_brief_with_protocol_preamble(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """auto_spawn={name: brief} must preserve the user's text verbatim while
+    adding the same room_id/own-name/message_post/anti-loop preamble as the
+    default brief — the user text is the task, the preamble is the delivery
+    protocol (both are needed, per live room_31d32c82 evidence)."""
+    fake_registry: list[spawn.SpawnSpec] = [
+        {"name": "Reviewer", "cmd": ["echo", "r={brief}"], "enabled": True},
+    ]
+    monkeypatch.setattr(spawn, "load_registry", lambda: fake_registry)
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path / "huddle"))
+    monkeypatch.setattr(bus, "HUDDLE_HOME", tmp_path / "huddle")
+
+    captured: dict[str, str] = {}
+    real_spawn_agent = spawn.spawn_agent
+
+    def capture(spec, brief, *a, **kw):
+        captured[spec["name"]] = brief
+        return real_spawn_agent(spec, brief, *a, **kw)
+
+    monkeypatch.setattr(spawn, "spawn_agent", capture)
+
+    user_text = "Please look for off-by-one errors in the pagination code."
+    room_id = bus.create_room("test-room", "Human", os.getpid(), str(tmp_path), "sess-1")
+    server._spawn_agents(
+        room_id=room_id, name="test-room", goal="g", cwd=str(tmp_path),
+        owner="Human", auto_spawn={"Reviewer": user_text},
+    )
+
+    brief = captured["Reviewer"]
+    assert user_text in brief  # verbatim, not rephrased
+    assert room_id in brief
+    assert 'You are: Reviewer' in brief
+    assert 'agent="Reviewer"' in brief
+    assert "message_post" in brief
+    assert "Anti-loop" in brief
+
+
+def test_wakeup_prompt_format_unchanged_after_refactor() -> None:
+    """The wake-up prompt's exact wire format (parsed by
+    openai_compatible_runner.extract_request_id and asserted on by other
+    tests) must survive the shared-helper refactor byte-for-byte for the
+    lines other code depends on."""
+    prompt = server._build_registry_agent_wakeup_prompt(
+        "room_test", "OpenCode", "Claude", "please check this", "OpenCode",
+        7, 3, "1: hi\n2: there")
+    assert "Room: room_test" in prompt
+    assert "You are: OpenCode" in prompt
+    assert "New request id: 7" in prompt
+    assert "Current full transcript:" in prompt
+    assert ('message_post(room_id="room_test", agent="OpenCode", kind="result", '
+            'to="Claude", reply_to=7, '
+            'idempotency_key="opencode-wake:room_test:7")') in prompt
+
+    codex_prompt = server._build_codex_wakeup_prompt(
+        "room_test", "Claude", "please check this", "Codex", 7, 3)
+    assert ('message_post(room_id="room_test", agent="Codex", kind="result", '
+            'to="Claude", reply_to=7, '
+            'idempotency_key="codex-wake:room_test:7")') in codex_prompt

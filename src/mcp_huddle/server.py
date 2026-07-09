@@ -1058,6 +1058,17 @@ def _spawn_agents(
     # "Codex", "Antigravity"). Caller is expected to pass canonical owner.
     skip_owner = {owner} if owner else set()
 
+    # Per-agent default briefs (auto_spawn=True path): each spawned agent
+    # gets its OWN name baked into the identity/reply-call preamble, instead
+    # of every agent receiving the exact same generic brief (room_31d32c82 —
+    # a shared brief with no concrete "you are X" let a model post under
+    # another participant's name).
+    per_agent_default_briefs = {
+        spec["name"]: _build_default_brief(room_id, name, goal, cwd, agent_name=spec["name"])
+        for spec in spawn.load_registry()
+        if spec.get("enabled") and spec["name"] not in skip_owner
+    }
+
     briefs_arg: dict[str, str] | None = None
     if isinstance(auto_spawn, dict):
         # Filter to enabled agents in the registry, but only those listed.
@@ -1086,7 +1097,7 @@ def _spawn_agents(
         # this branch mirrors it for the explicit-dict path.
         delays = spawn.compute_stagger_delays(enabled_specs)
         for spec in enabled_specs:
-            agent_brief = briefs_arg[spec["name"]]
+            agent_brief = _wrap_user_brief(room_id, spec["name"], briefs_arg[spec["name"]])
             delay = delays.get(spec["name"], 0.0)
             if delay > 0:
                 names.append(spec["name"])
@@ -1122,6 +1133,7 @@ def _spawn_agents(
     else:
         names, pids, agent_meta = spawn.spawn_all(
             default_brief, cwd, log_dir,
+            briefs=per_agent_default_briefs,
             on_exit_factory=lambda n: _make_initial_spawn_callback(room_id, n),
             skip_names=skip_owner,
             on_spawn_fail=lambda n, exc: _announce_spawn_failure(room_id, n, exc, "init"),
@@ -1932,6 +1944,44 @@ or verification response.
 """
 
 
+# ── Shared protocol building-blocks ──────────────────────────────────────
+# Used by every agent-facing prompt (cold-spawn default brief, per-agent
+# custom brief, and the mid-discussion wake-up prompt) so the delivery
+# protocol can't drift between them. Root cause this closes (room_31d32c82):
+# a weaker cold-spawn brief let small models answer to stdout instead of
+# calling message_post, or post under another participant's name — the same
+# models behaved correctly once driven by the wake prompt's explicit
+# identity + exact-tool-call framing below.
+
+
+def _agent_identity_block(room_id: str, agent_name: str) -> str:
+    """Room id + own-identity line, shared verbatim by every prompt."""
+    return (f"Room: {room_id}\n"
+            f'You are: {agent_name} — always post as agent="{agent_name}", '
+            f"never another participant's name.")
+
+
+def _reply_call(room_id: str, agent_name: str, to: str, idempotency_key: str,
+                 kind: str = "result", reply_to: Optional[int] = None) -> str:
+    """The exact message_post(...) call an agent should make to reply."""
+    reply_to_part = f", reply_to={reply_to}" if reply_to is not None else ""
+    return (f'message_post(room_id="{room_id}", agent="{agent_name}", '
+            f'kind="{kind}", to="{to}"{reply_to_part}, '
+            f'idempotency_key="{idempotency_key}")')
+
+
+def _stdout_not_delivered_note() -> str:
+    return ("Only mcp-huddle MCP tool calls are delivered to the room — "
+            "anything you print to stdout or return as a plain answer is "
+            "invisible to other participants.")
+
+
+def _anti_loop_block() -> str:
+    return ("Anti-loop: reply once per request. Do not answer a request "
+            "that already has reply_to set, and never send thanks/ack-only "
+            "chatter.")
+
+
 def _build_registry_agent_wakeup_prompt(
     room_id: str,
     agent_name: str,
@@ -1943,6 +1993,9 @@ def _build_registry_agent_wakeup_prompt(
     transcript: str,
 ) -> str:
     addressed = to or "all"
+    idempotency_key = f"{agent_name.lower()}-wake:{room_id}:{msg_id}"
+    reply_call = _reply_call(room_id, agent_name, sender, idempotency_key,
+                              kind="result", reply_to=msg_id)
     return f"""A new mcp-huddle request arrived.
 
 Room: {room_id}
@@ -1961,7 +2014,7 @@ Request body:
 Protocol:
 1. Call messages_read(room_id="{room_id}", since_id=0, limit=50).
 2. If message #{msg_id} is kind=request addressed to {agent_name} or all and has no reply_to, answer it exactly once.
-3. Post your answer with message_post(room_id="{room_id}", agent="{agent_name}", kind="result", to="{sender}", reply_to={msg_id}, idempotency_key="{agent_name.lower()}-wake:{room_id}:{msg_id}").
+3. Post your answer with {reply_call}.
 
 Do not answer requests that already have reply_to set. Do not send thanks/ack-only chatter.
 """
@@ -1976,6 +2029,9 @@ def _build_codex_wakeup_prompt(
     last_seen: int,
 ) -> str:
     addressed = to or "all"
+    reply_call = _reply_call(room_id, "Codex", sender,
+                              f"codex-wake:{room_id}:{msg_id}",
+                              kind="result", reply_to=msg_id)
     return f"""A new mcp-huddle request arrived in your existing room.
 
 Room: {room_id}
@@ -1991,16 +2047,32 @@ Request body:
 Use only huddle MCP tools for room coordination:
 1. Call messages_read(room_id="{room_id}", since_id=0, limit=50).
 2. If message #{msg_id} is a kind=request addressed to Codex or all and has no reply_to, answer it exactly once.
-3. Post your answer with message_post(room_id="{room_id}", agent="Codex", kind="result", to="{sender}", reply_to={msg_id}, idempotency_key="codex-wake:{room_id}:{msg_id}").
+3. Post your answer with {reply_call}.
 
 Do not answer requests that already have reply_to set. Do not send thanks/ack-only chatter.
 """
 
 
-def _build_default_brief(room_id: str, name: str, goal: str, cwd: str) -> str:
+def _build_default_brief(room_id: str, name: str, goal: str, cwd: str,
+                          agent_name: Optional[str] = None) -> str:
+    """Default reviewer brief for auto_spawn=True.
+
+    Wrapped in the same identity/reply-call framing as the wake-up prompt
+    (room id, own name, exact message_post call, anti-loop rule) so a
+    cold-spawned agent behaves the same as one woken mid-discussion —
+    without this, small models spawned cold answered to stdout instead of
+    calling message_post, or posted under another participant's name
+    (observed live in room_31d32c82). `agent_name` is the actual per-agent
+    identity to spawn under; omitted only by callers that don't yet know it
+    (falls back to a generic "check your invite" placeholder).
+    """
+    who = agent_name or "the name you were spawned/invited under (see room_info)"
+    idem_prefix = (agent_name or "agent").lower()
+    reply_call = _reply_call(room_id, who, "<original sender, or 'all'>",
+                              f"{idem_prefix}-init:{room_id}", kind="comment")
     return f"""# mcp-huddle — Room: {name}
 
-**Room ID:** {room_id}
+{_agent_identity_block(room_id, who)}
 **Goal:** {goal}
 **Project:** {cwd}
 **MCP server:** http://127.0.0.1:8014/mcp (HTTP) or stdio binary direct
@@ -2013,14 +2085,18 @@ You are an independent reviewer, NOT an executor.
 - NEVER send "Thanks", "Agreed", "Got it" — only technical arguments
 - Reply ONLY to kind=request addressed to you (to=your_name or to=all)
 
+## How to reply (MANDATORY)
+{_stdout_not_delivered_note()}
+To reply: {reply_call}
+
 ## Anti-loop rules
-- kind=request with reply_to!=null means it's someone's answer — NOT a new request to you → stay silent
+{_anti_loop_block()}
 - Keep a local set of reply_to IDs you already responded to — never reply twice to the same request
 
 ## How to connect
 Use MCP tools from mcp-huddle:
   messages_read("{room_id}") — read chat
-  message_post("{room_id}", "YourName", "...", kind="comment"|"request"|"result", ...) — post
+  message_post("{room_id}", "{who}", "...", kind="comment"|"request"|"result", ...) — post
   room_summarize("{room_id}", since_id=N) — token-efficient digest after absence
 
 ## MANDATORY: read full history BEFORE every reply
@@ -2038,6 +2114,31 @@ Lifecycle:
 - When a later kind=request is addressed to you or all, huddle wakes a new
   turn. Codex uses thread resume when available; other registry agents are
   started fresh with the room transcript prepended.
+"""
+
+
+def _wrap_user_brief(room_id: str, agent_name: str, brief: str) -> str:
+    """Wrap a user-supplied per-agent brief (auto_spawn={name: brief}) with
+    the same protocol preamble as the default brief/wake prompt.
+
+    The user's text is the task; the preamble is the delivery protocol —
+    both are required or small models drift into replying on stdout or
+    under the wrong name (room_31d32c82). The user brief is preserved
+    verbatim after the preamble.
+    """
+    idem = f"{agent_name.lower()}-init:{room_id}"
+    reply_call = _reply_call(room_id, agent_name, "<original sender, or 'all'>",
+                              idem, kind="comment")
+    return f"""{_agent_identity_block(room_id, agent_name)}
+
+{_stdout_not_delivered_note()}
+To reply: {reply_call}
+
+{_anti_loop_block()}
+
+---
+
+{brief}
 """
 
 
