@@ -1754,3 +1754,146 @@ def test_check_dead_wakes_disabled_by_zero(
     isolated_bus.set_status(room_id, "Codex", "busy", 300, "session-1")
 
     assert server._check_dead_wakes() == []
+
+
+# ── No-reply notices for the room_create INITIAL auto_spawn (not a wake) ────
+#
+# _spawn_agents (room_create auto_spawn) attached no exit callback beyond a
+# best-effort rate-limit check — an agent that started fine but died before
+# posting anything (e.g. a real `opencode run` exit with "database is
+# locked", rc != 0) left the room silent with no notice. _on_initial_spawn_exit
+# closes that gap the same way _on_wake_exit does for wakes, just without a
+# busy lease to release (there never was one for the very first spawn).
+
+def test_on_initial_spawn_exit_nonzero_no_post_announces_noreply_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An initial auto_spawn agent whose process exits rc!=0 having posted
+    nothing to the room at all gets exactly one noreply comment; a repeat
+    exit callback for the same initial spawn must not duplicate it."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    room_id = isolated_bus.create_room("Init", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "OpenCode")
+    log_path = isolated_bus._room_dir(room_id) / "agents" / "opencode.events.jsonl"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text('{"type":"error","error":"database is locked"}\n')
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {"OpenCode": {"log_path": str(log_path)}}
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+
+    server._on_initial_spawn_exit(room_id, "OpenCode", 1)
+
+    messages = isolated_bus._load_messages(room_id)
+    comments = [m for m in messages if m.get("kind") == "comment"]
+    assert len(comments) == 1
+    assert "не ответил" in comments[0]["body"]
+    assert "exit 1" in comments[0]["body"]
+
+    # Repeat exit callback (e.g. reaper fires twice) — idempotent, no duplicate.
+    server._on_initial_spawn_exit(room_id, "OpenCode", 1)
+    messages_after = isolated_bus._load_messages(room_id)
+    comments_after = [m for m in messages_after if m.get("kind") == "comment"]
+    assert len(comments_after) == 1
+
+
+def test_on_initial_spawn_exit_posted_message_no_noreply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An initial auto_spawn agent that posted ANY message before exiting
+    (even non-zero rc) must NOT get a noreply notice — it already explained
+    itself to the room."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    room_id = isolated_bus.create_room("Init", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "OpenCode")
+    isolated_bus.post_message(room_id, "OpenCode", "reviewing now", "comment")
+
+    server._on_initial_spawn_exit(room_id, "OpenCode", 1)
+
+    messages = isolated_bus._load_messages(room_id)
+    comments = [m for m in messages if m.get("kind") == "comment"]
+    # Only the agent's own pre-exit comment — no noreply notice piled on.
+    assert len(comments) == 1
+    assert comments[0]["agent"] == "OpenCode"
+
+
+def test_on_initial_spawn_exit_rate_limit_suppresses_noreply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A detected rate-limit on an initial-spawn exit already explains the
+    silence via its own notice — the noreply path must not pile on a second,
+    redundant comment."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    monkeypatch.setattr(server, "RATE_LIMIT_COOLDOWN_SECS", 900)
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    room_id = isolated_bus.create_room("Init", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Codex")
+    log_path = isolated_bus._room_dir(room_id) / "agents" / "codex.events.jsonl"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(
+        '{"type":"turn.failed","error":{"message":"You\'ve hit your usage limit. Try again later."}}\n'
+    )
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {"Codex": {"log_path": str(log_path)}}
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+
+    server._on_initial_spawn_exit(room_id, "Codex", 1)
+
+    messages = isolated_bus._load_messages(room_id)
+    comments = [m for m in messages if m.get("kind") == "comment"]
+    assert len(comments) == 1
+    assert "лимит" in comments[0]["body"]
+    assert "не ответил" not in comments[0]["body"]
+    assert "без ответа" not in comments[0]["body"]
+
+
+def test_spawn_agents_dict_branch_wires_noreply_callback_on_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end wiring check: _spawn_agents (auto_spawn={...} dict branch)
+    must pass an on_exit that, when invoked with a non-zero returncode and no
+    posted reply, produces a noreply notice — not just a rate-limit check."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path / "huddle"))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    fake_registry: list[spawn.SpawnSpec] = [
+        {"name": "OpenCode", "cmd": ["opencode", "run", "{brief}"], "enabled": True},
+    ]
+    monkeypatch.setattr(server.spawn, "load_registry", lambda: fake_registry)
+
+    captured_on_exit = {}
+
+    def fake_spawn_agent(spec, brief, cwd, log_dir, verify_alive_sec=0.0, on_exit=None):
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "opencode.events.jsonl"
+        log_path.write_text('{"type":"error","error":"database is locked"}\n')
+        captured_on_exit["cb"] = on_exit
+        return 4242, str(log_path), None
+
+    monkeypatch.setattr(server.spawn, "spawn_agent", fake_spawn_agent)
+
+    room_id = isolated_bus.create_room("Init2", "Claude", os.getpid(), str(tmp_path), "sess-1")
+    server._spawn_agents(
+        room_id=room_id, name="Init2", goal="g",
+        cwd=str(tmp_path), owner="Claude",
+        auto_spawn={"OpenCode": "review this"},
+    )
+
+    assert captured_on_exit.get("cb") is not None
+    captured_on_exit["cb"](1)  # simulate the reaper thread reporting exit 1
+
+    messages = isolated_bus._load_messages(room_id)
+    comments = [m for m in messages if m.get("kind") == "comment"]
+    assert len(comments) == 1
+    assert "OpenCode" in comments[0]["body"]
+    assert "не ответил" in comments[0]["body"]
+
+    assert server._check_dead_wakes() == []

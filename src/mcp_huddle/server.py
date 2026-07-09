@@ -1135,15 +1135,14 @@ def _make_wake_done_callback(room_id: str, agent_name: str, wake_id: str):
 
 def _make_initial_spawn_callback(room_id: str, agent_name: str):
     """Reaper on_exit callback for the room_create spawn: no busy lease to
-    release — just announce a rate-limit (if any) and drain any request queued
-    during the agent's first turn."""
+    release — explain the silence the same way a wake exit does (rate-limit
+    detection, else a noreply notice) and drain any request queued during
+    the agent's first turn."""
     def _callback(returncode) -> None:
         try:
-            if returncode not in (0, None):
-                _handle_rate_limit_on_exit(room_id, agent_name)
-            _drain_pending_wakes(room_id, agent_name)
+            _on_initial_spawn_exit(room_id, agent_name, returncode)
         except Exception as exc:
-            print(f"[huddle] initial-spawn drain error "
+            print(f"[huddle] initial-spawn exit callback error "
                   f"({agent_name}@{room_id}): {exc}", flush=True)
     return _callback
 
@@ -1269,6 +1268,74 @@ def _announce_noreply_on_exit(room_id: str, agent_name: str, msg_id: int,
     except Exception as exc:
         print(f"[huddle] noreply notice post failed "
               f"({agent_name}@{room_id}): {exc}", flush=True)
+
+
+def _announce_noreply_on_initial_exit(room_id: str, agent_name: str, rc: int,
+                                      log_path: Optional[str]) -> None:
+    """Same notice as _announce_noreply_on_exit, for the room_create
+    auto_spawn path where there is no wake msg_id to check a reply against —
+    "posted anything since the room was created" (message id > 0) is the bar
+    instead of "posted since this wake". Only called when the exit was NOT
+    already explained by a detected rate-limit.
+
+    Idempotent per (room, agent) via a fixed 'init' key: an agent gets
+    exactly one initial spawn per room (_spawn_agents runs once, from
+    room_create), so no per-attempt disambiguator is needed beyond that
+    constant suffix — a duplicate exit callback for the same initial spawn
+    will not double-post.
+    """
+    if _agent_posted_after(room_id, agent_name, 0):
+        return
+    if rc == 0:
+        body = (f"⚠️ {agent_name} завершился без ответа в комнату "
+                 f"(exit 0) — не ждите ответа.")
+    else:
+        tail = _log_tail(log_path)
+        suffix = f" {tail}" if tail else ""
+        body = (f"⚠️ {agent_name} завершился с ошибкой (exit {rc}) и не "
+                 f"ответил — не ждите ответа.{suffix}")
+    try:
+        _post_message_checked(
+            room_id, agent_name, body,
+            kind="comment",
+            idempotency_key=f"noreply:{room_id}:{agent_name}:init",
+        )
+    except Exception as exc:
+        print(f"[huddle] noreply notice post failed (init) "
+              f"({agent_name}@{room_id}): {exc}", flush=True)
+
+
+def _on_initial_spawn_exit(room_id: str, agent_name: str, returncode) -> None:
+    """Reaction to a room_create auto_spawn agent's process exit: unlike a
+    wake, there is no busy lease to release — but the same no-silent-failure
+    guarantee applies: detect a provider rate-limit, else post a noreply
+    notice if the agent exited without posting anything at all, then drain
+    any request that queued during the agent's first turn."""
+    rc = -999 if returncode is None else int(returncode)
+    rate_limit_announced = False
+    if rc != 0:
+        try:
+            rate_limit_announced = _handle_rate_limit_on_exit(room_id, agent_name)
+        except Exception as exc:
+            print(f"[huddle] rate-limit check error (init) "
+                  f"({agent_name}@{room_id}): {exc}", flush=True)
+    if not rate_limit_announced:
+        log_path = None
+        try:
+            meta = bus.get_room_info(room_id)
+            log_path = ((meta.get("agent_meta") or {}).get(agent_name) or {}).get("log_path")
+        except Exception:
+            pass
+        try:
+            _announce_noreply_on_initial_exit(room_id, agent_name, rc, log_path)
+        except Exception as exc:
+            print(f"[huddle] noreply check error (init) "
+                  f"({agent_name}@{room_id}): {exc}", flush=True)
+    try:
+        _drain_pending_wakes(room_id, agent_name)
+    except Exception as exc:
+        print(f"[huddle] wake drain error ({agent_name}@{room_id}): {exc}",
+              flush=True)
 
 
 def _on_wake_exit(room_id: str, agent_name: str, wake_id: str,
