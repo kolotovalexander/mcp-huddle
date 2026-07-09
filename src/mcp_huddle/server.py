@@ -1601,7 +1601,7 @@ def _wake_pending_agents() -> list[dict]:
     """
     wakes: list[dict] = []
     for meta in bus.list_rooms():
-        if meta.get("status") != "open":
+        if meta.get("status") not in ("open", "idle"):
             continue
         room_id = meta["id"]
         agent_meta = meta.get("agent_meta", {})

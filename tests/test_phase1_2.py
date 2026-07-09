@@ -817,6 +817,110 @@ def test_pending_wakeup_skips_request_agent_already_replied(
     assert updated["last_seen_id"] == 1
 
 
+def test_wake_pending_agents_wakes_idle_room(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A request addressed to an agent while the room was already idle (e.g.
+    posted before the agent was invited, or while the watchdog wasn't
+    running) must still be drained by the fallback sweep — idle just means
+    quiet, not done."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    calls: list[dict] = []
+
+    def fake_spawn_agent(spec, brief, cwd, log_dir, verify_alive_sec=0.0, on_exit=None):
+        calls.append({"spec": spec, "brief": brief, "cwd": cwd})
+        log_dir.mkdir(parents=True, exist_ok=True)
+        return 7171, str(log_dir / "gemini.events.jsonl"), None
+
+    fake_spec: spawn.SpawnSpec = {
+        "name": "Gemini",
+        "cmd": ["gemini", "-p", "{brief}"],
+        "enabled": True,
+    }
+    monkeypatch.setattr(server.spawn, "get_enabled_spec", lambda name: fake_spec if name == "Gemini" else None)
+    monkeypatch.setattr(server.spawn, "spawn_agent", fake_spawn_agent)
+
+    room_id = isolated_bus.create_room("IdleWake", "CodexMain", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Gemini")
+    isolated_bus.post_message(
+        room_id, "CodexMain", "Gemini, please weigh in.", "request", to="Gemini",
+    )
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {
+        "Gemini": {
+            "log_path": str(isolated_bus._room_dir(room_id) / "agents" / "gemini.events.jsonl"),
+            "last_message_path": None,
+        }
+    }
+    meta["status"] = "idle"
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+
+    wakes = server._wake_pending_agents()
+
+    assert len(calls) == 1
+    assert wakes[0]["agent"] == "Gemini"
+    assert isolated_bus.get_room_info(room_id)["status"] == "idle"
+
+
+def test_wake_pending_agents_skips_closed_room(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    calls: list[dict] = []
+    monkeypatch.setattr(server.spawn, "spawn_agent", lambda *args, **kwargs: calls.append({"args": args}) or (1, "", None))
+
+    room_id = isolated_bus.create_room("ClosedWake", "CodexMain", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Gemini")
+    isolated_bus.post_message(
+        room_id, "CodexMain", "Gemini, please weigh in.", "request", to="Gemini",
+    )
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {
+        "Gemini": {
+            "log_path": str(isolated_bus._room_dir(room_id) / "agents" / "gemini.events.jsonl"),
+            "last_message_path": None,
+        }
+    }
+    meta["status"] = "closed"
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+
+    wakes = server._wake_pending_agents()
+
+    assert wakes == []
+    assert calls == []
+
+
+def test_wake_pending_agents_skips_resolved_room(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    calls: list[dict] = []
+    monkeypatch.setattr(server.spawn, "spawn_agent", lambda *args, **kwargs: calls.append({"args": args}) or (1, "", None))
+
+    room_id = isolated_bus.create_room("ResolvedWake", "CodexMain", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Gemini")
+    isolated_bus.post_message(
+        room_id, "CodexMain", "Gemini, please weigh in.", "request", to="Gemini",
+    )
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {
+        "Gemini": {
+            "log_path": str(isolated_bus._room_dir(room_id) / "agents" / "gemini.events.jsonl"),
+            "last_message_path": None,
+        }
+    }
+    meta["status"] = "resolved"
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+
+    wakes = server._wake_pending_agents()
+
+    assert wakes == []
+    assert calls == []
+
+
 # ── Tools surface cleanup (room_c216d6e8 consensus) ──────────────────────────
 
 def test_dropped_tools_no_longer_exposed_as_mcp_tools() -> None:
