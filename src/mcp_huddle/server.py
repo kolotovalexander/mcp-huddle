@@ -8,6 +8,7 @@ import asyncio
 import contextlib
 import json
 import os
+import signal
 import sys
 import tempfile
 import threading
@@ -193,6 +194,13 @@ WAKE_STUCK_SECS = _env_num("MCP_HUDDLE_WAKE_STUCK_SEC", 1200, int)
 # this grace window, so the sweep doesn't race a reaper on_exit callback that
 # is about to fire and clear the lease on its own. 0 disables the check.
 DEAD_WAKE_GRACE_SECS = _env_num("MCP_HUDDLE_DEAD_WAKE_GRACE_SEC", 60, int)
+# When _check_stuck_wakes announces a hung wake, also SIGTERM the still-alive
+# process instead of only announcing — a leaked/hung CLI otherwise sits
+# forever holding the busy lease past WAKE_STUCK_SECS. Default ON (owner
+# decision). Set to 0/false/no for announce-only (legacy behavior).
+STUCK_KILL_ENABLED = os.environ.get("MCP_HUDDLE_STUCK_KILL", "1").lower() not in (
+    "0", "false", "no",
+)
 
 
 # Agents whose CLI sessions can be resumed by a stable thread/session id
@@ -222,12 +230,18 @@ def room_create(
 
     auto_spawn:
       False (default) — no agents spawned; you invite manually via room_invite.
-      True            — spawn every enabled agent in the registry
-                        with a default reviewer brief built from `goal`.
+      True            — spawn every enabled registry agent not marked
+                        "auto": false, with a default reviewer brief built
+                        from `goal`. The per-spec "auto" flag curates the
+                        auto-spawn roster without disabling an agent outright
+                        — it stays reachable via an explicit dict auto_spawn,
+                        room_invite, or a wake-path request (all three ignore
+                        "auto": false; a deliberately named agent always works).
       {Name: brief}   — spawn only these agents, each with its own custom brief.
                         Example: {"Codex": "Audit auth.py for security holes",
                                   "Antigravity": "Find race conditions in db.py"}.
-                        Agents not in the dict are skipped even if enabled.
+                        Agents not in the dict are skipped even if enabled, and
+                        each listed agent's "auto" flag is ignored.
 
     goal: short description of the discussion topic (used in default brief
           for auto_spawn=True; ignored when auto_spawn is a dict).
@@ -986,8 +1000,10 @@ def _spawn_agents(
     """Spawn helper agents into a room.
 
     auto_spawn:
-      True          — spawn every enabled agent with a default reviewer brief.
+      True          — spawn every enabled agent not marked "auto": false, with
+                      a default reviewer brief.
       dict          — spawn only listed agents; each gets its custom brief.
+                      Ignores each spec's "auto" flag.
 
     Side effects:
       * Builds a default brief and writes it to a secure temp file
@@ -1033,10 +1049,26 @@ def _spawn_agents(
         names: list[str] = []
         pids: list[int] = []
         agent_meta: dict[str, dict] = {}
-        for spec in registry:
-            if not spec.get("enabled"):
-                continue
+        enabled_specs = [spec for spec in registry if spec.get("enabled")]
+        # Same-binary stagger (see spawn.compute_stagger_delays): a dict
+        # auto_spawn naming two agents that resolve to the same underlying
+        # binary (e.g. two OpenCode-backed slots) must not start at the same
+        # instant either — spawn_all already does this for auto_spawn=True,
+        # this branch mirrors it for the explicit-dict path.
+        delays = spawn.compute_stagger_delays(enabled_specs)
+        for spec in enabled_specs:
             agent_brief = briefs_arg[spec["name"]]
+            delay = delays.get(spec["name"], 0.0)
+            if delay > 0:
+                names.append(spec["name"])
+                agent_meta[spec["name"]] = spawn._placeholder_agent_meta(
+                    spec, agent_brief, log_dir)
+                spawn._schedule_delayed_spawn(
+                    delay, spec, agent_brief, cwd, log_dir,
+                    on_exit=_make_initial_spawn_callback(room_id, spec["name"]),
+                    on_spawn_fail=lambda n, exc: _announce_spawn_failure(room_id, n, exc, "init"),
+                )
+                continue
             try:
                 pid, log_path, last_msg = spawn.spawn_agent(
                     spec, agent_brief, cwd, log_dir,
@@ -1405,6 +1437,11 @@ def _on_wake_exit(room_id: str, agent_name: str, wake_id: str,
     # superseded us (then it owns the busy state and the drain).
     if info.get("wake_id") != wake_id:
         return
+    if not already_announced and info.get("stuck_killed_wake_id") == wake_id:
+        # _check_stuck_wakes already posted the "⏳ ... остановлен" notice and
+        # SIGTERMed this wake's process — this exit is that kill landing, not
+        # a fresh silent failure. Don't post noreply/rate-limit on top of it.
+        already_announced = True
     rc = -999 if returncode is None else int(returncode)
     fail_count = int(info.get("wake_fail_count", 0) or 0)
     updates = {
@@ -1666,9 +1703,14 @@ def _check_dead_wakes() -> list[str]:
             # regardless — an agent that posted something before dying (e.g.
             # a reply that raced its own crash) already explained the
             # silence, so skip only the redundant notice, not the release.
+            # Same for a wake _check_stuck_wakes already killed and announced
+            # (e.g. its reaper thread never fired to release the lease on its
+            # own) — the room already has the "⏳ ... остановлен" notice.
             msg_id = int(info.get("last_wake_msg_id", 0) or 0)
-            already_explained = bool(msg_id) and _agent_posted_after(
-                room_id, agent_name, msg_id)
+            already_explained = (
+                (bool(msg_id) and _agent_posted_after(room_id, agent_name, msg_id))
+                or info.get("stuck_killed_wake_id") == wake_id
+            )
             if not already_explained:
                 try:
                     _post_message_checked(
@@ -1691,6 +1733,22 @@ def _check_dead_wakes() -> list[str]:
     return announced
 
 
+def _kill_stuck_wake_pid(pid: int, agent_name: str, room_id: str) -> bool:
+    """Best-effort SIGTERM of a hung wake's process. Returns True if a kill
+    signal was actually delivered (pid existed and we had permission) —
+    False for a pid that was already gone or we couldn't touch, in which
+    case the reaper/dead-wake sweep will clean up the lease on its own."""
+    try:
+        os.kill(pid, signal.SIGTERM)
+        return True
+    except ProcessLookupError:
+        return False  # already dead — nothing to kill
+    except PermissionError as exc:
+        print(f"[huddle] stuck-wake kill denied ({agent_name}@{room_id}, "
+              f"pid={pid}): {exc}", flush=True)
+        return False
+
+
 def _check_stuck_wakes() -> list[str]:
     """Watchdog sweep: announce (once per wake) a 'busy' lease held longer
     than WAKE_STUCK_SECS with no message posted by that agent since the wake
@@ -1698,7 +1756,13 @@ def _check_stuck_wakes() -> list[str]:
     silent-exit path: unlike _on_wake_exit / _handle_rate_limit_on_exit
     (which fire when the process exits), a genuinely hung process never
     exits, so nothing else in this file will ever tell the organizer to stop
-    waiting on it. Announce-only — never kills the process.
+    waiting on it.
+
+    When STUCK_KILL_ENABLED (default on), after announcing it also SIGTERMs
+    the still-alive process — the resulting exit runs the normal reaper
+    on_exit → _on_wake_exit, which checks stuck_killed_wake_id and skips its
+    own noreply/rate-limit announcement (this notice already explained the
+    silence). Set MCP_HUDDLE_STUCK_KILL=0 to fall back to announce-only.
     """
     if WAKE_STUCK_SECS <= 0:
         return []
@@ -1727,17 +1791,27 @@ def _check_stuck_wakes() -> list[str]:
             pid = info.get("last_wake_pid")
             alive = bool(pid) and bus._pid_alive(pid)
             mins = max(1, (now - last_wake_at) // 60)
-            body = (f"⏳ {agent_name} не отвечает уже ~{mins} мин "
-                    f"(процесс {pid} {'жив' if alive else 'мёртв'}) — "
-                    f"возможно завис; не ждите ответа.")
+            will_kill = STUCK_KILL_ENABLED and alive
+            if will_kill:
+                body = (f"⏳ {agent_name} не отвечает уже ~{mins} мин "
+                        f"(процесс {pid}) — возможно завис; процесс "
+                        f"остановлен, ответа не будет.")
+            else:
+                body = (f"⏳ {agent_name} не отвечает уже ~{mins} мин "
+                        f"(процесс {pid} {'жив' if alive else 'мёртв'}) — "
+                        f"возможно завис; не ждите ответа.")
             try:
                 _post_message_checked(
                     room_id, agent_name, body,
                     kind="comment",
                     idempotency_key=f"stuck:{room_id}:{agent_name}:{wake_id}",
                 )
-                _merge_agent_meta(room_id, agent_name,
-                                   {"stuck_announced_wake_id": wake_id})
+                fields = {"stuck_announced_wake_id": wake_id}
+                if will_kill and _kill_stuck_wake_pid(pid, agent_name, room_id):
+                    # Tells _on_wake_exit (fired by the normal reaper once the
+                    # SIGTERM lands) this wake's silence is already explained.
+                    fields["stuck_killed_wake_id"] = wake_id
+                _merge_agent_meta(room_id, agent_name, fields)
                 announced.append(f"{agent_name}@{room_id}")
             except Exception as exc:
                 print(f"[huddle] stuck-wake notice post failed "

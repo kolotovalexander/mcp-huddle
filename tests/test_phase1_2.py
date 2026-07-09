@@ -2,6 +2,7 @@
 thread_id parsing, codex_resume helper, /api/room_agents and SSE endpoint)."""
 import json
 import os
+import subprocess
 import tempfile
 import time
 import importlib
@@ -64,6 +65,10 @@ def test_spawn_all_per_agent_briefs(tmp_path: Path, monkeypatch) -> None:
         {"name": "Beta",  "cmd": ["echo", "beta={brief}"],  "enabled": True},
     ]
     monkeypatch.setattr(spawn, "load_registry", lambda: fake_registry)
+    # Alpha/Beta both resolve to the same effective binary ("echo") — disable
+    # the same-binary stagger so this brief-substitution test isn't slowed
+    # down by (or coupled to) unrelated staggering behavior.
+    monkeypatch.setenv("MCP_HUDDLE_SAME_BIN_STAGGER_SEC", "0")
     log_dir = tmp_path / "agents"
     names, pids, agent_meta = spawn.spawn_all(
         brief="DEFAULT", cwd=str(tmp_path), log_dir=log_dir,
@@ -86,6 +91,7 @@ def test_spawn_all_skip_names_excludes_owner(tmp_path: Path, monkeypatch) -> Non
         {"name": "Claude",      "cmd": ["echo", "claude={brief}"],      "enabled": True},
     ]
     monkeypatch.setattr(spawn, "load_registry", lambda: fake_registry)
+    monkeypatch.setenv("MCP_HUDDLE_SAME_BIN_STAGGER_SEC", "0")  # all 3 use "echo"
     names, _, _ = spawn.spawn_all(
         brief="B", cwd=str(tmp_path), log_dir=tmp_path / "agents",
         skip_names={"Codex"},
@@ -346,6 +352,7 @@ def test_spawn_agents_skips_owner_via_server(
     monkeypatch.setattr(spawn, "load_registry", lambda: fake_registry)
     monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path / "huddle"))
     monkeypatch.setattr(bus, "HUDDLE_HOME", tmp_path / "huddle")
+    monkeypatch.setenv("MCP_HUDDLE_SAME_BIN_STAGGER_SEC", "0")  # all 3 use "echo"
 
     captured: dict = {}
     real_spawn_all = spawn.spawn_all
@@ -385,6 +392,167 @@ def test_spawn_all_logs_unexpected_oserror(
     assert "failed to spawn Gemini" in err
     assert "BlockingIOError" in err
     assert "daemon spawn pipe blocked" in err
+
+
+# ── Same-binary spawn stagger (spawn.compute_stagger_delays) ────────────────
+
+def test_effective_binary_unwraps_timeout_wrapper() -> None:
+    """A `timeout N <bin> ...` prefix must resolve to the same effective
+    binary as a bare invocation of <bin>, so a timeout-wrapped and unwrapped
+    spec of the same underlying CLI are recognized as colliding."""
+    assert spawn._effective_binary(["timeout", "240", "opencode", "run"]) == "opencode"
+    assert spawn._effective_binary(
+        ["/opt/homebrew/bin/timeout", "590s", "agy", "-p", "x"]
+    ) == "agy"
+    assert spawn._effective_binary(["opencode", "run"]) == "opencode"
+    assert spawn._effective_binary([]) == ""
+    # A flag between `timeout` and the duration (e.g. --foreground) is skipped too.
+    assert spawn._effective_binary(
+        ["timeout", "--foreground", "120", "codex", "exec"]
+    ) == "codex"
+
+
+def test_compute_stagger_delays_same_vs_different_binary() -> None:
+    same_binary = [
+        {"name": "A", "cmd": ["opencode", "run"], "enabled": True},
+        {"name": "B", "cmd": ["opencode", "run"], "enabled": True},
+        {"name": "C", "cmd": ["timeout", "240", "opencode", "run"], "enabled": True},
+    ]
+    delays = spawn.compute_stagger_delays(same_binary, stagger_sec=20.0)
+    assert delays == {"A": 0.0, "B": 20.0, "C": 40.0}
+
+    different_binaries = [
+        {"name": "A", "cmd": ["codex", "exec"], "enabled": True},
+        {"name": "B", "cmd": ["agy", "-p"], "enabled": True},
+    ]
+    assert spawn.compute_stagger_delays(different_binaries, stagger_sec=20.0) == {
+        "A": 0.0, "B": 0.0,
+    }
+
+    # stagger_sec=0 (MCP_HUDDLE_SAME_BIN_STAGGER_SEC=0) disables it entirely.
+    assert spawn.compute_stagger_delays(same_binary, stagger_sec=0.0) == {
+        "A": 0.0, "B": 0.0, "C": 0.0,
+    }
+
+
+def test_spawn_all_staggers_second_same_binary_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """spawn_all must not start two same-binary specs at once (fixes
+    OpenCode's local-SQLite 'database is locked' when two `opencode run`
+    processes race). The second spec is scheduled via threading.Timer
+    instead of spawned synchronously; its identity (log paths) is still
+    registered in the return value immediately."""
+    fake_registry: list[spawn.SpawnSpec] = [
+        {"name": "First",  "cmd": ["echo", "first={brief}"],  "enabled": True},
+        {"name": "Second", "cmd": ["echo", "second={brief}"], "enabled": True},
+    ]
+    monkeypatch.setattr(spawn, "load_registry", lambda: fake_registry)
+    monkeypatch.setenv("MCP_HUDDLE_SAME_BIN_STAGGER_SEC", "20")
+
+    scheduled: list[tuple] = []
+
+    class FakeTimer:
+        def __init__(self, delay, func, *a, **kw):
+            scheduled.append((delay, func))
+
+        def start(self):
+            pass  # never actually fires — this test only asserts scheduling
+
+        daemon = False
+
+    monkeypatch.setattr(spawn.threading, "Timer", FakeTimer)
+
+    names, pids, agent_meta = spawn.spawn_all(
+        brief="B", cwd=str(tmp_path), log_dir=tmp_path / "agents",
+    )
+
+    assert sorted(names) == ["First", "Second"]
+    # Only the immediate (non-delayed) spec actually spawned a real process.
+    assert len(pids) == 1
+    # The delayed spec's identity is registered right away regardless.
+    assert agent_meta["Second"]["log_path"].endswith("second.events.jsonl")
+    assert len(scheduled) == 1
+    assert scheduled[0][0] == 20.0  # occurrence index 1 * stagger_sec
+
+
+def test_spawn_all_no_stagger_for_different_binaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two specs resolving to DIFFERENT effective binaries must both spawn
+    synchronously — the stagger only guards same-binary collisions."""
+    fake_registry: list[spawn.SpawnSpec] = [
+        {"name": "Alpha", "cmd": ["echo", "a={brief}"], "enabled": True},
+        {"name": "Beta",  "cmd": ["true"], "enabled": True},
+    ]
+    monkeypatch.setattr(spawn, "load_registry", lambda: fake_registry)
+    monkeypatch.setenv("MCP_HUDDLE_SAME_BIN_STAGGER_SEC", "20")
+
+    scheduled: list[tuple] = []
+    monkeypatch.setattr(
+        spawn.threading, "Timer",
+        lambda *a, **kw: scheduled.append(a) or type("T", (), {"start": lambda self: None})(),
+    )
+
+    names, pids, agent_meta = spawn.spawn_all(
+        brief="B", cwd=str(tmp_path), log_dir=tmp_path / "agents",
+    )
+
+    assert sorted(names) == ["Alpha", "Beta"]
+    assert len(pids) == 2  # both spawned synchronously — no stagger triggered
+    assert scheduled == []
+
+
+# ── Curated auto_spawn=True roster (SpawnSpec "auto" flag) ──────────────────
+
+def test_auto_spawn_true_skips_spec_marked_auto_false(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """spawn_all (the auto_spawn=True path) must skip a spec with
+    "auto": false even though it is enabled+available, while load_registry()
+    itself keeps listing it (the flag only curates the auto-spawn roster, it
+    doesn't disable the agent outright)."""
+    fake_registry: list[spawn.SpawnSpec] = [
+        {"name": "Included", "cmd": ["echo", "inc={brief}"], "enabled": True},
+        {"name": "Excluded", "cmd": ["echo", "exc={brief}"], "enabled": True,
+         "auto": False},
+    ]
+    monkeypatch.setattr(spawn, "load_registry", lambda: fake_registry)
+    monkeypatch.setenv("MCP_HUDDLE_SAME_BIN_STAGGER_SEC", "0")  # both use "echo"
+
+    names, _, _ = spawn.spawn_all(
+        brief="B", cwd=str(tmp_path), log_dir=tmp_path / "agents",
+    )
+    assert names == ["Included"]
+    assert "Excluded" not in names
+
+    # load_registry() (the raw enabled+available registry) still lists it —
+    # only the auto_spawn=True roster excludes it.
+    assert {s["name"] for s in spawn.load_registry()} == {"Included", "Excluded"}
+
+
+def test_dict_auto_spawn_ignores_auto_false_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit dict auto_spawn={name: brief} always spawns the named
+    agent, even if its spec is marked "auto": false — a deliberately named
+    agent always works (only auto_spawn=True consults the flag)."""
+    fake_registry: list[spawn.SpawnSpec] = [
+        {"name": "Excluded", "cmd": ["echo", "exc={brief}"], "enabled": True,
+         "auto": False},
+    ]
+    monkeypatch.setattr(spawn, "load_registry", lambda: fake_registry)
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path / "huddle"))
+    monkeypatch.setattr(bus, "HUDDLE_HOME", tmp_path / "huddle")
+
+    room_id = bus.create_room("test-room", "Human", os.getpid(), str(tmp_path), "sess-1")
+    server._spawn_agents(
+        room_id=room_id, name="test-room", goal="g", cwd=str(tmp_path),
+        owner="Human", auto_spawn={"Excluded": "custom brief"},
+    )
+    info = bus.get_room_info(room_id)
+    assert "Excluded" in info.get("participants", [])
+    assert "Excluded" in (info.get("agent_meta") or {})
 
 
 def test_binary_resolution_uses_absolute_fallback(
@@ -1634,6 +1802,11 @@ def test_check_stuck_wakes_announces_once(
     wake_id does not duplicate it."""
     monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
     monkeypatch.setattr(server, "WAKE_STUCK_SECS", 60)
+    # last_wake_pid below is THIS TEST PROCESS's own pid (a real live pid is
+    # needed for the "alive" branch) — the stuck-kill feature (see
+    # test_check_stuck_wakes_kills_live_pid) must stay OFF here, or it would
+    # SIGTERM the test runner itself.
+    monkeypatch.setattr(server, "STUCK_KILL_ENABLED", False)
     isolated_bus = importlib.reload(bus)
     monkeypatch.setattr(server, "bus", isolated_bus)
 
@@ -1690,6 +1863,135 @@ def test_check_stuck_wakes_disabled_by_zero(
     isolated_bus.set_status(room_id, "Codex", "busy", 300, "session-1")
 
     assert server._check_stuck_wakes() == []
+
+
+def test_check_stuck_wakes_kills_live_pid_when_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default STUCK_KILL_ENABLED behavior: a stuck wake with a genuinely
+    live pid gets SIGTERMed after the announcement, and the kill is recorded
+    via stuck_killed_wake_id (so the reaper's own _on_wake_exit doesn't post
+    a second, redundant notice — see test_on_wake_exit_after_stuck_kill_*)."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    monkeypatch.setattr(server, "WAKE_STUCK_SECS", 60)
+    monkeypatch.setattr(server, "STUCK_KILL_ENABLED", True)
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    room_id = isolated_bus.create_room("Wake", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Codex")
+
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        wake_id = "wake-kill"
+        meta = isolated_bus.get_room_info(room_id)
+        meta["agent_meta"] = {"Codex": {
+            "wake_id": wake_id,
+            "last_wake_pid": proc.pid,
+            "last_wake_at": int(time.time()) - 3600,
+            "last_wake_msg_id": 4,
+        }}
+        isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+        isolated_bus.set_status(room_id, "Codex", "busy", 300, "session-1")
+
+        announced = server._check_stuck_wakes()
+        assert announced == [f"Codex@{room_id}"]
+
+        rc = proc.wait(timeout=5)  # SIGTERM was delivered — must exit promptly
+        assert rc != 0  # terminated, not a clean exit
+
+        messages = isolated_bus._load_messages(room_id)
+        comments = [m for m in messages if m.get("kind") == "comment"]
+        assert len(comments) == 1
+        assert "остановлен" in comments[0]["body"]
+
+        info = isolated_bus.get_room_info(room_id)["agent_meta"]["Codex"]
+        assert info["stuck_killed_wake_id"] == wake_id
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+def test_check_stuck_wakes_disabled_flag_announces_only_no_kill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MCP_HUDDLE_STUCK_KILL=0 (STUCK_KILL_ENABLED False) → legacy
+    announce-only behavior, process is left running, no stuck_killed_wake_id."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    monkeypatch.setattr(server, "WAKE_STUCK_SECS", 60)
+    monkeypatch.setattr(server, "STUCK_KILL_ENABLED", False)
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    room_id = isolated_bus.create_room("Wake", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Codex")
+
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        wake_id = "wake-no-kill"
+        meta = isolated_bus.get_room_info(room_id)
+        meta["agent_meta"] = {"Codex": {
+            "wake_id": wake_id,
+            "last_wake_pid": proc.pid,
+            "last_wake_at": int(time.time()) - 3600,
+            "last_wake_msg_id": 4,
+        }}
+        isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+        isolated_bus.set_status(room_id, "Codex", "busy", 300, "session-1")
+
+        announced = server._check_stuck_wakes()
+        assert announced == [f"Codex@{room_id}"]
+
+        assert proc.poll() is None  # still alive — not killed
+
+        messages = isolated_bus._load_messages(room_id)
+        comments = [m for m in messages if m.get("kind") == "comment"]
+        assert len(comments) == 1
+        assert "жив" in comments[0]["body"]
+        assert "остановлен" not in comments[0]["body"]
+
+        info = isolated_bus.get_room_info(room_id)["agent_meta"]["Codex"]
+        assert "stuck_killed_wake_id" not in info
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
+def test_on_wake_exit_after_stuck_kill_suppresses_noreply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once _check_stuck_wakes has recorded stuck_killed_wake_id for a wake,
+    the killed process's own reaper on_exit (_on_wake_exit) must not post a
+    second, redundant noreply notice on top of the stuck notice."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    room_id = isolated_bus.create_room("Wake", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Codex")
+
+    wake_id = "wake-kill-2"
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {"Codex": {
+        "wake_id": wake_id,
+        "last_wake_pid": 999999999,  # _on_wake_exit doesn't consult this
+        "last_wake_at": int(time.time()) - 3600,
+        "last_wake_msg_id": 4,
+        "stuck_killed_wake_id": wake_id,  # as if _check_stuck_wakes just killed it
+    }}
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+    isolated_bus.set_status(room_id, "Codex", "busy", 300, "session-1")
+    # The stuck notice itself, as _check_stuck_wakes would have posted it.
+    isolated_bus.post_message(room_id, "Codex", "⏳ stuck — killed", "comment")
+
+    server._on_wake_exit(room_id, "Codex", wake_id, -15)  # SIGTERM exit
+
+    messages = isolated_bus._load_messages(room_id)
+    comments = [m for m in messages if m.get("kind") == "comment"]
+    assert len(comments) == 1  # no second (noreply) notice piled on top
+    statuses = isolated_bus.get_status(room_id)
+    assert statuses.get("Codex") == "online"  # lease still released normally
 
 
 # ── Dead-wake watchdog check (_check_dead_wakes) ────────────────────────────
@@ -1807,6 +2109,45 @@ def test_check_dead_wakes_skips_notice_but_still_clears_lease_if_agent_replied(
 
     statuses = isolated_bus.get_status(room_id)
     assert statuses.get("Codex") == "online"  # lease actually released
+
+
+def test_check_dead_wakes_skips_notice_for_already_stuck_killed_wake(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If _check_stuck_wakes killed a process whose own reaper thread never
+    fires (e.g. it died together with the server), _check_dead_wakes must
+    still release the lease but must NOT post its own "процесс умер" notice
+    on top of the stuck notice that already explained the silence."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    monkeypatch.setattr(server, "DEAD_WAKE_GRACE_SECS", 60)
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    room_id = isolated_bus.create_room("Wake", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Codex")
+    isolated_bus.post_message(room_id, "Codex", "⏳ stuck — killed", "comment")
+
+    wake_id = "wake-stuck-then-dead"
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {"Codex": {
+        "wake_id": wake_id,
+        "last_wake_pid": _DEAD_PID,
+        "last_wake_at": int(time.time()) - 3600,
+        "last_wake_msg_id": 4,
+        "stuck_killed_wake_id": wake_id,
+    }}
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+    isolated_bus.set_status(room_id, "Codex", "busy", 300, "session-1")
+
+    announced = server._check_dead_wakes()
+    assert announced == [f"Codex@{room_id}"]  # lease released
+
+    messages = isolated_bus._load_messages(room_id)
+    comments = [m for m in messages if m.get("kind") == "comment"]
+    assert len(comments) == 1  # only the earlier stuck notice — no dup
+
+    statuses = isolated_bus.get_status(room_id)
+    assert statuses.get("Codex") == "online"
 
 
 def test_check_dead_wakes_ignores_alive_pid(

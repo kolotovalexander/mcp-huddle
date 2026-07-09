@@ -19,7 +19,13 @@ Each registry entry is a SpawnSpec:
   {
     "name": "Codex",                              # display name in the room
     "cmd":  ["codex", "...", "{brief}"],          # argv; "{brief}" is replaced
-    "enabled": true                               # set False to skip
+    "enabled": true,                              # set False to skip
+    "auto": true                                  # optional, default true; set
+                                                    # false to exclude from
+                                                    # auto_spawn=True while still
+                                                    # reachable via an explicit
+                                                    # dict auto_spawn, room_invite,
+                                                    # or a wake-path request
   }
 
 A missing binary is auto-disabled at module-load time so room_create with
@@ -65,6 +71,12 @@ class SpawnSpec(TypedDict):
     probe_chat_url: NotRequired[str]
     probe_chat_model: NotRequired[str]
     probe_timeout_sec: NotRequired[float]
+    # Curated auto_spawn=True roster flag. Defaults to True when absent — set
+    # False on a spec to exclude it from `auto_spawn=True` while still
+    # allowing it to be woken by an explicit dict auto_spawn={name: brief},
+    # room_invite, or a wake-path request (those always ignore this flag; a
+    # deliberately named agent always works). See _filter_for_auto_spawn_true.
+    auto: NotRequired[bool]
 
 
 class AgentSpawnError(RuntimeError):
@@ -701,6 +713,116 @@ def spawn_agent(
     return proc.pid, str(log_path), last_msg_path
 
 
+# ── Same-binary spawn stagger ────────────────────────────────────────────────
+#
+# Two same-binary CLI processes started simultaneously in one batch can
+# collide on shared local state (verified live: two `opencode run` processes
+# racing on OpenCode's local SQLite → "database is locked"). Within a single
+# batch spawn (room_create auto_spawn=True / dict), each spec after the first
+# that resolves to the same *effective* binary is delayed by
+# MCP_HUDDLE_SAME_BIN_STAGGER_SEC seconds (multiplied by its occurrence index,
+# so a third same-binary spec waits 2x the stagger, a fourth 3x, ...).
+
+def _effective_binary(cmd: list[str]) -> str:
+    """Return the binary name a spec's argv actually execs, for same-binary
+    collision detection — cmd[0], but skipping a leading `timeout` wrapper
+    (`timeout 240 opencode ...` / `/opt/homebrew/bin/timeout 590s agy ...`)
+    and its duration/flag arguments, so a timeout-wrapped invocation and a
+    bare one of the same underlying binary are recognized as the same thing.
+    Empty cmd → "" (never staggered against anything).
+    """
+    if not cmd:
+        return ""
+    idx = 0
+    if Path(cmd[0]).name == "timeout":
+        idx = 1
+        while idx < len(cmd):
+            tok = cmd[idx]
+            if tok.startswith("-"):
+                idx += 1
+                continue
+            if re.fullmatch(r"\d+(\.\d+)?[smhd]?", tok):
+                idx += 1
+                continue
+            break
+    if idx >= len(cmd):
+        return ""
+    return Path(cmd[idx]).name
+
+
+def _same_bin_stagger_sec() -> float:
+    raw = os.environ.get("MCP_HUDDLE_SAME_BIN_STAGGER_SEC", "20")
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return 20.0
+    return max(0.0, val)
+
+
+def compute_stagger_delays(
+    specs: list[SpawnSpec], stagger_sec: float | None = None
+) -> dict[str, float]:
+    """Return {spec_name: delay_sec} for a batch of specs about to be spawned
+    together, in the given order. The first spec seen for a given effective
+    binary gets delay 0; each later spec resolving to the SAME effective
+    binary is delayed by stagger_sec * occurrence_index. A spec whose
+    effective binary can't be determined (empty cmd) is never delayed.
+    """
+    if stagger_sec is None:
+        stagger_sec = _same_bin_stagger_sec()
+    delays: dict[str, float] = {}
+    if stagger_sec <= 0:
+        return {spec["name"]: 0.0 for spec in specs}
+    seen: dict[str, int] = {}
+    for spec in specs:
+        binary = _effective_binary(spec.get("cmd") or [])
+        if not binary:
+            delays[spec["name"]] = 0.0
+            continue
+        occurrence = seen.get(binary, 0)
+        seen[binary] = occurrence + 1
+        delays[spec["name"]] = stagger_sec * occurrence
+    return delays
+
+
+def _placeholder_agent_meta(
+    spec: SpawnSpec, brief: str, log_dir: Path
+) -> dict[str, str | None]:
+    """Deterministic {log_path, last_message_path} for a spec, computable
+    without actually spawning a process — lets a delayed (staggered) spawn's
+    identity be registered in agent_meta immediately, before its process
+    exists, so the room already knows it's coming."""
+    _, last_msg_path = _resolve_spawn_args(spec, brief, log_dir)
+    log_path = log_dir / f"{spec['name'].lower()}.events.jsonl"
+    return {"log_path": str(log_path), "last_message_path": last_msg_path}
+
+
+def _schedule_delayed_spawn(
+    delay: float,
+    spec: SpawnSpec,
+    brief: str,
+    cwd: str,
+    log_dir: Path,
+    on_exit=None,
+    on_spawn_fail=None,
+) -> threading.Timer:
+    """Fire spawn_agent(spec, ...) after `delay` seconds on a daemon timer
+    thread, without blocking the caller. Spawn failures are logged/notified
+    the same way a synchronous spawn_all failure would be, but cannot
+    propagate to the caller (the caller has already returned)."""
+    def _fire() -> None:
+        try:
+            spawn_agent(spec, brief, cwd, log_dir, on_exit=on_exit)
+        except (FileNotFoundError, PermissionError, AgentSpawnError, OSError) as exc:
+            log_spawn_failure(spec, brief, cwd, log_dir, exc)
+            _safe_notify_spawn_fail(on_spawn_fail, spec["name"], exc)
+
+    timer = threading.Timer(delay, _fire)
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
 def _safe_notify_spawn_fail(on_spawn_fail, name: str, exc: BaseException) -> None:
     """Best-effort: a broken caller callback must never break the spawn loop."""
     if on_spawn_fail is None:
@@ -734,6 +856,22 @@ def spawn_all(
         every agent that fails to spawn, so the caller can surface it (e.g.
         post a room notice) without changing control flow here.
 
+    spawn_all is the auto_spawn=True path (the only caller, server._spawn_agents'
+    else-branch) — it honours each spec's optional "auto" flag: a spec with
+    "auto": false is skipped here even though it's enabled+available, staying
+    reachable only via an explicit dict auto_spawn={name: brief}, room_invite,
+    or a wake-path request (server.py talks to the registry directly for
+    those, bypassing this filter). A spec with no "auto" key defaults to True.
+
+    Same-binary stagger: within this batch, a spec resolving to the same
+    effective binary (see _effective_binary) as an earlier spec in the batch
+    is NOT spawned synchronously — it is scheduled on a daemon
+    threading.Timer after MCP_HUDDLE_SAME_BIN_STAGGER_SEC seconds (0
+    disables), so two colliding processes (e.g. two `opencode run`) never
+    start at the same instant. Its name/agent_meta (log paths) are still
+    registered in the return value immediately; its pid is not (unknown at
+    return time) and it does not participate in verify_alive_sec.
+
     Returns:
       (names, pids, agent_meta) where agent_meta is
       {name: {"log_path": "...", "last_message_path": "..." or None}}.
@@ -743,12 +881,25 @@ def spawn_all(
     agent_meta: dict[str, dict[str, str | None]] = {}
     briefs = briefs or {}
     skip_names = skip_names or set()
-    for spec in load_registry():
-        if not spec.get("enabled"):
-            continue
-        if spec["name"] in skip_names:
-            continue
+    specs = [
+        spec for spec in load_registry()
+        if spec.get("enabled")
+        and spec["name"] not in skip_names
+        and spec.get("auto", True) is not False
+    ]
+    delays = compute_stagger_delays(specs)
+    for spec in specs:
         agent_brief = briefs.get(spec["name"], brief)
+        delay = delays.get(spec["name"], 0.0)
+        if delay > 0:
+            names.append(spec["name"])
+            agent_meta[spec["name"]] = _placeholder_agent_meta(spec, agent_brief, log_dir)
+            _schedule_delayed_spawn(
+                delay, spec, agent_brief, cwd, log_dir,
+                on_exit=on_exit_factory(spec["name"]) if on_exit_factory else None,
+                on_spawn_fail=on_spawn_fail,
+            )
+            continue
         try:
             pid, log_path, last_msg = spawn_agent(
                 spec, agent_brief, cwd, log_dir,
