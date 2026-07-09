@@ -805,17 +805,51 @@ def _schedule_delayed_spawn(
     log_dir: Path,
     on_exit=None,
     on_spawn_fail=None,
+    should_spawn=None,
+    on_spawned=None,
 ) -> threading.Timer:
     """Fire spawn_agent(spec, ...) after `delay` seconds on a daemon timer
     thread, without blocking the caller. Spawn failures are logged/notified
     the same way a synchronous spawn_all failure would be, but cannot
-    propagate to the caller (the caller has already returned)."""
+    propagate to the caller (the caller has already returned).
+
+    should_spawn: optional callable() -> bool re-checked WHEN THE TIMER FIRES
+      (not at scheduling time) — the room's state may have changed inside the
+      stagger window (closed/deleted). False → the spawn is skipped with a
+      stderr log line; a check that raises is treated as False (don't spawn
+      into an unknown state).
+    on_spawned: optional callable(pid) invoked (best-effort) with the newly
+      spawned process's pid — lets the caller record it where the synchronous
+      path records pids (e.g. the room's spawned_pids, so close_room can kill
+      a staggered process instead of orphaning it).
+    """
     def _fire() -> None:
+        if should_spawn is not None:
+            try:
+                ok = bool(should_spawn())
+            except Exception as exc:
+                print(f"[mcp-huddle] delayed-spawn gate error for "
+                      f"{spec['name']}: {exc}; skipping spawn",
+                      file=sys.stderr, flush=True)
+                return
+            if not ok:
+                print(f"[mcp-huddle] skipping delayed spawn of {spec['name']}: "
+                      f"room no longer accepts spawns (closed/deleted during "
+                      f"the stagger window)", file=sys.stderr, flush=True)
+                return
         try:
-            spawn_agent(spec, brief, cwd, log_dir, on_exit=on_exit)
+            pid, _, _ = spawn_agent(spec, brief, cwd, log_dir, on_exit=on_exit)
         except (FileNotFoundError, PermissionError, AgentSpawnError, OSError) as exc:
             log_spawn_failure(spec, brief, cwd, log_dir, exc)
             _safe_notify_spawn_fail(on_spawn_fail, spec["name"], exc)
+            return
+        if on_spawned is not None:
+            try:
+                on_spawned(pid)
+            except Exception as exc:  # never let a broken callback leak upward
+                print(f"[mcp-huddle] delayed-spawn on_spawned callback error "
+                      f"for {spec['name']} (pid {pid}): {exc}",
+                      file=sys.stderr, flush=True)
 
     timer = threading.Timer(delay, _fire)
     timer.daemon = True
@@ -842,6 +876,8 @@ def spawn_all(
     on_exit_factory=None,
     skip_names: set[str] | None = None,
     on_spawn_fail=None,
+    delayed_spawn_gate=None,
+    on_delayed_spawn=None,
 ) -> tuple[list[str], list[int], dict[str, dict[str, str | None]]]:
     """Spawn every enabled agent in the registry.
 
@@ -855,6 +891,13 @@ def spawn_all(
       on_spawn_fail: optional callable(name, exc) invoked (best-effort) for
         every agent that fails to spawn, so the caller can surface it (e.g.
         post a room notice) without changing control flow here.
+      delayed_spawn_gate: optional callable() -> bool re-checked when a
+        staggered spawn's timer fires — False (or a raise) skips the spawn
+        (e.g. the room was closed/deleted inside the stagger window).
+      on_delayed_spawn: optional callable(name, pid) invoked once a staggered
+        spawn actually starts, so the caller can record the pid it could not
+        get from the return value (e.g. into the room's spawned_pids for
+        close_room's kill sweep).
 
     spawn_all is the auto_spawn=True path (the only caller, server._spawn_agents'
     else-branch) — it honours each spec's optional "auto" flag: a spec with
@@ -894,10 +937,15 @@ def spawn_all(
         if delay > 0:
             names.append(spec["name"])
             agent_meta[spec["name"]] = _placeholder_agent_meta(spec, agent_brief, log_dir)
+            spawned_cb = None
+            if on_delayed_spawn is not None:
+                spawned_cb = (lambda name_: lambda pid: on_delayed_spawn(name_, pid))(spec["name"])
             _schedule_delayed_spawn(
                 delay, spec, agent_brief, cwd, log_dir,
                 on_exit=on_exit_factory(spec["name"]) if on_exit_factory else None,
                 on_spawn_fail=on_spawn_fail,
+                should_spawn=delayed_spawn_gate,
+                on_spawned=spawned_cb,
             )
             continue
         try:

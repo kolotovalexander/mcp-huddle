@@ -555,6 +555,137 @@ def test_dict_auto_spawn_ignores_auto_false_flag(
     assert "Excluded" in (info.get("agent_meta") or {})
 
 
+class _CapturedTimer:
+    """threading.Timer stand-in: records the fire fn instead of scheduling it,
+    so a test can drive 'the stagger window elapsed' deterministically."""
+    fired: list = []  # (delay, func) — reset per test
+
+    def __init__(self, delay, func, *a, **kw):
+        _CapturedTimer.fired.append((delay, func))
+        self.daemon = False
+
+    def start(self):
+        pass
+
+
+def test_delayed_spawn_skipped_when_room_closed_mid_stagger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: a room closed inside the stagger window must NOT get a
+    fresh agent spawned into it when the delayed timer fires — the _fire
+    gate re-checks room status at fire time, not at scheduling time."""
+    fake_registry: list[spawn.SpawnSpec] = [
+        {"name": "First",  "cmd": ["echo", "first={brief}"],  "enabled": True},
+        {"name": "Second", "cmd": ["echo", "second={brief}"], "enabled": True},
+    ]
+    monkeypatch.setattr(spawn, "load_registry", lambda: fake_registry)
+    monkeypatch.setenv("MCP_HUDDLE_SAME_BIN_STAGGER_SEC", "20")
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path / "huddle"))
+    monkeypatch.setattr(bus, "HUDDLE_HOME", tmp_path / "huddle")
+    _CapturedTimer.fired = []
+    monkeypatch.setattr(spawn.threading, "Timer", _CapturedTimer)
+
+    spawn_calls: list[str] = []
+    real_spawn_agent = spawn.spawn_agent
+
+    def counting_spawn_agent(spec, *a, **kw):
+        spawn_calls.append(spec["name"])
+        return real_spawn_agent(spec, *a, **kw)
+
+    monkeypatch.setattr(spawn, "spawn_agent", counting_spawn_agent)
+
+    room_id = bus.create_room("test-room", "Human", os.getpid(), str(tmp_path), "sess-1")
+    server._spawn_agents(
+        room_id=room_id, name="test-room", goal="g", cwd=str(tmp_path),
+        owner="Human", auto_spawn=True,
+    )
+    assert spawn_calls == ["First"]  # Second is deferred to the timer
+    assert len(_CapturedTimer.fired) == 1
+
+    # The room closes INSIDE the stagger window, before the timer fires.
+    bus.close_room(room_id, "Human")
+
+    _CapturedTimer.fired[0][1]()  # the stagger window elapses
+
+    assert spawn_calls == ["First"]  # no spawn into the closed room
+    meta = bus._read_meta(room_id)
+    assert meta["status"] == "closed"
+
+
+def test_delayed_spawn_pid_recorded_in_spawned_pids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: a staggered spawn's pid (unknown at _spawn_agents return
+    time) must land in meta['spawned_pids'] once the timer fires — otherwise
+    close_room's kill sweep (_kill_spawned iterates spawned_pids) would
+    orphan a process started during the stagger window."""
+    fake_registry: list[spawn.SpawnSpec] = [
+        {"name": "First",  "cmd": ["echo", "first={brief}"],  "enabled": True},
+        {"name": "Second", "cmd": ["echo", "second={brief}"], "enabled": True},
+    ]
+    monkeypatch.setattr(spawn, "load_registry", lambda: fake_registry)
+    monkeypatch.setenv("MCP_HUDDLE_SAME_BIN_STAGGER_SEC", "20")
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path / "huddle"))
+    monkeypatch.setattr(bus, "HUDDLE_HOME", tmp_path / "huddle")
+    _CapturedTimer.fired = []
+    monkeypatch.setattr(spawn.threading, "Timer", _CapturedTimer)
+
+    room_id = bus.create_room("test-room", "Human", os.getpid(), str(tmp_path), "sess-1")
+    server._spawn_agents(
+        room_id=room_id, name="test-room", goal="g", cwd=str(tmp_path),
+        owner="Human", auto_spawn=True,
+    )
+    pids_before = list(bus._read_meta(room_id).get("spawned_pids") or [])
+    assert len(pids_before) == 1  # only the synchronous First so far
+    assert len(_CapturedTimer.fired) == 1
+
+    _CapturedTimer.fired[0][1]()  # room still open — the delayed spawn fires
+
+    pids_after = list(bus._read_meta(room_id).get("spawned_pids") or [])
+    assert len(pids_after) == 2  # Second's pid merged in → killable by close_room
+    assert set(pids_before) < set(pids_after)
+
+
+def test_delayed_spawn_dict_branch_gates_and_records_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The explicit-dict auto_spawn branch mirrors the spawn_all path: its
+    staggered spawn is gated on room status at fire time and records its pid."""
+    fake_registry: list[spawn.SpawnSpec] = [
+        {"name": "First",  "cmd": ["echo", "first={brief}"],  "enabled": True},
+        {"name": "Second", "cmd": ["echo", "second={brief}"], "enabled": True},
+    ]
+    monkeypatch.setattr(spawn, "load_registry", lambda: fake_registry)
+    monkeypatch.setenv("MCP_HUDDLE_SAME_BIN_STAGGER_SEC", "20")
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path / "huddle"))
+    monkeypatch.setattr(bus, "HUDDLE_HOME", tmp_path / "huddle")
+    _CapturedTimer.fired = []
+    monkeypatch.setattr(spawn.threading, "Timer", _CapturedTimer)
+
+    # Room 1: fire with the room open → pid recorded.
+    room_open = bus.create_room("r-open", "Human", os.getpid(), str(tmp_path), "s1")
+    server._spawn_agents(
+        room_id=room_open, name="r-open", goal="g", cwd=str(tmp_path),
+        owner="Human", auto_spawn={"First": "a", "Second": "b"},
+    )
+    assert len(_CapturedTimer.fired) == 1
+    _CapturedTimer.fired[0][1]()
+    assert len(bus._read_meta(room_open).get("spawned_pids") or []) == 2
+
+    # Room 2: close before the timer fires → delayed spawn skipped.
+    _CapturedTimer.fired = []
+    room_closed = bus.create_room("r-closed", "Human", os.getpid(), str(tmp_path), "s2")
+    server._spawn_agents(
+        room_id=room_closed, name="r-closed", goal="g", cwd=str(tmp_path),
+        owner="Human", auto_spawn={"First": "a", "Second": "b"},
+    )
+    assert len(_CapturedTimer.fired) == 1
+    pids_at_close = list(bus._read_meta(room_closed).get("spawned_pids") or [])
+    bus.close_room(room_closed, "Human")
+    _CapturedTimer.fired[0][1]()
+    assert (bus._read_meta(room_closed).get("spawned_pids") or []) == pids_at_close
+
+
 def test_binary_resolution_uses_absolute_fallback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

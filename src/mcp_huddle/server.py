@@ -989,6 +989,35 @@ def _announce_spawn_failure(room_id: str, agent_name: str, exc: BaseException,
               f"({agent_name}@{room_id}): {post_exc}", flush=True)
 
 
+def _room_open_for_spawn(room_id: str) -> bool:
+    """Gate for staggered (delayed) spawns: re-checked when the timer fires.
+    The room may have been closed or deleted inside the stagger window — a
+    fresh agent must not be spawned into a terminal/missing room."""
+    try:
+        info = bus.get_room_info(room_id)
+    except Exception:
+        return False
+    return bool(info) and info.get("status") in ("open", "idle")
+
+
+def _record_spawned_pid(room_id: str, pid: int) -> None:
+    """Merge one late-known pid into the room's spawned_pids (locked RMW).
+    Used by staggered spawns, whose pid isn't known at _spawn_agents time —
+    without this, close_room's kill sweep (_kill_spawned reads spawned_pids)
+    would orphan a process spawned during the stagger window."""
+    def _upd(m: dict) -> dict:
+        pids = m.get("spawned_pids") or []
+        if pid not in pids:
+            pids.append(pid)
+        m["spawned_pids"] = pids
+        return m
+    try:
+        bus._update_meta_locked(room_id, _upd)
+    except Exception as exc:
+        print(f"[huddle] failed to record delayed-spawn pid {pid} "
+              f"({room_id}): {exc}", flush=True)
+
+
 def _spawn_agents(
     room_id: str,
     name: str,
@@ -1067,6 +1096,8 @@ def _spawn_agents(
                     delay, spec, agent_brief, cwd, log_dir,
                     on_exit=_make_initial_spawn_callback(room_id, spec["name"]),
                     on_spawn_fail=lambda n, exc: _announce_spawn_failure(room_id, n, exc, "init"),
+                    should_spawn=lambda: _room_open_for_spawn(room_id),
+                    on_spawned=lambda pid: _record_spawned_pid(room_id, pid),
                 )
                 continue
             try:
@@ -1093,7 +1124,9 @@ def _spawn_agents(
             default_brief, cwd, log_dir,
             on_exit_factory=lambda n: _make_initial_spawn_callback(room_id, n),
             skip_names=skip_owner,
-            on_spawn_fail=lambda n, exc: _announce_spawn_failure(room_id, n, exc, "init"))
+            on_spawn_fail=lambda n, exc: _announce_spawn_failure(room_id, n, exc, "init"),
+            delayed_spawn_gate=lambda: _room_open_for_spawn(room_id),
+            on_delayed_spawn=lambda n, pid: _record_spawned_pid(room_id, pid))
 
     for n in names:
         bus.invite_agent(room_id, n)
@@ -1737,7 +1770,12 @@ def _kill_stuck_wake_pid(pid: int, agent_name: str, room_id: str) -> bool:
     """Best-effort SIGTERM of a hung wake's process. Returns True if a kill
     signal was actually delivered (pid existed and we had permission) —
     False for a pid that was already gone or we couldn't touch, in which
-    case the reaper/dead-wake sweep will clean up the lease on its own."""
+    case the reaper/dead-wake sweep will clean up the lease on its own.
+
+    NB: for a `timeout N <cli> ...`-wrapped spec the tracked pid is the
+    timeout wrapper's — we rely on GNU/coreutils timeout forwarding SIGTERM
+    to its child (its documented default behavior), so the real CLI dies too.
+    """
     try:
         os.kill(pid, signal.SIGTERM)
         return True
