@@ -5,6 +5,7 @@ HTTP mode (`--http`): uvicorn + Liquid Glass dashboard on :8014.
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import sys
@@ -103,7 +104,54 @@ at http://127.0.0.1:8014/dashboard. Humans can post `kind=system` messages
 that bypass anti-loop rules.
 """
 
-mcp = FastMCP("mcp-huddle", instructions=_AGENT_INSTRUCTIONS)
+# ── Watchdog lifespan (shared by stdio and HTTP transports) ─────────────────
+#
+# FastMCP's `lifespan=` constructor arg wraps the low-level Server's lifespan,
+# which fires around *every* `Server.run()` call: once for the whole process
+# in stdio mode (mcp.run() -> run_stdio_async() -> one Server.run()), but once
+# PER SESSION in HTTP mode (StreamableHTTPSessionManager calls
+# `self.app.run(...)` — i.e. `Server.run()` — for each new HTTP connection).
+# build_app()'s combined_lifespan ALSO enters this (wrapping the whole HTTP
+# app's lifetime), concurrently with whatever per-session entries are live at
+# the time.
+#
+# So this must tolerate an arbitrary number of overlapping entries in any
+# order, not just "the first one wins": it's reference-counted rather than
+# ownership-based — the watchdog task starts on the 1st entry (or restarts if
+# it isn't alive, e.g. it crashed) and is cancelled only when the LAST live
+# entry exits (refcount back to 0), regardless of entry/exit order. This
+# avoids a real bug an ownership model would have: if a per-session lifespan
+# happened to be first in and combined_lifespan's app-level entry outlived
+# it, an "only the starter cancels" model would kill the watchdog the moment
+# that one session closed, silently starving zombie-room cleanup for every
+# other still-open session.
+_watchdog_task: "asyncio.Task | None" = None
+_watchdog_refcount = 0
+
+
+@contextlib.asynccontextmanager
+async def _watchdog_lifespan(_server=None):
+    """Keep `_background_watchdog()` running while at least one caller has
+    this context manager open; tear it down only once the last caller exits.
+    Safe to enter concurrently/re-entrantly in any order (HTTP: once per
+    session plus once for the whole app; stdio: once total)."""
+    global _watchdog_task, _watchdog_refcount
+    _watchdog_refcount += 1
+    if _watchdog_task is None or _watchdog_task.done():
+        _watchdog_task = asyncio.create_task(_background_watchdog())
+    try:
+        yield
+    finally:
+        _watchdog_refcount = max(0, _watchdog_refcount - 1)
+        if _watchdog_refcount == 0:
+            task, _watchdog_task = _watchdog_task, None
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+
+mcp = FastMCP("mcp-huddle", instructions=_AGENT_INSTRUCTIONS, lifespan=_watchdog_lifespan)
 
 
 def _env_num(name: str, default, cast):
@@ -1883,15 +1931,15 @@ Lifecycle:
 
 # ── App build (single MCP app + custom routes + watchdog lifespan) ──────────
 
-import contextlib
-
 
 def build_app():
     """Build the Starlette app: MCP transport + custom HTTP routes + watchdog.
 
     All HTTP routes are registered via @mcp.custom_route(), so streamable_http_app()
     returns a Starlette app with everything wired in. Its lifespan runs the MCP
-    session_manager — we wrap it to also start/stop the zombie watchdog cleanly.
+    session_manager — we wrap it in `_watchdog_lifespan` (the same idempotent
+    helper the stdio path gets via FastMCP's `lifespan=` constructor arg) so the
+    watchdog starts once for the whole HTTP app's lifetime, not per session.
     """
     app = mcp.streamable_http_app()
     mcp_lifespan = app.router.lifespan_context
@@ -1899,13 +1947,8 @@ def build_app():
     @contextlib.asynccontextmanager
     async def combined_lifespan(a):
         async with mcp_lifespan(a):
-            watchdog = asyncio.create_task(_background_watchdog())
-            try:
+            async with _watchdog_lifespan():
                 yield
-            finally:
-                watchdog.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await watchdog
 
     app.router.lifespan_context = combined_lifespan
     return app
