@@ -75,6 +75,16 @@ DELTA READS (token efficiency):
   since_id=last_seen)` next turn — only new messages.
 - After a long absence, prefer `room_summarize(room_id, since_id=last_seen)`.
 
+LIFECYCLE / WAITING:
+- Spawned participants move through `queued` → `starting` → `thinking`/`working`
+  → `responding` → `completed`; failures are `unavailable`, `rate_limited`, or
+  `stuck`.
+- A live process, quiet log, or `busy` status is NOT a completed answer. Call
+  `room_status(room_id)` to see `process_alive`, phase, pending request ids,
+  and `wait_recommended`; wait while a participant is in an active phase.
+- Agents should report active work with `status_set` and publish the final
+  answer with `message_post(kind="result", ...)`.
+
 KIND ENUM (vital — wrong kind breaks anti-loop):
 - `request`: a question/task expecting a reply (auto-notifies addressee)
 - `comment`: observation, no reply expected
@@ -513,24 +523,132 @@ def respond_via_agent(
 
 # ── Status tools ──────────────────────────────────────────────────────────────
 
+_AGENT_REPORTED_PHASES = frozenset({"thinking", "working", "responding"})
+_ACTIVE_PHASES = frozenset({"queued", "starting", "thinking", "working", "responding"})
+
+@mcp.tool()
 def status_set(
     room_id: str,
     agent: str,
-    status: str,
+    phase: str,
+    task_id: int | str = "",
+    detail: str = "",
     expires_in_sec: int = 0,
     session_id: str = "",
 ) -> str:
-    """Set agent status. status: online|busy|done|typing.
+    """Report your current lifecycle phase to the room.
 
-    expires_in_sec > 0: status auto-resets to 'online' after that many seconds (lease).
+    Agents may report thinking, working, or responding. The server owns queued,
+    starting, completed, unavailable, rate_limited, and stuck transitions.
+    expires_in_sec > 0 keeps the underlying lease behavior for callers that
+    want an automatic online reset.
     """
-    bus.set_status(room_id, agent, status, expires_in_sec, session_id)
+    if phase not in _AGENT_REPORTED_PHASES:
+        raise ValueError(
+            f"Agent phase must be one of {sorted(_AGENT_REPORTED_PHASES)}, got {phase!r}"
+        )
+    info = bus.get_room_info(room_id)
+    if agent not in info.get("participants", []):
+        raise ValueError(f"Agent {agent!r} is not a participant in {room_id}")
+    operational = "busy"
+    bus.set_status(
+        room_id, agent, operational, expires_in_sec, session_id,
+        phase=phase, task_id=task_id, detail=detail, source="agent",
+    )
     return "ok"
 
 
 def status_get(room_id: str) -> dict:
     """Get all agent statuses in a room (expired leases auto-reset to online)."""
     return bus.get_status(room_id)
+
+
+def _pending_requests(room_id: str, participants: list[str]) -> list[dict]:
+    """Return unanswered request work, including the agents still expected."""
+    messages = bus._load_messages(room_id)
+    replies_by_request: dict[int, set[str]] = {}
+    for message in messages:
+        reply_to = message.get("reply_to")
+        if reply_to is not None:
+            replies_by_request.setdefault(int(reply_to), set()).add(message.get("agent", ""))
+
+    pending: list[dict] = []
+    for message in messages:
+        if message.get("kind") != "request" or message.get("reply_to") is not None:
+            continue
+        to = message.get("to")
+        if to and to != "all":
+            targets = [to] if to in participants else []
+        else:
+            targets = [name for name in participants if name != message.get("agent")]
+        waiting_for = [name for name in targets
+                       if name not in replies_by_request.get(int(message["id"]), set())]
+        if not waiting_for:
+            continue
+        pending.append({
+            "id": int(message["id"]),
+            "from": message.get("agent", ""),
+            "to": to or "all",
+            "body": message.get("body", "")[:240],
+            "created_at": int(message.get("timestamp", 0) or 0),
+            "waiting_for": waiting_for,
+        })
+    return pending
+
+
+@mcp.tool()
+def room_status(room_id: str) -> dict:
+    """Return an actionable lifecycle snapshot for orchestrators.
+
+    ``wait_recommended`` is true while an agent is starting/working/responding
+    or while a request still has one or more expected replies. A live process
+    is never treated as completed merely because its output log is quiet.
+    """
+    meta = bus.get_room_info(room_id)
+    participants = list(meta.get("participants", []))
+    agent_meta = meta.get("agent_meta", {}) or {}
+    status_details = bus.get_status_details(room_id)
+    pending = _pending_requests(room_id, participants)
+    pending_by_agent = {
+        name: [item["id"] for item in pending if name in item["waiting_for"]]
+        for name in set(participants) | set(agent_meta) | set(status_details)
+    }
+
+    agents: dict[str, dict] = {}
+    for name in pending_by_agent:
+        info = agent_meta.get(name) or {}
+        status_info = dict(status_details.get(name) or {
+            "status": "offline", "phase": "unavailable", "updated_at": 0,
+        })
+        status = status_info.get("status", "offline")
+        health = _agent_wake_health(info, status)
+        pid = info.get("last_wake_pid")
+        process_alive = bool(pid) and bus._pid_alive(pid)
+        phase = status_info.get("phase", "online")
+        if health.get("rate_limited"):
+            phase = "rate_limited"
+        elif (health.get("stale_lease") and phase in _ACTIVE_PHASES
+              and status_info.get("source") != "agent"):
+            phase = "unavailable"
+        agents[name] = {
+            **status_info,
+            "phase": phase,
+            "process_alive": process_alive,
+            "pending_request_ids": pending_by_agent[name],
+            "health": health,
+        }
+
+    active = any(agent.get("phase") in _ACTIVE_PHASES for agent in agents.values())
+    waiting = bool(pending) or active
+    return {
+        "room_id": room_id,
+        "room_status": meta.get("status", "unknown"),
+        "participants": participants,
+        "agents": agents,
+        "pending_requests": pending,
+        "wait_recommended": waiting,
+        "all_terminal": not waiting,
+    }
 
 
 def _post_message_checked(
@@ -548,7 +666,12 @@ def _post_message_checked(
         bus.revive(room_id)
     # reply_to is validated inside bus.post_message under the messages lock —
     # atomic with the append, so a duplicate reply cannot race through the gap.
-    return bus.post_message(room_id, agent, body, kind, to, reply_to, idempotency_key, msg_meta=meta)
+    msg_id = bus.post_message(
+        room_id, agent, body, kind, to, reply_to, idempotency_key, msg_meta=meta,
+    )
+    if kind in ("result", "final"):
+        _set_agent_phase(room_id, agent, "completed", task_id=reply_to or "")
+    return msg_id
 
 
 # ── Consensus tools ───────────────────────────────────────────────────────────
@@ -963,6 +1086,36 @@ async def api_agent_events(request: Request) -> StreamingResponse:
 
 # ── Spawn helpers ─────────────────────────────────────────────────────────────
 
+def _set_agent_phase(
+    room_id: str,
+    agent_name: str,
+    phase: str,
+    task_id: int | str = "",
+    detail: str = "",
+    source: str = "server",
+) -> None:
+    """Persist one lifecycle transition without disturbing wake metadata."""
+    if phase not in bus.VALID_AGENT_PHASES:
+        return
+    try:
+        meta = bus.get_room_info(room_id)
+        current = (bus.get_status_details(room_id).get(agent_name) or {})
+        operational = "busy" if phase in _ACTIVE_PHASES else "online"
+        bus.set_status(
+            room_id,
+            agent_name,
+            operational,
+            0,
+            meta.get("session_id", ""),
+            phase=phase,
+            task_id=task_id if task_id != "" else current.get("task_id", ""),
+            detail=detail[:500] if detail else "",
+            source=source,
+        )
+    except Exception as exc:
+        print(f"[huddle] lifecycle status update failed "
+              f"({agent_name}@{room_id}, {phase}): {exc}", flush=True)
+
 def _announce_spawn_failure(room_id: str, agent_name: str, exc: BaseException,
                             context_id: str) -> None:
     """Best-effort room notice for an outright spawn/resume failure (the
@@ -977,6 +1130,7 @@ def _announce_spawn_failure(room_id: str, agent_name: str, exc: BaseException,
     short = f"{type(exc).__name__}: {exc}"
     if len(short) > 200:
         short = short[:197] + "..."
+    _set_agent_phase(room_id, agent_name, "unavailable", detail=short)
     try:
         _post_message_checked(
             room_id, agent_name,
@@ -1000,7 +1154,7 @@ def _room_open_for_spawn(room_id: str) -> bool:
     return bool(info) and info.get("status") in ("open", "idle")
 
 
-def _record_spawned_pid(room_id: str, pid: int) -> None:
+def _record_spawned_pid(room_id: str, pid: int, agent_name: str = "") -> None:
     """Merge one late-known pid into the room's spawned_pids (locked RMW).
     Used by staggered spawns, whose pid isn't known at _spawn_agents time —
     without this, close_room's kill sweep (_kill_spawned reads spawned_pids)
@@ -1010,12 +1164,19 @@ def _record_spawned_pid(room_id: str, pid: int) -> None:
         if pid not in pids:
             pids.append(pid)
         m["spawned_pids"] = pids
+        if agent_name:
+            info = (m.setdefault("agent_meta", {}).get(agent_name) or {})
+            info["last_wake_pid"] = pid
+            info["last_wake_at"] = int(time.time())
+            m["agent_meta"][agent_name] = info
         return m
     try:
         bus._update_meta_locked(room_id, _upd)
     except Exception as exc:
         print(f"[huddle] failed to record delayed-spawn pid {pid} "
               f"({room_id}): {exc}", flush=True)
+    if agent_name:
+        _set_agent_phase(room_id, agent_name, "working")
 
 
 def _spawn_agents(
@@ -1103,15 +1264,17 @@ def _spawn_agents(
                 names.append(spec["name"])
                 agent_meta[spec["name"]] = spawn._placeholder_agent_meta(
                     spec, agent_brief, log_dir)
+                _set_agent_phase(room_id, spec["name"], "queued")
                 spawn._schedule_delayed_spawn(
                     delay, spec, agent_brief, cwd, log_dir,
                     on_exit=_make_initial_spawn_callback(room_id, spec["name"]),
                     on_spawn_fail=lambda n, exc: _announce_spawn_failure(room_id, n, exc, "init"),
                     should_spawn=lambda: _room_open_for_spawn(room_id),
-                    on_spawned=lambda pid: _record_spawned_pid(room_id, pid),
+                    on_spawned=(lambda n: lambda pid: _record_spawned_pid(room_id, pid, n))(spec["name"]),
                 )
                 continue
             try:
+                _set_agent_phase(room_id, spec["name"], "starting")
                 pid, log_path, last_msg = spawn.spawn_agent(
                     spec, agent_brief, cwd, log_dir,
                     on_exit=_make_initial_spawn_callback(room_id, spec["name"]))
@@ -1120,7 +1283,10 @@ def _spawn_agents(
                 agent_meta[spec["name"]] = {
                     "log_path": log_path,
                     "last_message_path": last_msg,
+                    "last_wake_pid": pid,
+                    "last_wake_at": int(time.time()),
                 }
+                _set_agent_phase(room_id, spec["name"], "working")
             except (FileNotFoundError, PermissionError) as exc:
                 spawn.log_spawn_failure(spec, agent_brief, cwd, log_dir, exc)
                 _announce_spawn_failure(room_id, spec["name"], exc, "init")
@@ -1131,6 +1297,8 @@ def _spawn_agents(
                 _announce_spawn_failure(room_id, spec["name"], exc, "init")
                 raise
     else:
+        for agent_name in per_agent_default_briefs:
+            _set_agent_phase(room_id, agent_name, "starting")
         names, pids, agent_meta = spawn.spawn_all(
             default_brief, cwd, log_dir,
             briefs=per_agent_default_briefs,
@@ -1138,7 +1306,7 @@ def _spawn_agents(
             skip_names=skip_owner,
             on_spawn_fail=lambda n, exc: _announce_spawn_failure(room_id, n, exc, "init"),
             delayed_spawn_gate=lambda: _room_open_for_spawn(room_id),
-            on_delayed_spawn=lambda n, pid: _record_spawned_pid(room_id, pid))
+            on_delayed_spawn=lambda n, pid: _record_spawned_pid(room_id, pid, n))
 
     for n in names:
         bus.invite_agent(room_id, n)
@@ -1165,6 +1333,13 @@ def _spawn_agents(
         m["spawned_pids"] = existing_pids + [p for p in pids if p not in existing_pids]
         merged = m.get("agent_meta") or {}
         for name_, info_ in agent_meta.items():
+            info_ = dict(info_)
+            pid = info_.pop("pid", None)
+            if pid:
+                info_["last_wake_pid"] = pid
+                info_["last_wake_at"] = int(time.time())
+                agent_meta[name_]["last_wake_pid"] = pid
+                agent_meta[name_]["last_wake_at"] = info_["last_wake_at"]
             slot = merged.get(name_)
             if isinstance(slot, dict):
                 slot.update(info_)
@@ -1173,6 +1348,11 @@ def _spawn_agents(
         m["agent_meta"] = merged
         return m
     bus._update_meta_locked(room_id, _save_spawn_meta)
+    for agent_name, info in agent_meta.items():
+        pid = info.get("last_wake_pid")
+        current = bus.get_status_details(room_id).get(agent_name) or {}
+        if pid and bus._pid_alive(pid) and current.get("phase") in ("starting", "queued"):
+            _set_agent_phase(room_id, agent_name, "working")
 
 
 # ── Wake lease helpers ────────────────────────────────────────────────────────
@@ -1444,6 +1624,13 @@ def _on_initial_spawn_exit(room_id: str, agent_name: str, returncode) -> None:
         except Exception as exc:
             print(f"[huddle] rate-limit check error (init) "
                   f"({agent_name}@{room_id}): {exc}", flush=True)
+    posted = _agent_posted_after(room_id, agent_name, 0)
+    if rate_limit_announced:
+        _set_agent_phase(room_id, agent_name, "rate_limited")
+    elif posted:
+        _set_agent_phase(room_id, agent_name, "completed")
+    else:
+        _set_agent_phase(room_id, agent_name, "unavailable")
     if not rate_limit_announced:
         log_path = None
         try:
@@ -1506,7 +1693,17 @@ def _on_wake_exit(room_id: str, agent_name: str, wake_id: str,
         except Exception as exc:
             print(f"[huddle] rate-limit check error "
                   f"({agent_name}@{room_id}): {exc}", flush=True)
-    bus.set_status(room_id, agent_name, "online", 0, meta.get("session_id", ""))
+    posted = _agent_posted_after(
+        room_id, agent_name, int(info.get("last_wake_msg_id", 0) or 0))
+    if info.get("stuck_killed_wake_id") == wake_id:
+        final_phase = "stuck"
+    elif rate_limit_announced:
+        final_phase = "rate_limited"
+    elif posted:
+        final_phase = "completed"
+    else:
+        final_phase = "unavailable"
+    _set_agent_phase(room_id, agent_name, final_phase)
     if not rate_limit_announced:
         try:
             _announce_noreply_on_exit(
@@ -1581,7 +1778,6 @@ def _wake_agents_for_request(
     meta = bus.get_room_info(room_id)
     agent_meta = meta.get("agent_meta", {})
     cwd = meta.get("cwd", "") or ""
-    session_id = meta.get("session_id", "")
     wakes: list[dict] = []
 
     for agent_name in list(agent_meta.keys()):
@@ -1627,7 +1823,7 @@ def _wake_agents_for_request(
                     continue
                 prompt = _build_codex_wakeup_prompt(
                     room_id, sender, body, to, msg_id, last_seen)
-                bus.set_status(room_id, agent_name, "busy", 300, session_id)
+                _set_agent_phase(room_id, agent_name, "starting", task_id=msg_id)
                 try:
                     pid = spawn.codex_resume(
                         thread_id, prompt, cwd, log_path,
@@ -1635,7 +1831,7 @@ def _wake_agents_for_request(
                         on_exit=_make_wake_done_callback(room_id, agent_name, wake_id),
                     )
                 except Exception as exc:
-                    bus.set_status(room_id, agent_name, "online", 0, session_id)
+                    _set_agent_phase(room_id, agent_name, "unavailable", msg_id, str(exc))
                     print(f"[huddle] codex_resume failed ({room_id}): {exc}",
                           flush=True)
                     _announce_spawn_failure(room_id, agent_name, exc, str(msg_id))
@@ -1645,6 +1841,7 @@ def _wake_agents_for_request(
                     "last_wake_pid": pid, "last_wake_at": int(time.time()),
                     "wake_id": wake_id,
                 })
+                _set_agent_phase(room_id, agent_name, "working", task_id=msg_id)
                 wakes.append({"agent": agent_name, "pid": pid,
                               "thread_id": thread_id})
                 continue
@@ -1862,6 +2059,10 @@ def _check_stuck_wakes() -> list[str]:
                     # SIGTERM lands) this wake's silence is already explained.
                     fields["stuck_killed_wake_id"] = wake_id
                 _merge_agent_meta(room_id, agent_name, fields)
+                _set_agent_phase(
+                    room_id, agent_name, "stuck", task_id=msg_id,
+                    detail=f"no reply for ~{mins} min",
+                )
                 announced.append(f"{agent_name}@{room_id}")
             except Exception as exc:
                 print(f"[huddle] stuck-wake notice post failed "
@@ -1892,7 +2093,7 @@ def _spawn_fresh_room_agent(
     if wake_id is None:
         wake_id = uuid.uuid4().hex[:12]
     session_id = meta.get("session_id", "")
-    bus.set_status(room_id, agent_name, "busy", 300, session_id)
+    _set_agent_phase(room_id, agent_name, "starting", task_id=msg_id or "")
     try:
         pid, log_path, last_msg_path = spawn.spawn_agent(
             spec,
@@ -1901,8 +2102,8 @@ def _spawn_fresh_room_agent(
             bus._room_dir(room_id) / "agents",
             on_exit=_make_wake_done_callback(room_id, agent_name, wake_id),
         )
-    except Exception:
-        bus.set_status(room_id, agent_name, "online", 0, session_id)
+    except Exception as exc:
+        _set_agent_phase(room_id, agent_name, "unavailable", detail=str(exc))
         raise
 
     fields = {
@@ -1916,6 +2117,7 @@ def _spawn_fresh_room_agent(
         fields["last_wake_msg_id"] = msg_id
         fields["last_seen_id"] = msg_id
     _merge_agent_meta(room_id, agent_name, fields)
+    _set_agent_phase(room_id, agent_name, "working", task_id=msg_id or "")
     return pid, log_path, last_msg_path
 
 
@@ -1929,6 +2131,8 @@ def _build_fresh_agent_prompt(
 
 Room: {room_id}
 You are: {agent_name}
+
+{_lifecycle_protocol_block(room_id, agent_name)}
 
 Current room transcript:
 {transcript}
@@ -1982,6 +2186,29 @@ def _anti_loop_block() -> str:
             "chatter.")
 
 
+def _lifecycle_protocol_block(room_id: str, agent_name: str,
+                              task_id: int | str = "") -> str:
+    """Shared lifecycle contract for every process-backed agent prompt."""
+    task = str(task_id) if task_id != "" else "current-request"
+    return f'''## Lifecycle and waiting (MANDATORY)
+The server owns the lifecycle: queued, starting, thinking, working, responding,
+completed, unavailable, rate_limited, and stuck.
+- At the start of work, call `status_set(room_id="{room_id}", agent="{agent_name}", phase="working", task_id="{task}")`.
+- During research or generation, use phase `thinking` or `working`; before
+  publishing the answer, use phase `responding`.
+- Publish the answer with `message_post(..., kind="result", ...)`. The server
+  marks the turn `completed` after that result is stored.
+- If you create a room or ask other agents, call `room_status(room_id="{room_id}")`.
+  Wait while their phase is `queued`, `starting`, `thinking`, `working`, or
+  `responding`, or while `wait_recommended` is true. Do not busy-loop.
+- `process_alive=true` only means that a process exists; it does not mean that
+  generation, research, or the answer is finished. Read completed output with
+  `messages_read(..., kind="result")`.
+- Treat `completed` as done. Treat `unavailable`, `rate_limited`, and `stuck`
+  as terminal failures and report them instead of waiting forever.
+'''
+
+
 def _build_registry_agent_wakeup_prompt(
     room_id: str,
     agent_name: str,
@@ -2004,6 +2231,8 @@ New request id: {msg_id}
 From: {sender}
 To: {addressed}
 Last delivered message id: {last_seen}
+
+{_lifecycle_protocol_block(room_id, agent_name, msg_id)}
 
 Current full transcript:
 {transcript}
@@ -2041,6 +2270,8 @@ From: {sender}
 To: {addressed}
 Last delivered message id: {last_seen}
 
+{_lifecycle_protocol_block(room_id, "Codex", msg_id)}
+
 Request body:
 {body}
 
@@ -2069,7 +2300,7 @@ def _build_default_brief(room_id: str, name: str, goal: str, cwd: str,
     who = agent_name or "the name you were spawned/invited under (see room_info)"
     idem_prefix = (agent_name or "agent").lower()
     reply_call = _reply_call(room_id, who, "<original sender, or 'all'>",
-                              f"{idem_prefix}-init:{room_id}", kind="comment")
+                              f"{idem_prefix}-init:{room_id}", kind="result")
     return f"""# mcp-huddle — Room: {name}
 
 {_agent_identity_block(room_id, who)}
@@ -2092,6 +2323,8 @@ To reply: {reply_call}
 ## Anti-loop rules
 {_anti_loop_block()}
 - Keep a local set of reply_to IDs you already responded to — never reply twice to the same request
+
+{_lifecycle_protocol_block(room_id, who, "initial")}
 
 ## How to connect
 Use MCP tools from mcp-huddle:
@@ -2128,13 +2361,15 @@ def _wrap_user_brief(room_id: str, agent_name: str, brief: str) -> str:
     """
     idem = f"{agent_name.lower()}-init:{room_id}"
     reply_call = _reply_call(room_id, agent_name, "<original sender, or 'all'>",
-                              idem, kind="comment")
+                              idem, kind="result")
     return f"""{_agent_identity_block(room_id, agent_name)}
 
 {_stdout_not_delivered_note()}
 To reply: {reply_call}
 
 {_anti_loop_block()}
+
+{_lifecycle_protocol_block(room_id, agent_name, "initial")}
 
 ---
 

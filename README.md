@@ -86,7 +86,7 @@ Dashboard: <http://127.0.0.1:8014/dashboard>. The dashboard reads the same files
 
 ## Features
 
-- **12 MCP tools** for room creation, messaging, rounds, status, and consensus
+- **14 MCP tools** for room creation, messaging, rounds, lifecycle status, and consensus
 - **JSONL storage** at `~/.mcp-huddle/rooms/` — grep-able, no DB
 - **Anti-loop guards**: `kind` enum (`request`/`comment`/`ack`/`busy`/`result`/`final`/`system`/`close`), per-message dedup, server-side circuit breaker
 - **Bounded reads**: `messages_read` head+tail truncates long bodies (`max_chars`), windows by `until_id`, and filters by `kind` — a fat agent summary can't overflow the reader
@@ -111,15 +111,17 @@ These are the tools exposed over MCP (decorated with `@mcp.tool()` in
 | `message_post` | Post a message to a room; returns `message_id`. Accepts `kind`, `to`, `reply_to`, `idempotency_key`. |
 | `messages_read` | Read chat history as plain text. Delta reads via `since_id`; `until_id` window; `round` filter; `kind` filter (e.g. just `result`); long bodies head+tail truncated to `max_chars`. |
 | `room_summarize` | No-LLM digest: counts, open requests, and each agent's latest position. Scoped by `round` or `since_id`. |
+| `room_status` | Actionable lifecycle snapshot: per-agent phase, process liveness, pending request IDs, and `wait_recommended`. |
+| `status_set` | Agent self-report for active `thinking`, `working`, or `responding` phases. The server owns terminal transitions. |
 | `room_round_advance` | Open a new discussion round (owner-only): bumps the round counter, stamps messages, posts a visible divider. |
 | `room_reclaim` | Re-stamp a room's `owner_pid` after the owner's session resumed with a new PID, so the watchdog won't reap a live room (owner-only). |
 | `propose_resolution` | Propose a resolution to end discussion; returns `resolution_id`. |
 | `resolution_vote` | Vote `ack` or `reject` on a resolution; all-ack makes the room `resolved`. |
 | `notify_register` | Register a file path to receive notifications when a `kind=request` message arrives. |
 
-Room lifecycle operations (request-close, close, delete, close-session) and
-agent status are driven by the server internals and the dashboard HTTP API
-rather than exposed as MCP tools.
+Room lifecycle operations (request-close, close, delete, close-session) remain
+human/server-owned. Agent work status is exposed through `room_status`; agents
+may report active work through `status_set`.
 
 ## Configuration
 
@@ -249,6 +251,15 @@ Agents should treat the room as an append-only work queue, not a casual chat:
 - Do not reply to `kind=request` with `reply_to` set; it is already somebody's answer, not a new task.
 - Use `idempotency_key` when retrying `message_post` so network or process retries do not duplicate messages.
 - Once a resolution is accepted, the room is read-only for normal discussion; only `system` and `close` messages are accepted.
+
+### Waiting for spawned agents
+
+After `room_create` or a request to other agents, call `room_status`. Wait while
+`wait_recommended` is true or a participant is `queued`, `starting`, `thinking`,
+`working`, or `responding`; then read finished answers with
+`messages_read(kind="result")`. `process_alive=true` only means the process
+exists. `completed` is the successful terminal state; `unavailable`,
+`rate_limited`, and `stuck` are terminal failures that should be reported.
 
 ## Codex lifecycle
 

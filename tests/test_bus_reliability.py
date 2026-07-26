@@ -141,6 +141,31 @@ def test_expired_lease_reset_preserves_concurrent_busy(isolated_bus) -> None:
     assert statuses.get("B") == "busy"     # concurrent write not clobbered
 
 
+def test_status_details_persist_phase_and_task_metadata(isolated_bus) -> None:
+    room_id = _create_room(isolated_bus)
+
+    isolated_bus.set_status(
+        room_id,
+        "Codex",
+        "busy",
+        300,
+        "sess",
+        phase="thinking",
+        task_id=17,
+        detail="researching sources",
+        source="agent",
+    )
+
+    details = isolated_bus.get_status_details(room_id)
+    codex = details["Codex"]
+    assert codex["status"] == "busy"
+    assert codex["phase"] == "thinking"
+    assert codex["task_id"] == 17
+    assert codex["detail"] == "researching sources"
+    assert codex["source"] == "agent"
+    assert codex["updated_at"] > 0
+
+
 def test_load_messages_cache_invalidates_on_append(isolated_bus) -> None:
     """_load_messages caches by (size, mtime); a new append must be visible."""
     room_id = _create_room(isolated_bus)

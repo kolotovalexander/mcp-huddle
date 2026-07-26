@@ -895,6 +895,64 @@ def test_request_message_wakes_existing_codex_thread(tmp_path: Path, monkeypatch
     assert len(calls) == 1
 
 
+def test_room_status_reports_waiting_agent_and_pending_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    room_id = isolated_bus.create_room("Status", "CodexMain", os.getpid(), "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Antigravity")
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {
+        "Antigravity": {
+            "last_wake_pid": os.getpid(),
+            "last_wake_msg_id": 0,
+            "wake_id": "wake-1",
+        }
+    }
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+    isolated_bus.set_status(
+        room_id, "Antigravity", "busy", 0, "session-1",
+        phase="working", task_id=1,
+    )
+    request_id = isolated_bus.post_message(
+        room_id, "CodexMain", "Research this", "request", to="Antigravity",
+    )
+
+    snapshot = server.room_status(room_id)
+
+    assert snapshot["wait_recommended"] is True
+    assert request_id in [item["id"] for item in snapshot["pending_requests"]]
+    assert snapshot["pending_requests"][0]["waiting_for"] == ["Antigravity"]
+    agent = snapshot["agents"]["Antigravity"]
+    assert agent["phase"] == "working"
+    assert agent["process_alive"] is True
+    assert agent["task_id"] == 1
+
+
+def test_agent_reported_phase_does_not_require_server_wake_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Externally launched agents can report work without agent_meta PID."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    room_id = isolated_bus.create_room("External", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "ExternalAgent")
+
+    with pytest.raises(ValueError):
+        server.status_set(room_id, "ExternalAgent", "completed")
+    assert server.status_set(room_id, "ExternalAgent", "working", task_id="research") == "ok"
+
+    agent = server.room_status(room_id)["agents"]["ExternalAgent"]
+    assert agent["phase"] == "working"
+    assert agent["process_alive"] is False
+    assert agent["health"]["stale_lease"] is True
+
+
 def test_request_wakeup_skips_self_and_reply_requests(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
     isolated_bus = importlib.reload(bus)
@@ -1233,7 +1291,7 @@ def test_dropped_tools_no_longer_exposed_as_mcp_tools() -> None:
     exposed = set(pat.findall(source))
     dropped = {
         "room_request_close", "room_close", "room_delete", "room_close_session",
-        "respond_via_agent", "status_set", "status_get",
+        "respond_via_agent", "status_get",
     }
     assert dropped.isdisjoint(exposed), (
         f"Tools that must NOT be MCP-exposed are still exposed: {dropped & exposed}"
@@ -1244,6 +1302,7 @@ def test_dropped_tools_no_longer_exposed_as_mcp_tools() -> None:
         "room_create", "room_invite", "room_info", "room_list",
         "message_post", "messages_read", "room_summarize",
         "propose_resolution", "resolution_vote", "notify_register",
+        "status_set", "room_status",
     }
     assert expected_kept <= exposed, f"Missing expected tools: {expected_kept - exposed}"
 
@@ -1349,7 +1408,7 @@ def test_no_dropped_tool_references_in_agent_facing_prompts() -> None:
     Per Codex review of feat/agent-tools-cleanup."""
     dropped = [
         "room_close", "room_close_session", "room_delete", "room_request_close",
-        "status_set", "status_get", "respond_via_agent",
+        "status_get", "respond_via_agent",
     ]
     samples = {
         "default_brief": server._build_default_brief(
@@ -1833,6 +1892,31 @@ def test_on_wake_exit_nonlimit_error_posts_noreply_once(
     messages_after = isolated_bus._load_messages(room_id)
     comments_after = [m for m in messages_after if m.get("kind") == "comment"]
     assert len(comments_after) == 1
+
+
+def test_result_reply_marks_agent_completed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    room_id = isolated_bus.create_room("Complete", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Codex")
+    request_id = isolated_bus.post_message(
+        room_id, "Claude", "Review this", "request", to="Codex",
+    )
+    isolated_bus.set_status(
+        room_id, "Codex", "busy", 0, "session-1",
+        phase="working", task_id=request_id,
+    )
+
+    server.message_post(
+        room_id, "Codex", "Review complete", "result", to="Claude",
+        reply_to=request_id,
+    )
+
+    assert isolated_bus.get_status_details(room_id)["Codex"]["phase"] == "completed"
 
 
 def test_on_wake_exit_clean_exit_no_message_posts_noreply(
@@ -2495,6 +2579,45 @@ def test_default_brief_contains_room_id_own_name_and_goal() -> None:
     # Own-identity instruction, not just a bare mention of the name.
     assert 'You are: OpenCode' in brief
     assert 'agent="OpenCode"' in brief
+
+
+def test_all_spawn_prompts_include_lifecycle_wait_protocol() -> None:
+    """Every spawned turn must know how to report work and when to wait."""
+    samples = {
+        "fresh": server._build_fresh_agent_prompt(
+            "room_xyz", "OpenCode", "review this", "1: prior message"),
+        "registry": server._build_registry_agent_wakeup_prompt(
+            "room_xyz", "OpenCode", "Claude", "review this", "OpenCode",
+            7, 3, "1: prior message"),
+        "codex": server._build_codex_wakeup_prompt(
+            "room_xyz", "Claude", "review this", "Codex", 7, 3),
+        "default": server._build_default_brief(
+            "room_xyz", "room-name", "review this", "/tmp/proj",
+            agent_name="OpenCode"),
+        "custom": server._wrap_user_brief(
+            "room_xyz", "OpenCode", "review this"),
+    }
+    for name, prompt in samples.items():
+        assert "status_set" in prompt, name
+        assert "room_status" in prompt, name
+        assert "queued" in prompt and "completed" in prompt, name
+        assert "process_alive" in prompt, name
+
+
+def test_non_mcp_runner_prompts_explain_server_owned_completion() -> None:
+    from mcp_huddle import mimo_runner, openai_compatible_runner
+
+    request = {"id": 7, "agent": "Claude", "body": "review this"}
+    samples = {
+        "openai": openai_compatible_runner.build_messages(
+            "OpenRouter", "1: prior message", request, "high")[0]["content"],
+        "mimo": mimo_runner.build_prompt(
+            "MiMo", "1: prior message", request),
+    }
+    for name, prompt in samples.items():
+        assert "completed" in prompt, name
+        assert "server" in prompt, name
+        assert "process" in prompt, name
 
 
 def test_auto_spawn_true_gives_each_agent_its_own_name_in_the_brief(
