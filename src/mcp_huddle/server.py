@@ -1519,6 +1519,16 @@ def _agent_posted_after(room_id: str, agent_name: str, msg_id: int) -> bool:
     return False
 
 
+def _agent_result_posted_after(room_id: str, agent_name: str, msg_id: int) -> bool:
+    """True only when the agent stored a deliverable result after the wake."""
+    return any(
+        msg.get("agent") == agent_name
+        and msg.get("id", 0) > msg_id
+        and msg.get("kind") in ("result", "final")
+        for msg in bus._load_messages(room_id)
+    )
+
+
 def _log_tail(log_path: Optional[str], max_len: int = 200) -> str:
     """Short ANSI-stripped tail of an agent log, for a failure notice."""
     if not log_path:
@@ -1624,10 +1634,10 @@ def _on_initial_spawn_exit(room_id: str, agent_name: str, returncode) -> None:
         except Exception as exc:
             print(f"[huddle] rate-limit check error (init) "
                   f"({agent_name}@{room_id}): {exc}", flush=True)
-    posted = _agent_posted_after(room_id, agent_name, 0)
+    posted_result = _agent_result_posted_after(room_id, agent_name, 0)
     if rate_limit_announced:
         _set_agent_phase(room_id, agent_name, "rate_limited")
-    elif posted:
+    elif posted_result:
         _set_agent_phase(room_id, agent_name, "completed")
     else:
         _set_agent_phase(room_id, agent_name, "unavailable")
@@ -1686,25 +1696,25 @@ def _on_wake_exit(room_id: str, agent_name: str, wake_id: str,
         # woken again immediately.
         updates["rate_limited_until"] = 0
     _merge_agent_meta(room_id, agent_name, updates)
-    rate_limit_announced = already_announced
+    rate_limit_announced = False
     if not already_announced and rc != 0:
         try:
             rate_limit_announced = _handle_rate_limit_on_exit(room_id, agent_name)
         except Exception as exc:
             print(f"[huddle] rate-limit check error "
                   f"({agent_name}@{room_id}): {exc}", flush=True)
-    posted = _agent_posted_after(
+    posted_result = _agent_result_posted_after(
         room_id, agent_name, int(info.get("last_wake_msg_id", 0) or 0))
     if info.get("stuck_killed_wake_id") == wake_id:
         final_phase = "stuck"
     elif rate_limit_announced:
         final_phase = "rate_limited"
-    elif posted:
+    elif posted_result:
         final_phase = "completed"
     else:
         final_phase = "unavailable"
     _set_agent_phase(room_id, agent_name, final_phase)
-    if not rate_limit_announced:
+    if not already_announced and not rate_limit_announced:
         try:
             _announce_noreply_on_exit(
                 room_id, agent_name,

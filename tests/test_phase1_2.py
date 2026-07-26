@@ -1919,6 +1919,56 @@ def test_result_reply_marks_agent_completed(
     assert isolated_bus.get_status_details(room_id)["Codex"]["phase"] == "completed"
 
 
+def test_comment_does_not_mark_agent_completed_on_wake_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    room_id = isolated_bus.create_room("CommentOnly", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Codex")
+    request_id = isolated_bus.post_message(
+        room_id, "Claude", "Review this", "request", to="Codex",
+    )
+    wake_id = "wake-comment-only"
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {"Codex": {
+        "wake_id": wake_id, "last_wake_msg_id": request_id,
+    }}
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+    isolated_bus.set_status(room_id, "Codex", "busy", 300, "session-1")
+    isolated_bus.post_message(room_id, "Codex", "still researching", "comment")
+
+    server._on_wake_exit(room_id, "Codex", wake_id, 0)
+
+    assert isolated_bus.get_status_details(room_id)["Codex"]["phase"] == "unavailable"
+
+
+def test_already_announced_dead_wake_is_not_rate_limited(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    room_id = isolated_bus.create_room("Dead", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Codex")
+    wake_id = "wake-dead"
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {"Codex": {
+        "wake_id": wake_id, "last_wake_msg_id": 1,
+    }}
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+    isolated_bus.set_status(room_id, "Codex", "busy", 300, "session-1")
+
+    server._on_wake_exit(room_id, "Codex", wake_id, 1, already_announced=True)
+
+    status = isolated_bus.get_status_details(room_id)["Codex"]
+    assert status["phase"] == "unavailable"
+    assert status.get("source") == "server"
+
+
 def test_on_wake_exit_clean_exit_no_message_posts_noreply(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
