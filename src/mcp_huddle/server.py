@@ -525,6 +525,7 @@ def respond_via_agent(
 
 _AGENT_REPORTED_PHASES = frozenset({"thinking", "working", "responding"})
 _ACTIVE_PHASES = frozenset({"queued", "starting", "thinking", "working", "responding"})
+_TERMINAL_PHASES = frozenset({"completed", "unavailable", "rate_limited", "stuck"})
 
 @mcp.tool()
 def status_set(
@@ -563,7 +564,20 @@ def status_get(room_id: str) -> dict:
     return bus.get_status(room_id)
 
 
-def _pending_requests(room_id: str, participants: list[str]) -> list[dict]:
+def _agent_phase_snapshot(status_info: dict, wake_info: dict) -> tuple[str, dict]:
+    status = status_info.get("status", "offline")
+    health = _agent_wake_health(wake_info, status)
+    phase = status_info.get("phase", "online")
+    if health.get("rate_limited"):
+        phase = "rate_limited"
+    elif (health.get("stale_lease") and phase in _ACTIVE_PHASES
+          and status_info.get("source") != "agent"):
+        phase = "unavailable"
+    return phase, health
+
+
+def _pending_requests(room_id: str, participants: list[str],
+                      terminal_agents: set[str] | frozenset[str] = frozenset()) -> list[dict]:
     """Return unanswered request work, including the agents still expected."""
     messages = bus._load_messages(room_id)
     replies_by_request: dict[int, set[str]] = {}
@@ -582,7 +596,8 @@ def _pending_requests(room_id: str, participants: list[str]) -> list[dict]:
         else:
             targets = [name for name in participants if name != message.get("agent")]
         waiting_for = [name for name in targets
-                       if name not in replies_by_request.get(int(message["id"]), set())]
+                       if name not in terminal_agents
+                       and name not in replies_by_request.get(int(message["id"]), set())]
         if not waiting_for:
             continue
         pending.append({
@@ -608,7 +623,12 @@ def room_status(room_id: str) -> dict:
     participants = list(meta.get("participants", []))
     agent_meta = meta.get("agent_meta", {}) or {}
     status_details = bus.get_status_details(room_id)
-    pending = _pending_requests(room_id, participants)
+    terminal_agents = {
+        name for name, status_info in status_details.items()
+        if _agent_phase_snapshot(status_info, agent_meta.get(name) or {})[0]
+        in _TERMINAL_PHASES
+    }
+    pending = _pending_requests(room_id, participants, terminal_agents)
     pending_by_agent = {
         name: [item["id"] for item in pending if name in item["waiting_for"]]
         for name in set(participants) | set(agent_meta) | set(status_details)
@@ -620,16 +640,9 @@ def room_status(room_id: str) -> dict:
         status_info = dict(status_details.get(name) or {
             "status": "offline", "phase": "unavailable", "updated_at": 0,
         })
-        status = status_info.get("status", "offline")
-        health = _agent_wake_health(info, status)
         pid = info.get("last_wake_pid")
         process_alive = bool(pid) and bus._pid_alive(pid)
-        phase = status_info.get("phase", "online")
-        if health.get("rate_limited"):
-            phase = "rate_limited"
-        elif (health.get("stale_lease") and phase in _ACTIVE_PHASES
-              and status_info.get("source") != "agent"):
-            phase = "unavailable"
+        phase, health = _agent_phase_snapshot(status_info, info)
         agents[name] = {
             **status_info,
             "phase": phase,
@@ -1227,7 +1240,8 @@ def _spawn_agents(
     per_agent_default_briefs = {
         spec["name"]: _build_default_brief(room_id, name, goal, cwd, agent_name=spec["name"])
         for spec in spawn.load_registry()
-        if spec.get("enabled") and spec["name"] not in skip_owner
+        if (spec.get("enabled") and spec.get("auto", True) is not False
+            and spec["name"] not in skip_owner)
     }
 
     briefs_arg: dict[str, str] | None = None

@@ -953,6 +953,53 @@ def test_agent_reported_phase_does_not_require_server_wake_pid(
     assert agent["health"]["stale_lease"] is True
 
 
+def test_terminal_agent_failure_closes_pending_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    room_id = isolated_bus.create_room("Unavailable", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "Antigravity")
+    isolated_bus.post_message(
+        room_id, "Claude", "Please research this", "request", to="Antigravity",
+    )
+    isolated_bus.set_status(
+        room_id, "Antigravity", "online", 0, "session-1",
+        phase="unavailable", detail="spawn failed",
+    )
+
+    snapshot = server.room_status(room_id)
+
+    assert snapshot["pending_requests"] == []
+    assert snapshot["wait_recommended"] is False
+    assert snapshot["all_terminal"] is True
+
+
+def test_auto_spawn_false_agent_is_not_marked_starting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+    fake_registry: list[spawn.SpawnSpec] = [{
+        "name": "OptIn",
+        "cmd": ["echo", "{brief}"],
+        "enabled": True,
+        "auto": False,
+    }]
+    monkeypatch.setattr(server.spawn, "load_registry", lambda: fake_registry)
+    monkeypatch.setattr(server.spawn, "spawn_all", lambda *args, **kwargs: ([], [], {}))
+
+    room_id = isolated_bus.create_room("AutoFilter", "Claude", 0, str(tmp_path), "session-1")
+    server._spawn_agents(
+        room_id, "AutoFilter", "test", str(tmp_path), "Claude", auto_spawn=True,
+    )
+
+    assert "OptIn" not in isolated_bus.get_status_details(room_id)
+
+
 def test_request_wakeup_skips_self_and_reply_requests(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
     isolated_bus = importlib.reload(bus)
