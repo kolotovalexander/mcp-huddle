@@ -105,7 +105,20 @@ def test_default_registry_roster() -> None:
     depends on which binaries the test host has installed). Qwen and DeepSeek
     were retired; the active roster is Claude / Codex / Antigravity / MiMo."""
     spec_names = {s["name"] for s in spawn.DEFAULT_REGISTRY}
-    assert spec_names == {"Codex", "Antigravity", "MiMo", "Claude"}
+    assert spec_names == {"Codex", "Antigravity", "MiMo", "OpenCode", "Claude"}
+
+
+def test_opencode_slot_is_opt_in_timeout_wrapped_and_uses_local_model_config() -> None:
+    spec = next(s for s in spawn.DEFAULT_REGISTRY if s["name"] == "OpenCode")
+    assert spec["enabled"] == (
+        spawn._OPENCODE_BIN is not None
+        and spawn._OPENCODE_TIMEOUT_BIN is not None
+        and os.environ.get("MCP_HUDDLE_OPENCODE_ENABLED", "0") == "1"
+    )
+    assert spec["cmd"][0] == (spawn._OPENCODE_TIMEOUT_BIN or "timeout")
+    assert spec["cmd"][1] == str(spawn._OPENCODE_TIMEOUT_SEC)
+    assert "-m" not in spec["cmd"]
+    assert not any("9router" in arg for arg in spec["cmd"])
 
 
 def test_mimo_spec_uses_runner() -> None:
