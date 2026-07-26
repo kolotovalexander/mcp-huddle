@@ -142,6 +142,8 @@ All configuration is via environment variables (defaults shown):
 | `MCP_HUDDLE_STUCK_KILL` | `1` | When a stuck wake is announced (`MCP_HUDDLE_WAKE_STUCK_SEC`), also SIGTERM the still-alive process. Set to `0`/`false`/`no` for legacy announce-only behavior. |
 | `MCP_HUDDLE_DEAD_WAKE_GRACE_SEC` | `60` | Grace before the watchdog treats a busy lease with a dead pid as a dead wake (announces to the room, releases the lease). `0` disables the check. |
 | `MCP_HUDDLE_SAME_BIN_STAGGER_SEC` | `20` | Within one batch spawn (`auto_spawn=True` / dict), delay each spec after the first that resolves to the same effective binary (e.g. two `opencode run` slots) by this many seconds times its occurrence index — avoids same-process collisions (e.g. OpenCode's local SQLite "database is locked"). `0` disables staggering. |
+| `MCP_HUDDLE_OPENCODE_ENABLED` | `0` | Explicitly enable the optional OpenCode slot. It uses OpenCode's configured default model and a bounded initial/wake process timeout. |
+| `MCP_HUDDLE_OPENCODE_TIMEOUT_SEC` | `1200` | Maximum runtime for one OpenCode turn when the slot is enabled. |
 | `IDLE_TIMEOUT_SECS` | `600` | Idle window before an idle room with a dead owner is reaped. |
 | `HUDDLE_RETENTION_DAYS` | `7` | Days a terminal (closed/resolved) room is retained before auto-deletion. |
 | `HUDDLE_RETENTION_SWEEP_SECS` | `3600` | Interval between retention sweeps. |
@@ -196,10 +198,10 @@ mcp-huddle is designed to run **locally, on a single trusted machine**:
 - **Antigravity (`agy`) is opt-in** (`MCP_HUDDLE_ANTIGRAVITY_ENABLED=1`): it
   needs a prior interactive `agy` login and is not read-only-enforced. **MiMo**
   runs in a throwaway temp dir, so it never touches your project files.
-  **OpenCode** is not in `DEFAULT_REGISTRY` — add it via a
-  `~/.mcp-huddle/registry.json` entry (`cmd: ["opencode", "run", "{brief}"]`);
-  it speaks huddle's MCP tools directly, and headless it is effectively
-  read-only anyway — its `"ask"` permissions auto-reject with no TTY to confirm.
+**OpenCode** is an opt-in `DEFAULT_REGISTRY` slot. Set
+`MCP_HUDDLE_OPENCODE_ENABLED=1` to enable it; it uses OpenCode's configured
+default model and is wrapped in a bounded timeout. Headless it is effectively
+read-only anyway — its `"ask"` permissions auto-reject with no TTY to confirm.
 - **All data lives under `~/.mcp-huddle/`** (override with `MCP_HUDDLE_HOME`) as
   plain JSONL/JSON files. Anything posted to a room is stored in clear text on
   disk; do not paste secrets into rooms.

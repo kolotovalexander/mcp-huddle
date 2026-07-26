@@ -123,6 +123,16 @@ _MIMO_BIN = _first_existing_binary([
     "mimo",
     "/opt/homebrew/bin/mimo",
 ])
+_OPENCODE_BIN = _first_existing_binary([
+    "opencode",
+    "/opt/homebrew/bin/opencode",
+])
+_OPENCODE_TIMEOUT_BIN = _first_existing_binary([
+    "timeout",
+    "gtimeout",
+    "/opt/homebrew/bin/timeout",
+])
+_OPENCODE_TIMEOUT_SEC = int(os.environ.get("MCP_HUDDLE_OPENCODE_TIMEOUT_SEC", "1200"))
 
 # Codex sandbox for huddle participation. Codex talks to the room via the
 # huddle MCP server. Under a RESTRICTED sandbox (read-only / workspace-write)
@@ -195,6 +205,32 @@ def _mimo_advisor_spec() -> SpawnSpec:
         "name": "MiMo",
         "cmd": [sys.executable, "-m", "mcp_huddle.mimo_runner", "--brief", "{brief}"],
         "enabled": False,
+    }
+
+
+def _opencode_spec() -> SpawnSpec:
+    """Build the optional OpenCode slot without assuming a provider route.
+
+    OpenCode's model/provider names are local configuration, not a stable
+    huddle contract. Do not pin a route that may not exist on this machine;
+    ``opencode`` resolves its configured default model after explicit opt-in.
+    A timeout wrapper is required because initial auto-spawn has no wake lease
+    for the existing stuck-wake watchdog to release.
+    """
+    enabled = (
+        _OPENCODE_BIN is not None
+        and _OPENCODE_TIMEOUT_BIN is not None
+        and os.environ.get("MCP_HUDDLE_OPENCODE_ENABLED", "0") == "1"
+    )
+    timeout_bin = _OPENCODE_TIMEOUT_BIN or "timeout"
+    opencode_bin = _OPENCODE_BIN or "opencode"
+    return {
+        "name": "OpenCode",
+        "cmd": [
+            timeout_bin, str(_OPENCODE_TIMEOUT_SEC),
+            opencode_bin, "run", "{brief}",
+        ],
+        "enabled": enabled,
     }
 
 
@@ -341,6 +377,7 @@ DEFAULT_REGISTRY: list[SpawnSpec] = [
     },
     _google_advisor_spec(),
     _mimo_advisor_spec(),
+    _opencode_spec(),
     {
         "name": "Claude",
         "cmd": [
