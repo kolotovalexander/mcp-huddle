@@ -878,7 +878,7 @@ def spawn_all(
     on_spawn_fail=None,
     delayed_spawn_gate=None,
     on_delayed_spawn=None,
-) -> tuple[list[str], list[int], dict[str, dict[str, str | None]]]:
+) -> tuple[list[str], list[int], dict[str, dict[str, object]]]:
     """Spawn every enabled agent in the registry.
 
     Args:
@@ -917,11 +917,12 @@ def spawn_all(
 
     Returns:
       (names, pids, agent_meta) where agent_meta is
-      {name: {"log_path": "...", "last_message_path": "..." or None}}.
+      {name: {"log_path": "...", "last_message_path": "..." or None,
+              "pid": int}}. Delayed entries omit the pid until they start.
     """
     names: list[str] = []
     pids: list[int] = []
-    agent_meta: dict[str, dict[str, str | None]] = {}
+    agent_meta: dict[str, dict[str, object]] = {}
     briefs = briefs or {}
     skip_names = skip_names or set()
     specs = [
@@ -959,6 +960,7 @@ def spawn_all(
             agent_meta[spec["name"]] = {
                 "log_path": log_path,
                 "last_message_path": last_msg,
+                "pid": pid,
             }
         except (FileNotFoundError, PermissionError) as exc:
             # Tolerate races (binary disappears between check and spawn).

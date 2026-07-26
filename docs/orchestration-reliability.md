@@ -12,6 +12,13 @@ From a multi-agent orchestrator's session report. Split into what huddle fixed
 | Mechanical digest too thin | digest now reports **latest position per agent** + still-open requests, round-scoped | `room_summarize(round=…)` |
 | resume → new PID → zombie-watchdog closes live room | grace window (open/closing rooms reaped only after silence) + explicit re-stamp | `room_reclaim(room_id, owner, owner_pid)` |
 | MiMo advisor dead (empty headless output) | default OFF, opt-in | `MCP_HUDDLE_MIMO_ENABLED=1` |
+| Spawned agents look available while still researching/generating | persisted lifecycle phases, process health, unanswered-request tracking, and explicit terminal failures | `room_status(room_id)`, `status_set(room_id, agent, phase)` |
+
+For orchestration, `process_alive` is only liveness. Wait while
+`wait_recommended=true` or a participant is `queued`, `starting`, `thinking`,
+`working`, or `responding`; then read durable answers with
+`messages_read(kind="result")`. `completed` means a result was stored;
+`unavailable`, `rate_limited`, and `stuck` are terminal failures.
 
 **Truncation = head+tail (60/40), not head-only.** "Lost in the middle" research +
 Hermes/Claude-Code production: conclusions live in the tail, so the middle is the

@@ -38,6 +38,14 @@ MAX_BODY_CHARS = 2000         # per-message body cap in read_messages — one fa
 
 VALID_KINDS = {"request", "comment", "ack", "busy", "result", "final", "system", "close"}
 
+# `status` remains the operational lease used by the wake machinery. `phase`
+# is the human/agent-facing lifecycle detail and is safe to extend without
+# breaking callers that still consume get_status() -> {agent: "online"|"busy"}.
+VALID_AGENT_PHASES = {
+    "online", "queued", "starting", "thinking", "working", "responding",
+    "completed", "unavailable", "rate_limited", "stuck",
+}
+
 
 # ── Rooms ────────────────────────────────────────────────────────────────────
 
@@ -74,7 +82,10 @@ def create_room(name: str, owner: str, owner_pid: int, cwd: str = "",
     }
     _write_json(rdir / "meta.json", meta)
     _write_json(rdir / "status.json", {
-        owner: {"status": "online", "expires_at": 0, "session_id": session_id}
+        owner: {
+            "status": "online", "phase": "online", "expires_at": 0,
+            "session_id": session_id, "updated_at": now, "source": "server",
+        }
     })
     return room_id
 
@@ -457,12 +468,26 @@ def summarize_messages(room_id: str, since_id: int = 0, round: int = 0) -> str:
 # ── Status ───────────────────────────────────────────────────────────────────
 
 def set_status(room_id: str, agent: str, status: str,
-               expires_in_sec: int = 0, session_id: str = "") -> None:
+               expires_in_sec: int = 0, session_id: str = "",
+               phase: str = "", task_id: int | str = "", detail: str = "",
+               source: str = "server") -> None:
     expires_at = int(time.time()) + expires_in_sec if expires_in_sec > 0 else 0
-    _patch_status(room_id, agent, status, expires_at, session_id)
+    _patch_status(room_id, agent, status, expires_at, session_id,
+                  phase=phase, task_id=task_id, detail=detail, source=source)
 
 
 def get_status(room_id: str) -> dict:
+    return {agent: info["status"]
+            for agent, info in get_status_details(room_id).items()}
+
+
+def get_status_details(room_id: str) -> dict:
+    """Return normalized lifecycle records while preserving legacy leases.
+
+    Readers may observe an old status.json written before ``phase`` existed;
+    derive a phase in memory instead of rewriting it. Expired leases are reset
+    under the existing status lock so concurrent wake writers are not clobbered.
+    """
     status_file = _room_dir(room_id) / "status.json"
     if not status_file.exists():
         return {}
@@ -470,35 +495,52 @@ def get_status(room_id: str) -> dict:
         data = json.loads(status_file.read_text())
     except Exception:
         return {}
+    if not isinstance(data, dict):
+        return {}
+
     now = int(time.time())
-    result = {}
-    expired = []
-    for agent, info in data.items():
-        expires = info.get("expires_at", 0)
+    result: dict = {}
+    expired: list[str] = []
+    fallback_phase = {
+        "online": "online", "busy": "working", "done": "completed",
+        "typing": "responding",
+    }
+    for agent, raw in data.items():
+        info = dict(raw) if isinstance(raw, dict) else {"status": "online"}
+        status = info.get("status", "online")
+        expires = int(info.get("expires_at", 0) or 0)
         if expires > 0 and now > expires:
-            result[agent] = "online"
+            status = "online"
+            info["status"] = status
+            info["expires_at"] = 0
+            info["phase"] = "online"
             expired.append(agent)
         else:
-            result[agent] = info.get("status", "online")
-    # Persist expiry resets under the lock with a fresh read so we never
-    # clobber a busy lease another thread wrote between our read and write.
+            info["status"] = status
+            info.setdefault("phase", fallback_phase.get(status, status))
+        info.setdefault("updated_at", 0)
+        result[agent] = info
+
     if expired:
         with _lock(_room_dir(room_id) / "status.lock"):
             if status_file.exists():
                 try:
-                    data = json.loads(status_file.read_text())
+                    latest = json.loads(status_file.read_text())
                 except Exception:
-                    data = {}
+                    latest = {}
                 changed = False
                 for agent in expired:
-                    info = data.get(agent)
-                    if (info and info.get("expires_at", 0) > 0
-                            and now > info["expires_at"]):
+                    info = latest.get(agent)
+                    if (isinstance(info, dict)
+                            and int(info.get("expires_at", 0) or 0) > 0
+                            and now > int(info["expires_at"])):
                         info["status"] = "online"
                         info["expires_at"] = 0
+                        info["phase"] = "online"
+                        info["updated_at"] = now
                         changed = True
                 if changed:
-                    _write_json(status_file, data)
+                    _write_json(status_file, latest)
     return result
 
 
@@ -709,7 +751,9 @@ def _update_meta_locked(room_id: str, update_fn) -> dict:
         return updated
 
 
-def _patch_status(room_id: str, agent: str, status: str, expires_at: int, session_id: str) -> None:
+def _patch_status(room_id: str, agent: str, status: str, expires_at: int,
+                  session_id: str, *, phase: str = "", task_id: int | str = "",
+                  detail: str = "", source: str = "server") -> None:
     p = _room_dir(room_id) / "status.json"
     # Locked read-modify-write: concurrent wake threads / reaper callbacks /
     # watchdog all patch status.json. Without the lock, two writers that read
@@ -722,7 +766,30 @@ def _patch_status(room_id: str, agent: str, status: str, expires_at: int, sessio
                 data = json.loads(p.read_text())
             except Exception:
                 data = {}
-        data[agent] = {"status": status, "expires_at": expires_at, "session_id": session_id}
+        if not isinstance(data, dict):
+            data = {}
+        previous = data.get(agent) if isinstance(data.get(agent), dict) else {}
+        if phase and phase not in VALID_AGENT_PHASES:
+            raise ValueError(
+                f"Invalid agent phase {phase!r}. Valid: {sorted(VALID_AGENT_PHASES)}"
+            )
+        record = {
+            "status": status,
+            "phase": phase or previous.get("phase") or status,
+            "expires_at": expires_at,
+            "session_id": session_id or previous.get("session_id", ""),
+            "updated_at": int(time.time()),
+            "source": source or previous.get("source", "server"),
+        }
+        if task_id != "":
+            record["task_id"] = task_id
+        elif "task_id" in previous:
+            record["task_id"] = previous["task_id"]
+        if detail:
+            record["detail"] = detail
+        elif previous.get("detail"):
+            record["detail"] = previous["detail"]
+        data[agent] = record
         _write_json(p, data)
 
 

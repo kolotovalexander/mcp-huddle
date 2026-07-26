@@ -76,7 +76,10 @@ def build_messages(agent: str, transcript: str, request_msg: dict, reasoning: st
                 "Use maximum careful reasoning internally. Reply with only the "
                 "room-visible technical answer: cite concrete message ids, point "
                 "out risks, and avoid thanks/ack-only chatter. Do not claim tool "
-                "access; the runner will post your answer."
+                "access; the runner will post your answer. The server owns the "
+                "lifecycle and marks this turn completed only after the runner "
+                "posts the result. A live process or quiet log is not completion; "
+                "process means work is still in progress."
             ),
         },
         {
