@@ -132,7 +132,12 @@ _OPENCODE_TIMEOUT_BIN = _first_existing_binary([
     "gtimeout",
     "/opt/homebrew/bin/timeout",
 ])
-_OPENCODE_TIMEOUT_SEC = int(os.environ.get("MCP_HUDDLE_OPENCODE_TIMEOUT_SEC", "1200"))
+try:
+    _OPENCODE_TIMEOUT_SEC = int(os.environ.get("MCP_HUDDLE_OPENCODE_TIMEOUT_SEC", "1200"))
+except ValueError:
+    _OPENCODE_TIMEOUT_SEC = 1200
+if _OPENCODE_TIMEOUT_SEC <= 0:
+    _OPENCODE_TIMEOUT_SEC = 1200
 
 # Codex sandbox for huddle participation. Codex talks to the room via the
 # huddle MCP server. Under a RESTRICTED sandbox (read-only / workspace-write)

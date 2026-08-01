@@ -3,6 +3,7 @@ thread_id parsing, codex_resume helper, /api/room_agents and SSE endpoint)."""
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 import importlib
@@ -119,6 +120,29 @@ def test_opencode_slot_is_opt_in_timeout_wrapped_and_uses_local_model_config() -
     assert spec["cmd"][1] == str(spawn._OPENCODE_TIMEOUT_SEC)
     assert "-m" not in spec["cmd"]
     assert not any("9router" in arg for arg in spec["cmd"])
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("not-a-number", "1200"), ("0", "1200"), ("-1", "1200"), ("45", "45")],
+)
+def test_opencode_timeout_env_cannot_break_server_import(
+    raw: str, expected: str,
+) -> None:
+    env = os.environ.copy()
+    env["MCP_HUDDLE_OPENCODE_TIMEOUT_SEC"] = raw
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+
+    result = subprocess.run(
+        [sys.executable, "-c", "from mcp_huddle import spawn; print(spawn._OPENCODE_TIMEOUT_SEC)"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == expected
 
 
 def test_mimo_spec_uses_runner() -> None:
