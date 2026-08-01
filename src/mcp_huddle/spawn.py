@@ -123,6 +123,21 @@ _MIMO_BIN = _first_existing_binary([
     "mimo",
     "/opt/homebrew/bin/mimo",
 ])
+_OPENCODE_BIN = _first_existing_binary([
+    "opencode",
+    "/opt/homebrew/bin/opencode",
+])
+_OPENCODE_TIMEOUT_BIN = _first_existing_binary([
+    "timeout",
+    "gtimeout",
+    "/opt/homebrew/bin/timeout",
+])
+try:
+    _OPENCODE_TIMEOUT_SEC = int(os.environ.get("MCP_HUDDLE_OPENCODE_TIMEOUT_SEC", "1200"))
+except ValueError:
+    _OPENCODE_TIMEOUT_SEC = 1200
+if _OPENCODE_TIMEOUT_SEC <= 0:
+    _OPENCODE_TIMEOUT_SEC = 1200
 
 # Codex sandbox for huddle participation. Codex talks to the room via the
 # huddle MCP server. Under a RESTRICTED sandbox (read-only / workspace-write)
@@ -195,6 +210,32 @@ def _mimo_advisor_spec() -> SpawnSpec:
         "name": "MiMo",
         "cmd": [sys.executable, "-m", "mcp_huddle.mimo_runner", "--brief", "{brief}"],
         "enabled": False,
+    }
+
+
+def _opencode_spec() -> SpawnSpec:
+    """Build the optional OpenCode slot without assuming a provider route.
+
+    OpenCode's model/provider names are local configuration, not a stable
+    huddle contract. Do not pin a route that may not exist on this machine;
+    ``opencode`` resolves its configured default model after explicit opt-in.
+    A timeout wrapper is required because initial auto-spawn has no wake lease
+    for the existing stuck-wake watchdog to release.
+    """
+    enabled = (
+        _OPENCODE_BIN is not None
+        and _OPENCODE_TIMEOUT_BIN is not None
+        and os.environ.get("MCP_HUDDLE_OPENCODE_ENABLED", "0") == "1"
+    )
+    timeout_bin = _OPENCODE_TIMEOUT_BIN or "timeout"
+    opencode_bin = _OPENCODE_BIN or "opencode"
+    return {
+        "name": "OpenCode",
+        "cmd": [
+            timeout_bin, str(_OPENCODE_TIMEOUT_SEC),
+            opencode_bin, "run", "{brief}",
+        ],
+        "enabled": enabled,
     }
 
 
@@ -341,6 +382,7 @@ DEFAULT_REGISTRY: list[SpawnSpec] = [
     },
     _google_advisor_spec(),
     _mimo_advisor_spec(),
+    _opencode_spec(),
     {
         "name": "Claude",
         "cmd": [
@@ -878,7 +920,7 @@ def spawn_all(
     on_spawn_fail=None,
     delayed_spawn_gate=None,
     on_delayed_spawn=None,
-) -> tuple[list[str], list[int], dict[str, dict[str, str | None]]]:
+) -> tuple[list[str], list[int], dict[str, dict[str, object]]]:
     """Spawn every enabled agent in the registry.
 
     Args:
@@ -917,11 +959,12 @@ def spawn_all(
 
     Returns:
       (names, pids, agent_meta) where agent_meta is
-      {name: {"log_path": "...", "last_message_path": "..." or None}}.
+      {name: {"log_path": "...", "last_message_path": "..." or None,
+              "pid": int}}. Delayed entries omit the pid until they start.
     """
     names: list[str] = []
     pids: list[int] = []
-    agent_meta: dict[str, dict[str, str | None]] = {}
+    agent_meta: dict[str, dict[str, object]] = {}
     briefs = briefs or {}
     skip_names = skip_names or set()
     specs = [
@@ -959,6 +1002,7 @@ def spawn_all(
             agent_meta[spec["name"]] = {
                 "log_path": log_path,
                 "last_message_path": last_msg,
+                "pid": pid,
             }
         except (FileNotFoundError, PermissionError) as exc:
             # Tolerate races (binary disappears between check and spawn).
