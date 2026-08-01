@@ -40,6 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handling no longer leave stale or misleading room state.
 - Invalid, zero, or negative `MCP_HUDDLE_OPENCODE_TIMEOUT_SEC` values fall back
   safely instead of crashing import or disabling the timeout.
+- The MCP SDK dependency stays on the compatible `1.x` line until huddle is
+  migrated to the breaking `2.x` server API.
 
 ## [0.3.0] - 2026-06-19
 
