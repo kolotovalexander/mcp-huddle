@@ -25,7 +25,7 @@ Or run it without installing, using [`uvx`](https://docs.astral.sh/uv/):
 uvx mcp-huddle --http        # HTTP + dashboard
 ```
 
-This is version **0.3.0**. See [CHANGELOG.md](CHANGELOG.md) for release notes.
+This is version **0.6.0**. See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## Two ways to run
 
@@ -70,7 +70,7 @@ args = ["mcp-huddle"]
 > Want the bleeding edge straight from GitHub instead of PyPI? Swap the args for
 > `["--from", "git+https://github.com/kolotovalexander/mcp-huddle", "mcp-huddle"]`.
 
-Restart the client. The 12 huddle tools become available.
+Restart the client. The 14 huddle tools become available.
 
 > Tip: if your client doesn't see `uvx` because PATH is empty when it spawns the server, replace `"uvx"` with the absolute path (`which uvx` to find it — typically `/Users/you/.local/bin/uvx` on macOS).
 
@@ -198,10 +198,10 @@ mcp-huddle is designed to run **locally, on a single trusted machine**:
 - **Antigravity (`agy`) is opt-in** (`MCP_HUDDLE_ANTIGRAVITY_ENABLED=1`): it
   needs a prior interactive `agy` login and is not read-only-enforced. **MiMo**
   runs in a throwaway temp dir, so it never touches your project files.
-**OpenCode** is an opt-in `DEFAULT_REGISTRY` slot. Set
-`MCP_HUDDLE_OPENCODE_ENABLED=1` to enable it; it uses OpenCode's configured
-default model and is wrapped in a bounded timeout. Headless it is effectively
-read-only anyway — its `"ask"` permissions auto-reject with no TTY to confirm.
+- **OpenCode** is an opt-in `DEFAULT_REGISTRY` slot. Set
+  `MCP_HUDDLE_OPENCODE_ENABLED=1` to enable it; it uses OpenCode's configured
+  default model and is wrapped in a bounded timeout. Headless it is effectively
+  read-only anyway — its `"ask"` permissions auto-reject with no TTY to confirm.
 - **All data lives under `~/.mcp-huddle/`** (override with `MCP_HUDDLE_HOME`) as
   plain JSONL/JSON files. Anything posted to a room is stored in clear text on
   disk; do not paste secrets into rooms.
@@ -297,15 +297,24 @@ Everything is in the **⚙️ settings popover**: light/dark/auto **theme**, thr
 
 ## Publishing
 
-Maintainer notes for cutting a release to PyPI:
+Maintainer notes for cutting a release to GitHub and PyPI:
 
 1. Bump the version in `pyproject.toml` and `src/mcp_huddle/__init__.py`.
-2. Add a [CHANGELOG.md](CHANGELOG.md) entry and tag the release.
-3. Build and upload:
+2. Add a [CHANGELOG.md](CHANGELOG.md) entry and merge the release commit.
+3. From a clean release worktree with an empty `dist/`, build and validate:
 
    ```bash
-   python -m build                 # builds sdist + wheel into dist/
-   python -m twine upload dist/*   # requires a PyPI API token
+   uvx --from build pyproject-build
+   uvx --from twine twine check dist/*
+   ```
+
+4. Tag the merged commit, create the GitHub Release, then upload only the
+   freshly validated artifacts:
+
+   ```bash
+   git tag vX.Y.Z && git push origin vX.Y.Z
+   gh release create vX.Y.Z --verify-tag --generate-notes
+   uvx --from twine twine upload dist/mcp_huddle-X.Y.Z*  # requires ~/.pypirc
    ```
 
 ## Contributing

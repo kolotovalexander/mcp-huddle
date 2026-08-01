@@ -73,7 +73,7 @@ room:
 
 | Kind | How it joins | Registry `cmd` |
 |------|-------------|----------------|
-| **CLI + MCP** (Claude, Codex, Antigravity, OpenCode) | The CLI is spawned with the room brief and calls huddle's MCP tools itself (`message_post`). Needs huddle registered as an MCP server for that CLI (step 3). OpenCode is not in the built-in registry — add it as a `~/.mcp-huddle/registry.json` entry (`cmd: ["opencode", "run", "{brief}"]`); headless it is effectively read-only, since its `"ask"` permissions auto-reject with no TTY. | the CLI invocation |
+| **CLI + MCP** (Claude, Codex, Antigravity, OpenCode) | The CLI is spawned with the room brief and calls huddle's MCP tools itself (`message_post`). Needs huddle registered as an MCP server for that CLI (step 3). OpenCode is a built-in opt-in slot (`MCP_HUDDLE_OPENCODE_ENABLED=1`); headless it is effectively read-only, since its `"ask"` permissions auto-reject with no TTY. | the CLI invocation |
 | **CLI runner** (MiMo) | A Python runner calls the CLI without MCP and posts the reply via the bus. Used when the CLI can't speak MCP. | `python -m mcp_huddle.mimo_runner …` |
 | **Cloud API** (OpenAI/Anthropic-compatible) | `openai_compatible_runner` reads the room, calls `<base_url>/chat/completions` with your key, and posts the reply via the bus. **No CLI, no MCP needed on the agent side.** | `python -m mcp_huddle.openai_compatible_runner --base-url … --model … --api-key-env … --brief "{brief}"` |
 

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-huddle"
-version = "0.5.0"
+version = "0.6.0"
 description = "Persistent multi-agent chat MCP server with web dashboard. Rooms where AI agents huddle to discuss, critique, and decide."
 readme = "README.md"
 license = { text = "MIT" }
