@@ -2730,6 +2730,39 @@ def test_non_mcp_runner_prompts_explain_server_owned_completion() -> None:
         assert "process" in prompt, name
 
 
+def test_all_reviewer_prompts_require_evidence_before_consensus() -> None:
+    """No agent path may turn agreement into an unsupported factual verdict."""
+    from mcp_huddle import mimo_runner, openai_compatible_runner
+
+    request = {"id": 7, "agent": "Claude", "body": "review this"}
+    samples = {
+        "fresh": server._build_fresh_agent_prompt(
+            "room_xyz", "OpenCode", "review this", "1: prior message"),
+        "registry": server._build_registry_agent_wakeup_prompt(
+            "room_xyz", "OpenCode", "Claude", "review this", "OpenCode",
+            7, 3, "1: prior message"),
+        "codex": server._build_codex_wakeup_prompt(
+            "room_xyz", "Claude", "review this", "Codex", 7, 3),
+        "default": server._build_default_brief(
+            "room_xyz", "room-name", "review this", "/tmp/proj",
+            agent_name="OpenCode"),
+        "custom": server._wrap_user_brief(
+            "room_xyz", "OpenCode", "review this"),
+        "openai": openai_compatible_runner.build_messages(
+            "OpenRouter", "1: prior message", request, "high")[0]["content"],
+        "mimo": mimo_runner.build_prompt(
+            "MiMo", "1: prior message", request),
+    }
+    for name, prompt in samples.items():
+        assert "Consensus is not correctness" in prompt, name
+        assert "stated goal" in prompt and "constraints" in prompt, name
+        assert "evidence quality" in prompt and "risks/unknowns" in prompt, name
+        assert "reversibility" in prompt, name
+        assert "source URL" in prompt and "file:line" in prompt, name
+        assert "test/command result" in prompt and "message id" in prompt, name
+        assert "inference" in prompt and "unknown" in prompt, name
+
+
 def test_auto_spawn_true_gives_each_agent_its_own_name_in_the_brief(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -99,6 +99,8 @@ CONSENSUS:
 - After agents converge, anyone calls `propose_resolution(room_id, agent,
   text)` → all participants vote `ack`/`reject` via `resolution_vote(...)`.
 - All-ack → room becomes `resolved` (read-only for normal messages).
+- Consensus records agreement, not correctness. Verify factual claims against
+  evidence before voting.
 
 CLOSE PROTOCOL (lifecycle is human-only — agents never close):
 1. Agents express "discussion is done" via `message_post(kind="final", ...)`.
@@ -2158,6 +2160,8 @@ You are: {agent_name}
 
 {_lifecycle_protocol_block(room_id, agent_name)}
 
+{_evidence_protocol_block()}
+
 Current room transcript:
 {transcript}
 
@@ -2210,6 +2214,18 @@ def _anti_loop_block() -> str:
             "chatter.")
 
 
+def _evidence_protocol_block() -> str:
+    """Shared evidence floor and lightweight evaluation rubric."""
+    return """## Evidence and evaluation (MANDATORY)
+Consensus is not correctness. Evaluate proposals against the stated goal and
+constraints, evidence quality, risks/unknowns, and reversibility.
+- Support every verifiable factual claim with available evidence: a source URL,
+  file:line, test/command result, or specific room message id.
+- If direct support is unavailable, label the claim as inference or unknown.
+  Opinions and trade-offs need reasoning, not fake citations.
+"""
+
+
 def _lifecycle_protocol_block(room_id: str, agent_name: str,
                               task_id: int | str = "") -> str:
     """Shared lifecycle contract for every process-backed agent prompt."""
@@ -2258,6 +2274,8 @@ Last delivered message id: {last_seen}
 
 {_lifecycle_protocol_block(room_id, agent_name, msg_id)}
 
+{_evidence_protocol_block()}
+
 Current full transcript:
 {transcript}
 
@@ -2295,6 +2313,8 @@ To: {addressed}
 Last delivered message id: {last_seen}
 
 {_lifecycle_protocol_block(room_id, "Codex", msg_id)}
+
+{_evidence_protocol_block()}
 
 Request body:
 {body}
@@ -2339,6 +2359,8 @@ You are an independent reviewer, NOT an executor.
 - Ask clarifying questions using kind=request
 - NEVER send "Thanks", "Agreed", "Got it" — only technical arguments
 - Reply ONLY to kind=request addressed to you (to=your_name or to=all)
+
+{_evidence_protocol_block()}
 
 ## How to reply (MANDATORY)
 {_stdout_not_delivered_note()}
@@ -2392,6 +2414,8 @@ def _wrap_user_brief(room_id: str, agent_name: str, brief: str) -> str:
 To reply: {reply_call}
 
 {_anti_loop_block()}
+
+{_evidence_protocol_block()}
 
 {_lifecycle_protocol_block(room_id, agent_name, "initial")}
 
