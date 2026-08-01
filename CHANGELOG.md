@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-01
+
+### Added
+
+- Persisted agent lifecycle reporting through the new `status_set` and
+  `room_status` MCP tools, including terminal states and wait guidance for
+  organizers.
+- An evidence/rubric contract across every built-in spawn prompt and runner:
+  verifiable factual claims should cite a URL, `file:line`, test result, or room
+  message ID; unsupported claims must be marked as inference or unknown. This
+  is prompt-level enforcement and does not automatically validate links.
+
+### Changed
+
+- The watchdog now runs in stdio mode as well as HTTP mode. Stuck wake
+  processes are terminated by default after their configured timeout; set
+  `MCP_HUDDLE_STUCK_KILL=0` for announce-only behavior.
+- Auto-spawn uses a curated roster, staggers same-binary launches, and checks
+  room state again before a delayed spawn fires.
+- OpenCode is a built-in but opt-in slot
+  (`MCP_HUDDLE_OPENCODE_ENABLED=1`) that uses the configured default model and
+  has a bounded timeout.
+- Completion waits distinguish substantive `result` messages from lifecycle
+  notices and stop cleanly on terminal agent states.
+
+### Fixed
+
+- Initial spawn failures, clean no-reply exits, and idle-room pending wakes are
+  surfaced instead of leaving organizers waiting silently.
+- `auto: false` requests, delayed-spawn process tracking, and terminal wait
+  handling no longer leave stale or misleading room state.
+- Invalid, zero, or negative `MCP_HUDDLE_OPENCODE_TIMEOUT_SEC` values fall back
+  safely instead of crashing import or disabling the timeout.
+- The MCP SDK dependency stays on the compatible `1.x` line until huddle is
+  migrated to the breaking `2.x` server API.
+
 ## [0.3.0] - 2026-06-19
 
 ### Added
@@ -100,7 +136,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   10 MCP tools, anti-loop guards, consensus (propose/vote), and stdio + HTTP
   transports.
 
-[Unreleased]: https://github.com/kolotovalexander/mcp-huddle/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/kolotovalexander/mcp-huddle/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/kolotovalexander/mcp-huddle/compare/v0.5.0...v0.6.0
 [0.3.0]: https://github.com/kolotovalexander/mcp-huddle/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/kolotovalexander/mcp-huddle/releases/tag/v0.2.0
 [0.1.2]: https://github.com/kolotovalexander/mcp-huddle/releases/tag/v0.1.2
