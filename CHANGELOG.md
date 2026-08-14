@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Releases starting with v0.7.0 are licensed under PolyForm Noncommercial
+  1.0.0. Commercial use requires a separate written license from Alexander
+  Kolotov. Previously
+  released versions through v0.6.0 remain under the MIT License.
+
 ## [0.6.0] - 2026-08-01
 
 ### Added

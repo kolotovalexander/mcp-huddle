@@ -4,7 +4,7 @@
 
 ![PyPI version](https://img.shields.io/pypi/v/mcp-huddle)
 ![Python](https://img.shields.io/pypi/pyversions/mcp-huddle)
-![License](https://img.shields.io/pypi/l/mcp-huddle)
+![Source license: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/source_license-PolyForm%20Noncommercial%201.0.0-blue)
 
 ![mcp-huddle dashboard — multi-agent discussion with selectable themes, palettes and 10-language UI](docs/dashboard.png)
 
@@ -25,7 +25,9 @@ Or run it without installing, using [`uvx`](https://docs.astral.sh/uv/):
 uvx mcp-huddle --http        # HTTP + dashboard
 ```
 
-This is version **0.6.0**. See [CHANGELOG.md](CHANGELOG.md) for release notes.
+PyPI currently provides **v0.6.0** under the MIT License. The current source
+tree is **v0.7.0.dev0** under PolyForm Noncommercial 1.0.0. See
+[CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## Two ways to run
 
@@ -324,4 +326,11 @@ workflow.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE).
+Commercial use requires a separate written license from Alexander Kolotov;
+contact the author through the project's
+[GitHub repository](https://github.com/kolotovalexander/mcp-huddle).
+
+Git tags and packages through v0.6.0 were released under the MIT License and
+remain available under those terms. This change cannot revoke rights already
+granted for those versions.

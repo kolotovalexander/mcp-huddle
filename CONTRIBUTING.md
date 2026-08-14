@@ -63,5 +63,6 @@ Open an issue at <https://github.com/kolotovalexander/mcp-huddle/issues> with
 steps to reproduce, what you expected, and what happened (including relevant
 stderr output).
 
-By contributing, you agree that your contributions are licensed under the
-project's [MIT License](LICENSE).
+Before contributing, open an issue to arrange contributor terms with the
+maintainer. This keeps the project's noncommercial and separately licensed
+commercial distributions legally consistent.
