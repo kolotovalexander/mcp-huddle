@@ -1817,9 +1817,19 @@ def test_direct_anthropic_opus_stays_readonly_when_global_toggle_is_off(
     spawn.spawn_agent(spawn._claude_opus_review_spec(), "review", str(project), tmp_path / "agents")
 
     argv = captured["argv"]
-    assert "--allowedTools" in argv and "Grep" in argv[argv.index("--allowedTools") + 1]
-    assert "--disallowedTools" in argv and "Bash" in argv[argv.index("--disallowedTools") + 1]
+    assert argv[argv.index("--tools") + 1] == "Read,Glob,Grep,WebSearch,ToolSearch"
+    allowed = argv[argv.index("--allowedTools") + 1]
+    assert allowed == (
+        "mcp__huddle__messages_read,mcp__huddle__message_post,"
+        "mcp__huddle__status_set,mcp__huddle__room_info,"
+        "mcp__huddle__room_status,mcp__huddle__room_summarize"
+    )
+    assert "*" not in allowed
+    disallowed = argv[argv.index("--disallowedTools") + 1]
+    assert "Bash" in disallowed and "Agent" in disallowed and "mcp__huddle__room_create" in disallowed
+    assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
     assert "--dangerously-skip-permissions" not in argv
+    assert "only to return one `result`" in argv[-1]
     assert captured["cwd"] != str(project)
     shutil.rmtree(captured["cwd"])
 

@@ -103,6 +103,22 @@ _DIRECT_OPUS_REMOVED_ENV = frozenset({
 })
 _DIRECT_OPUS_ENDPOINT_ENV = "MCP_HUDDLE_DIRECT_REVIEW_MCP_URL"
 _DIRECT_OPUS_WORKSPACE_ENV = "MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER"
+_DIRECT_OPUS_REVIEW_FLAGS = [
+    "--tools", "Read,Glob,Grep,WebSearch,ToolSearch",
+    "--allowedTools", (
+        "mcp__huddle__messages_read,mcp__huddle__message_post,"
+        "mcp__huddle__status_set,mcp__huddle__room_info,"
+        "mcp__huddle__room_status,mcp__huddle__room_summarize"
+    ),
+    "--disallowedTools", (
+        "Edit,Write,NotebookEdit,MultiEdit,Bash,Agent,Task,"
+        "mcp__huddle__room_create,mcp__huddle__room_invite,"
+        "mcp__huddle__notify_register,mcp__huddle__room_reclaim,"
+        "mcp__huddle__room_round_advance,mcp__huddle__propose_resolution,"
+        "mcp__huddle__resolution_vote"
+    ),
+    "--permission-mode", "dontAsk",
+]
 
 
 def _first_existing_binary(candidates: list[str]) -> str | None:
@@ -529,14 +545,19 @@ def _direct_opus_review_argv(brief: str, read_root: str, mcp_config: str) -> lis
     """Build the non-overridable native Claude invocation for this profile."""
     return [
         _CLAUDE_BIN or "claude",
-        *_CLAUDE_RO_FLAGS,
+        *_DIRECT_OPUS_REVIEW_FLAGS,
         "--bare",
         "--restricted",
         "--strict-mcp-config",
         "--mcp-config", mcp_config,
         "--add-dir", read_root,
         "--model", "claude-opus-5",
-        "-p", brief,
+        "-p", (
+            f"{brief}\n\n"
+            "For this direct-review turn, use Huddle only to return one `result` "
+            "to the request that invoked this review. Do not post Huddle `request` "
+            "messages or initiate additional work."
+        ),
     ]
 
 
