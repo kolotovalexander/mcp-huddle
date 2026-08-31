@@ -77,6 +77,16 @@ class SpawnSpec(TypedDict):
     # room_invite, or a wake-path request (those always ignore this flag; a
     # deliberately named agent always works). See _filter_for_auto_spawn_true.
     auto: NotRequired[bool]
+    # The read-only transform is selected by runner kind, never the display
+    # name. This lets separately named Claude profiles retain the same guard.
+    readonly_adapter: NotRequired[str]
+    # Per-profile child environment. Values are names, never secret values:
+    # `env_from` copies a required runtime variable into the child under a
+    # provider-recognised name, while `unset_env` removes conflicting auth.
+    environment: NotRequired[dict[str, str]]
+    env_from: NotRequired[dict[str, str]]
+    required_env: NotRequired[list[str]]
+    unset_env: NotRequired[list[str]]
 
 
 class AgentSpawnError(RuntimeError):
@@ -405,8 +415,41 @@ DEFAULT_REGISTRY: list[SpawnSpec] = [
             _CLAUDE_BIN is not None
             and os.environ.get("MCP_HUDDLE_CLAUDE_ENABLED", "0") != "0"
         ),
+        "readonly_adapter": "claude",
+    },
+    # Explicit, direct Anthropic reviewer. Deliberately disabled and excluded
+    # from auto-spawn: an owner must supply API credentials and a workspace
+    # header through its service/runtime environment before inviting it.
+    # Do not place key or workspace values in this registry.
+    {
+        "name": "Claude Opus 5 (direct review)",
+        "cmd": [
+            _CLAUDE_BIN or "claude",
+            "--model", "claude-opus-5",
+            "-p", "{brief}",
+        ],
+        "enabled": False,
+        "auto": False,
+        "readonly_adapter": "claude",
+        "environment": {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
+        "env_from": {
+            "ANTHROPIC_CUSTOM_HEADERS": "MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER",
+        },
+        "required_env": [
+            "ANTHROPIC_API_KEY",
+            "MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER",
+        ],
+        "unset_env": ["ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"],
     },
 ]
+
+
+def _claude_opus_review_spec() -> SpawnSpec:
+    """Return the built-in manual direct-Anthropic Opus review profile."""
+    return next(
+        spec for spec in DEFAULT_REGISTRY
+        if spec["name"] == "Claude Opus 5 (direct review)"
+    )
 
 
 def _resolve_spawn_args(
@@ -604,13 +647,14 @@ def _apply_readonly(spec: SpawnSpec) -> SpawnSpec:
       which `-a never` would cancel). Cross-model council, 2026-06-19.
     Other agents are returned unchanged (no confirmed read-only flag yet).
     """
+    adapter = spec.get("readonly_adapter")
     name = spec.get("name")
     cmd = list(spec.get("cmd") or [])
-    if name == "Claude":
+    if adapter == "claude" or (adapter is None and name == "Claude"):
         cmd = [c for c in cmd if c != "--dangerously-skip-permissions"]
         if cmd:
             cmd = [cmd[0], *_CLAUDE_RO_FLAGS, *cmd[1:]]
-    elif name == "Codex":
+    elif adapter == "codex" or (adapter is None and name == "Codex"):
         out: list[str] = []
         i = 0
         while i < len(cmd):
@@ -729,6 +773,7 @@ def spawn_agent(
         cwd, brief = _codex_safe_cwd_and_brief(cwd, brief)
     argv, last_msg_path = _resolve_spawn_args(spec, brief, log_dir)
 
+    env = _spawn_environment(spec)
     log_file = open(log_path, "ab", buffering=0)
     try:
         proc = subprocess.Popen(
@@ -737,6 +782,7 @@ def spawn_agent(
             stdin=subprocess.DEVNULL,
             stdout=log_file,
             stderr=subprocess.STDOUT,
+            env=env,
         )
     finally:
         # Popen dups the fd into the child; we can close ours so the parent
@@ -753,6 +799,23 @@ def spawn_agent(
             log_spawn_failure(spec, brief, cwd, log_dir, exc)
             raise exc
     return proc.pid, str(log_path), last_msg_path
+
+
+def _spawn_environment(spec: SpawnSpec) -> dict[str, str]:
+    """Build a child environment without exposing profile secret values."""
+    env = os.environ.copy()
+    required = spec.get("required_env", [])
+    missing = [name for name in required if not env.get(name)]
+    if missing:
+        raise AgentSpawnError(
+            f"{spec['name']} missing required environment: {', '.join(missing)}"
+        )
+    env.update(spec.get("environment", {}))
+    for target, source in spec.get("env_from", {}).items():
+        env[target] = env[source]
+    for name in spec.get("unset_env", []):
+        env.pop(name, None)
+    return env
 
 
 # ── Same-binary spawn stagger ────────────────────────────────────────────────

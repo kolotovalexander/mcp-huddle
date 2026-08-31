@@ -40,5 +40,21 @@
     "probe_chat_url": "http://127.0.0.1:11434/v1/chat/completions",
     "probe_chat_model": "qwen2.5-coder",
     "probe_timeout_sec": 0.8
+  },
+  {
+    "name": "Claude Opus 5 (direct review)",
+    "cmd": ["claude", "--model", "claude-opus-5", "-p", "{brief}"],
+    "enabled": false,
+    "auto": false,
+    "readonly_adapter": "claude",
+    "environment": {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
+    "env_from": {
+      "ANTHROPIC_CUSTOM_HEADERS": "MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER"
+    },
+    "required_env": [
+      "ANTHROPIC_API_KEY",
+      "MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER"
+    ],
+    "unset_env": ["ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"]
   }
 ]

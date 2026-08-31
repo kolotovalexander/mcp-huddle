@@ -106,7 +106,10 @@ def test_default_registry_roster() -> None:
     depends on which binaries the test host has installed). Qwen and DeepSeek
     were retired; the active roster is Claude / Codex / Antigravity / MiMo."""
     spec_names = {s["name"] for s in spawn.DEFAULT_REGISTRY}
-    assert spec_names == {"Codex", "Antigravity", "MiMo", "OpenCode", "Claude"}
+    assert spec_names == {
+        "Codex", "Antigravity", "MiMo", "OpenCode", "Claude",
+        "Claude Opus 5 (direct review)",
+    }
 
 
 def test_opencode_slot_is_opt_in_timeout_wrapped_and_uses_local_model_config() -> None:
@@ -774,8 +777,10 @@ def test_spawn_agent_registers_background_reaper(
         def poll(self):
             return None
 
-    def fake_popen(argv, cwd, stdin, stdout, stderr):
-        popen_calls.append({"argv": argv, "cwd": cwd, "stdin": stdin, "stderr": stderr})
+    def fake_popen(argv, cwd, stdin, stdout, stderr, env):
+        popen_calls.append({
+            "argv": argv, "cwd": cwd, "stdin": stdin, "stderr": stderr, "env": env,
+        })
         return FakeProc()
 
     monkeypatch.setattr(spawn.subprocess, "Popen", fake_popen)
@@ -1763,6 +1768,80 @@ def test_readonly_opt_out_restores_full_access(monkeypatch: pytest.MonkeyPatch) 
     reg = {s["name"]: s for s in spawn._raw_registry()}
     assert "danger-full-access" in " ".join(reg["Codex"]["cmd"])
     assert "--dangerously-skip-permissions" in reg["Claude"]["cmd"]
+
+
+def test_direct_anthropic_opus_profile_is_manual_and_readonly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The separately named direct profile keeps Claude's read-only envelope."""
+    monkeypatch.delenv("MCP_HUDDLE_READONLY", raising=False)
+    profile = spawn._claude_opus_review_spec()
+
+    assert profile["name"] == "Claude Opus 5 (direct review)"
+    assert profile["enabled"] is False
+    assert profile["auto"] is False
+    assert profile["cmd"][-4:] == ["--model", "claude-opus-5", "-p", "{brief}"]
+    assert "9router" not in " ".join(profile["cmd"])
+    assert "--dangerously-skip-permissions" not in spawn._apply_readonly(profile)["cmd"]
+    assert "--allowedTools" in spawn._apply_readonly(profile)["cmd"]
+
+
+def test_direct_anthropic_opus_spawn_uses_only_direct_api_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Direct API spawn passes its API key, workspace header, and no OAuth aliases."""
+    profile = spawn._claude_opus_review_spec()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER", "workspace-header")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "oauth-alias")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "claude-oauth")
+    captured: dict[str, object] = {}
+
+    class FakeProc:
+        pid = 12345
+
+        def poll(self):
+            return None
+
+    def fake_popen(argv, cwd, stdin, stdout, stderr, env):
+        captured["argv"] = argv
+        captured["env"] = env
+        return FakeProc()
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(spawn, "_reap_in_background", lambda *args, **kwargs: None)
+
+    spawn.spawn_agent(profile, "review", str(tmp_path), tmp_path / "agents")
+
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["ANTHROPIC_BASE_URL"] == "https://api.anthropic.com"
+    assert env["ANTHROPIC_CUSTOM_HEADERS"] == "workspace-header"
+    assert env["ANTHROPIC_API_KEY"] == "test-key"
+    assert "ANTHROPIC_AUTH_TOKEN" not in env
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+    assert "9router" not in " ".join(captured["argv"])
+
+
+def test_direct_anthropic_opus_missing_key_fails_before_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Missing direct API credentials are explicit and never reach Popen or logs."""
+    profile = spawn._claude_opus_review_spec()
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER", "workspace-header")
+    monkeypatch.setattr(
+        spawn.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("must not spawn")
+    )
+
+    with pytest.raises(spawn.AgentSpawnError, match="ANTHROPIC_API_KEY"):
+        spawn.spawn_agent(profile, "review", str(tmp_path), tmp_path / "agents")
+
+    spawn.log_spawn_failure(
+        profile, "review", str(tmp_path), tmp_path / "agents",
+        spawn.AgentSpawnError("missing key"),
+    )
+    assert "workspace-header" not in capsys.readouterr().err
 
 
 # ── Rate-limit detection: ANSI stripping + OpenRouter/OpenCode phrasing ───────
