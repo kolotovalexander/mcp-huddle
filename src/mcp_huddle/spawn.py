@@ -697,7 +697,8 @@ def _merge_registry(
     """Merge `overrides` onto `base` keyed by "name".
 
     An override whose name matches an existing entry replaces it in place
-    (preserving order); a new name is appended. Inputs are not mutated.
+    (preserving order), except the protected direct-review profile; a new name
+    is appended. Inputs are not mutated.
     """
     merged: list[SpawnSpec] = [dict(spec) for spec in base]  # type: ignore[misc]
     index = {spec.get("name"): i for i, spec in enumerate(merged)}
@@ -748,7 +749,7 @@ def _preserve_direct_opus_profile_contract(registry: list[SpawnSpec]) -> list[Sp
 _CLAUDE_RO_FLAGS = [
     "--allowedTools", "Read,Glob,Grep,WebFetch,WebSearch,mcp__huddle__*",
     "--disallowedTools", "Edit,Write,NotebookEdit,MultiEdit,Bash",
-    "--permission-mode", "default",
+    "--permission-mode", "manual",
 ]
 
 

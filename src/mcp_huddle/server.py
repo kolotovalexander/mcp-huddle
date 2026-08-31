@@ -578,14 +578,23 @@ def _agent_phase_snapshot(status_info: dict, wake_info: dict) -> tuple[str, dict
     return phase, health
 
 
-def _pending_requests(room_id: str, participants: list[str],
-                      terminal_agents: set[str] | frozenset[str] = frozenset()) -> list[dict]:
-    """Return unanswered request work, including the agents still expected."""
+def _pending_requests(
+    room_id: str,
+    participants: list[str],
+    terminal_tasks: dict[str, int | str] | None = None,
+) -> list[dict]:
+    """Return unanswered request work, including agents still expected.
+
+    A terminal lifecycle phase only settles the request recorded in its
+    ``task_id``. Progress messages (ack/busy/comment) are not a receipt;
+    only a stored result/final reply settles a request.
+    """
+    terminal_tasks = terminal_tasks or {}
     messages = bus._load_messages(room_id)
     replies_by_request: dict[int, set[str]] = {}
     for message in messages:
         reply_to = message.get("reply_to")
-        if reply_to is not None:
+        if reply_to is not None and message.get("kind") in {"result", "final"}:
             replies_by_request.setdefault(int(reply_to), set()).add(message.get("agent", ""))
 
     pending: list[dict] = []
@@ -598,7 +607,7 @@ def _pending_requests(room_id: str, participants: list[str],
         else:
             targets = [name for name in participants if name != message.get("agent")]
         waiting_for = [name for name in targets
-                       if name not in terminal_agents
+                       if str(terminal_tasks.get(name, "")) != str(message["id"])
                        and name not in replies_by_request.get(int(message["id"]), set())]
         if not waiting_for:
             continue
@@ -625,12 +634,16 @@ def room_status(room_id: str) -> dict:
     participants = list(meta.get("participants", []))
     agent_meta = meta.get("agent_meta", {}) or {}
     status_details = bus.get_status_details(room_id)
-    terminal_agents = {
-        name for name, status_info in status_details.items()
-        if _agent_phase_snapshot(status_info, agent_meta.get(name) or {})[0]
-        in _TERMINAL_PHASES
+    terminal_tasks = {
+        name: status_info.get("task_id", "")
+        for name, status_info in status_details.items()
+        if (
+            _agent_phase_snapshot(status_info, agent_meta.get(name) or {})[0]
+            in _TERMINAL_PHASES
+            and status_info.get("task_id", "") != ""
+        )
     }
-    pending = _pending_requests(room_id, participants, terminal_agents)
+    pending = _pending_requests(room_id, participants, terminal_tasks)
     pending_by_agent = {
         name: [item["id"] for item in pending if name in item["waiting_for"]]
         for name in set(participants) | set(agent_meta) | set(status_details)
@@ -1892,9 +1905,13 @@ def _wake_agents_for_request(
 
 
 def _agent_replied_to_request(room_id: str, agent_name: str, msg_id: int) -> bool:
-    """Return True if this agent already posted a visible reply to a request."""
+    """Return whether an agent stored a terminal receipt for this request."""
     for msg in bus._load_messages(room_id):
-        if msg.get("agent") == agent_name and msg.get("reply_to") == msg_id:
+        if (
+            msg.get("agent") == agent_name
+            and msg.get("reply_to") == msg_id
+            and msg.get("kind") in {"result", "final"}
+        ):
             return True
     return False
 

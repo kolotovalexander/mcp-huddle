@@ -1006,12 +1006,12 @@ def test_terminal_agent_failure_closes_pending_request(
 
     room_id = isolated_bus.create_room("Unavailable", "Claude", 0, "/tmp/project", "session-1")
     isolated_bus.invite_agent(room_id, "Antigravity")
-    isolated_bus.post_message(
+    request_id = isolated_bus.post_message(
         room_id, "Claude", "Please research this", "request", to="Antigravity",
     )
     isolated_bus.set_status(
         room_id, "Antigravity", "online", 0, "session-1",
-        phase="unavailable", detail="spawn failed",
+        phase="unavailable", task_id=request_id, detail="spawn failed",
     )
 
     snapshot = server.room_status(room_id)
@@ -1019,6 +1019,53 @@ def test_terminal_agent_failure_closes_pending_request(
     assert snapshot["pending_requests"] == []
     assert snapshot["wait_recommended"] is False
     assert snapshot["all_terminal"] is True
+
+
+def test_room_status_old_completed_manual_agent_does_not_close_new_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A manual participant's old completion cannot hide later unanswered work."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+    room_id = isolated_bus.create_room("Manual", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "ManualReviewer")
+    old_request = isolated_bus.post_message(
+        room_id, "Claude", "First review", "request", to="ManualReviewer",
+    )
+    server._post_message_checked(
+        room_id, "ManualReviewer", "First result", "result", to="Claude", reply_to=old_request,
+    )
+    new_request = isolated_bus.post_message(
+        room_id, "Claude", "Second review", "request", to="ManualReviewer",
+    )
+
+    pending = server.room_status(room_id)["pending_requests"]
+
+    assert [item["id"] for item in pending] == [new_request]
+    assert pending[0]["waiting_for"] == ["ManualReviewer"]
+
+
+def test_room_status_ack_does_not_receipt_a_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ack is progress only; the request stays pending until a result is stored."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+    room_id = isolated_bus.create_room("Ack", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "ManualReviewer")
+    request_id = isolated_bus.post_message(
+        room_id, "Claude", "Review", "request", to="ManualReviewer",
+    )
+    isolated_bus.post_message(
+        room_id, "ManualReviewer", "Working", "ack", to="Claude", reply_to=request_id,
+    )
+
+    pending = server.room_status(room_id)["pending_requests"]
+
+    assert [item["id"] for item in pending] == [request_id]
+    assert pending[0]["waiting_for"] == ["ManualReviewer"]
 
 
 def test_auto_spawn_false_agent_is_not_marked_starting(
@@ -1761,6 +1808,7 @@ def test_readonly_default_on_codex_and_claude(monkeypatch: pytest.MonkeyPatch) -
     assert "--disallowedTools" in claude
     di = claude.index("--disallowedTools")
     assert "Edit" in claude[di + 1] and "Write" in claude[di + 1] and "Bash" in claude[di + 1]
+    assert claude[claude.index("--permission-mode") + 1] == "manual"
 
 
 def test_readonly_opt_out_restores_full_access(monkeypatch: pytest.MonkeyPatch) -> None:
