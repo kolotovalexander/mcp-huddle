@@ -528,6 +528,7 @@ def respond_via_agent(
 _AGENT_REPORTED_PHASES = frozenset({"thinking", "working", "responding"})
 _ACTIVE_PHASES = frozenset({"queued", "starting", "thinking", "working", "responding"})
 _TERMINAL_PHASES = frozenset({"completed", "unavailable", "rate_limited", "stuck"})
+_SERVER_FAILURE_PHASES = frozenset({"unavailable", "rate_limited", "stuck"})
 
 @mcp.tool()
 def status_set(
@@ -578,14 +579,46 @@ def _agent_phase_snapshot(status_info: dict, wake_info: dict) -> tuple[str, dict
     return phase, health
 
 
-def _pending_requests(room_id: str, participants: list[str],
-                      terminal_agents: set[str] | frozenset[str] = frozenset()) -> list[dict]:
-    """Return unanswered request work, including the agents still expected."""
+def _server_terminal_failure_task_ids(status_info: dict, wake_info: dict) -> set[str]:
+    """Return request ids settled by server-owned terminal failure receipts.
+
+    The current failure is included for compatibility with status records that
+    predate persisted receipts. Agent-reported status is never treated as a
+    failure receipt.
+    """
+    receipts = status_info.get("terminal_failure_receipts", [])
+    task_ids = {
+        str(receipt.get("task_id", ""))
+        for receipt in receipts if isinstance(receipt, dict)
+        if receipt.get("source") == "server" and receipt.get("task_id", "") != ""
+    }
+    phase, _ = _agent_phase_snapshot(status_info, wake_info)
+    if (
+        status_info.get("source") == "server"
+        and phase in _SERVER_FAILURE_PHASES
+        and status_info.get("task_id", "") != ""
+    ):
+        task_ids.add(str(status_info["task_id"]))
+    return task_ids
+
+
+def _pending_requests(
+    room_id: str,
+    participants: list[str],
+    terminal_tasks: dict[str, set[str]] | None = None,
+) -> list[dict]:
+    """Return unanswered request work, including agents still expected.
+
+    A terminal lifecycle phase only settles the request recorded in its
+    ``task_id``. Progress messages (ack/busy/comment) are not a receipt;
+    only a stored result/final reply settles a request.
+    """
+    terminal_tasks = terminal_tasks or {}
     messages = bus._load_messages(room_id)
     replies_by_request: dict[int, set[str]] = {}
     for message in messages:
         reply_to = message.get("reply_to")
-        if reply_to is not None:
+        if reply_to is not None and message.get("kind") in {"result", "final"}:
             replies_by_request.setdefault(int(reply_to), set()).add(message.get("agent", ""))
 
     pending: list[dict] = []
@@ -598,7 +631,7 @@ def _pending_requests(room_id: str, participants: list[str],
         else:
             targets = [name for name in participants if name != message.get("agent")]
         waiting_for = [name for name in targets
-                       if name not in terminal_agents
+                       if str(message["id"]) not in terminal_tasks.get(name, set())
                        and name not in replies_by_request.get(int(message["id"]), set())]
         if not waiting_for:
             continue
@@ -625,12 +658,14 @@ def room_status(room_id: str) -> dict:
     participants = list(meta.get("participants", []))
     agent_meta = meta.get("agent_meta", {}) or {}
     status_details = bus.get_status_details(room_id)
-    terminal_agents = {
-        name for name, status_info in status_details.items()
-        if _agent_phase_snapshot(status_info, agent_meta.get(name) or {})[0]
-        in _TERMINAL_PHASES
-    }
-    pending = _pending_requests(room_id, participants, terminal_agents)
+    terminal_tasks: dict[str, set[str]] = {}
+    for name, status_info in status_details.items():
+        task_ids = _server_terminal_failure_task_ids(
+            status_info, agent_meta.get(name) or {}
+        )
+        if task_ids:
+            terminal_tasks[name] = task_ids
+    pending = _pending_requests(room_id, participants, terminal_tasks)
     pending_by_agent = {
         name: [item["id"] for item in pending if name in item["waiting_for"]]
         for name in set(participants) | set(agent_meta) | set(status_details)
@@ -1892,11 +1927,25 @@ def _wake_agents_for_request(
 
 
 def _agent_replied_to_request(room_id: str, agent_name: str, msg_id: int) -> bool:
-    """Return True if this agent already posted a visible reply to a request."""
+    """Return whether a result/final or server failure settled this request.
+
+    A failure settlement remains a failure lifecycle state; this predicate only
+    prevents a duplicate wake when wake metadata is missing.
+    """
     for msg in bus._load_messages(room_id):
-        if msg.get("agent") == agent_name and msg.get("reply_to") == msg_id:
+        if (
+            msg.get("agent") == agent_name
+            and msg.get("reply_to") == msg_id
+            and msg.get("kind") in {"result", "final"}
+        ):
             return True
-    return False
+    try:
+        status_info = bus.get_status_details(room_id).get(agent_name) or {}
+        meta = bus.get_room_info(room_id)
+    except Exception:
+        return False
+    wake_info = (meta.get("agent_meta") or {}).get(agent_name) or {}
+    return str(msg_id) in _server_terminal_failure_task_ids(status_info, wake_info)
 
 
 def _wake_pending_agents() -> list[dict]:

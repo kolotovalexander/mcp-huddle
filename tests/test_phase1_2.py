@@ -2,9 +2,11 @@
 thread_id parsing, codex_resume helper, /api/room_agents and SSE endpoint)."""
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import importlib
 from pathlib import Path
@@ -106,7 +108,10 @@ def test_default_registry_roster() -> None:
     depends on which binaries the test host has installed). Qwen and DeepSeek
     were retired; the active roster is Claude / Codex / Antigravity / MiMo."""
     spec_names = {s["name"] for s in spawn.DEFAULT_REGISTRY}
-    assert spec_names == {"Codex", "Antigravity", "MiMo", "OpenCode", "Claude"}
+    assert spec_names == {
+        "Codex", "Antigravity", "MiMo", "OpenCode", "Claude",
+        "Claude Opus 5 (direct review)",
+    }
 
 
 def test_opencode_slot_is_opt_in_timeout_wrapped_and_uses_local_model_config() -> None:
@@ -774,8 +779,10 @@ def test_spawn_agent_registers_background_reaper(
         def poll(self):
             return None
 
-    def fake_popen(argv, cwd, stdin, stdout, stderr):
-        popen_calls.append({"argv": argv, "cwd": cwd, "stdin": stdin, "stderr": stderr})
+    def fake_popen(argv, cwd, stdin, stdout, stderr, env):
+        popen_calls.append({
+            "argv": argv, "cwd": cwd, "stdin": stdin, "stderr": stderr, "env": env,
+        })
         return FakeProc()
 
     monkeypatch.setattr(spawn.subprocess, "Popen", fake_popen)
@@ -999,12 +1006,12 @@ def test_terminal_agent_failure_closes_pending_request(
 
     room_id = isolated_bus.create_room("Unavailable", "Claude", 0, "/tmp/project", "session-1")
     isolated_bus.invite_agent(room_id, "Antigravity")
-    isolated_bus.post_message(
+    request_id = isolated_bus.post_message(
         room_id, "Claude", "Please research this", "request", to="Antigravity",
     )
     isolated_bus.set_status(
         room_id, "Antigravity", "online", 0, "session-1",
-        phase="unavailable", detail="spawn failed",
+        phase="unavailable", task_id=request_id, detail="spawn failed",
     )
 
     snapshot = server.room_status(room_id)
@@ -1012,6 +1019,87 @@ def test_terminal_agent_failure_closes_pending_request(
     assert snapshot["pending_requests"] == []
     assert snapshot["wait_recommended"] is False
     assert snapshot["all_terminal"] is True
+
+
+def test_room_status_failure_receipt_survives_later_request_lifecycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A server-recorded failure remains terminal after a later request completes."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+    room_id = isolated_bus.create_room("Receipts", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "ManualReviewer")
+    failed_request = isolated_bus.post_message(
+        room_id, "Claude", "First review", "request", to="ManualReviewer",
+    )
+    server._set_agent_phase(room_id, "ManualReviewer", "unavailable", task_id=failed_request)
+    receipt = isolated_bus.get_status_details(room_id)["ManualReviewer"]["terminal_failure_receipts"]
+    assert receipt[0]["task_id"] == failed_request
+    assert receipt[0]["phase"] == "unavailable"
+    assert receipt[0]["source"] == "server"
+    assert isinstance(receipt[0]["timestamp"], int)
+    completed_request = isolated_bus.post_message(
+        room_id, "Claude", "Second review", "request", to="ManualReviewer",
+    )
+    server._set_agent_phase(room_id, "ManualReviewer", "working", task_id=completed_request)
+    server._post_message_checked(
+        room_id, "ManualReviewer", "Second result", "result", to="Claude", reply_to=completed_request,
+    )
+
+    snapshot = server.room_status(room_id)
+
+    assert snapshot["pending_requests"] == []
+    assert snapshot["all_terminal"] is True
+    assert server._agent_replied_to_request(room_id, "ManualReviewer", failed_request)
+
+
+def test_room_status_old_completed_manual_agent_does_not_close_new_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A manual participant's old completion cannot hide later unanswered work."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+    room_id = isolated_bus.create_room("Manual", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "ManualReviewer")
+    old_request = isolated_bus.post_message(
+        room_id, "Claude", "First review", "request", to="ManualReviewer",
+    )
+    server._post_message_checked(
+        room_id, "ManualReviewer", "First result", "result", to="Claude", reply_to=old_request,
+    )
+    new_request = isolated_bus.post_message(
+        room_id, "Claude", "Second review", "request", to="ManualReviewer",
+    )
+
+    pending = server.room_status(room_id)["pending_requests"]
+
+    assert [item["id"] for item in pending] == [new_request]
+    assert pending[0]["waiting_for"] == ["ManualReviewer"]
+
+
+def test_room_status_ack_does_not_receipt_a_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ack is progress only; the request stays pending until a result is stored."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+    room_id = isolated_bus.create_room("Ack", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "ManualReviewer")
+    request_id = isolated_bus.post_message(
+        room_id, "Claude", "Review", "request", to="ManualReviewer",
+    )
+    isolated_bus.post_message(
+        room_id, "ManualReviewer", "Working", "ack", to="Claude", reply_to=request_id,
+    )
+
+    pending = server.room_status(room_id)["pending_requests"]
+
+    assert [item["id"] for item in pending] == [request_id]
+    assert pending[0]["waiting_for"] == ["ManualReviewer"]
+    assert not server._agent_replied_to_request(room_id, "ManualReviewer", request_id)
 
 
 def test_auto_spawn_false_agent_is_not_marked_starting(
@@ -1754,6 +1842,7 @@ def test_readonly_default_on_codex_and_claude(monkeypatch: pytest.MonkeyPatch) -
     assert "--disallowedTools" in claude
     di = claude.index("--disallowedTools")
     assert "Edit" in claude[di + 1] and "Write" in claude[di + 1] and "Bash" in claude[di + 1]
+    assert claude[claude.index("--permission-mode") + 1] == "manual"
 
 
 def test_readonly_opt_out_restores_full_access(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1763,6 +1852,266 @@ def test_readonly_opt_out_restores_full_access(monkeypatch: pytest.MonkeyPatch) 
     reg = {s["name"]: s for s in spawn._raw_registry()}
     assert "danger-full-access" in " ".join(reg["Codex"]["cmd"])
     assert "--dangerously-skip-permissions" in reg["Claude"]["cmd"]
+
+
+def test_direct_anthropic_opus_profile_is_manual_and_readonly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The separately named direct profile keeps Claude's read-only envelope."""
+    monkeypatch.delenv("MCP_HUDDLE_READONLY", raising=False)
+    profile = spawn._claude_opus_review_spec()
+
+    assert profile["name"] == "Claude Opus 5 (direct review)"
+    assert profile["enabled"] is False
+    assert profile["auto"] is False
+    assert profile["profile"] == "claude-opus-direct-review"
+    assert profile["cmd"] == [spawn._CLAUDE_BIN or "claude"]
+    assert "9router" not in " ".join(profile["cmd"])
+    assert "--dangerously-skip-permissions" not in spawn._apply_readonly(profile)["cmd"]
+    assert "--allowedTools" in spawn._apply_readonly(profile)["cmd"]
+
+
+def test_direct_anthropic_opus_stays_readonly_when_global_toggle_is_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The actual direct-profile spawn stays read-only when global toggle is off."""
+    monkeypatch.setenv("MCP_HUDDLE_READONLY", "0")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER", "workspace-header")
+    monkeypatch.setenv("MCP_HUDDLE_DIRECT_REVIEW_MCP_URL", "http://127.0.0.1:45111/mcp")
+    captured: dict[str, object] = {}
+
+    class FakeProc:
+        pid = 12345
+
+        def poll(self):
+            return None
+
+    def fake_popen(argv, cwd, stdin, stdout, stderr, env):
+        captured["argv"] = argv
+        captured["cwd"] = cwd
+        return FakeProc()
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(spawn, "_reap_in_background", lambda *args, **kwargs: None)
+    project = tmp_path / "project"
+    project.mkdir()
+    spawn.spawn_agent(spawn._claude_opus_review_spec(), "review", str(project), tmp_path / "agents")
+
+    argv = captured["argv"]
+    assert argv[argv.index("--tools") + 1] == "Read,Glob,Grep,WebSearch,ToolSearch"
+    allowed = argv[argv.index("--allowedTools") + 1]
+    assert allowed == (
+        "mcp__huddle__messages_read,mcp__huddle__message_post,"
+        "mcp__huddle__status_set,mcp__huddle__room_info,"
+        "mcp__huddle__room_status,mcp__huddle__room_summarize"
+    )
+    assert "*" not in allowed
+    disallowed = argv[argv.index("--disallowedTools") + 1]
+    assert "Bash" in disallowed and "Agent" in disallowed and "mcp__huddle__room_create" in disallowed
+    assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
+    assert "--dangerously-skip-permissions" not in argv
+    assert "only to return one `result`" in argv[-1]
+    assert captured["cwd"] != str(project)
+    shutil.rmtree(captured["cwd"])
+
+
+def test_direct_anthropic_opus_spawn_uses_only_direct_api_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Direct API spawn passes its API key, workspace header, and no OAuth aliases."""
+    profile = spawn._claude_opus_review_spec()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER", "workspace-header")
+    monkeypatch.setenv("MCP_HUDDLE_DIRECT_REVIEW_MCP_URL", "http://127.0.0.1:45111/mcp")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "oauth-alias")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "claude-oauth")
+    monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
+    monkeypatch.setenv("CLAUDE_CODE_USE_VERTEX", "1")
+    monkeypatch.setenv("CLAUDE_CODE_USE_FOUNDRY", "1")
+    monkeypatch.setenv("ANTHROPIC_MODEL", "other-model")
+    captured: dict[str, object] = {}
+
+    class FakeProc:
+        pid = 12345
+
+        def poll(self):
+            return None
+
+    def fake_popen(argv, cwd, stdin, stdout, stderr, env):
+        captured["argv"] = argv
+        captured["env"] = env
+        captured["cwd"] = cwd
+        return FakeProc()
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(spawn, "_reap_in_background", lambda *args, **kwargs: None)
+
+    project = tmp_path / "approved-project"
+    project.mkdir()
+    spawn.spawn_agent(profile, "review", str(project), tmp_path / "agents")
+
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["ANTHROPIC_BASE_URL"] == "https://api.anthropic.com"
+    assert env["ANTHROPIC_CUSTOM_HEADERS"] == "workspace-header"
+    assert env["ANTHROPIC_API_KEY"] == "test-key"
+    assert "MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER" not in env
+    assert "MCP_HUDDLE_DIRECT_REVIEW_MCP_URL" not in env
+    assert "ANTHROPIC_AUTH_TOKEN" not in env
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+    assert "CLAUDE_CODE_USE_BEDROCK" not in env
+    assert "CLAUDE_CODE_USE_VERTEX" not in env
+    assert "CLAUDE_CODE_USE_FOUNDRY" not in env
+    assert "ANTHROPIC_MODEL" not in env
+    assert "9router" not in " ".join(captured["argv"])
+    assert Path(captured["cwd"]).name.startswith("mcp-huddle-opus-review-")
+    assert Path(captured["cwd"]).is_dir()
+    assert "--allowedTools" in captured["argv"]
+    argv = captured["argv"]
+    assert "--bare" in argv and "--restricted" in argv and "--strict-mcp-config" in argv
+    assert argv[argv.index("--model") + 1] == "claude-opus-5"
+    assert argv[argv.index("--add-dir") + 1] == str(project.resolve())
+    mcp_config = json.loads(argv[argv.index("--mcp-config") + 1])
+    assert mcp_config["mcpServers"]["huddle"]["url"] == "http://127.0.0.1:45111/mcp"
+    shutil.rmtree(captured["cwd"])
+
+
+def test_direct_anthropic_opus_missing_key_fails_before_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Missing direct API credentials are explicit and never reach Popen or logs."""
+    profile = spawn._claude_opus_review_spec()
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER", "workspace-header")
+    monkeypatch.setattr(
+        spawn.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("must not spawn")
+    )
+
+    with pytest.raises(spawn.AgentSpawnError, match="ANTHROPIC_API_KEY"):
+        spawn.spawn_agent(profile, "review", str(tmp_path), tmp_path / "agents")
+
+    spawn.log_spawn_failure(
+        profile, "review", str(tmp_path), tmp_path / "agents",
+        spawn.AgentSpawnError("missing key"),
+    )
+    assert "workspace-header" not in capsys.readouterr().err
+
+
+def test_direct_anthropic_opus_rejects_unsafe_runtime_route_before_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The direct profile accepts only a local Huddle endpoint, never a remote route."""
+    profile = spawn._claude_opus_review_spec()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER", "workspace-header")
+    monkeypatch.setenv("MCP_HUDDLE_DIRECT_REVIEW_MCP_URL", "https://example.com/mcp")
+    monkeypatch.setattr(
+        spawn.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("must not spawn")
+    )
+
+    with pytest.raises(spawn.AgentSpawnError, match="MCP_HUDDLE_DIRECT_REVIEW_MCP_URL"):
+        spawn.spawn_agent(profile, "review", str(tmp_path), tmp_path / "agents")
+
+
+def test_direct_anthropic_opus_rejects_symlink_read_root_before_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The restricted runner grants reads only to a real, explicitly supplied room cwd."""
+    profile = spawn._claude_opus_review_spec()
+    target = tmp_path / "project"
+    target.mkdir()
+    link = tmp_path / "project-link"
+    link.symlink_to(target, target_is_directory=True)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER", "workspace-header")
+    monkeypatch.setenv("MCP_HUDDLE_DIRECT_REVIEW_MCP_URL", "http://127.0.0.1:45111/mcp")
+    monkeypatch.setattr(
+        spawn.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("must not spawn")
+    )
+
+    with pytest.raises(spawn.AgentSpawnError, match="approved read root"):
+        spawn.spawn_agent(profile, "review", str(link), tmp_path / "agents")
+
+
+def test_direct_anthropic_opus_rejects_home_ancestor_read_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A broad ancestor of HOME cannot become the restricted profile's read root."""
+    profile = spawn._claude_opus_review_spec()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER", "workspace-header")
+    monkeypatch.setenv("MCP_HUDDLE_DIRECT_REVIEW_MCP_URL", "http://127.0.0.1:45111/mcp")
+    monkeypatch.setattr(
+        spawn.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("must not spawn")
+    )
+
+    with pytest.raises(spawn.AgentSpawnError, match="project-scoped approved read root"):
+        spawn.spawn_agent(profile, "review", str(Path.home().parent), tmp_path / "agents")
+
+
+def test_direct_anthropic_opus_reaper_removes_only_its_owned_temp_cwd(
+    tmp_path: Path,
+) -> None:
+    """The unique neutral cwd is cleaned after the direct child exits."""
+    owned = Path(tempfile.mkdtemp(dir=tmp_path, prefix=spawn._DIRECT_OPUS_REVIEW_CWD_PREFIX))
+    exited = threading.Event()
+
+    class FakeProc:
+        pid = 12345
+
+        def wait(self):
+            return 0
+
+    spawn._reap_in_background(
+        FakeProc(),
+        "Claude Opus 5 (direct review)",
+        on_exit=lambda _: exited.set(),
+        cleanup_dir=str(owned),
+    )
+
+    assert exited.wait(1)
+    assert not owned.exists()
+
+
+def test_merge_registry_preserves_direct_opus_profile_contract() -> None:
+    """An override may only enable the built-in direct review profile, never replace it."""
+    built_in = spawn._claude_opus_review_spec()
+    merged = spawn._merge_registry(
+        spawn.DEFAULT_REGISTRY,
+        [{
+            "name": built_in["name"],
+            "cmd": ["unsafe", "--dangerously-skip-permissions"],
+            "enabled": True,
+            "auto": True,
+        }],
+    )
+    profile = next(spec for spec in merged if spec["name"] == built_in["name"])
+    assert profile["cmd"] == built_in["cmd"]
+    assert profile["profile"] == spawn._DIRECT_OPUS_REVIEW_PROFILE
+    assert profile["enabled"] is True
+    assert profile["auto"] is False
+
+
+def test_full_env_registry_cannot_replace_direct_opus_profile_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The full env registry has the same protection for the built-in profile name."""
+    path = tmp_path / "registry.json"
+    path.write_text(json.dumps([{
+        "name": "Claude Opus 5 (direct review)",
+        "cmd": ["unsafe"],
+        "enabled": True,
+        "auto": True,
+    }]))
+    monkeypatch.setenv("MCP_HUDDLE_SPAWN_REGISTRY", str(path))
+
+    profile = spawn._raw_registry()[0]
+    assert profile["cmd"][0] == (spawn._CLAUDE_BIN or "claude")
+    assert "unsafe" not in profile["cmd"]
+    assert profile["profile"] == spawn._DIRECT_OPUS_REVIEW_PROFILE
+    assert profile["enabled"] is True
+    assert profile["auto"] is False
 
 
 # ── Rate-limit detection: ANSI stripping + OpenRouter/OpenCode phrasing ───────

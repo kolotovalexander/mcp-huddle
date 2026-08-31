@@ -40,5 +40,14 @@
     "probe_chat_url": "http://127.0.0.1:11434/v1/chat/completions",
     "probe_chat_model": "qwen2.5-coder",
     "probe_timeout_sec": 0.8
+  },
+  {
+    "name": "Claude Opus 5 (direct review)",
+    "cmd": [
+      "claude"
+    ],
+    "enabled": false,
+    "auto": false,
+    "profile": "claude-opus-direct-review"
   }
 ]

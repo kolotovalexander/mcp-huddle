@@ -45,6 +45,7 @@ VALID_AGENT_PHASES = {
     "online", "queued", "starting", "thinking", "working", "responding",
     "completed", "unavailable", "rate_limited", "stuck",
 }
+_SERVER_TERMINAL_FAILURE_PHASES = frozenset({"unavailable", "rate_limited", "stuck"})
 
 
 # ── Rooms ────────────────────────────────────────────────────────────────────
@@ -789,6 +790,24 @@ def _patch_status(room_id: str, agent: str, status: str, expires_at: int,
             record["detail"] = detail
         elif previous.get("detail"):
             record["detail"] = previous["detail"]
+        previous_receipts = previous.get("terminal_failure_receipts", [])
+        receipts = list(previous_receipts) if isinstance(previous_receipts, list) else []
+        if (
+            source == "server"
+            and phase in _SERVER_TERMINAL_FAILURE_PHASES
+            and task_id != ""
+        ):
+            receipt = {
+                "task_id": task_id,
+                "phase": phase,
+                "timestamp": record["updated_at"],
+                "source": "server",
+            }
+            if not any(str(item.get("task_id", "")) == str(task_id)
+                       for item in receipts if isinstance(item, dict)):
+                receipts.append(receipt)
+        if receipts:
+            record["terminal_failure_receipts"] = receipts
         data[agent] = record
         _write_json(p, data)
 

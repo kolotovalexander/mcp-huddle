@@ -51,6 +51,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -58,6 +59,7 @@ from pathlib import Path
 from typing import NotRequired, TypedDict
 from urllib import error as urlerror
 from urllib import request as urlrequest
+from urllib.parse import urlparse
 
 from . import bus  # reuse HUDDLE_HOME so the on-disk registry lives next to rooms
 
@@ -77,10 +79,46 @@ class SpawnSpec(TypedDict):
     # room_invite, or a wake-path request (those always ignore this flag; a
     # deliberately named agent always works). See _filter_for_auto_spawn_true.
     auto: NotRequired[bool]
+    # A named profile is a fixed, reviewed runner contract. It is deliberately
+    # narrower than a generic environment/configuration API for registry JSON.
+    profile: NotRequired[str]
 
 
 class AgentSpawnError(RuntimeError):
     """Raised when a process starts but fails the optional health check."""
+
+
+_DIRECT_OPUS_REVIEW_PROFILE = "claude-opus-direct-review"
+_DIRECT_OPUS_REVIEW_CWD_PREFIX = "mcp-huddle-opus-review-"
+_DIRECT_OPUS_REMOVED_ENV = frozenset({
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_MODEL",
+    "CLAUDE_CODE_MODEL",
+    "CLAUDE_CODE_FALLBACK_MODEL",
+})
+_DIRECT_OPUS_ENDPOINT_ENV = "MCP_HUDDLE_DIRECT_REVIEW_MCP_URL"
+_DIRECT_OPUS_WORKSPACE_ENV = "MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER"
+_DIRECT_OPUS_REVIEW_FLAGS = [
+    "--tools", "Read,Glob,Grep,WebSearch,ToolSearch",
+    "--allowedTools", (
+        "mcp__huddle__messages_read,mcp__huddle__message_post,"
+        "mcp__huddle__status_set,mcp__huddle__room_info,"
+        "mcp__huddle__room_status,mcp__huddle__room_summarize"
+    ),
+    "--disallowedTools", (
+        "Edit,Write,NotebookEdit,MultiEdit,Bash,Agent,Task,"
+        "mcp__huddle__room_create,mcp__huddle__room_invite,"
+        "mcp__huddle__notify_register,mcp__huddle__room_reclaim,"
+        "mcp__huddle__room_round_advance,mcp__huddle__propose_resolution,"
+        "mcp__huddle__resolution_vote"
+    ),
+    "--permission-mode", "dontAsk",
+]
 
 
 def _first_existing_binary(candidates: list[str]) -> str | None:
@@ -406,7 +444,28 @@ DEFAULT_REGISTRY: list[SpawnSpec] = [
             and os.environ.get("MCP_HUDDLE_CLAUDE_ENABLED", "0") != "0"
         ),
     },
+    # Explicit, direct Anthropic reviewer. Deliberately disabled and excluded
+    # from auto-spawn: an owner must supply API credentials and a workspace
+    # header through its service/runtime environment before inviting it.
+    # Do not place key or workspace values in this registry.
+    {
+        "name": "Claude Opus 5 (direct review)",
+        # The typed profile below ignores registry argv and builds its fixed,
+        # restricted invocation. Keep a binary here for discovery only.
+        "cmd": [_CLAUDE_BIN or "claude"],
+        "enabled": False,
+        "auto": False,
+        "profile": _DIRECT_OPUS_REVIEW_PROFILE,
+    },
 ]
+
+
+def _claude_opus_review_spec() -> SpawnSpec:
+    """Return the built-in manual direct-Anthropic Opus review profile."""
+    return next(
+        spec for spec in DEFAULT_REGISTRY
+        if spec["name"] == "Claude Opus 5 (direct review)"
+    )
 
 
 def _resolve_spawn_args(
@@ -425,6 +484,81 @@ def _resolve_spawn_args(
             arg = arg.replace("{last_message}", last_msg_path)
         argv.append(arg)
     return argv, last_msg_path
+
+
+def _direct_opus_review_endpoint_config(raw_url: str | None) -> str:
+    """Return strict MCP JSON for a runtime-provided loopback Huddle endpoint.
+
+    A room server chooses its own local port, so this profile must not embed a
+    stale endpoint in code or registry. The URL is deliberately not repeated in
+    errors or logs because a malformed runtime value could contain sensitive
+    data.
+    """
+    if not raw_url:
+        raise AgentSpawnError(f"missing required environment: {_DIRECT_OPUS_ENDPOINT_ENV}")
+    try:
+        parsed = urlparse(raw_url)
+        valid_port = parsed.port is not None
+    except ValueError:
+        valid_port = False
+        parsed = None
+    if (
+        parsed is None
+        or parsed.scheme not in {"http", "https"}
+        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or not valid_port
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path != "/mcp"
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise AgentSpawnError(
+            f"{_DIRECT_OPUS_ENDPOINT_ENV} must be a loopback http(s) URL ending in /mcp"
+        )
+    return json.dumps({"mcpServers": {"huddle": {"type": "http", "url": raw_url}}})
+
+
+def _direct_opus_review_read_root(cwd: str) -> str:
+    """Validate the one project directory Claude may read under --restricted."""
+    candidate = Path(cwd)
+    if not candidate.is_absolute() or candidate.is_symlink() or not candidate.is_dir():
+        raise AgentSpawnError(
+            "direct review requires an absolute, existing non-symlink approved read root"
+        )
+    resolved = candidate.resolve()
+    home = Path.home().resolve()
+    if (
+        resolved == Path(resolved.anchor)
+        or resolved == home
+        or home.is_relative_to(resolved)
+        or resolved in {
+            Path("/System"), Path("/usr"), Path("/var"), Path("/private"), Path("/Volumes"),
+        }
+    ):
+        raise AgentSpawnError("direct review requires a project-scoped approved read root")
+    return str(resolved)
+
+
+def _direct_opus_review_argv(brief: str, read_root: str, mcp_config: str) -> list[str]:
+    """Build the non-overridable native Claude invocation for this profile."""
+    return [
+        _CLAUDE_BIN or "claude",
+        *_DIRECT_OPUS_REVIEW_FLAGS,
+        "--bare",
+        "--restricted",
+        "--strict-mcp-config",
+        "--mcp-config", mcp_config,
+        "--add-dir", read_root,
+        "--model", "claude-opus-5",
+        "-p", (
+            f"{brief}\n\n"
+            "For this direct-review turn, use Huddle only to return one `result` "
+            "to the request that invoked this review. Do not post Huddle `request` "
+            "messages or initiate additional work."
+        ),
+    ]
 
 
 def log_spawn_failure(
@@ -451,7 +585,7 @@ def log_spawn_failure(
 
 
 def _reap_in_background(proc: subprocess.Popen, name: str,
-                        on_exit=None) -> None:
+                        on_exit=None, cleanup_dir: str | None = None) -> None:
     """Ensure short-lived spawned agents do not remain as defunct children.
 
     on_exit: optional callable(returncode) invoked once the process exits.
@@ -463,6 +597,9 @@ def _reap_in_background(proc: subprocess.Popen, name: str,
             returncode = proc.wait()
         except Exception:
             pass
+        finally:
+            if cleanup_dir is not None:
+                shutil.rmtree(cleanup_dir, ignore_errors=True)
         if on_exit is not None:
             try:
                 on_exit(returncode)
@@ -560,18 +697,48 @@ def _merge_registry(
     """Merge `overrides` onto `base` keyed by "name".
 
     An override whose name matches an existing entry replaces it in place
-    (preserving order); a new name is appended. Inputs are not mutated.
+    (preserving order), except the protected direct-review profile; a new name
+    is appended. Inputs are not mutated.
     """
     merged: list[SpawnSpec] = [dict(spec) for spec in base]  # type: ignore[misc]
     index = {spec.get("name"): i for i, spec in enumerate(merged)}
     for spec in overrides:
         name = spec.get("name")
         if name in index:
-            merged[index[name]] = spec
+            current = merged[index[name]]
+            if current.get("profile") == _DIRECT_OPUS_REVIEW_PROFILE:
+                # This contract is a fixed runner, not a configurable command.
+                # An owner may deliberately enable it, but cannot replace its
+                # profile, argv, or exclusion from auto-spawn in registry JSON.
+                enabled = spec.get("enabled")
+                merged[index[name]] = {
+                    **current,
+                    **({"enabled": enabled} if isinstance(enabled, bool) else {}),
+                    "auto": False,
+                }
+            else:
+                merged[index[name]] = spec
         else:
             index[name] = len(merged)
             merged.append(spec)
     return merged
+
+
+def _preserve_direct_opus_profile_contract(registry: list[SpawnSpec]) -> list[SpawnSpec]:
+    """Keep the built-in direct-review name bound to its typed runner contract."""
+    built_in = _claude_opus_review_spec()
+    preserved: list[SpawnSpec] = []
+    for spec in registry:
+        if spec.get("name") != built_in["name"]:
+            preserved.append(spec)
+            continue
+        enabled = spec.get("enabled")
+        preserved.append({
+            **built_in,
+            **({"enabled": enabled} if isinstance(enabled, bool) else {}),
+            "auto": False,
+        })
+    return preserved
 
 
 # Read-only discussant mode (MCP_HUDDLE_READONLY): spawned agents may READ
@@ -580,9 +747,9 @@ def _merge_registry(
 # never by changing files. Agents communicate via the bus, not file edits, so
 # this does not hamper participation.
 _CLAUDE_RO_FLAGS = [
-    "--allowedTools", "Read,Glob,WebFetch,WebSearch,mcp__huddle__*",
+    "--allowedTools", "Read,Glob,Grep,WebFetch,WebSearch,mcp__huddle__*",
     "--disallowedTools", "Edit,Write,NotebookEdit,MultiEdit,Bash",
-    "--permission-mode", "default",
+    "--permission-mode", "manual",
 ]
 
 
@@ -604,11 +771,12 @@ def _apply_readonly(spec: SpawnSpec) -> SpawnSpec:
       which `-a never` would cancel). Cross-model council, 2026-06-19.
     Other agents are returned unchanged (no confirmed read-only flag yet).
     """
+    profile = spec.get("profile")
     name = spec.get("name")
     cmd = list(spec.get("cmd") or [])
-    if name == "Claude":
+    if profile == _DIRECT_OPUS_REVIEW_PROFILE or name == "Claude":
         cmd = [c for c in cmd if c != "--dangerously-skip-permissions"]
-        if cmd:
+        if cmd and "--allowedTools" not in cmd:
             cmd = [cmd[0], *_CLAUDE_RO_FLAGS, *cmd[1:]]
     elif name == "Codex":
         out: list[str] = []
@@ -637,13 +805,23 @@ def _raw_registry() -> list[SpawnSpec]:
     """
     env_registry = _load_env_registry()
     if env_registry is not None:
-        reg = env_registry
+        reg = _preserve_direct_opus_profile_contract(env_registry)
     else:
         file_overrides = _load_registry_file()
         reg = (_merge_registry(DEFAULT_REGISTRY, file_overrides)
                if file_overrides is not None else list(DEFAULT_REGISTRY))
-    if _readonly_enabled():
-        reg = [_apply_readonly(s) for s in reg]
+    if _readonly_enabled() or any(
+        spec.get("profile") == _DIRECT_OPUS_REVIEW_PROFILE and spec.get("enabled")
+        for spec in reg
+    ):
+        reg = [
+            _apply_readonly(spec)
+            if _readonly_enabled() or (
+                spec.get("profile") == _DIRECT_OPUS_REVIEW_PROFILE and spec.get("enabled")
+            )
+            else spec
+            for spec in reg
+        ]
     return reg
 
 
@@ -725,10 +903,25 @@ def spawn_agent(
     log_dir.mkdir(parents=True, exist_ok=True)
     name = spec["name"]
     log_path = log_dir / f"{name.lower()}.events.jsonl"
+    cleanup_dir: str | None = None
     if name == "Codex":
         cwd, brief = _codex_safe_cwd_and_brief(cwd, brief)
-    argv, last_msg_path = _resolve_spawn_args(spec, brief, log_dir)
-
+    if spec.get("profile") == _DIRECT_OPUS_REVIEW_PROFILE:
+        # This typed profile deliberately ignores registry argv: it always has
+        # a neutral cwd, a single validated project read root, direct API
+        # routing, and the reviewed Claude tool allowlist.
+        env = _spawn_environment(spec)
+        read_root = _direct_opus_review_read_root(cwd)
+        mcp_config = _direct_opus_review_endpoint_config(
+            env.pop(_DIRECT_OPUS_ENDPOINT_ENV, None)
+        )
+        argv = _direct_opus_review_argv(brief, read_root, mcp_config)
+        cleanup_dir = tempfile.mkdtemp(prefix=_DIRECT_OPUS_REVIEW_CWD_PREFIX)
+        cwd = cleanup_dir
+        last_msg_path = None
+    else:
+        argv, last_msg_path = _resolve_spawn_args(spec, brief, log_dir)
+        env = _spawn_environment(spec)
     log_file = open(log_path, "ab", buffering=0)
     try:
         proc = subprocess.Popen(
@@ -737,12 +930,20 @@ def spawn_agent(
             stdin=subprocess.DEVNULL,
             stdout=log_file,
             stderr=subprocess.STDOUT,
+            env=env,
         )
+    except Exception:
+        if cleanup_dir is not None:
+            shutil.rmtree(cleanup_dir, ignore_errors=True)
+        raise
     finally:
         # Popen dups the fd into the child; we can close ours so the parent
         # process doesn't keep the log file held open after the child exits.
         log_file.close()
-    _reap_in_background(proc, name, on_exit=on_exit)
+    if cleanup_dir is None:
+        _reap_in_background(proc, name, on_exit=on_exit)
+    else:
+        _reap_in_background(proc, name, on_exit=on_exit, cleanup_dir=cleanup_dir)
     if verify_alive_sec > 0:
         time.sleep(verify_alive_sec)
         returncode = proc.poll()
@@ -753,6 +954,28 @@ def spawn_agent(
             log_spawn_failure(spec, brief, cwd, log_dir, exc)
             raise exc
     return proc.pid, str(log_path), last_msg_path
+
+
+def _spawn_environment(spec: SpawnSpec) -> dict[str, str]:
+    """Build a child environment without exposing profile secret values."""
+    env = os.environ.copy()
+    if spec.get("profile") != _DIRECT_OPUS_REVIEW_PROFILE:
+        return env
+    required = (
+        "ANTHROPIC_API_KEY",
+        _DIRECT_OPUS_WORKSPACE_ENV,
+        _DIRECT_OPUS_ENDPOINT_ENV,
+    )
+    missing = [name for name in required if not env.get(name)]
+    if missing:
+        raise AgentSpawnError(
+            f"{spec['name']} missing required environment: {', '.join(missing)}"
+        )
+    for name in _DIRECT_OPUS_REMOVED_ENV:
+        env.pop(name, None)
+    env["ANTHROPIC_BASE_URL"] = "https://api.anthropic.com"
+    env["ANTHROPIC_CUSTOM_HEADERS"] = env.pop(_DIRECT_OPUS_WORKSPACE_ENV)
+    return env
 
 
 # ── Same-binary spawn stagger ────────────────────────────────────────────────
