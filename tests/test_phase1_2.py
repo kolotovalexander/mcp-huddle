@@ -111,6 +111,7 @@ def test_default_registry_roster() -> None:
     assert spec_names == {
         "Codex", "Antigravity", "MiMo", "OpenCode", "Claude",
         "Claude Opus 5 (direct review)",
+        "Claude Opus 5 (subscription review)",
     }
 
 
