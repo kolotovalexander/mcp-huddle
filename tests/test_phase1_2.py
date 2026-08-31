@@ -1102,6 +1102,38 @@ def test_room_status_ack_does_not_receipt_a_request(
     assert not server._agent_replied_to_request(room_id, "ManualReviewer", request_id)
 
 
+@pytest.mark.parametrize("progress_kind", ["ack", "busy", "comment"])
+def test_progress_reply_allows_one_terminal_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, progress_kind: str,
+) -> None:
+    """Progress replies do not consume the single terminal reply allowance."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+    room_id = isolated_bus.create_room("Progress", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "ManualReviewer")
+
+    request_id = server.message_post(
+        room_id, "Claude", "Review", "request", to="ManualReviewer",
+    )
+    server.message_post(
+        room_id, "ManualReviewer", "Working", progress_kind,
+        to="Claude", reply_to=request_id,
+    )
+    result_id = server.message_post(
+        room_id, "ManualReviewer", "Completed review", "result",
+        to="Claude", reply_to=request_id,
+    )
+
+    assert result_id == 3
+    assert server.room_status(room_id)["pending_requests"] == []
+    with pytest.raises(ValueError, match="already answered"):
+        server.message_post(
+            room_id, "ManualReviewer", "Duplicate terminal reply", "final",
+            to="Claude", reply_to=request_id,
+        )
+
+
 def test_auto_spawn_false_agent_is_not_marked_starting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
