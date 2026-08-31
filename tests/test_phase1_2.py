@@ -1051,6 +1051,7 @@ def test_room_status_failure_receipt_survives_later_request_lifecycle(
 
     assert snapshot["pending_requests"] == []
     assert snapshot["all_terminal"] is True
+    assert server._agent_replied_to_request(room_id, "ManualReviewer", failed_request)
 
 
 def test_room_status_old_completed_manual_agent_does_not_close_new_request(
@@ -1098,6 +1099,7 @@ def test_room_status_ack_does_not_receipt_a_request(
 
     assert [item["id"] for item in pending] == [request_id]
     assert pending[0]["waiting_for"] == ["ManualReviewer"]
+    assert not server._agent_replied_to_request(room_id, "ManualReviewer", request_id)
 
 
 def test_auto_spawn_false_agent_is_not_marked_starting(
