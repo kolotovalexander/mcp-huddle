@@ -1,9 +1,10 @@
 """Configurable agent-spawn registry for auto_spawn rooms.
 
 Default registry uses Codex, Antigravity, MiMo, Qwen, and DeepSeek when available.
-Claude is present but OFF by default (opt-in via MCP_HUDDLE_CLAUDE_ENABLED=1)
-because since 2026-06-15 headless `claude -p` is metered against a separate
-Agent SDK credit pool, not the subscription.
+Claude is opt-in: automated reviewers consume the owner's available usage.
+Anthropic paused the announced separate SDK billing change on 2026-06-15;
+`claude -p` still supports subscription usage. Verify native authentication
+rather than inferring billing or availability from an absent API key.
 
 Adding / overriding agents (precedence high → low):
   1. MCP_HUDDLE_SPAWN_REGISTRY env var → JSON file, a FULL replacement of the
@@ -82,6 +83,9 @@ class SpawnSpec(TypedDict):
     # A named profile is a fixed, reviewed runner contract. It is deliberately
     # narrower than a generic environment/configuration API for registry JSON.
     profile: NotRequired[str]
+    # Local endpoint for the owner-enabled subscription reviewer. Validated
+    # before spawn; credentials and remote URLs are never accepted here.
+    mcp_url: NotRequired[str]
 
 
 class AgentSpawnError(RuntimeError):
@@ -89,6 +93,7 @@ class AgentSpawnError(RuntimeError):
 
 
 _DIRECT_OPUS_REVIEW_PROFILE = "claude-opus-direct-review"
+_SUBSCRIPTION_OPUS_REVIEW_PROFILE = "claude-opus-subscription-review"
 _DIRECT_OPUS_REVIEW_CWD_PREFIX = "mcp-huddle-opus-review-"
 _DIRECT_OPUS_REMOVED_ENV = frozenset({
     "ANTHROPIC_AUTH_TOKEN",
@@ -153,6 +158,7 @@ _ANTIGRAVITY_BIN = _first_existing_binary([
 ])
 _CLAUDE_BIN = _first_existing_binary([
     "claude",
+    str(Path.home() / ".local/bin/claude"),
     "/Applications/cmux.app/Contents/Resources/bin/claude",
     "/opt/homebrew/bin/claude",
     str(Path.home() / ".claude/local/claude"),
@@ -429,16 +435,10 @@ DEFAULT_REGISTRY: list[SpawnSpec] = [
             "--model", "sonnet",
             "-p", "{brief}",
         ],
-        # Opt-in (default OFF). Since 2026-06-15 Anthropic moved `claude -p`
-        # (headless) off the subscription onto a separate, metered Agent SDK
-        # credit pool (Pro $20 / Max5x $100 / Max20x $200, no rollover, full
-        # API rates). Each invited-Claude turn here is a fresh `claude -p`
-        # spawn, so auto-spawning it bleeds that credit pool for the least
-        # differentiated voice in a multi-model room — the organizer's own
-        # interactive Claude session is already present for free. Enable
-        # deliberately via MCP_HUDDLE_CLAUDE_ENABLED=1 when you specifically
-        # want a second Claude perspective and accept the metered cost.
-        # Ref: support.claude.com article 15036540.
+        # Explicit opt-in avoids spending usage on an unsolicited second
+        # reviewer. SDK/print usage is still supported by subscriptions:
+        # support.claude.com article 15036540, update 2026-06-15 (checked
+        # 2026-08-31). Authentication and current plan limits decide the route.
         "enabled": (
             _CLAUDE_BIN is not None
             and os.environ.get("MCP_HUDDLE_CLAUDE_ENABLED", "0") != "0"
@@ -457,6 +457,13 @@ DEFAULT_REGISTRY: list[SpawnSpec] = [
         "auto": False,
         "profile": _DIRECT_OPUS_REVIEW_PROFILE,
     },
+    {
+        "name": "Claude Opus 5 (subscription review)",
+        "cmd": [_CLAUDE_BIN or "claude"],
+        "enabled": False,
+        "auto": False,
+        "profile": _SUBSCRIPTION_OPUS_REVIEW_PROFILE,
+    },
 ]
 
 
@@ -466,6 +473,36 @@ def _claude_opus_review_spec() -> SpawnSpec:
         spec for spec in DEFAULT_REGISTRY
         if spec["name"] == "Claude Opus 5 (direct review)"
     )
+
+
+def _protected_opus_profiles() -> dict[str, SpawnSpec]:
+    return {
+        spec["name"]: spec for spec in DEFAULT_REGISTRY
+        if spec.get("profile") in {
+            _DIRECT_OPUS_REVIEW_PROFILE, _SUBSCRIPTION_OPUS_REVIEW_PROFILE,
+        }
+    }
+
+
+def _opus_profile_override(current: SpawnSpec, override: SpawnSpec) -> SpawnSpec:
+    """Only enablement and the subscription's local endpoint are configurable."""
+    result = dict(current)
+    if isinstance(override.get("enabled"), bool):
+        result["enabled"] = override["enabled"]
+    if current.get("profile") == _SUBSCRIPTION_OPUS_REVIEW_PROFILE:
+        if "mcp_url" in override:
+            result["mcp_url"] = override["mcp_url"]
+    result["auto"] = False
+    return result
+
+
+def _validate_protected_profile_names(registry: list[SpawnSpec]) -> None:
+    """A typed profile cannot be aliased to bypass its explicit-selection rule."""
+    canonical = {spec["profile"]: name for name, spec in _protected_opus_profiles().items()}
+    for spec in registry:
+        name = canonical.get(spec.get("profile"))
+        if name is not None and spec.get("name") != name:
+            raise AgentSpawnError("protected Opus profile must use its canonical registry name")
 
 
 def _resolve_spawn_args(
@@ -559,6 +596,48 @@ def _direct_opus_review_argv(brief: str, read_root: str, mcp_config: str) -> lis
             "messages or initiate additional work."
         ),
     ]
+
+
+def _subscription_opus_review_argv(brief: str, read_root: str, mcp_config: str) -> list[str]:
+    """Use native account login with the same fixed read-only review boundary.
+
+    --bare is intentionally absent: it disables OAuth/Keychain authentication.
+    --restricted ignores user/project settings; only the selected room MCP and
+    approved read root are exposed. No provider, model, or permission fallback.
+    """
+    argv = _direct_opus_review_argv(brief, read_root, mcp_config)
+    argv.remove("--bare")
+    argv[argv.index("--tools") + 1] = "Read,Glob,Grep,ToolSearch"
+    argv[argv.index("--allowedTools") + 1] = (
+        "Read,Glob,Grep,ToolSearch," + argv[argv.index("--allowedTools") + 1]
+    )
+    argv[argv.index("-p"):argv.index("-p")] = [
+        "--setting-sources", "", "--disable-slash-commands", "--no-chrome",
+        "--output-format", "stream-json", "--verbose",
+    ]
+    argv[-1] = argv[-1].replace("direct-review turn", "subscription-review turn")
+    return argv
+
+
+def _verify_subscription_auth(env: dict[str, str], cwd: str) -> None:
+    """Native CLI owns credentials. Inspect only non-secret status fields."""
+    try:
+        probe = subprocess.run(
+            [_CLAUDE_BIN or "claude", "--restricted", "--setting-sources", "",
+             "auth", "status", "--json"],
+            cwd=cwd, env=env, capture_output=True, text=True, timeout=20,
+        )
+        auth = json.loads(probe.stdout)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        raise AgentSpawnError("subscription review: native auth status unavailable") from None
+    if not (
+        probe.returncode == 0 and isinstance(auth, dict)
+        and auth.get("loggedIn") is True
+        and auth.get("authMethod") == "claude.ai"
+        and auth.get("apiProvider") == "firstParty"
+        and auth.get("subscriptionType")
+    ):
+        raise AgentSpawnError("subscription review requires an existing claude.ai subscription login")
 
 
 def log_spawn_failure(
@@ -706,16 +785,13 @@ def _merge_registry(
         name = spec.get("name")
         if name in index:
             current = merged[index[name]]
-            if current.get("profile") == _DIRECT_OPUS_REVIEW_PROFILE:
+            if current.get("profile") in {
+                _DIRECT_OPUS_REVIEW_PROFILE, _SUBSCRIPTION_OPUS_REVIEW_PROFILE,
+            }:
                 # This contract is a fixed runner, not a configurable command.
                 # An owner may deliberately enable it, but cannot replace its
                 # profile, argv, or exclusion from auto-spawn in registry JSON.
-                enabled = spec.get("enabled")
-                merged[index[name]] = {
-                    **current,
-                    **({"enabled": enabled} if isinstance(enabled, bool) else {}),
-                    "auto": False,
-                }
+                merged[index[name]] = _opus_profile_override(current, spec)
             else:
                 merged[index[name]] = spec
         else:
@@ -725,19 +801,15 @@ def _merge_registry(
 
 
 def _preserve_direct_opus_profile_contract(registry: list[SpawnSpec]) -> list[SpawnSpec]:
-    """Keep the built-in direct-review name bound to its typed runner contract."""
-    built_in = _claude_opus_review_spec()
+    """Keep both built-in Opus names bound to their reviewed runner contracts."""
+    profiles = _protected_opus_profiles()
     preserved: list[SpawnSpec] = []
     for spec in registry:
-        if spec.get("name") != built_in["name"]:
+        built_in = profiles.get(spec.get("name", ""))
+        if built_in is None:
             preserved.append(spec)
             continue
-        enabled = spec.get("enabled")
-        preserved.append({
-            **built_in,
-            **({"enabled": enabled} if isinstance(enabled, bool) else {}),
-            "auto": False,
-        })
+        preserved.append(_opus_profile_override(built_in, spec))
     return preserved
 
 
@@ -774,7 +846,7 @@ def _apply_readonly(spec: SpawnSpec) -> SpawnSpec:
     profile = spec.get("profile")
     name = spec.get("name")
     cmd = list(spec.get("cmd") or [])
-    if profile == _DIRECT_OPUS_REVIEW_PROFILE or name == "Claude":
+    if profile in {_DIRECT_OPUS_REVIEW_PROFILE, _SUBSCRIPTION_OPUS_REVIEW_PROFILE} or name == "Claude":
         cmd = [c for c in cmd if c != "--dangerously-skip-permissions"]
         if cmd and "--allowedTools" not in cmd:
             cmd = [cmd[0], *_CLAUDE_RO_FLAGS, *cmd[1:]]
@@ -810,6 +882,7 @@ def _raw_registry() -> list[SpawnSpec]:
         file_overrides = _load_registry_file()
         reg = (_merge_registry(DEFAULT_REGISTRY, file_overrides)
                if file_overrides is not None else list(DEFAULT_REGISTRY))
+    _validate_protected_profile_names(reg)
     if _readonly_enabled() or any(
         spec.get("profile") == _DIRECT_OPUS_REVIEW_PROFILE and spec.get("enabled")
         for spec in reg
@@ -900,25 +973,35 @@ def spawn_agent(
 
     Side effects: creates log_dir, opens log file, redirects stdout+stderr to it.
     """
+    _validate_protected_profile_names([spec])
     log_dir.mkdir(parents=True, exist_ok=True)
     name = spec["name"]
     log_path = log_dir / f"{name.lower()}.events.jsonl"
     cleanup_dir: str | None = None
     if name == "Codex":
         cwd, brief = _codex_safe_cwd_and_brief(cwd, brief)
-    if spec.get("profile") == _DIRECT_OPUS_REVIEW_PROFILE:
+    if spec.get("profile") in {_DIRECT_OPUS_REVIEW_PROFILE, _SUBSCRIPTION_OPUS_REVIEW_PROFILE}:
         # This typed profile deliberately ignores registry argv: it always has
         # a neutral cwd, a single validated project read root, direct API
         # routing, and the reviewed Claude tool allowlist.
         env = _spawn_environment(spec)
         read_root = _direct_opus_review_read_root(cwd)
-        mcp_config = _direct_opus_review_endpoint_config(
-            env.pop(_DIRECT_OPUS_ENDPOINT_ENV, None)
-        )
-        argv = _direct_opus_review_argv(brief, read_root, mcp_config)
+        subscription = spec.get("profile") == _SUBSCRIPTION_OPUS_REVIEW_PROFILE
+        endpoint = spec.get("mcp_url") if subscription else env.pop(_DIRECT_OPUS_ENDPOINT_ENV, None)
+        if subscription and not isinstance(endpoint, str):
+            raise AgentSpawnError("subscription review requires a local mcp_url in the registry")
+        mcp_config = _direct_opus_review_endpoint_config(endpoint)
+        argv_builder = _subscription_opus_review_argv if subscription else _direct_opus_review_argv
+        argv = argv_builder(brief, read_root, mcp_config)
         cleanup_dir = tempfile.mkdtemp(prefix=_DIRECT_OPUS_REVIEW_CWD_PREFIX)
         cwd = cleanup_dir
         last_msg_path = None
+        if subscription:
+            try:
+                _verify_subscription_auth(env, cwd)
+            except Exception:
+                shutil.rmtree(cleanup_dir, ignore_errors=True)
+                raise
     else:
         argv, last_msg_path = _resolve_spawn_args(spec, brief, log_dir)
         env = _spawn_environment(spec)
@@ -959,6 +1042,17 @@ def spawn_agent(
 def _spawn_environment(spec: SpawnSpec) -> dict[str, str]:
     """Build a child environment without exposing profile secret values."""
     env = os.environ.copy()
+    if spec.get("profile") == _SUBSCRIPTION_OPUS_REVIEW_PROFILE:
+        conflicting = sorted(name for name in (
+            *_DIRECT_OPUS_REMOVED_ENV,
+            "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL", "CLAUDE_CODE_API_KEY_HELPER",
+        ) if env.get(name))
+        if conflicting:
+            raise AgentSpawnError(
+                "subscription review refuses conflicting environment: " + ", ".join(conflicting)
+            )
+        return env
     if spec.get("profile") != _DIRECT_OPUS_REVIEW_PROFILE:
         return env
     required = (

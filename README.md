@@ -135,7 +135,7 @@ All configuration is via environment variables (defaults shown):
 | `MCP_HUDDLE_HTTP` | (unset) | If set, run in HTTP + dashboard mode without passing `--http`. |
 | `MCP_HUDDLE_HOME` | `~/.mcp-huddle` | Storage root. Rooms are stored in `$MCP_HUDDLE_HOME/rooms`. |
 | `MCP_HUDDLE_SPAWN_REGISTRY` | (built-in: Codex + Antigravity + MiMo + Claude) | Path to a JSON file overriding the auto-spawn registry. See [`examples/registry.json`](examples/registry.json). |
-| `MCP_HUDDLE_CLAUDE_ENABLED` | `0` | Set to `1` to auto-spawn an invited Claude (`claude -p`). OFF by default — `claude -p` is metered. |
+| `MCP_HUDDLE_CLAUDE_ENABLED` | `0` | Set to `1` to allow the legacy Claude slot. Opt-in avoids unsolicited usage; native account/API authentication determines the billing route. |
 | `MCP_HUDDLE_DIRECT_REVIEW_MCP_URL` | (required for direct Opus review) | Runtime loopback `http(s)://…/mcp` endpoint for the disabled `Claude Opus 5 (direct review)` profile. No credentials or query string; it is never stored in the registry. |
 | `MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER` | (required for direct Opus review) | Runtime Anthropic workspace header for that manual profile. Keep its value out of registry files and logs. |
 | `MCP_HUDDLE_ANTIGRAVITY_ENABLED` | `0` | Set to `1` to enable the Antigravity (`agy`) advisor slot (needs a prior interactive `agy` login; not read-only-enforced). |
@@ -151,6 +151,42 @@ All configuration is via environment variables (defaults shown):
 | `IDLE_TIMEOUT_SECS` | `600` | Idle window before an idle room with a dead owner is reaped. |
 | `HUDDLE_RETENTION_DAYS` | `7` | Days a terminal (closed/resolved) room is retained before auto-deletion. |
 | `HUDDLE_RETENTION_SWEEP_SECS` | `3600` | Interval between retention sweeps. |
+
+### Opus through an existing Claude Code subscription
+
+The optional `Claude Opus 5 (subscription review)` profile uses the installed
+Claude CLI with an existing `claude.ai` login. It checks native authentication
+before launching, fixes the model to `claude-opus-5`, and refuses conflicting
+API keys, provider overrides or authentication-token environment variables.
+It never logs in, extracts credentials, switches providers or falls back to
+another model. `--bare` is deliberately absent because it disables OAuth.
+
+Enable only this entry in the existing `~/.mcp-huddle/registry.json`, preserving
+the other entries and using the actual local Huddle endpoint:
+
+```json
+{
+  "name": "Claude Opus 5 (subscription review)",
+  "enabled": true,
+  "mcp_url": "http://127.0.0.1:45111/mcp"
+}
+```
+
+The endpoint must be loopback HTTP(S), include a port, end in `/mcp`, and have
+no credentials or query string. This entry cannot override the model, command,
+permissions or `auto:false`. It is excluded from blanket `auto_spawn=True`;
+select it explicitly with `room_invite` followed by an addressed request, or
+with `auto_spawn={"Claude Opus 5 (subscription review)": "bounded brief"}`.
+Each request is a bounded `claude -p` turn; read the stored Huddle result and
+lifecycle rather than treating stdout or a live process as completion.
+
+The child starts in a temporary neutral directory, with `--restricted`, only
+the selected Huddle MCP, and the room's single approved project read root.
+File edits, shell commands and spawning other agents are not available.
+Subscription limits still apply. Anthropic's announced SDK billing change
+was paused; see the current update in
+[Use the Claude Agent SDK with your Claude plan](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan).
+The separate direct-API profile remains disabled unless deliberately configured.
 
 ## Failure visibility
 
