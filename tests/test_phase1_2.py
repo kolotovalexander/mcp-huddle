@@ -1781,10 +1781,7 @@ def test_direct_anthropic_opus_profile_is_manual_and_readonly(
     assert profile["enabled"] is False
     assert profile["auto"] is False
     assert profile["profile"] == "claude-opus-direct-review"
-    assert profile["cmd"][-4:] == ["--model", "claude-opus-5", "-p", "{brief}"]
-    assert "--bare" in profile["cmd"]
-    assert "--restricted" in profile["cmd"]
-    assert "--strict-mcp-config" in profile["cmd"]
+    assert profile["cmd"] == [spawn._CLAUDE_BIN or "claude"]
     assert "9router" not in " ".join(profile["cmd"])
     assert "--dangerously-skip-permissions" not in spawn._apply_readonly(profile)["cmd"]
     assert "--allowedTools" in spawn._apply_readonly(profile)["cmd"]
@@ -1810,6 +1807,7 @@ def test_direct_anthropic_opus_spawn_uses_only_direct_api_environment(
     profile = spawn._claude_opus_review_spec()
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     monkeypatch.setenv("MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER", "workspace-header")
+    monkeypatch.setenv("MCP_HUDDLE_DIRECT_REVIEW_MCP_URL", "http://127.0.0.1:45111/mcp")
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "oauth-alias")
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "claude-oauth")
     monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
@@ -1833,13 +1831,17 @@ def test_direct_anthropic_opus_spawn_uses_only_direct_api_environment(
     monkeypatch.setattr(spawn.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(spawn, "_reap_in_background", lambda *args, **kwargs: None)
 
-    spawn.spawn_agent(profile, "review", str(tmp_path), tmp_path / "agents")
+    project = tmp_path / "approved-project"
+    project.mkdir()
+    spawn.spawn_agent(profile, "review", str(project), tmp_path / "agents")
 
     env = captured["env"]
     assert isinstance(env, dict)
     assert env["ANTHROPIC_BASE_URL"] == "https://api.anthropic.com"
     assert env["ANTHROPIC_CUSTOM_HEADERS"] == "workspace-header"
     assert env["ANTHROPIC_API_KEY"] == "test-key"
+    assert "MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER" not in env
+    assert "MCP_HUDDLE_DIRECT_REVIEW_MCP_URL" not in env
     assert "ANTHROPIC_AUTH_TOKEN" not in env
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
     assert "CLAUDE_CODE_USE_BEDROCK" not in env
@@ -1849,6 +1851,12 @@ def test_direct_anthropic_opus_spawn_uses_only_direct_api_environment(
     assert "9router" not in " ".join(captured["argv"])
     assert captured["cwd"] == spawn._DIRECT_OPUS_REVIEW_CWD
     assert "--allowedTools" in captured["argv"]
+    argv = captured["argv"]
+    assert "--bare" in argv and "--restricted" in argv and "--strict-mcp-config" in argv
+    assert argv[argv.index("--model") + 1] == "claude-opus-5"
+    assert argv[argv.index("--add-dir") + 1] == str(project.resolve())
+    mcp_config = json.loads(argv[argv.index("--mcp-config") + 1])
+    assert mcp_config["mcpServers"]["huddle"]["url"] == "http://127.0.0.1:45111/mcp"
 
 
 def test_direct_anthropic_opus_missing_key_fails_before_spawn(
@@ -1870,6 +1878,42 @@ def test_direct_anthropic_opus_missing_key_fails_before_spawn(
         spawn.AgentSpawnError("missing key"),
     )
     assert "workspace-header" not in capsys.readouterr().err
+
+
+def test_direct_anthropic_opus_rejects_unsafe_runtime_route_before_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The direct profile accepts only a local Huddle endpoint, never a remote route."""
+    profile = spawn._claude_opus_review_spec()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER", "workspace-header")
+    monkeypatch.setenv("MCP_HUDDLE_DIRECT_REVIEW_MCP_URL", "https://example.com/mcp")
+    monkeypatch.setattr(
+        spawn.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("must not spawn")
+    )
+
+    with pytest.raises(spawn.AgentSpawnError, match="MCP_HUDDLE_DIRECT_REVIEW_MCP_URL"):
+        spawn.spawn_agent(profile, "review", str(tmp_path), tmp_path / "agents")
+
+
+def test_direct_anthropic_opus_rejects_symlink_read_root_before_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The restricted runner grants reads only to a real, explicitly supplied room cwd."""
+    profile = spawn._claude_opus_review_spec()
+    target = tmp_path / "project"
+    target.mkdir()
+    link = tmp_path / "project-link"
+    link.symlink_to(target, target_is_directory=True)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER", "workspace-header")
+    monkeypatch.setenv("MCP_HUDDLE_DIRECT_REVIEW_MCP_URL", "http://127.0.0.1:45111/mcp")
+    monkeypatch.setattr(
+        spawn.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("must not spawn")
+    )
+
+    with pytest.raises(spawn.AgentSpawnError, match="approved read root"):
+        spawn.spawn_agent(profile, "review", str(link), tmp_path / "agents")
 
 
 # ── Rate-limit detection: ANSI stripping + OpenRouter/OpenCode phrasing ───────

@@ -136,6 +136,8 @@ All configuration is via environment variables (defaults shown):
 | `MCP_HUDDLE_HOME` | `~/.mcp-huddle` | Storage root. Rooms are stored in `$MCP_HUDDLE_HOME/rooms`. |
 | `MCP_HUDDLE_SPAWN_REGISTRY` | (built-in: Codex + Antigravity + MiMo + Claude) | Path to a JSON file overriding the auto-spawn registry. See [`examples/registry.json`](examples/registry.json). |
 | `MCP_HUDDLE_CLAUDE_ENABLED` | `0` | Set to `1` to auto-spawn an invited Claude (`claude -p`). OFF by default — `claude -p` is metered. |
+| `MCP_HUDDLE_DIRECT_REVIEW_MCP_URL` | (required for direct Opus review) | Runtime loopback `http(s)://…/mcp` endpoint for the disabled `Claude Opus 5 (direct review)` profile. No credentials or query string; it is never stored in the registry. |
+| `MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER` | (required for direct Opus review) | Runtime Anthropic workspace header for that manual profile. Keep its value out of registry files and logs. |
 | `MCP_HUDDLE_ANTIGRAVITY_ENABLED` | `0` | Set to `1` to enable the Antigravity (`agy`) advisor slot (needs a prior interactive `agy` login; not read-only-enforced). |
 | `MCP_HUDDLE_MIMO_ENABLED` | `0` | Set to `1` to enable the MiMo advisor slot (opt-in; unreliable headless output upstream). |
 | `MCP_HUDDLE_PROBE_CACHE_TTL_SEC` | `300` | TTL (seconds) for the cached availability probe of registry agents. |
@@ -197,6 +199,12 @@ mcp-huddle is designed to run **locally, on a single trusted machine**:
   `name`**: a name that already exists (e.g. `Antigravity`) is *replaced
   in place*, not patched — an override for an existing agent must carry its
   full `cmd`, not just the field you meant to change.
+- **`Claude Opus 5 (direct review)` is a manual, per-profile session.** It is
+  disabled and excluded from auto-spawn. Its typed runner ignores registry
+  argv, starts in a neutral temporary directory with `--bare --restricted`,
+  grants reads only to the validated room project via `--add-dir`, and uses a
+  required runtime loopback Huddle endpoint. It does not reuse or migrate a
+  Claude conversation history; each invited review starts a new headless turn.
 - **Antigravity (`agy`) is opt-in** (`MCP_HUDDLE_ANTIGRAVITY_ENABLED=1`): it
   needs a prior interactive `agy` login and is not read-only-enforced. **MiMo**
   runs in a throwaway temp dir, so it never touches your project files.
