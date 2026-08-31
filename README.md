@@ -138,6 +138,19 @@ All configuration is via environment variables (defaults shown):
 | `MCP_HUDDLE_CLAUDE_ENABLED` | `0` | Set to `1` to allow the legacy Claude slot. Opt-in avoids unsolicited usage; native account/API authentication determines the billing route. |
 | `MCP_HUDDLE_DIRECT_REVIEW_MCP_URL` | (required for direct Opus review) | Runtime loopback `http(s)://…/mcp` endpoint for the disabled `Claude Opus 5 (direct review)` profile. No credentials or query string; it is never stored in the registry. |
 | `MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER` | (required for direct Opus review) | Runtime Anthropic workspace header for that manual profile. Keep its value out of registry files and logs. |
+| `MCP_HUDDLE_ANTIGRAVITY_ENABLED` | `0` | Set to `1` to enable the Antigravity (`agy`) advisor slot (needs a prior interactive `agy` login; not read-only-enforced). |
+| `MCP_HUDDLE_MIMO_ENABLED` | `0` | Set to `1` to enable the MiMo advisor slot (opt-in; unreliable headless output upstream). |
+| `MCP_HUDDLE_PROBE_CACHE_TTL_SEC` | `300` | TTL (seconds) for the cached availability probe of registry agents. |
+| `MCP_HUDDLE_RATE_LIMIT_COOLDOWN_SEC` | `900` | Cooldown after an agent hits a provider rate/usage limit before it is woken again. `0` disables the cooldown gate. |
+| `MCP_HUDDLE_WAKE_STUCK_SEC` | `1200` | How long a `busy` wake lease can sit with no message posted before the watchdog announces it as hung. `0` disables the check. |
+| `MCP_HUDDLE_STUCK_KILL` | `1` | When a stuck wake is announced (`MCP_HUDDLE_WAKE_STUCK_SEC`), also SIGTERM the still-alive process. Set to `0`/`false`/`no` for legacy announce-only behavior. |
+| `MCP_HUDDLE_DEAD_WAKE_GRACE_SEC` | `60` | Grace before the watchdog treats a busy lease with a dead pid as a dead wake (announces to the room, releases the lease). `0` disables the check. |
+| `MCP_HUDDLE_SAME_BIN_STAGGER_SEC` | `20` | Within one batch spawn (`auto_spawn=True` / dict), delay each spec after the first that resolves to the same effective binary (e.g. two `opencode run` slots) by this many seconds times its occurrence index — avoids same-process collisions (e.g. OpenCode's local SQLite "database is locked"). `0` disables staggering. |
+| `MCP_HUDDLE_OPENCODE_ENABLED` | `0` | Explicitly enable the optional OpenCode slot. It uses OpenCode's configured default model and a bounded initial/wake process timeout. |
+| `MCP_HUDDLE_OPENCODE_TIMEOUT_SEC` | `1200` | Maximum runtime for one OpenCode turn when the slot is enabled. |
+| `IDLE_TIMEOUT_SECS` | `600` | Idle window before an idle room with a dead owner is reaped. |
+| `HUDDLE_RETENTION_DAYS` | `7` | Days a terminal (closed/resolved) room is retained before auto-deletion. |
+| `HUDDLE_RETENTION_SWEEP_SECS` | `3600` | Interval between retention sweeps. |
 
 ### Opus through an existing Claude Code subscription
 
@@ -174,19 +187,6 @@ Subscription limits still apply. Anthropic's announced SDK billing change
 was paused; see the current update in
 [Use the Claude Agent SDK with your Claude plan](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan).
 The separate direct-API profile remains disabled unless deliberately configured.
-| `MCP_HUDDLE_ANTIGRAVITY_ENABLED` | `0` | Set to `1` to enable the Antigravity (`agy`) advisor slot (needs a prior interactive `agy` login; not read-only-enforced). |
-| `MCP_HUDDLE_MIMO_ENABLED` | `0` | Set to `1` to enable the MiMo advisor slot (opt-in; unreliable headless output upstream). |
-| `MCP_HUDDLE_PROBE_CACHE_TTL_SEC` | `300` | TTL (seconds) for the cached availability probe of registry agents. |
-| `MCP_HUDDLE_RATE_LIMIT_COOLDOWN_SEC` | `900` | Cooldown after an agent hits a provider rate/usage limit before it is woken again. `0` disables the cooldown gate. |
-| `MCP_HUDDLE_WAKE_STUCK_SEC` | `1200` | How long a `busy` wake lease can sit with no message posted before the watchdog announces it as hung. `0` disables the check. |
-| `MCP_HUDDLE_STUCK_KILL` | `1` | When a stuck wake is announced (`MCP_HUDDLE_WAKE_STUCK_SEC`), also SIGTERM the still-alive process. Set to `0`/`false`/`no` for legacy announce-only behavior. |
-| `MCP_HUDDLE_DEAD_WAKE_GRACE_SEC` | `60` | Grace before the watchdog treats a busy lease with a dead pid as a dead wake (announces to the room, releases the lease). `0` disables the check. |
-| `MCP_HUDDLE_SAME_BIN_STAGGER_SEC` | `20` | Within one batch spawn (`auto_spawn=True` / dict), delay each spec after the first that resolves to the same effective binary (e.g. two `opencode run` slots) by this many seconds times its occurrence index — avoids same-process collisions (e.g. OpenCode's local SQLite "database is locked"). `0` disables staggering. |
-| `MCP_HUDDLE_OPENCODE_ENABLED` | `0` | Explicitly enable the optional OpenCode slot. It uses OpenCode's configured default model and a bounded initial/wake process timeout. |
-| `MCP_HUDDLE_OPENCODE_TIMEOUT_SEC` | `1200` | Maximum runtime for one OpenCode turn when the slot is enabled. |
-| `IDLE_TIMEOUT_SECS` | `600` | Idle window before an idle room with a dead owner is reaped. |
-| `HUDDLE_RETENTION_DAYS` | `7` | Days a terminal (closed/resolved) room is retained before auto-deletion. |
-| `HUDDLE_RETENTION_SWEEP_SECS` | `3600` | Interval between retention sweeps. |
 
 ## Failure visibility
 
