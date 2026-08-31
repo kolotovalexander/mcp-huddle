@@ -581,7 +581,7 @@ def _agent_phase_snapshot(status_info: dict, wake_info: dict) -> tuple[str, dict
 def _pending_requests(
     room_id: str,
     participants: list[str],
-    terminal_tasks: dict[str, int | str] | None = None,
+    terminal_tasks: dict[str, set[str]] | None = None,
 ) -> list[dict]:
     """Return unanswered request work, including agents still expected.
 
@@ -607,7 +607,7 @@ def _pending_requests(
         else:
             targets = [name for name in participants if name != message.get("agent")]
         waiting_for = [name for name in targets
-                       if str(terminal_tasks.get(name, "")) != str(message["id"])
+                       if str(message["id"]) not in terminal_tasks.get(name, set())
                        and name not in replies_by_request.get(int(message["id"]), set())]
         if not waiting_for:
             continue
@@ -634,15 +634,26 @@ def room_status(room_id: str) -> dict:
     participants = list(meta.get("participants", []))
     agent_meta = meta.get("agent_meta", {}) or {}
     status_details = bus.get_status_details(room_id)
-    terminal_tasks = {
-        name: status_info.get("task_id", "")
-        for name, status_info in status_details.items()
+    terminal_tasks: dict[str, set[str]] = {}
+    for name, status_info in status_details.items():
+        receipts = status_info.get("terminal_failure_receipts", [])
+        task_ids = {
+            str(receipt.get("task_id", ""))
+            for receipt in receipts if isinstance(receipt, dict)
+            if receipt.get("source") == "server" and receipt.get("task_id", "") != ""
+        }
+        # Compatibility for a current server-owned failure written before the
+        # persisted receipt field. Older overwritten failures without a task id
+        # cannot be correlated safely and remain pending.
+        phase, _ = _agent_phase_snapshot(status_info, agent_meta.get(name) or {})
         if (
-            _agent_phase_snapshot(status_info, agent_meta.get(name) or {})[0]
-            in _TERMINAL_PHASES
+            status_info.get("source") == "server"
+            and phase in {"unavailable", "rate_limited", "stuck"}
             and status_info.get("task_id", "") != ""
-        )
-    }
+        ):
+            task_ids.add(str(status_info["task_id"]))
+        if task_ids:
+            terminal_tasks[name] = task_ids
     pending = _pending_requests(room_id, participants, terminal_tasks)
     pending_by_agent = {
         name: [item["id"] for item in pending if name in item["waiting_for"]]

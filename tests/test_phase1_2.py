@@ -1021,6 +1021,38 @@ def test_terminal_agent_failure_closes_pending_request(
     assert snapshot["all_terminal"] is True
 
 
+def test_room_status_failure_receipt_survives_later_request_lifecycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A server-recorded failure remains terminal after a later request completes."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+    room_id = isolated_bus.create_room("Receipts", "Claude", 0, "/tmp/project", "session-1")
+    isolated_bus.invite_agent(room_id, "ManualReviewer")
+    failed_request = isolated_bus.post_message(
+        room_id, "Claude", "First review", "request", to="ManualReviewer",
+    )
+    server._set_agent_phase(room_id, "ManualReviewer", "unavailable", task_id=failed_request)
+    receipt = isolated_bus.get_status_details(room_id)["ManualReviewer"]["terminal_failure_receipts"]
+    assert receipt[0]["task_id"] == failed_request
+    assert receipt[0]["phase"] == "unavailable"
+    assert receipt[0]["source"] == "server"
+    assert isinstance(receipt[0]["timestamp"], int)
+    completed_request = isolated_bus.post_message(
+        room_id, "Claude", "Second review", "request", to="ManualReviewer",
+    )
+    server._set_agent_phase(room_id, "ManualReviewer", "working", task_id=completed_request)
+    server._post_message_checked(
+        room_id, "ManualReviewer", "Second result", "result", to="Claude", reply_to=completed_request,
+    )
+
+    snapshot = server.room_status(room_id)
+
+    assert snapshot["pending_requests"] == []
+    assert snapshot["all_terminal"] is True
+
+
 def test_room_status_old_completed_manual_agent_does_not_close_new_request(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
