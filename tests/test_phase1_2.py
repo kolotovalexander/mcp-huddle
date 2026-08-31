@@ -2,9 +2,11 @@
 thread_id parsing, codex_resume helper, /api/room_agents and SSE endpoint)."""
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import importlib
 from pathlib import Path
@@ -1788,16 +1790,38 @@ def test_direct_anthropic_opus_profile_is_manual_and_readonly(
 
 
 def test_direct_anthropic_opus_stays_readonly_when_global_toggle_is_off(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A direct review profile never turns into a writer through the global toggle."""
+    """The actual direct-profile spawn stays read-only when global toggle is off."""
     monkeypatch.setenv("MCP_HUDDLE_READONLY", "0")
-    monkeypatch.setitem(spawn._claude_opus_review_spec(), "enabled", True)
-    reg = {spec["name"]: spec for spec in spawn._raw_registry()}
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER", "workspace-header")
+    monkeypatch.setenv("MCP_HUDDLE_DIRECT_REVIEW_MCP_URL", "http://127.0.0.1:45111/mcp")
+    captured: dict[str, object] = {}
 
-    cmd = reg["Claude Opus 5 (direct review)"]["cmd"]
-    assert "--allowedTools" in cmd
-    assert "--dangerously-skip-permissions" not in cmd
+    class FakeProc:
+        pid = 12345
+
+        def poll(self):
+            return None
+
+    def fake_popen(argv, cwd, stdin, stdout, stderr, env):
+        captured["argv"] = argv
+        captured["cwd"] = cwd
+        return FakeProc()
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(spawn, "_reap_in_background", lambda *args, **kwargs: None)
+    project = tmp_path / "project"
+    project.mkdir()
+    spawn.spawn_agent(spawn._claude_opus_review_spec(), "review", str(project), tmp_path / "agents")
+
+    argv = captured["argv"]
+    assert "--allowedTools" in argv and "Grep" in argv[argv.index("--allowedTools") + 1]
+    assert "--disallowedTools" in argv and "Bash" in argv[argv.index("--disallowedTools") + 1]
+    assert "--dangerously-skip-permissions" not in argv
+    assert captured["cwd"] != str(project)
+    shutil.rmtree(captured["cwd"])
 
 
 def test_direct_anthropic_opus_spawn_uses_only_direct_api_environment(
@@ -1849,7 +1873,8 @@ def test_direct_anthropic_opus_spawn_uses_only_direct_api_environment(
     assert "CLAUDE_CODE_USE_FOUNDRY" not in env
     assert "ANTHROPIC_MODEL" not in env
     assert "9router" not in " ".join(captured["argv"])
-    assert captured["cwd"] == spawn._DIRECT_OPUS_REVIEW_CWD
+    assert Path(captured["cwd"]).name.startswith("mcp-huddle-opus-review-")
+    assert Path(captured["cwd"]).is_dir()
     assert "--allowedTools" in captured["argv"]
     argv = captured["argv"]
     assert "--bare" in argv and "--restricted" in argv and "--strict-mcp-config" in argv
@@ -1857,6 +1882,7 @@ def test_direct_anthropic_opus_spawn_uses_only_direct_api_environment(
     assert argv[argv.index("--add-dir") + 1] == str(project.resolve())
     mcp_config = json.loads(argv[argv.index("--mcp-config") + 1])
     assert mcp_config["mcpServers"]["huddle"]["url"] == "http://127.0.0.1:45111/mcp"
+    shutil.rmtree(captured["cwd"])
 
 
 def test_direct_anthropic_opus_missing_key_fails_before_spawn(
@@ -1914,6 +1940,86 @@ def test_direct_anthropic_opus_rejects_symlink_read_root_before_spawn(
 
     with pytest.raises(spawn.AgentSpawnError, match="approved read root"):
         spawn.spawn_agent(profile, "review", str(link), tmp_path / "agents")
+
+
+def test_direct_anthropic_opus_rejects_home_ancestor_read_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A broad ancestor of HOME cannot become the restricted profile's read root."""
+    profile = spawn._claude_opus_review_spec()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER", "workspace-header")
+    monkeypatch.setenv("MCP_HUDDLE_DIRECT_REVIEW_MCP_URL", "http://127.0.0.1:45111/mcp")
+    monkeypatch.setattr(
+        spawn.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("must not spawn")
+    )
+
+    with pytest.raises(spawn.AgentSpawnError, match="project-scoped approved read root"):
+        spawn.spawn_agent(profile, "review", str(Path.home().parent), tmp_path / "agents")
+
+
+def test_direct_anthropic_opus_reaper_removes_only_its_owned_temp_cwd(
+    tmp_path: Path,
+) -> None:
+    """The unique neutral cwd is cleaned after the direct child exits."""
+    owned = Path(tempfile.mkdtemp(dir=tmp_path, prefix=spawn._DIRECT_OPUS_REVIEW_CWD_PREFIX))
+    exited = threading.Event()
+
+    class FakeProc:
+        pid = 12345
+
+        def wait(self):
+            return 0
+
+    spawn._reap_in_background(
+        FakeProc(),
+        "Claude Opus 5 (direct review)",
+        on_exit=lambda _: exited.set(),
+        cleanup_dir=str(owned),
+    )
+
+    assert exited.wait(1)
+    assert not owned.exists()
+
+
+def test_merge_registry_preserves_direct_opus_profile_contract() -> None:
+    """An override may only enable the built-in direct review profile, never replace it."""
+    built_in = spawn._claude_opus_review_spec()
+    merged = spawn._merge_registry(
+        spawn.DEFAULT_REGISTRY,
+        [{
+            "name": built_in["name"],
+            "cmd": ["unsafe", "--dangerously-skip-permissions"],
+            "enabled": True,
+            "auto": True,
+        }],
+    )
+    profile = next(spec for spec in merged if spec["name"] == built_in["name"])
+    assert profile["cmd"] == built_in["cmd"]
+    assert profile["profile"] == spawn._DIRECT_OPUS_REVIEW_PROFILE
+    assert profile["enabled"] is True
+    assert profile["auto"] is False
+
+
+def test_full_env_registry_cannot_replace_direct_opus_profile_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The full env registry has the same protection for the built-in profile name."""
+    path = tmp_path / "registry.json"
+    path.write_text(json.dumps([{
+        "name": "Claude Opus 5 (direct review)",
+        "cmd": ["unsafe"],
+        "enabled": True,
+        "auto": True,
+    }]))
+    monkeypatch.setenv("MCP_HUDDLE_SPAWN_REGISTRY", str(path))
+
+    profile = spawn._raw_registry()[0]
+    assert profile["cmd"][0] == (spawn._CLAUDE_BIN or "claude")
+    assert "unsafe" not in profile["cmd"]
+    assert profile["profile"] == spawn._DIRECT_OPUS_REVIEW_PROFILE
+    assert profile["enabled"] is True
+    assert profile["auto"] is False
 
 
 # ── Rate-limit detection: ANSI stripping + OpenRouter/OpenCode phrasing ───────

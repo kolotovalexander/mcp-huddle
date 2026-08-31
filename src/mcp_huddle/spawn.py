@@ -89,7 +89,7 @@ class AgentSpawnError(RuntimeError):
 
 
 _DIRECT_OPUS_REVIEW_PROFILE = "claude-opus-direct-review"
-_DIRECT_OPUS_REVIEW_CWD = tempfile.gettempdir()
+_DIRECT_OPUS_REVIEW_CWD_PREFIX = "mcp-huddle-opus-review-"
 _DIRECT_OPUS_REMOVED_ENV = frozenset({
     "ANTHROPIC_AUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN",
@@ -508,9 +508,19 @@ def _direct_opus_review_read_root(cwd: str) -> str:
     """Validate the one project directory Claude may read under --restricted."""
     candidate = Path(cwd)
     if not candidate.is_absolute() or candidate.is_symlink() or not candidate.is_dir():
-        raise AgentSpawnError("direct review requires an absolute, existing non-symlink approved read root")
+        raise AgentSpawnError(
+            "direct review requires an absolute, existing non-symlink approved read root"
+        )
     resolved = candidate.resolve()
-    if resolved == Path(resolved.anchor) or resolved == Path.home().resolve():
+    home = Path.home().resolve()
+    if (
+        resolved == Path(resolved.anchor)
+        or resolved == home
+        or home.is_relative_to(resolved)
+        or resolved in {
+            Path("/System"), Path("/usr"), Path("/var"), Path("/private"), Path("/Volumes"),
+        }
+    ):
         raise AgentSpawnError("direct review requires a project-scoped approved read root")
     return str(resolved)
 
@@ -554,7 +564,7 @@ def log_spawn_failure(
 
 
 def _reap_in_background(proc: subprocess.Popen, name: str,
-                        on_exit=None) -> None:
+                        on_exit=None, cleanup_dir: str | None = None) -> None:
     """Ensure short-lived spawned agents do not remain as defunct children.
 
     on_exit: optional callable(returncode) invoked once the process exits.
@@ -566,6 +576,9 @@ def _reap_in_background(proc: subprocess.Popen, name: str,
             returncode = proc.wait()
         except Exception:
             pass
+        finally:
+            if cleanup_dir is not None:
+                shutil.rmtree(cleanup_dir, ignore_errors=True)
         if on_exit is not None:
             try:
                 on_exit(returncode)
@@ -670,11 +683,40 @@ def _merge_registry(
     for spec in overrides:
         name = spec.get("name")
         if name in index:
-            merged[index[name]] = spec
+            current = merged[index[name]]
+            if current.get("profile") == _DIRECT_OPUS_REVIEW_PROFILE:
+                # This contract is a fixed runner, not a configurable command.
+                # An owner may deliberately enable it, but cannot replace its
+                # profile, argv, or exclusion from auto-spawn in registry JSON.
+                enabled = spec.get("enabled")
+                merged[index[name]] = {
+                    **current,
+                    **({"enabled": enabled} if isinstance(enabled, bool) else {}),
+                    "auto": False,
+                }
+            else:
+                merged[index[name]] = spec
         else:
             index[name] = len(merged)
             merged.append(spec)
     return merged
+
+
+def _preserve_direct_opus_profile_contract(registry: list[SpawnSpec]) -> list[SpawnSpec]:
+    """Keep the built-in direct-review name bound to its typed runner contract."""
+    built_in = _claude_opus_review_spec()
+    preserved: list[SpawnSpec] = []
+    for spec in registry:
+        if spec.get("name") != built_in["name"]:
+            preserved.append(spec)
+            continue
+        enabled = spec.get("enabled")
+        preserved.append({
+            **built_in,
+            **({"enabled": enabled} if isinstance(enabled, bool) else {}),
+            "auto": False,
+        })
+    return preserved
 
 
 # Read-only discussant mode (MCP_HUDDLE_READONLY): spawned agents may READ
@@ -683,7 +725,7 @@ def _merge_registry(
 # never by changing files. Agents communicate via the bus, not file edits, so
 # this does not hamper participation.
 _CLAUDE_RO_FLAGS = [
-    "--allowedTools", "Read,Glob,WebFetch,WebSearch,mcp__huddle__*",
+    "--allowedTools", "Read,Glob,Grep,WebFetch,WebSearch,mcp__huddle__*",
     "--disallowedTools", "Edit,Write,NotebookEdit,MultiEdit,Bash",
     "--permission-mode", "default",
 ]
@@ -741,7 +783,7 @@ def _raw_registry() -> list[SpawnSpec]:
     """
     env_registry = _load_env_registry()
     if env_registry is not None:
-        reg = env_registry
+        reg = _preserve_direct_opus_profile_contract(env_registry)
     else:
         file_overrides = _load_registry_file()
         reg = (_merge_registry(DEFAULT_REGISTRY, file_overrides)
@@ -839,6 +881,7 @@ def spawn_agent(
     log_dir.mkdir(parents=True, exist_ok=True)
     name = spec["name"]
     log_path = log_dir / f"{name.lower()}.events.jsonl"
+    cleanup_dir: str | None = None
     if name == "Codex":
         cwd, brief = _codex_safe_cwd_and_brief(cwd, brief)
     if spec.get("profile") == _DIRECT_OPUS_REVIEW_PROFILE:
@@ -851,7 +894,8 @@ def spawn_agent(
             env.pop(_DIRECT_OPUS_ENDPOINT_ENV, None)
         )
         argv = _direct_opus_review_argv(brief, read_root, mcp_config)
-        cwd = _DIRECT_OPUS_REVIEW_CWD
+        cleanup_dir = tempfile.mkdtemp(prefix=_DIRECT_OPUS_REVIEW_CWD_PREFIX)
+        cwd = cleanup_dir
         last_msg_path = None
     else:
         argv, last_msg_path = _resolve_spawn_args(spec, brief, log_dir)
@@ -866,11 +910,18 @@ def spawn_agent(
             stderr=subprocess.STDOUT,
             env=env,
         )
+    except Exception:
+        if cleanup_dir is not None:
+            shutil.rmtree(cleanup_dir, ignore_errors=True)
+        raise
     finally:
         # Popen dups the fd into the child; we can close ours so the parent
         # process doesn't keep the log file held open after the child exits.
         log_file.close()
-    _reap_in_background(proc, name, on_exit=on_exit)
+    if cleanup_dir is None:
+        _reap_in_background(proc, name, on_exit=on_exit)
+    else:
+        _reap_in_background(proc, name, on_exit=on_exit, cleanup_dir=cleanup_dir)
     if verify_alive_sec > 0:
         time.sleep(verify_alive_sec)
         returncode = proc.poll()
