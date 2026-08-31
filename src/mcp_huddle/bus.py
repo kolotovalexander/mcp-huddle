@@ -287,7 +287,7 @@ def post_message(room_id: str, agent: str, body: str, kind: str,
         # atomic with the append below: a parallel duplicate reply from the
         # same agent cannot slip through the gap between validate and write.
         if reply_to is not None:
-            _validate_reply_to_locked(room_id, int(reply_to), agent)
+            _validate_reply_to_locked(room_id, int(reply_to), agent, kind)
 
         # Assign next ID
         msg_id = _next_id(msgs_file)
@@ -334,7 +334,7 @@ def post_message(room_id: str, agent: str, body: str, kind: str,
     return msg_id
 
 
-def _validate_reply_to_locked(room_id: str, target_id: int, agent: str) -> None:
+def _validate_reply_to_locked(room_id: str, target_id: int, agent: str, kind: str) -> None:
     """Validate a reply_to target. Call ONLY while holding the messages lock so
     the check is atomic with the append that follows.
 
@@ -342,9 +342,10 @@ def _validate_reply_to_locked(room_id: str, target_id: int, agent: str) -> None:
       * target must exist and be a `request`;
       * the replying agent must have been an addressee (`to` empty / "all" /
         the agent itself) — Human/System bypass this;
-      * a broadcast request (`to=all` / no `to`) expects one reply per
-        addressee, so we reject only a SECOND reply from the SAME agent —
-        replies from other agents are allowed.
+      * a broadcast request (`to=all` / no `to`) expects one terminal reply
+        per addressee, so we reject only a SECOND `result`/`final` from the
+        SAME agent — replies from other agents are allowed. Progress messages
+        (`ack`, `busy`, `comment`) do not consume that terminal reply.
     """
     # Caller holds the messages LOCK_EX; read lock-free to avoid self-deadlock.
     messages = _load_messages_unlocked(room_id)
@@ -359,8 +360,11 @@ def _validate_reply_to_locked(room_id: str, target_id: int, agent: str) -> None:
         raise ValueError(
             f"reply_to target #{target_id} was addressed to {target_to!r}, "
             f"not to {agent!r}")
-    if any(m.get("reply_to") == target_id and m.get("agent") == agent
-           for m in messages):
+    if kind in {"result", "final"} and any(
+            m.get("reply_to") == target_id
+            and m.get("agent") == agent
+            and m.get("kind") in {"result", "final"}
+            for m in messages):
         raise ValueError(f"{agent} already answered request #{target_id}")
 
 
