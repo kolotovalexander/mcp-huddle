@@ -1780,10 +1780,27 @@ def test_direct_anthropic_opus_profile_is_manual_and_readonly(
     assert profile["name"] == "Claude Opus 5 (direct review)"
     assert profile["enabled"] is False
     assert profile["auto"] is False
+    assert profile["profile"] == "claude-opus-direct-review"
     assert profile["cmd"][-4:] == ["--model", "claude-opus-5", "-p", "{brief}"]
+    assert "--bare" in profile["cmd"]
+    assert "--restricted" in profile["cmd"]
+    assert "--strict-mcp-config" in profile["cmd"]
     assert "9router" not in " ".join(profile["cmd"])
     assert "--dangerously-skip-permissions" not in spawn._apply_readonly(profile)["cmd"]
     assert "--allowedTools" in spawn._apply_readonly(profile)["cmd"]
+
+
+def test_direct_anthropic_opus_stays_readonly_when_global_toggle_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A direct review profile never turns into a writer through the global toggle."""
+    monkeypatch.setenv("MCP_HUDDLE_READONLY", "0")
+    monkeypatch.setitem(spawn._claude_opus_review_spec(), "enabled", True)
+    reg = {spec["name"]: spec for spec in spawn._raw_registry()}
+
+    cmd = reg["Claude Opus 5 (direct review)"]["cmd"]
+    assert "--allowedTools" in cmd
+    assert "--dangerously-skip-permissions" not in cmd
 
 
 def test_direct_anthropic_opus_spawn_uses_only_direct_api_environment(
@@ -1795,6 +1812,10 @@ def test_direct_anthropic_opus_spawn_uses_only_direct_api_environment(
     monkeypatch.setenv("MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER", "workspace-header")
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "oauth-alias")
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "claude-oauth")
+    monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
+    monkeypatch.setenv("CLAUDE_CODE_USE_VERTEX", "1")
+    monkeypatch.setenv("CLAUDE_CODE_USE_FOUNDRY", "1")
+    monkeypatch.setenv("ANTHROPIC_MODEL", "other-model")
     captured: dict[str, object] = {}
 
     class FakeProc:
@@ -1806,6 +1827,7 @@ def test_direct_anthropic_opus_spawn_uses_only_direct_api_environment(
     def fake_popen(argv, cwd, stdin, stdout, stderr, env):
         captured["argv"] = argv
         captured["env"] = env
+        captured["cwd"] = cwd
         return FakeProc()
 
     monkeypatch.setattr(spawn.subprocess, "Popen", fake_popen)
@@ -1820,7 +1842,13 @@ def test_direct_anthropic_opus_spawn_uses_only_direct_api_environment(
     assert env["ANTHROPIC_API_KEY"] == "test-key"
     assert "ANTHROPIC_AUTH_TOKEN" not in env
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+    assert "CLAUDE_CODE_USE_BEDROCK" not in env
+    assert "CLAUDE_CODE_USE_VERTEX" not in env
+    assert "CLAUDE_CODE_USE_FOUNDRY" not in env
+    assert "ANTHROPIC_MODEL" not in env
     assert "9router" not in " ".join(captured["argv"])
+    assert captured["cwd"] == spawn._DIRECT_OPUS_REVIEW_CWD
+    assert "--allowedTools" in captured["argv"]
 
 
 def test_direct_anthropic_opus_missing_key_fails_before_spawn(

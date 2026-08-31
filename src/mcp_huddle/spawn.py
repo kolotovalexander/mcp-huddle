@@ -51,6 +51,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -77,20 +78,31 @@ class SpawnSpec(TypedDict):
     # room_invite, or a wake-path request (those always ignore this flag; a
     # deliberately named agent always works). See _filter_for_auto_spawn_true.
     auto: NotRequired[bool]
-    # The read-only transform is selected by runner kind, never the display
-    # name. This lets separately named Claude profiles retain the same guard.
-    readonly_adapter: NotRequired[str]
-    # Per-profile child environment. Values are names, never secret values:
-    # `env_from` copies a required runtime variable into the child under a
-    # provider-recognised name, while `unset_env` removes conflicting auth.
-    environment: NotRequired[dict[str, str]]
-    env_from: NotRequired[dict[str, str]]
-    required_env: NotRequired[list[str]]
-    unset_env: NotRequired[list[str]]
+    # A named profile is a fixed, reviewed runner contract. It is deliberately
+    # narrower than a generic environment/configuration API for registry JSON.
+    profile: NotRequired[str]
 
 
 class AgentSpawnError(RuntimeError):
     """Raised when a process starts but fails the optional health check."""
+
+
+_DIRECT_OPUS_REVIEW_PROFILE = "claude-opus-direct-review"
+_DIRECT_OPUS_REVIEW_CWD = tempfile.gettempdir()
+_DIRECT_OPUS_REMOVED_ENV = frozenset({
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_MODEL",
+    "CLAUDE_CODE_MODEL",
+    "CLAUDE_CODE_FALLBACK_MODEL",
+})
+_DIRECT_OPUS_MCP_CONFIG = (
+    '{"mcpServers":{"huddle":{"type":"http","url":"http://127.0.0.1:8014/mcp"}}}'
+)
 
 
 def _first_existing_binary(candidates: list[str]) -> str | None:
@@ -415,7 +427,6 @@ DEFAULT_REGISTRY: list[SpawnSpec] = [
             _CLAUDE_BIN is not None
             and os.environ.get("MCP_HUDDLE_CLAUDE_ENABLED", "0") != "0"
         ),
-        "readonly_adapter": "claude",
     },
     # Explicit, direct Anthropic reviewer. Deliberately disabled and excluded
     # from auto-spawn: an owner must supply API credentials and a workspace
@@ -425,21 +436,16 @@ DEFAULT_REGISTRY: list[SpawnSpec] = [
         "name": "Claude Opus 5 (direct review)",
         "cmd": [
             _CLAUDE_BIN or "claude",
+            "--bare",
+            "--restricted",
+            "--strict-mcp-config",
+            "--mcp-config", _DIRECT_OPUS_MCP_CONFIG,
             "--model", "claude-opus-5",
             "-p", "{brief}",
         ],
         "enabled": False,
         "auto": False,
-        "readonly_adapter": "claude",
-        "environment": {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
-        "env_from": {
-            "ANTHROPIC_CUSTOM_HEADERS": "MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER",
-        },
-        "required_env": [
-            "ANTHROPIC_API_KEY",
-            "MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER",
-        ],
-        "unset_env": ["ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"],
+        "profile": _DIRECT_OPUS_REVIEW_PROFILE,
     },
 ]
 
@@ -647,14 +653,14 @@ def _apply_readonly(spec: SpawnSpec) -> SpawnSpec:
       which `-a never` would cancel). Cross-model council, 2026-06-19.
     Other agents are returned unchanged (no confirmed read-only flag yet).
     """
-    adapter = spec.get("readonly_adapter")
+    profile = spec.get("profile")
     name = spec.get("name")
     cmd = list(spec.get("cmd") or [])
-    if adapter == "claude" or (adapter is None and name == "Claude"):
+    if profile == _DIRECT_OPUS_REVIEW_PROFILE or name == "Claude":
         cmd = [c for c in cmd if c != "--dangerously-skip-permissions"]
-        if cmd:
+        if cmd and "--allowedTools" not in cmd:
             cmd = [cmd[0], *_CLAUDE_RO_FLAGS, *cmd[1:]]
-    elif adapter == "codex" or (adapter is None and name == "Codex"):
+    elif name == "Codex":
         out: list[str] = []
         i = 0
         while i < len(cmd):
@@ -686,8 +692,18 @@ def _raw_registry() -> list[SpawnSpec]:
         file_overrides = _load_registry_file()
         reg = (_merge_registry(DEFAULT_REGISTRY, file_overrides)
                if file_overrides is not None else list(DEFAULT_REGISTRY))
-    if _readonly_enabled():
-        reg = [_apply_readonly(s) for s in reg]
+    if _readonly_enabled() or any(
+        spec.get("profile") == _DIRECT_OPUS_REVIEW_PROFILE and spec.get("enabled")
+        for spec in reg
+    ):
+        reg = [
+            _apply_readonly(spec)
+            if _readonly_enabled() or (
+                spec.get("profile") == _DIRECT_OPUS_REVIEW_PROFILE and spec.get("enabled")
+            )
+            else spec
+            for spec in reg
+        ]
     return reg
 
 
@@ -771,6 +787,9 @@ def spawn_agent(
     log_path = log_dir / f"{name.lower()}.events.jsonl"
     if name == "Codex":
         cwd, brief = _codex_safe_cwd_and_brief(cwd, brief)
+    if spec.get("profile") == _DIRECT_OPUS_REVIEW_PROFILE:
+        spec = _apply_readonly(spec)
+        cwd = _DIRECT_OPUS_REVIEW_CWD
     argv, last_msg_path = _resolve_spawn_args(spec, brief, log_dir)
 
     env = _spawn_environment(spec)
@@ -804,17 +823,20 @@ def spawn_agent(
 def _spawn_environment(spec: SpawnSpec) -> dict[str, str]:
     """Build a child environment without exposing profile secret values."""
     env = os.environ.copy()
-    required = spec.get("required_env", [])
+    if spec.get("profile") != _DIRECT_OPUS_REVIEW_PROFILE:
+        return env
+    required = ("ANTHROPIC_API_KEY", "MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER")
     missing = [name for name in required if not env.get(name)]
     if missing:
         raise AgentSpawnError(
             f"{spec['name']} missing required environment: {', '.join(missing)}"
         )
-    env.update(spec.get("environment", {}))
-    for target, source in spec.get("env_from", {}).items():
-        env[target] = env[source]
-    for name in spec.get("unset_env", []):
+    for name in _DIRECT_OPUS_REMOVED_ENV:
         env.pop(name, None)
+    env["ANTHROPIC_BASE_URL"] = "https://api.anthropic.com"
+    env["ANTHROPIC_CUSTOM_HEADERS"] = env[
+        "MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER"
+    ]
     return env
 
 
