@@ -7,33 +7,70 @@ import ipaddress
 import json
 import os
 import select
+import signal
 import stat
 import sys
+import time
 import urllib.parse
 import urllib.request
 
 MAX_HOOK_INPUT = 65536
 MAX_SESSION_FILE = 4096
+HOOK_INPUT_WAIT_SECS = 0.2
+HTTP_TIMEOUT_SECS = 0.8
+HOOK_WORK_BUDGET_SECS = 1.0
+HOOK_STARTED_AT = time.monotonic()
+
+
+class HookDeadlineExpired(TimeoutError):
+    pass
+
+
+def expire_hook(_signum, _frame):
+    raise HookDeadlineExpired("SessionEnd hook deadline expired")
+
+
+def hook_input():
+    """Read delayed or partial pipe input without ever waiting indefinitely."""
+    raw = bytearray()
+    try:
+        fd = sys.stdin.buffer.fileno()
+        deadline = time.monotonic() + HOOK_INPUT_WAIT_SECS
+        while len(raw) <= MAX_HOOK_INPUT:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            ready, _, _ = select.select([fd], [], [], remaining)
+            if not ready:
+                break
+            chunk = os.read(fd, min(8192, MAX_HOOK_INPUT + 1 - len(raw)))
+            if not chunk:
+                break
+            raw.extend(chunk)
+        return bytes(raw) if raw else None
+    except Exception:
+        # Once any hook bytes were observed, suppress compatibility fallbacks
+        # even if a later read/select fails.
+        return bytes(raw) if raw else None
 
 
 def hook_session_id():
-    try:
-        ready, _, _ = select.select([sys.stdin.buffer], [], [], 0)
-        if ready:
-            raw = sys.stdin.buffer.read(MAX_HOOK_INPUT + 1)
-            if raw.strip():
-                # Any supplied hook payload suppresses compatibility fallbacks.
-                # A missing/wrong event must never turn Stop into SessionEnd.
-                if len(raw) > MAX_HOOK_INPUT:
-                    return ""
-                payload = json.loads(raw)
-                if (not isinstance(payload, dict)
-                        or payload.get("hook_event_name") != "SessionEnd"):
-                    return ""
-                value = payload.get("session_id")
-                return value.strip() if isinstance(value, str) else ""
-    except Exception:
-        return ""
+    raw = hook_input()
+    if raw is not None:
+        try:
+            # Any supplied hook payload suppresses compatibility fallbacks.
+            # A partial, malformed, missing/wrong event must never turn Stop
+            # into SessionEnd.
+            if len(raw) > MAX_HOOK_INPUT or not raw.strip():
+                return ""
+            payload = json.loads(raw)
+            if (not isinstance(payload, dict)
+                    or payload.get("hook_event_name") != "SessionEnd"):
+                return ""
+            value = payload.get("session_id")
+            return value.strip() if isinstance(value, str) else ""
+        except Exception:
+            return ""
 
     value = os.environ.get("MCP_HUDDLE_SESSION_ID", "").strip()
     if value:
@@ -109,8 +146,21 @@ try:
                 return None
         opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({}), NoRedirect())
-        with opener.open(request, timeout=3) as response:
-            response.read(1024)
+        # SessionEnd has a short default hook budget. urllib timeouts apply per
+        # socket operation, so a trickled response needs a separate wall clock
+        # deadline. Receiving the local response headers is sufficient.
+        remaining = HOOK_STARTED_AT + HOOK_WORK_BUDGET_SECS - time.monotonic()
+        if remaining > 0:
+            previous_handler = signal.signal(signal.SIGALRM, expire_hook)
+            signal.setitimer(signal.ITIMER_REAL, remaining)
+            try:
+                with opener.open(
+                    request, timeout=min(HTTP_TIMEOUT_SECS, remaining),
+                ):
+                    pass
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, previous_handler)
 except Exception:
     # SessionEnd hooks are best effort and must never block session exit.
     pass

@@ -105,6 +105,38 @@ def redirect_capture():
         destination_thread.join(timeout=2)
 
 
+@pytest.fixture
+def slow_header_capture():
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802 - stdlib handler API
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            requests.append(self.path)
+            try:
+                self.connection.sendall(b"HTTP/1.1 200 OK\r\n")
+                # Never terminate the headers naturally within the hook budget.
+                for index in range(12):
+                    time.sleep(0.2)
+                    self.connection.sendall(f"X-Slow-{index}: 1\r\n".encode())
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+
+        def log_message(self, _format, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", requests
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 @pytest.mark.parametrize(
     "script",
     NOTIFICATION_HOOKS,
@@ -211,6 +243,94 @@ def test_session_end_uses_hook_input_configured_loopback_and_token(
     source = script.read_text()
     assert "/tmp/claude-session-id" not in source
     assert "curl " not in source
+
+
+@pytest.mark.parametrize("script", SESSION_HOOKS)
+def test_session_end_waits_briefly_for_delayed_hook_input(
+    script: Path, tmp_path: Path, http_capture
+) -> None:
+    base_url, requests = http_capture
+    process = subprocess.Popen(
+        ["bash", str(script)],
+        cwd=tmp_path,
+        env=dict(os.environ, MCP_HUDDLE_HTTP_BASE_URL=base_url),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert process.stdin is not None
+    assert process.stdout is not None
+    assert process.stderr is not None
+    time.sleep(0.05)
+    process.stdin.write(json.dumps({
+        "hook_event_name": "SessionEnd",
+        "session_id": "delayed-session",
+    }))
+    process.stdin.close()
+    assert process.wait(timeout=2) == 0
+    assert process.stdout.read() == ""
+    assert process.stderr.read() == ""
+    assert len(requests) == 1
+    assert json.loads(requests[0]["body"]) == {"session_id": "delayed-session"}
+
+
+@pytest.mark.parametrize("script", SESSION_HOOKS)
+def test_session_end_partial_hook_input_is_bounded_and_suppresses_fallback(
+    script: Path, tmp_path: Path, http_capture
+) -> None:
+    base_url, requests = http_capture
+    process = subprocess.Popen(
+        ["bash", str(script)],
+        cwd=tmp_path,
+        env=dict(
+            os.environ,
+            MCP_HUDDLE_HTTP_BASE_URL=base_url,
+            MCP_HUDDLE_SESSION_ID="fallback-must-not-run",
+        ),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert process.stdin is not None
+    started = time.monotonic()
+    process.stdin.write('{"hook_event_name":"SessionEnd",')
+    process.stdin.flush()
+    assert process.wait(timeout=1.2) == 0
+    elapsed = time.monotonic() - started
+    process.stdin.close()
+
+    assert elapsed < 1.0
+    assert requests == []
+
+
+@pytest.mark.parametrize("script", SESSION_HOOKS)
+def test_session_end_has_hard_wall_budget_for_trickled_http_headers(
+    script: Path, tmp_path: Path, slow_header_capture
+) -> None:
+    base_url, requests = slow_header_capture
+    started = time.monotonic()
+
+    completed = subprocess.run(
+        ["bash", str(script)],
+        input=json.dumps({
+            "hook_event_name": "SessionEnd",
+            "session_id": "bounded-http-session",
+        }),
+        cwd=tmp_path,
+        env=dict(os.environ, MCP_HUDDLE_HTTP_BASE_URL=base_url),
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=2,
+    )
+    elapsed = time.monotonic() - started
+
+    assert completed.stdout == ""
+    assert completed.stderr == ""
+    assert requests == ["/api/rooms_close_session"]
+    assert elapsed < 1.5
 
 
 @pytest.mark.parametrize("script", SESSION_HOOKS)

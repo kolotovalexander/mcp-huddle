@@ -46,7 +46,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   opens across room metadata, messages, locks, agent logs and notifications.
 - Concurrent post admission, close/delete/retention transitions, late child
   registration and bulk-close lifecycle races. Terminal rooms now stop owned
-  children before their data is removed.
+  children before their data is removed, and a failed close side effect no
+  longer leaves an otherwise recoverable room stranded in `closing`.
 - Zombie cleanup now revalidates owner PID, session, lifecycle and activity in
   the atomic close claim, so a concurrent room reclaim or fresh message cannot
   be closed from a stale watchdog snapshot.
@@ -63,9 +64,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fallback reaper; standalone logs reject traversal, symlinks and hardlinks.
 - Bundled notification hooks recover abandoned bounded claims without deleting
   a live or concurrently replaced notification. The SessionEnd hook now
-  consumes the caller's session id, supports authenticated loopback HTTP, and
-  no longer depends on a shared predictable `/tmp` file or a non-exported MCP
-  tool.
+  consumes the caller's session id only for a verified SessionEnd event, safely
+  bounds delayed or partial stdin and the complete loopback request, supports
+  authenticated HTTP, and no longer depends on a shared predictable `/tmp`
+  file or a non-exported MCP tool.
 - `mcp-huddle --version` reports the checked-out source version in editable
   development trees instead of stale installed-package metadata.
 

@@ -456,9 +456,29 @@ def _close_room_once(
     # Only exact Popen objects created by this server instance are authority.
     # Persisted PIDs may have been reused after a restart and are never sent a
     # signal. The room tombstone also terminates a spawn that registers late.
-    counts = child_processes.close_room(room_id)
-    _append_terminal_system(room_id, terminal_text)
-    _update_meta_locked(room_id, lambda meta: {**meta, "status": "closed"})
+    counts = {"sent": 0, "exited": 0, "denied": 0}
+    close_errors: list[BaseException] = []
+    try:
+        counts = child_processes.close_room(room_id)
+    except BaseException as exc:  # preserve the lifecycle invariant on shutdown
+        close_errors.append(exc)
+    try:
+        # Keep the room non-deletable until every close side effect has been
+        # attempted. A teardown failure must not suppress the terminal marker.
+        _append_terminal_system(room_id, terminal_text)
+    except BaseException as exc:  # preserve the lifecycle invariant on shutdown
+        close_errors.append(exc)
+    try:
+        _update_meta_locked(room_id, lambda meta: {**meta, "status": "closed"})
+    except BaseException as exc:  # do not mask an earlier teardown/marker error
+        close_errors.append(exc)
+    if close_errors:
+        primary = close_errors[0]
+        for secondary in close_errors[1:]:
+            primary.add_note(
+                f"Additional room-close failure: {type(secondary).__name__}: {secondary}"
+            )
+        raise primary
     return True, counts, leader["meta"]
 
 
@@ -1445,7 +1465,7 @@ def _serialize_message_entry(entry: dict) -> str:
 
 
 def _append_terminal_system(room_id: str, text: str) -> int:
-    """Append the one close marker after the atomic closed transition.
+    """Append the one close marker while the atomic closing claim is held.
 
     This deliberately bypasses post_message's closed-room rejection. Only the
     winner of close_room's meta-lock claim calls it.

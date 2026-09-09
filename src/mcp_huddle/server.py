@@ -3086,6 +3086,9 @@ def _check_stuck_wakes() -> list[str]:
             if msg_id and _agent_posted_after(room_id, agent_name, msg_id):
                 continue  # it has been talking — a slow lease release, not a hang
             pid = info.get("last_wake_pid")
+            pid_available = (
+                isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+            )
             process_state = _owned_process_state(room_id, info)
             alive = process_state == "alive"
             mins = max(1, (now - last_wake_at) // 60)
@@ -3102,6 +3105,7 @@ def _check_stuck_wakes() -> list[str]:
                 kill_sent = (
                     STUCK_KILL_ENABLED
                     and alive
+                    and pid_available
                     and _terminate_stuck_wake(
                         wake_id, pid, agent_name, room_id,
                     )
@@ -3113,6 +3117,11 @@ def _check_stuck_wakes() -> list[str]:
                     body = (f"⏳ {agent_name} не отвечает уже ~{mins} мин "
                             f"(процесс {pid}) — возможно завис; "
                             f"SIGTERM отправлен, ожидается завершение.")
+                elif not pid_available:
+                    body = (f"⏳ {agent_name} не отвечает уже ~{mins} мин "
+                            "(PID ещё не опубликован; запуск остаётся "
+                            "зарезервированным) — возможно завис; "
+                            "не ждите ответа.")
                 else:
                     state_label = (
                         "жив" if alive

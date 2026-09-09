@@ -569,6 +569,42 @@ def test_concurrent_close_has_one_message_and_one_kill_sweep(
     assert len(close_messages) == 1
 
 
+@pytest.mark.parametrize("failing_step", ["child-close", "terminal-marker"])
+def test_close_tail_failure_still_finishes_closed_and_attempts_both_side_effects(
+    isolated_bus, monkeypatch: pytest.MonkeyPatch, failing_step: str,
+) -> None:
+    room_id = _create_room(isolated_bus)
+    attempted: list[str] = []
+    real_marker = isolated_bus._append_terminal_system
+
+    def close_children(target_room_id: str) -> dict:
+        assert target_room_id == room_id
+        attempted.append("child-close")
+        if failing_step == "child-close":
+            raise RuntimeError("child close failed")
+        return {"sent": 0, "exited": 0, "denied": 0}
+
+    def append_marker(target_room_id: str, text: str) -> int:
+        assert target_room_id == room_id
+        attempted.append("terminal-marker")
+        if failing_step == "terminal-marker":
+            raise RuntimeError("terminal marker failed")
+        return real_marker(target_room_id, text)
+
+    monkeypatch.setattr(isolated_bus.child_processes, "close_room", close_children)
+    monkeypatch.setattr(isolated_bus, "_append_terminal_system", append_marker)
+
+    with pytest.raises(RuntimeError, match=failing_step.replace("-", " ")):
+        isolated_bus.close_room(room_id, "Codex")
+
+    assert attempted == ["child-close", "terminal-marker"]
+    assert isolated_bus.get_room_info(room_id)["status"] == "closed"
+
+    # A retry observes the terminal state and never repeats either side effect.
+    isolated_bus.close_room(room_id, "Codex")
+    assert attempted == ["child-close", "terminal-marker"]
+
+
 def test_delete_cannot_race_close_side_effects(
     isolated_bus, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
