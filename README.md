@@ -90,14 +90,22 @@ Dashboard: <http://127.0.0.1:8014/dashboard>. The dashboard reads the same files
 
 - **14 MCP tools** for room creation, messaging, rounds, lifecycle status, and consensus
 - **JSONL storage** at `~/.mcp-huddle/rooms/` — grep-able, no DB
-- **Anti-loop guards**: `kind` enum (`request`/`comment`/`ack`/`busy`/`result`/`final`/`system`/`close`), per-message dedup, server-side circuit breaker
+- **Bounded writes and anti-loop guards**: `kind` enum, per-message dedup,
+  a server-side circuit breaker, a persisted 120-messages/minute room limit,
+  and hard 256 KiB body / 320 KiB serialized-entry caps
 - **Bounded reads**: `messages_read` head+tail truncates long bodies (`max_chars`), windows by `until_id`, and filters by `kind` — a fat agent summary can't overflow the reader
 - **Rounds**: `room_round_advance` opens an orchestrator-controlled round (visible divider + per-message round stamp); read a single round with `messages_read(round=N)` / `room_summarize(round=N)`
 - **Liquid Glass web dashboard** with two themes (dark/light), agent avatars, polished kind badges, reply-to quotes
-- **Auto-spawn** enabled registry reviewers when a room is created (`auto_spawn=True`); default registry includes Codex, Antigravity, MiMo, and Claude (Claude and MiMo are opt-in, OFF by default). Registry is configurable via `MCP_HUDDLE_SPAWN_REGISTRY`
+- **Auto-spawn** enabled registry reviewers when a room is created
+  (`auto_spawn=True`); built-in slots cover Codex, Antigravity, MiMo, OpenCode,
+  Claude and two fixed Opus review profiles. Account-consuming or less-isolated
+  slots are opt-in, and the registry is configurable via
+  `MCP_HUDDLE_SPAWN_REGISTRY`
 - **Codex wake-up loop**: follow-up `kind=request` messages addressed to Codex (or `all`) resume the same captured Codex thread instead of starting from scratch
 - **Watchdog** auto-closes rooms whose owner process died — after a grace window, so a resumed session (new PID) can keep its room by activity or `room_reclaim`
-- **No-silent-failure guarantee**: whenever a spawned agent will not reply, the server itself posts a room comment explaining why instead of leaving the organizer waiting on silence — see [Failure visibility](#failure-visibility) below
+- **Failure visibility**: while the owning Huddle server is running, known
+  spawn, exit, provider-limit and stuck paths post an idempotent room notice —
+  see [Failure visibility](#failure-visibility) below
 
 ## Tools
 
@@ -119,7 +127,7 @@ These are the tools exposed over MCP (decorated with `@mcp.tool()` in
 | `room_reclaim` | Re-stamp a room's `owner_pid` after the owner's session resumed with a new PID, so the watchdog won't reap a live room (owner-only). |
 | `propose_resolution` | Propose a resolution to end discussion; returns `resolution_id`. |
 | `resolution_vote` | Vote `ack` or `reject` on a resolution; all-ack makes the room `resolved`. |
-| `notify_register` | Register a file path to receive notifications when a `kind=request` message arrives. |
+| `notify_register` | Register a notification filename (or compatible absolute direct child) under `$MCP_HUDDLE_HOME/notifications/` for addressed `kind=request` messages. |
 
 Room lifecycle operations (request-close, close, delete, close-session) remain
 human/server-owned. Agent work status is exposed through `room_status`; agents
@@ -134,7 +142,9 @@ All configuration is via environment variables (defaults shown):
 | `PORT` | `8014` | HTTP port the server listens on (only used with `--http`). |
 | `MCP_HUDDLE_HTTP` | (unset) | If set, run in HTTP + dashboard mode without passing `--http`. |
 | `MCP_HUDDLE_HOME` | `~/.mcp-huddle` | Storage root. Rooms are stored in `$MCP_HUDDLE_HOME/rooms`. |
-| `MCP_HUDDLE_SPAWN_REGISTRY` | (built-in: Codex + Antigravity + MiMo + Claude) | Path to a JSON file overriding the auto-spawn registry. See [`examples/registry.json`](examples/registry.json). |
+| `MCP_HUDDLE_TOKEN` | (unset) | Optional HTTP/MCP token. When set, every data/action/MCP endpoint requires it; the dashboard exchanges it once for a process-local credential kept only in page memory. |
+| `MCP_HUDDLE_READONLY` | `1` | Apply Huddle's reviewed read-only command transform to supported CLIs (currently Claude and Codex). `0` requests full-access workers; it does not change unsupported CLIs such as Antigravity. |
+| `MCP_HUDDLE_SPAWN_REGISTRY` | built-in reviewed slots | Path to a JSON file replacing the registry. Without it, `~/.mcp-huddle/registry.json` is merged by name over the built-in Codex, Antigravity, MiMo, OpenCode, Claude and fixed Opus profiles. See [`examples/registry.json`](examples/registry.json). |
 | `MCP_HUDDLE_CLAUDE_ENABLED` | `0` | Set to `1` to allow the legacy Claude slot. Opt-in avoids unsolicited usage; native account/API authentication determines the billing route. |
 | `MCP_HUDDLE_DIRECT_REVIEW_MCP_URL` | (required for direct Opus review) | Runtime loopback `http(s)://…/mcp` endpoint for the disabled `Claude Opus 5 (direct review)` profile. No credentials or query string; it is never stored in the registry. |
 | `MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER` | (required for direct Opus review) | Runtime Anthropic workspace header for that manual profile. Keep its value out of registry files and logs. |
@@ -143,8 +153,8 @@ All configuration is via environment variables (defaults shown):
 | `MCP_HUDDLE_PROBE_CACHE_TTL_SEC` | `300` | TTL (seconds) for the cached availability probe of registry agents. |
 | `MCP_HUDDLE_RATE_LIMIT_COOLDOWN_SEC` | `900` | Cooldown after an agent hits a provider rate/usage limit before it is woken again. `0` disables the cooldown gate. |
 | `MCP_HUDDLE_WAKE_STUCK_SEC` | `1200` | How long a `busy` wake lease can sit with no message posted before the watchdog announces it as hung. `0` disables the check. |
-| `MCP_HUDDLE_STUCK_KILL` | `1` | When a stuck wake is announced (`MCP_HUDDLE_WAKE_STUCK_SEC`), also SIGTERM the still-alive process. Set to `0`/`false`/`no` for legacy announce-only behavior. |
-| `MCP_HUDDLE_DEAD_WAKE_GRACE_SEC` | `60` | Grace before the watchdog treats a busy lease with a dead pid as a dead wake (announces to the room, releases the lease). `0` disables the check. |
+| `MCP_HUDDLE_STUCK_KILL` | `1` | When a stuck wake is announced, send SIGTERM only to the exact child `Popen` owned by this server instance. The lease remains occupied until exit is confirmed. Set to `0`/`false`/`no` for announce-only behavior. |
+| `MCP_HUDDLE_DEAD_WAKE_GRACE_SEC` | `60` | Grace before the watchdog releases a busy lease whose exact locally owned process has exited. A persisted PID owned by another server instance is never treated as signalling authority. `0` disables the check. |
 | `MCP_HUDDLE_SAME_BIN_STAGGER_SEC` | `20` | Within one batch spawn (`auto_spawn=True` / dict), delay each spec after the first that resolves to the same effective binary (e.g. two `opencode run` slots) by this many seconds times its occurrence index — avoids same-process collisions (e.g. OpenCode's local SQLite "database is locked"). `0` disables staggering. |
 | `MCP_HUDDLE_OPENCODE_ENABLED` | `0` | Explicitly enable the optional OpenCode slot. It uses OpenCode's configured default model and a bounded initial/wake process timeout. |
 | `MCP_HUDDLE_OPENCODE_TIMEOUT_SEC` | `1200` | Maximum runtime for one OpenCode turn when the slot is enabled. |
@@ -190,10 +200,9 @@ The separate direct-API profile remains disabled unless deliberately configured.
 
 ## Failure visibility
 
-The organizer should never have to guess why an agent went quiet. The server
-itself detects every way a spawned agent's turn can end without a reply and
-posts a `kind=comment` room notice explaining it — best-effort, idempotent
-(one notice per episode, no spam):
+While the owning Huddle server remains alive, it detects the known ways a
+spawned turn can end without a reply and posts a `kind=comment` room notice —
+best-effort and idempotent (one notice per episode, no spam):
 
 | Scenario | What the room sees |
 |----------|--------------------|
@@ -201,7 +210,7 @@ posts a `kind=comment` room notice explaining it — best-effort, idempotent
 | Spawn itself throws (fresh wake, Codex resume, or `auto_spawn` at `room_create`) | `⚠️ <agent> не заспавнился: ...` |
 | Process exits with an error and posted nothing | `⚠️ <agent> завершился с ошибкой (exit N)...` + an ANSI-stripped tail of its log |
 | Process exits `rc=0` but posted nothing | `⚠️ <agent> завершился без ответа в комнату (exit 0)...` |
-| Wake hangs (process never exits) | after `MCP_HUDDLE_WAKE_STUCK_SEC` the watchdog posts `⏳ <agent> не отвечает...`, then SIGTERMs the process (`MCP_HUDDLE_STUCK_KILL`, default on) |
+| Wake hangs (process never exits) | after `MCP_HUDDLE_WAKE_STUCK_SEC` the watchdog posts `⏳ <agent> не отвечает...`; when enabled it sends SIGTERM only through this server instance's exact child handle and keeps the lease until exit is confirmed |
 
 Rate-limit detection (`spawn.detect_rate_limit`) is conservative to avoid false
 positives: Codex `--json` logs are trusted only via `error`/`turn.failed`
@@ -215,10 +224,17 @@ first so they can't hide a marker.
 
 mcp-huddle is designed to run **locally, on a single trusted machine**:
 
-- **The HTTP dashboard binds to `127.0.0.1` only** (hardcoded in
-  `src/mcp_huddle/__main__.py`). It is not exposed to your network, and there is
-  no authentication — anyone with access to localhost can read and post to
-  rooms. Do not put it behind a public reverse proxy without adding your own auth.
+- **The HTTP server binds to `127.0.0.1` only** (hardcoded in
+  `src/mcp_huddle/__main__.py`) and rejects non-loopback Host/Origin requests.
+  Set `MCP_HUDDLE_TOKEN` to require authentication for every room, action and
+  MCP transport endpoint. MCP clients may send the raw token as
+  `Authorization: Bearer …` or `X-Huddle-Token`; the dashboard submits it once
+  to `/api/auth`, keeps only a process-local derived credential in JavaScript
+  memory, and never puts it in a URL, cookie or browser storage. With the
+  variable unset, any local process able to reach the port can read and post.
+  The token is server-wide rather than room-scoped, so do not pass it to an
+  untrusted spawned reviewer merely to make its MCP client work. Do not expose
+  Huddle through a public reverse proxy.
 - **Auto-spawned agents are read-only discussants by default**
   (`MCP_HUDDLE_READONLY`, default ON). They run as local CLI subprocesses (e.g.
   `codex exec`, optionally `claude -p`) in the organizer's project directory and
@@ -227,9 +243,12 @@ mcp-huddle is designed to run **locally, on a single trusted machine**:
   (`message_post` / `messages_read`). Under the hood: Claude gets an allow/deny
   tool list (no `Edit`/`Write`/`Bash`); Codex runs `-s read-only` with the
   huddle MCP tools auto-approved. Set `MCP_HUDDLE_READONLY=0` to spawn
-  full-access **worker** agents instead (they then inherit your shell
-  credentials and can act on your machine). Only enable registry agents you
-  trust, and review any `MCP_HUDDLE_SPAWN_REGISTRY` / `~/.mcp-huddle/registry.json`
+  full-access **worker** agents instead. Child processes receive a scrubbed
+  environment; provider variables must be explicitly named in `pass_env`, and
+  the variable named by `--api-key-env` is opted in automatically. This is
+  environment minimization, not an OS sandbox: a full-access CLI may still use
+  files and native credential stores available to the user. Only enable
+  registry agents you trust, and review any `MCP_HUDDLE_SPAWN_REGISTRY` / `~/.mcp-huddle/registry.json`
   override before use — its `cmd` entries are executed verbatim. Entries in
   `~/.mcp-huddle/registry.json` are **merged onto `DEFAULT_REGISTRY` by
   `name`**: a name that already exists (e.g. `Antigravity`) is *replaced
@@ -251,6 +270,14 @@ mcp-huddle is designed to run **locally, on a single trusted machine**:
 - **All data lives under `~/.mcp-huddle/`** (override with `MCP_HUDDLE_HOME`) as
   plain JSONL/JSON files. Anything posted to a room is stored in clear text on
   disk; do not paste secrets into rooms.
+- **Persisted PIDs are diagnostics, not permission to signal.** Each process
+  may terminate only children represented by its own exact `Popen` objects.
+  Multiple stdio/HTTP servers coordinate wake claims through room metadata;
+  an unknown foreign lease stays occupied rather than risking a duplicate
+  spawn or PID-reuse kill. Live owners cooperatively stop their own children
+  after another instance closes, resolves or removes the room. If the owning
+  server itself crashes, explicit recovery may be required; see
+  [`docs/TODO.md`](docs/TODO.md).
 
 ## Troubleshooting
 
@@ -279,6 +306,7 @@ src/mcp_huddle/
                 #   watchdog, wake/spawn orchestration
   bus.py        # storage layer: JSONL rooms under ~/.mcp-huddle, file locks,
                 #   dedup, resolutions, retention
+  child_processes.py          # exact local Popen ownership; no raw-PID signalling
   spawn.py      # SpawnSpec registry + agent process spawning / availability probes
   mimo_runner.py               # MiMo advisor runner (MCP-disabled `mimo run`)
   openai_compatible_runner.py  # generic OpenAI-compatible chat runner
@@ -308,6 +336,8 @@ After `room_create` or a request to other agents, call `room_status`. Wait while
 `messages_read(kind="result")`. `process_alive=true` only means the process
 exists. `completed` is the successful terminal state; `unavailable`,
 `rate_limited`, and `stuck` are terminal failures that should be reported.
+An `unowned_lease` means another server instance may still own the child; it is
+deliberately kept occupied, so do not retry that request automatically.
 
 ## Codex lifecycle
 

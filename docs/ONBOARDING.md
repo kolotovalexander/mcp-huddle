@@ -12,8 +12,10 @@ you use, install the hooks, and write a spawn registry for your agents.
 ```
 You are setting up "mcp-huddle" (https://github.com/kolotovalexander/mcp-huddle)
 on my machine. It is a persistent multi-agent chat MCP server: AI agents join
-rooms and discuss. Spawned agents are READ-ONLY discussants by default (they read
-files/web/docs but never edit; they talk via huddle's MCP tools).
+rooms and discuss. Use Huddle's read-only transform where the selected CLI
+supports it (Claude and Codex). Do not describe Antigravity as read-only: its
+CLI has no enforced read-only mode. MiMo must stay in its neutral temp cwd, and
+cloud API runners may only read the room and post their validated reply.
 
 >>> MY AGENTS (edit this list) <<<
 - Claude Code  — CLI, command: claude        (I use it: yes/no)
@@ -27,7 +29,12 @@ Do this, step by step, asking me only if something is ambiguous:
 
 1. Install huddle: `pipx install mcp-huddle` (or `pip install --user mcp-huddle`).
    Confirm `mcp-huddle --version` works.
-2. Start the HTTP server once to get the MCP endpoint: `mcp-huddle --http`
+2. Ask whether I want `MCP_HUDDLE_TOKEN` enabled. If yes, have me provide or
+   generate a strong value outside registry files, export it before starting
+   the HTTP server, and configure each trusted HTTP MCP client to send it as a
+   Bearer token or `X-Huddle-Token`. Explain that it is server-wide, not
+   room-scoped, before passing it to any spawned reviewer. Then start the HTTP server once:
+   `mcp-huddle --http`
    (dashboard + MCP at http://127.0.0.1:8014 ; MCP endpoint is /mcp). Leave it
    running (or set it up as a background service). The MCP URL is
    http://127.0.0.1:8014/mcp .
@@ -53,11 +60,15 @@ Do this, step by step, asking me only if something is ambiguous:
                  "--api-key-env","<API_KEY_ENV_VAR>","--brief","{brief}"],
          "enabled": true
        }
-   Keep agents I marked "no" out of the registry.
+   The runner's `--api-key-env` automatically opts that one named variable into
+   the otherwise scrubbed child environment. For any other custom CLI variable,
+   add its exact name to the entry's `"pass_env": ["NAME"]`; never put secret
+   values in registry JSON. Keep agents I marked "no" out of the registry.
 6. Tell me which env vars to set (e.g. MCP_HUDDLE_ANTIGRAVITY_ENABLED=1 if I
    enabled Antigravity; the API key env var for any API agent), and how to keep
-   the server running. Then verify: open http://127.0.0.1:8014/dashboard and,
-   from one agent, call room_create + message_post to confirm round-trip.
+   the server running. Then verify: open http://127.0.0.1:8014/dashboard (enter
+   the token when prompted, if enabled) and, from one agent, call room_create +
+   message_post to confirm round-trip.
 
 Read https://github.com/kolotovalexander/mcp-huddle README for tool names and
 configuration before writing any config. Do not enable agents I didn't list.
@@ -83,14 +94,20 @@ Use the **cloud API** row above. `openai_compatible_runner` speaks the
 OpenAI-compatible `/chat/completions` shape and authenticates with
 `Authorization: Bearer $<API_KEY_ENV_VAR>` (set `--api-key-env`). It works with
 any OpenAI-compatible endpoint (OpenAI, OpenRouter, local llama.cpp/vLLM,
-Anthropic via a compatible proxy, etc.). The key is read from the environment —
-never hard-coded in the registry.
+Anthropic via a compatible proxy, etc.). The key is read from the environment;
+the variable named by `--api-key-env` is the only provider credential
+automatically copied into that child process. Never hard-code the value in the
+registry.
 
 ## Read-only by default
 
-Spawned agents can read but not edit (`MCP_HUDDLE_READONLY`, default ON; `=0`
-for full-access workers). API-runner agents are inherently read-only — they only
-read the room and post a reply.
+`MCP_HUDDLE_READONLY` defaults to ON and is enforced by Huddle's reviewed
+Claude and Codex command transforms. Set `=0` only when you deliberately want a
+full-access worker. Antigravity has no equivalent enforced read-only flag;
+MiMo is isolated from the project by a temporary cwd. API-runner agents only
+read the room and post a validated reply. All spawned children receive a
+minimal environment plus explicit `pass_env` names; this does not replace the
+CLI's own filesystem or OS sandbox.
 
 ## Manual fallback (the same steps without an agent)
 

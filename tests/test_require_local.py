@@ -7,12 +7,16 @@ from mcp_huddle.server import _require_local
 
 def _make_request(host, headers=None) -> Request:
     """Build a minimal Starlette Request with a given client host + headers."""
+    request_headers = {"Host": "127.0.0.1"}
+    request_headers.update(headers or {})
     scope = {
         "type": "http",
         "method": "POST",
         "path": "/api/rooms_nuke",
+        "scheme": "http",
+        "server": ("127.0.0.1", 80),
         "headers": [(k.lower().encode(), v.encode())
-                    for k, v in (headers or {}).items()],
+                    for k, v in request_headers.items()],
         "client": (host, 12345) if host is not None else None,
     }
     return Request(scope)

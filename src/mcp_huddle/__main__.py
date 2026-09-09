@@ -17,6 +17,16 @@ DEFAULT_PORT = 8014
 
 
 def _version() -> str:
+    # The package source is the canonical version while running from a checkout.
+    # An editable environment can retain stale distribution metadata after a
+    # version bump, which previously made ``--version`` report the old release.
+    try:
+        from . import __version__
+
+        if __version__:
+            return __version__
+    except Exception:
+        pass
     try:
         from importlib.metadata import PackageNotFoundError, version
 
@@ -26,12 +36,7 @@ def _version() -> str:
             pass
     except Exception:
         pass
-    try:
-        from . import __version__
-
-        return __version__
-    except Exception:
-        return "unknown"
+    return "unknown"
 
 
 def _resolve_port(cli_port: "int | None") -> int:

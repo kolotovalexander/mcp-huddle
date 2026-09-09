@@ -59,6 +59,7 @@ def test_concurrent_appends_have_unique_sequential_ids(isolated_bus) -> None:
     for thread in threads:
         thread.join(timeout=5)
 
+    assert all(not thread.is_alive() for thread in threads)
     assert errors == []
     assert sorted(results) == list(range(1, count + 1))
     messages = isolated_bus._load_messages(room_id)
@@ -95,6 +96,7 @@ def test_concurrent_status_updates_do_not_clobber(isolated_bus) -> None:
     for thread in threads:
         thread.join(timeout=5)
 
+    assert all(not thread.is_alive() for thread in threads)
     assert errors == []
     statuses = isolated_bus.get_status(room_id)
     missing = [i for i in range(count) if statuses.get(f"agent-{i}") != "busy"]
@@ -135,6 +137,7 @@ def test_expired_lease_reset_preserves_concurrent_busy(isolated_bus) -> None:
     t1.start(); t2.start()
     t1.join(timeout=5); t2.join(timeout=5)
 
+    assert not t1.is_alive() and not t2.is_alive()
     assert errors == []
     statuses = isolated_bus.get_status(room_id)
     assert statuses.get("A") == "online"  # expired lease reset
@@ -234,6 +237,7 @@ def test_meta_writers_do_not_clobber_concurrent_agent_meta(isolated_bus) -> None
     t1.start(); t2.start()
     t1.join(timeout=5); t2.join(timeout=5)
 
+    assert not t1.is_alive() and not t2.is_alive()
     assert errors == []
     meta = isolated_bus.get_room_info(room_id)
     am = meta.get("agent_meta", {})
@@ -252,7 +256,7 @@ def test_concurrent_register_notify_keeps_all_entries(isolated_bus) -> None:
     def worker(index: int) -> None:
         try:
             barrier.wait(timeout=5)
-            isolated_bus.register_notify(room_id, f"agent-{index}", f"/tmp/notify-{index}")
+            isolated_bus.register_notify(room_id, f"agent-{index}", f"notify-{index}.json")
         except BaseException as exc:  # noqa: BLE001
             errors.append(exc)
 
@@ -262,10 +266,231 @@ def test_concurrent_register_notify_keeps_all_entries(isolated_bus) -> None:
     for thread in threads:
         thread.join(timeout=5)
 
+    assert all(not thread.is_alive() for thread in threads)
     assert errors == []
     registry = json.loads((isolated_bus._room_dir(room_id) / "notify_registry.json").read_text())
     missing = [f"agent-{i}" for i in range(count) if f"agent-{i}" not in registry]
     assert missing == [], f"register_notify lost {missing}"
+    root = (isolated_bus.HUDDLE_HOME / "notifications").resolve()
+    assert all(Path(path).resolve().parent == root for path in registry.values())
+
+
+@pytest.mark.parametrize("bad_room_id", [
+    "", ".", "..", "../escape", "a/b", "a\\b", "/tmp/escape", "room_abc\n",
+])
+def test_room_id_rejects_traversal_and_separators(isolated_bus, bad_room_id: str) -> None:
+    with pytest.raises(ValueError):
+        isolated_bus.get_room_info(bad_room_id)
+
+
+def test_room_id_accepts_generated_and_safe_historical_ids(isolated_bus) -> None:
+    room_id = _create_room(isolated_bus)
+    assert isolated_bus._room_dir(room_id).parent == isolated_bus.BUS_DIR.resolve()
+    assert isolated_bus._room_dir("historic-room.v1").name == "historic-room.v1"
+
+
+def test_room_symlink_cannot_escape_bus_root(isolated_bus, tmp_path: Path) -> None:
+    isolated_bus.BUS_DIR.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside-room"
+    outside.mkdir()
+    (isolated_bus.BUS_DIR / "room_deadbeef").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="escapes"):
+        isolated_bus.get_room_info("room_deadbeef")
+
+
+@pytest.mark.parametrize("bad_agent", [
+    "", ".", "..", "../escape", "a/b", "a\\b", "agent\x00name", "agent\nname",
+])
+def test_external_agent_filename_rejects_unsafe_names(isolated_bus, bad_agent: str) -> None:
+    room_id = _create_room(isolated_bus)
+    with pytest.raises(ValueError):
+        isolated_bus.register_external_agent(room_id, bad_agent)
+    with pytest.raises(ValueError):
+        isolated_bus.append_agent_event(room_id, bad_agent, {"event": "test"})
+
+
+def test_external_agent_paths_are_contained_and_historical_names_work(isolated_bus) -> None:
+    room_id = _create_room(isolated_bus)
+    paths = isolated_bus.register_external_agent(
+        room_id, "Claude Opus 5 (subscription review)")
+    agents_root = (isolated_bus._room_dir(room_id) / "agents").resolve()
+
+    assert Path(paths["log_path"]).resolve().parent == agents_root
+    assert Path(paths["last_message_path"]).resolve().parent == agents_root
+
+
+def test_external_agent_rejects_symlinked_agents_directory(
+    isolated_bus, tmp_path: Path,
+) -> None:
+    room_id = _create_room(isolated_bus)
+    outside = tmp_path / "outside-agents"
+    outside.mkdir()
+    (isolated_bus._room_dir(room_id) / "agents").symlink_to(
+        outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        isolated_bus.append_agent_event(room_id, "Codex", {"secret": "no"})
+    assert not (outside / "codex.events.jsonl").exists()
+
+
+def test_room_owned_file_symlinks_fail_closed(isolated_bus, tmp_path: Path) -> None:
+    outside = tmp_path / "outside-owned-file"
+    outside.write_text("outside-sentinel")
+
+    meta_room = _create_room(isolated_bus)
+    meta_path = isolated_bus._room_dir(meta_room) / "meta.json"
+    meta_path.unlink()
+    meta_path.symlink_to(outside)
+    with pytest.raises((ValueError, OSError)):
+        isolated_bus.get_room_info(meta_room)
+
+    messages_room = _create_room(isolated_bus)
+    messages_path = isolated_bus._room_dir(messages_room) / "messages.jsonl"
+    messages_path.symlink_to(outside)
+    with pytest.raises((ValueError, OSError)):
+        isolated_bus.post_message(messages_room, "Codex", "must-not-escape", "request")
+
+    status_room = _create_room(isolated_bus)
+    status_path = isolated_bus._room_dir(status_room) / "status.json"
+    status_path.unlink()
+    status_path.symlink_to(outside)
+    with pytest.raises((ValueError, OSError)):
+        isolated_bus.set_status(status_room, "Codex", "busy")
+
+    notify_room = _create_room(isolated_bus)
+    registry_path = isolated_bus._room_dir(notify_room) / "notify_registry.json"
+    registry_path.symlink_to(outside)
+    with pytest.raises((ValueError, OSError)):
+        isolated_bus.register_notify(notify_room, "Codex", "codex.json")
+
+    event_room = _create_room(isolated_bus)
+    paths = isolated_bus.register_external_agent(event_room, "Codex")
+    event_path = Path(paths["log_path"])
+    event_path.unlink()
+    event_path.symlink_to(outside)
+    with pytest.raises((ValueError, OSError)):
+        isolated_bus.append_agent_event(event_room, "Codex", {"must": "not escape"})
+
+    assert outside.read_text() == "outside-sentinel"
+
+
+def test_room_directory_swap_after_validation_cannot_escape(
+    isolated_bus, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    room_id = _create_room(isolated_bus)
+    rdir = isolated_bus._room_dir(room_id)
+    parked = tmp_path / "parked-room"
+    outside = tmp_path / "outside-room-race"
+    outside.mkdir()
+    (outside / "meta.json").write_text('{"secret": "outside"}')
+    real_room_dir = isolated_bus._room_dir
+    swapped = False
+
+    def swap_after_validation(requested: str) -> Path:
+        nonlocal swapped
+        result = real_room_dir(requested)
+        if requested == room_id and not swapped:
+            swapped = True
+            rdir.rename(parked)
+            rdir.symlink_to(outside, target_is_directory=True)
+        return result
+
+    monkeypatch.setattr(isolated_bus, "_room_dir", swap_after_validation)
+    with pytest.raises((ValueError, OSError)):
+        isolated_bus.get_room_info(room_id)
+    assert (outside / "meta.json").read_text() == '{"secret": "outside"}'
+
+
+def test_register_notify_rejects_outside_and_symlink_targets(
+    isolated_bus, tmp_path: Path,
+) -> None:
+    room_id = _create_room(isolated_bus)
+    outside = tmp_path / "outside-notify.json"
+    with pytest.raises(ValueError, match="inside"):
+        isolated_bus.register_notify(room_id, "Codex", str(outside))
+    with pytest.raises(ValueError):
+        isolated_bus.register_notify(room_id, "Codex", "../outside-notify.json")
+
+    notifications = isolated_bus.HUDDLE_HOME / "notifications"
+    notifications.mkdir(parents=True, exist_ok=True)
+    (notifications / "linked.json").symlink_to(outside)
+    with pytest.raises(ValueError, match="symlink"):
+        isolated_bus.register_notify(room_id, "Codex", "linked.json")
+    assert not outside.exists()
+
+
+@pytest.mark.parametrize("bad_filename", ["bad\\name", "bad\nname", "x" * 256])
+def test_register_notify_rejects_unsafe_filename_components(
+    isolated_bus, bad_filename: str,
+) -> None:
+    room_id = _create_room(isolated_bus)
+    with pytest.raises(ValueError):
+        isolated_bus.register_notify(room_id, "Codex", bad_filename)
+
+
+@pytest.mark.parametrize("bad_agent", ["../agent", "agent\\name", "agent\x00name", "x" * 256])
+def test_register_notify_rejects_unsafe_agent_components(
+    isolated_bus, bad_agent: str,
+) -> None:
+    room_id = _create_room(isolated_bus)
+    with pytest.raises(ValueError):
+        isolated_bus.register_notify(room_id, bad_agent, "notify.json")
+
+
+def test_notify_accepts_configured_symlink_root(
+    isolated_bus, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    room_id = _create_room(isolated_bus)
+    actual_root = tmp_path / "actual-notifications"
+    actual_root.mkdir()
+    configured_root = tmp_path / "configured-notifications"
+    configured_root.symlink_to(actual_root, target_is_directory=True)
+    monkeypatch.setattr(isolated_bus, "NOTIFICATIONS_DIR", configured_root)
+    lexical_target = configured_root / "watcher.json"
+
+    isolated_bus.register_notify(room_id, "Watcher", str(lexical_target))
+    msg_id = isolated_bus.post_message(room_id, "Codex", "wake", "request")
+
+    payload = json.loads((actual_root / "watcher.json").read_text())
+    assert payload["msg_id"] == msg_id
+    registry = json.loads(
+        (isolated_bus._room_dir(room_id) / "notify_registry.json").read_text())
+    assert registry["Watcher"] == str(actual_root / "watcher.json")
+
+
+def test_concurrent_notification_delivery_is_atomic_and_keeps_newest(isolated_bus) -> None:
+    room_id = _create_room(isolated_bus)
+    target = isolated_bus.HUDDLE_HOME / "notifications" / "watcher.json"
+    isolated_bus.register_notify(room_id, "Watcher", str(target))
+    count = 16
+    barrier = threading.Barrier(count)
+    ids: list[int] = []
+    errors: list[BaseException] = []
+    guard = threading.Lock()
+
+    def worker(index: int) -> None:
+        try:
+            barrier.wait(timeout=5)
+            msg_id = isolated_bus.post_message(
+                room_id, f"sender-{index}", f"request-{index}", "request")
+            with guard:
+                ids.append(msg_id)
+        except BaseException as exc:  # noqa: BLE001
+            with guard:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert json.loads(target.read_text())["msg_id"] == max(ids)
+    assert {item.name for item in target.parent.iterdir()} == {target.name}
+    assert any(isolated_bus.NOTIFICATION_LOCKS_DIR.iterdir())
 
 
 def test_post_message_rejected_after_close(isolated_bus) -> None:
@@ -275,6 +500,246 @@ def test_post_message_rejected_after_close(isolated_bus) -> None:
     isolated_bus.close_room(room_id, "Codex")
     with pytest.raises(ValueError, match="closed"):
         isolated_bus.post_message(room_id, "Codex", "late", "comment")
+
+
+def test_close_and_delete_reject_non_owner_before_side_effects(
+    isolated_bus, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    room_id = _create_room(isolated_bus)
+    calls = {"kill": 0, "message": 0}
+    monkeypatch.setattr(
+        isolated_bus.child_processes, "close_room",
+        lambda _room: calls.__setitem__("kill", calls["kill"] + 1),
+    )
+    monkeypatch.setattr(
+        isolated_bus, "_append_terminal_system",
+        lambda _room, _text: calls.__setitem__("message", calls["message"] + 1),
+    )
+
+    with pytest.raises(ValueError, match="not the owner"):
+        isolated_bus.close_room(room_id, "Mallory")
+    assert calls == {"kill": 0, "message": 0}
+    assert isolated_bus.get_room_info(room_id)["status"] == "open"
+
+    isolated_bus.close_room(room_id, "Codex")
+    with pytest.raises(ValueError, match="not the owner"):
+        isolated_bus.delete_room(room_id, "Mallory")
+    assert isolated_bus._room_dir(room_id).exists()
+
+
+def test_concurrent_close_has_one_message_and_one_kill_sweep(
+    isolated_bus, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    room_id = _create_room(isolated_bus)
+    count = 12
+    barrier = threading.Barrier(count)
+    errors: list[BaseException] = []
+    kills = 0
+    kills_guard = threading.Lock()
+    real_kill = isolated_bus.child_processes.close_room
+
+    def counted_kill(target_room_id: str) -> dict:
+        nonlocal kills
+        with kills_guard:
+            kills += 1
+        return real_kill(target_room_id)
+
+    monkeypatch.setattr(isolated_bus.child_processes, "close_room", counted_kill)
+
+    def worker() -> None:
+        try:
+            barrier.wait(timeout=5)
+            isolated_bus.close_room(room_id, "Codex")
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert kills == 1
+    close_messages = [
+        m for m in isolated_bus._load_messages(room_id)
+        if m.get("agent") == "System" and m.get("body") == "Чат закрыт."
+    ]
+    assert len(close_messages) == 1
+
+
+def test_delete_cannot_race_close_side_effects(
+    isolated_bus, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    room_id = _create_room(isolated_bus)
+    termination_started = threading.Event()
+    allow_termination = threading.Event()
+    errors: list[BaseException] = []
+
+    def slow_close(target_room_id: str) -> dict:
+        assert target_room_id == room_id
+        termination_started.set()
+        assert allow_termination.wait(timeout=5)
+        return {"sent": 0, "exited": 0, "denied": 0}
+
+    monkeypatch.setattr(isolated_bus.child_processes, "close_room", slow_close)
+
+    def closer() -> None:
+        try:
+            isolated_bus.close_room(room_id, "Codex")
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    thread = threading.Thread(target=closer)
+    thread.start()
+    assert termination_started.wait(timeout=5)
+    assert isolated_bus.get_room_info(room_id)["status"] == "closing"
+
+    with pytest.raises(ValueError, match="Close it first"):
+        isolated_bus.delete_room(room_id, "Codex")
+    assert isolated_bus._room_dir(room_id).exists()
+
+    allow_termination.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert errors == []
+    assert isolated_bus.get_room_info(room_id)["status"] == "closed"
+    close_messages = [
+        item for item in isolated_bus._load_messages(room_id)
+        if item.get("body") == "Чат закрыт."
+    ]
+    assert len(close_messages) == 1
+
+    isolated_bus.delete_room(room_id, "Codex")
+    assert not isolated_bus._room_dir(room_id).exists()
+
+
+def test_corrupt_meta_fails_closed_without_overwrite(isolated_bus) -> None:
+    room_id = _create_room(isolated_bus)
+    meta_path = isolated_bus._room_dir(room_id) / "meta.json"
+    corrupt = "{not-json\n"
+    meta_path.write_text(corrupt)
+
+    with pytest.raises(ValueError, match="Corrupt"):
+        isolated_bus.get_room_info(room_id)
+    with pytest.raises(ValueError, match="refusing to overwrite"):
+        isolated_bus.invite_agent(room_id, "Gemini")
+    assert meta_path.read_text() == corrupt
+
+
+@pytest.mark.parametrize(("field", "bad_value"), [
+    ("id", "room_wrong"),
+    ("status", "teleported"),
+    ("participants", "Codex"),
+    ("participants", []),
+    ("participants", ["Codex", 7]),
+    ("owner", "Mallory"),
+    ("created_at", "yesterday"),
+    ("created_at", float("nan")),
+])
+def test_semantically_invalid_meta_is_skipped_and_not_overwritten(
+    isolated_bus, field: str, bad_value,
+) -> None:
+    room_id = _create_room(isolated_bus)
+    meta_path = isolated_bus._room_dir(room_id) / "meta.json"
+    meta = isolated_bus.get_room_info(room_id)
+    meta[field] = bad_value
+    invalid_raw = json.dumps(meta, ensure_ascii=False)
+    meta_path.write_text(invalid_raw)
+
+    with pytest.raises(ValueError, match="Corrupt"):
+        isolated_bus.get_room_info(room_id)
+    with pytest.raises(ValueError, match="refusing to overwrite"):
+        isolated_bus.invite_agent(room_id, "Gemini")
+    assert room_id not in {item["id"] for item in isolated_bus.list_rooms()}
+    assert meta_path.read_text() == invalid_raw
+
+
+def test_circuit_breaker_check_is_atomic_with_append(isolated_bus) -> None:
+    room_id = _create_room(isolated_bus)
+    for index in range(isolated_bus.CIRCUIT_BREAKER_LIMIT - 1):
+        isolated_bus.post_message(room_id, "Gemini", f"comment-{index}", "comment")
+
+    count = 10
+    barrier = threading.Barrier(count)
+    successes: list[int] = []
+    errors: list[BaseException] = []
+    guard = threading.Lock()
+
+    def worker(index: int) -> None:
+        try:
+            barrier.wait(timeout=5)
+            msg_id = isolated_bus.post_message(
+                room_id, "Gemini", f"parallel-{index}", "comment")
+            with guard:
+                successes.append(msg_id)
+        except BaseException as exc:  # noqa: BLE001
+            with guard:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(successes) == 1
+    assert len(errors) == count - 1
+    assert all("Circuit breaker" in str(exc) for exc in errors)
+    assert len(isolated_bus._load_messages(room_id)) == isolated_bus.CIRCUIT_BREAKER_LIMIT
+
+
+def test_stored_message_body_has_hard_byte_cap(isolated_bus) -> None:
+    room_id = _create_room(isolated_bus)
+    accepted = "x" * isolated_bus.MAX_STORED_BODY_BYTES
+    isolated_bus.post_message(room_id, "Codex", accepted, "request")
+
+    with pytest.raises(ValueError, match="too large"):
+        isolated_bus.post_message(
+            room_id, "Codex", "y" * (isolated_bus.MAX_STORED_BODY_BYTES + 1), "request")
+    assert len(isolated_bus._load_messages(room_id)) == 1
+
+
+@pytest.mark.parametrize("oversized_field", ["agent", "to", "idempotency_key", "meta"])
+def test_complete_serialized_message_has_unicode_byte_cap(
+    isolated_bus, oversized_field: str,
+) -> None:
+    room_id = _create_room(isolated_bus)
+    huge = "🔥" * isolated_bus.MAX_STORED_MESSAGE_BYTES
+    kwargs = {
+        "agent": "Codex",
+        "to": None,
+        "idempotency_key": None,
+        "msg_meta": None,
+    }
+    if oversized_field == "meta":
+        kwargs["msg_meta"] = {"model": huge}
+    else:
+        kwargs[oversized_field] = huge
+
+    with pytest.raises(ValueError, match="Serialized message is too large"):
+        isolated_bus.post_message(
+            room_id,
+            kwargs["agent"],
+            "small body",
+            "request",
+            to=kwargs["to"],
+            idempotency_key=kwargs["idempotency_key"],
+            msg_meta=kwargs["msg_meta"],
+        )
+    assert isolated_bus._load_messages(room_id) == []
+
+
+def test_message_entry_rejects_non_json_numeric_metadata(isolated_bus) -> None:
+    room_id = _create_room(isolated_bus)
+    with pytest.raises(ValueError, match="not JSON-serializable"):
+        isolated_bus.post_message(
+            room_id, "Codex", "small", "request",
+            msg_meta={"duration_ms": float("nan")},
+        )
+    assert isolated_bus._load_messages(room_id) == []
 
 
 def test_idempotency_key_reuses_message_id(isolated_bus) -> None:
@@ -364,6 +829,93 @@ def test_circuit_breaker_blocks_repeated_non_request_messages(isolated_bus) -> N
         isolated_bus.post_message(room_id, "Gemini", "one too many", "comment")
 
 
+def test_room_rate_limit_has_deterministic_open_window_boundary(
+    isolated_bus, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    room_id = _create_room(isolated_bus)
+    clock = [1_000]
+    monkeypatch.setattr(isolated_bus, "ROOM_MESSAGE_RATE_LIMIT", 3)
+    monkeypatch.setattr(isolated_bus, "ROOM_MESSAGE_RATE_WINDOW_SECS", 60)
+    monkeypatch.setattr(isolated_bus.time, "time", lambda: clock[0])
+
+    for index in range(3):
+        isolated_bus.post_message(room_id, f"agent-{index}", "ok", "request")
+    with pytest.raises(ValueError, match="Room rate limit"):
+        isolated_bus.post_message(room_id, "agent-3", "blocked", "request")
+
+    # Exactly one full window old is outside the open lower boundary.
+    clock[0] = 1_060
+    assert isolated_bus.post_message(room_id, "agent-3", "admitted", "request") == 4
+
+
+def test_room_rate_limit_cannot_be_bypassed_by_human_or_system_and_close_marks(
+    isolated_bus, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    room_id = _create_room(isolated_bus)
+    monkeypatch.setattr(isolated_bus, "ROOM_MESSAGE_RATE_LIMIT", 2)
+
+    isolated_bus.post_message(room_id, "Human", "one", "comment")
+    isolated_bus.post_message(room_id, "System", "two", "system")
+    with pytest.raises(ValueError, match="Room rate limit"):
+        isolated_bus.post_message(room_id, "Human", "spoofed bypass", "request")
+
+    isolated_bus.close_room(room_id, "Codex")
+    messages = isolated_bus._load_messages(room_id)
+    assert len(messages) == 3
+    assert messages[-1]["body"] == "Чат закрыт."
+
+
+def test_idempotent_retry_precedes_room_rate_admission(
+    isolated_bus, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    room_id = _create_room(isolated_bus)
+    monkeypatch.setattr(isolated_bus, "ROOM_MESSAGE_RATE_LIMIT", 1)
+    first = isolated_bus.post_message(
+        room_id, "Codex", "once", "request", idempotency_key="same")
+
+    assert isolated_bus.post_message(
+        room_id, "Codex", "once", "request", idempotency_key="same") == first
+    with pytest.raises(ValueError, match="Room rate limit"):
+        isolated_bus.post_message(room_id, "Codex", "different", "request")
+    assert len(isolated_bus._load_messages(room_id)) == 1
+
+
+def test_room_rate_admission_is_atomic_across_concurrent_posters(
+    isolated_bus, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    room_id = _create_room(isolated_bus)
+    limit = 12
+    count = 30
+    monkeypatch.setattr(isolated_bus, "ROOM_MESSAGE_RATE_LIMIT", limit)
+    barrier = threading.Barrier(count)
+    successes: list[int] = []
+    errors: list[BaseException] = []
+    guard = threading.Lock()
+
+    def worker(index: int) -> None:
+        try:
+            barrier.wait(timeout=5)
+            msg_id = isolated_bus.post_message(
+                room_id, f"agent-{index}", "parallel", "request")
+            with guard:
+                successes.append(msg_id)
+        except BaseException as exc:  # noqa: BLE001
+            with guard:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(index,)) for index in range(count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert sorted(successes) == list(range(1, limit + 1))
+    assert len(errors) == count - limit
+    assert all("Room rate limit" in str(exc) for exc in errors)
+    assert len(isolated_bus._load_messages(room_id)) == limit
+
+
 def test_deadlock_watchdog_posts_one_timeout_then_resets_timer(isolated_bus) -> None:
     room_id = _create_room(isolated_bus)
     meta_path = isolated_bus._room_dir(room_id) / "meta.json"
@@ -436,6 +988,81 @@ def test_delete_old_terminal_rooms_respects_age_and_status(isolated_bus) -> None
 
     # disabled (0 days) is a no-op even on old terminal rooms
     assert isolated_bus.delete_old_terminal_rooms(0)["deleted"] == []
+
+
+def test_bulk_close_blocks_delete_until_teardown_finishes(
+    isolated_bus, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    room_id = _create_room(isolated_bus)
+    teardown_started = threading.Event()
+    allow_teardown = threading.Event()
+    errors: list[BaseException] = []
+
+    def slow_close(target_room_id: str) -> dict:
+        assert target_room_id == room_id
+        teardown_started.set()
+        assert allow_teardown.wait(timeout=5)
+        return {"sent": 0, "exited": 0, "denied": 0}
+
+    monkeypatch.setattr(isolated_bus.child_processes, "close_room", slow_close)
+
+    def bulk_closer() -> None:
+        try:
+            result = isolated_bus.close_all_rooms()
+            assert result["closed"] == [room_id]
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    thread = threading.Thread(target=bulk_closer)
+    thread.start()
+    assert teardown_started.wait(timeout=5)
+    assert isolated_bus.get_room_info(room_id)["status"] == "closing"
+    with pytest.raises(ValueError, match="Close it first"):
+        isolated_bus.delete_room(room_id, "Codex")
+
+    allow_teardown.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert errors == []
+    assert isolated_bus.get_room_info(room_id)["status"] == "closed"
+
+
+def test_retention_tombstones_resolved_room_children_before_delete(isolated_bus) -> None:
+    import os
+
+    class FakeProc:
+        pid = 424242
+
+        def __init__(self) -> None:
+            self.terminated = False
+
+        def poll(self):
+            return -15 if self.terminated else None
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+    isolated_bus.child_processes._reset_for_tests()
+    try:
+        room_id = _create_room(isolated_bus)
+        isolated_bus._update_meta_locked(
+            room_id, lambda meta: {**meta, "status": "resolved"})
+        old = time.time() - 8 * 86400
+        os.utime(isolated_bus._room_dir(room_id), (old, old))
+        existing = FakeProc()
+        isolated_bus.child_processes.register(existing, room_id, "existing")
+
+        result = isolated_bus.delete_old_terminal_rooms(7)
+
+        assert result["deleted"] == [room_id]
+        assert existing.terminated
+        assert not isolated_bus._room_dir(room_id).exists()
+
+        late = FakeProc()
+        isolated_bus.child_processes.register(late, room_id, "late")
+        assert late.terminated
+    finally:
+        isolated_bus.child_processes._reset_for_tests()
 
 
 def test_zombie_check_reaps_idle_room_with_dead_owner(isolated_bus) -> None:

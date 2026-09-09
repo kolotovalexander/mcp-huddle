@@ -1,7 +1,9 @@
 """Configurable agent-spawn registry for auto_spawn rooms.
 
-Default registry uses Codex, Antigravity, MiMo, Qwen, and DeepSeek when available.
-Claude is opt-in: automated reviewers consume the owner's available usage.
+The default registry provides Codex, Antigravity, MiMo, OpenCode, Claude and
+two fixed Opus review profiles. Only explicitly enabled/available slots run;
+Claude-family, Antigravity, MiMo and OpenCode automation is opt-in because it
+may consume account usage or lacks a fully enforced read-only mode.
 Anthropic paused the announced separate SDK billing change on 2026-06-15;
 `claude -p` still supports subscription usage. Verify native authentication
 rather than inferring billing or availability from an absent API key.
@@ -21,12 +23,14 @@ Each registry entry is a SpawnSpec:
     "name": "Codex",                              # display name in the room
     "cmd":  ["codex", "...", "{brief}"],          # argv; "{brief}" is replaced
     "enabled": true,                              # set False to skip
-    "auto": true                                  # optional, default true; set
+    "auto": true,                                 # optional, default true; set
                                                     # false to exclude from
                                                     # auto_spawn=True while still
                                                     # reachable via an explicit
                                                     # dict auto_spawn, room_invite,
                                                     # or a wake-path request
+    "pass_env": ["PROVIDER_API_KEY"]              # optional explicit names;
+                                                    # values are copied at spawn
   }
 
 A missing binary is auto-disabled at module-load time so room_create with
@@ -55,7 +59,6 @@ import sys
 import tempfile
 import threading
 import time
-import traceback
 from pathlib import Path
 from typing import NotRequired, TypedDict
 from urllib import error as urlerror
@@ -63,6 +66,7 @@ from urllib import request as urlrequest
 from urllib.parse import urlparse
 
 from . import bus  # reuse HUDDLE_HOME so the on-disk registry lives next to rooms
+from . import child_processes
 
 
 class SpawnSpec(TypedDict):
@@ -86,6 +90,11 @@ class SpawnSpec(TypedDict):
     # Local endpoint for the owner-enabled subscription reviewer. Validated
     # before spawn; credentials and remote URLs are never accepted here.
     mcp_url: NotRequired[str]
+    # Additional parent environment variable names that this child explicitly
+    # needs. Values stay out of registry JSON and logs; only the named values
+    # are copied at spawn time. Provider runners also opt in their
+    # ``--api-key-env`` variable automatically.
+    pass_env: NotRequired[list[str]]
 
 
 class AgentSpawnError(RuntimeError):
@@ -124,6 +133,37 @@ _DIRECT_OPUS_REVIEW_FLAGS = [
     ),
     "--permission-mode", "dontAsk",
 ]
+
+
+# Child processes must not inherit the server's whole environment: a Huddle
+# reviewer has no reason to receive unrelated GitHub/AWS/etc. credentials.
+# Keep only process-discovery, locale, user config paths and the room store.
+# Variables that can carry provider credentials are deliberately absent and
+# must be opted in by a typed profile, ``--api-key-env`` or SpawnSpec.pass_env.
+_SAFE_CHILD_ENV = frozenset({
+    "PATH", "HOME", "TMPDIR", "TMP", "TEMP", "USER", "LOGNAME", "SHELL",
+    "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM", "NO_COLOR",
+    "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
+    "PYTHONPATH", "VIRTUAL_ENV", "MCP_HUDDLE_HOME", "CODEX_HOME",
+    "CLAUDE_CONFIG_DIR",
+})
+_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_BACKGROUND_LOCK = threading.Lock()
+_REAPER_THREADS: set[threading.Thread] = set()
+_SPAWN_TIMERS: set[threading.Timer] = set()
+
+
+def _reset_background_after_fork() -> None:
+    """A fork child owns none of the parent's reaper threads or timers."""
+    global _BACKGROUND_LOCK, _REAPER_THREADS, _SPAWN_TIMERS
+    _BACKGROUND_LOCK = threading.Lock()
+    _REAPER_THREADS = set()
+    _SPAWN_TIMERS = set()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_background_after_fork)
 
 
 def _first_existing_binary(candidates: list[str]) -> str | None:
@@ -647,33 +687,52 @@ def log_spawn_failure(
     log_dir: Path,
     exc: BaseException,
 ) -> None:
-    """Write spawn failures to stderr so daemon logs keep the real cause."""
-    try:
-        argv, _ = _resolve_spawn_args(spec, brief, log_dir)
-    except Exception:  # pragma: no cover - defensive logging only
-        argv = list(spec.get("cmd", []))
+    """Write a value-free spawn failure summary to daemon stderr.
+
+    Registry argv may contain an expanded room brief, provider arguments, or
+    other caller-controlled values.  Neither argv nor the exception message is
+    safe to copy into a shared daemon log.
+    """
     log_path = log_dir / f"{spec['name'].lower()}.events.jsonl"
     print(
         "[mcp-huddle] failed to spawn "
-        f"{spec['name']}: {type(exc).__name__}: {exc}; "
-        f"cwd={cwd!r}; argv={argv!r}; log_path={log_path}",
+        f"{spec['name']}: error_type={type(exc).__name__}; "
+        f"arg_count={len(spec.get('cmd') or [])}; "
+        f"cwd={cwd!r}; log_path={log_path}",
         file=sys.stderr,
         flush=True,
     )
-    traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
 
 
-def _reap_in_background(proc: subprocess.Popen, name: str,
-                        on_exit=None, cleanup_dir: str | None = None) -> None:
+def _reap_in_background(
+    proc: subprocess.Popen,
+    name: str,
+    on_exit=None,
+    cleanup_dir: str | None = None,
+    owner_room_id: str = "",
+    process_handle: str | None = None,
+) -> str:
     """Ensure short-lived spawned agents do not remain as defunct children.
 
     on_exit: optional callable(returncode) invoked once the process exits.
     Used by the wake machinery to clear the busy lease and drain queued
     requests the moment an agent turn ends (event-driven, no polling)."""
+    handle = child_processes.register(proc, owner_room_id, process_handle)
+    if owner_room_id:
+        try:
+            room_status = bus.get_room_info(owner_room_id).get("status")
+        except Exception:
+            room_status = "missing"
+        if room_status in {"missing", "closing", "closed", "resolved"}:
+            # Close may win after the pre-spawn gate but before registration.
+            # Now that we own the exact Popen, stop it synchronously instead of
+            # waiting for the periodic cooperative reconciliation sweep.
+            child_processes.close_room(owner_room_id)
+
     def wait_for_exit() -> None:
         returncode = None
         try:
-            returncode = proc.wait()
+            returncode = child_processes.wait(owner_room_id, handle)
         except Exception:
             pass
         finally:
@@ -684,17 +743,24 @@ def _reap_in_background(proc: subprocess.Popen, name: str,
                 on_exit(returncode)
             except Exception:
                 pass
+        with _BACKGROUND_LOCK:
+            _REAPER_THREADS.discard(threading.current_thread())
 
-    # daemon=True so these reaper threads never block interpreter exit. There is
-    # no process-wide shutdown/cleanup hook to join them against; each thread
-    # only blocks on proc.wait() and is harmless to abandon at exit (any pending
-    # on_exit cleanup is best-effort and bounded by the child's lifetime).
+    # daemon=True so these reaper threads never block interpreter exit. Polling
+    # goes through child_processes, serialized with termination; callbacks and
+    # cleanup happen only after the ownership record has been removed.
     thread = threading.Thread(
         target=wait_for_exit,
         name=f"mcp-huddle-reap-{name}-{proc.pid}",
         daemon=True,
     )
-    thread.start()
+    with _BACKGROUND_LOCK:
+        _REAPER_THREADS.add(thread)
+        # Publish and start atomically with respect to the test drain. Without
+        # this ordering, teardown can snapshot the Thread after add() but
+        # before start(), where join() raises RuntimeError.
+        thread.start()
+    return handle
 
 
 def _registry_file_path() -> Path:
@@ -963,6 +1029,8 @@ def spawn_agent(
     log_dir: Path,
     verify_alive_sec: float = 0.0,
     on_exit=None,
+    owner_room_id: str = "",
+    process_handle: str | None = None,
 ) -> tuple[int, str, str | None]:
     """Spawn one agent.
 
@@ -974,9 +1042,13 @@ def spawn_agent(
     Side effects: creates log_dir, opens log file, redirects stdout+stderr to it.
     """
     _validate_protected_profile_names([spec])
-    log_dir.mkdir(parents=True, exist_ok=True)
     name = spec["name"]
-    log_path = log_dir / f"{name.lower()}.events.jsonl"
+    if owner_room_id:
+        log_path, _ = bus._agent_paths(owner_room_id, name, create=True)
+        log_dir = log_path.parent
+    else:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"{name.lower()}.events.jsonl"
     cleanup_dir: str | None = None
     if name == "Codex":
         cwd, brief = _codex_safe_cwd_and_brief(cwd, brief)
@@ -1004,8 +1076,14 @@ def spawn_agent(
                 raise
     else:
         argv, last_msg_path = _resolve_spawn_args(spec, brief, log_dir)
-        env = _spawn_environment(spec)
-    log_file = open(log_path, "ab", buffering=0)
+        env = _spawn_environment(spec, argv)
+    if owner_room_id:
+        log_fd = bus._safe_open_fd(
+            log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600,
+        )
+        log_file = os.fdopen(log_fd, "ab", buffering=0)
+    else:
+        log_file = open(log_path, "ab", buffering=0)
     try:
         proc = subprocess.Popen(
             argv,
@@ -1023,14 +1101,14 @@ def spawn_agent(
         # Popen dups the fd into the child; we can close ours so the parent
         # process doesn't keep the log file held open after the child exits.
         log_file.close()
-    if cleanup_dir is None:
-        _reap_in_background(proc, name, on_exit=on_exit)
-    else:
-        _reap_in_background(proc, name, on_exit=on_exit, cleanup_dir=cleanup_dir)
+    handle = _reap_in_background(
+        proc, name, on_exit=on_exit, cleanup_dir=cleanup_dir,
+        owner_room_id=owner_room_id, process_handle=process_handle,
+    )
     if verify_alive_sec > 0:
         time.sleep(verify_alive_sec)
-        returncode = proc.poll()
-        if returncode is not None:
+        if child_processes.state(owner_room_id, handle) != "alive":
+            returncode = proc.returncode
             exc = AgentSpawnError(
                 f"{name} exited within {verify_alive_sec:.3g}s with status {returncode}"
             )
@@ -1039,34 +1117,64 @@ def spawn_agent(
     return proc.pid, str(log_path), last_msg_path
 
 
-def _spawn_environment(spec: SpawnSpec) -> dict[str, str]:
-    """Build a child environment without exposing profile secret values."""
-    env = os.environ.copy()
+def build_sanitized_environment(extra_names: tuple[str, ...] | list[str] = ()) -> dict[str, str]:
+    """Copy the minimal non-secret child environment plus explicit names.
+
+    This function never logs names or values. Invalid explicit names fail
+    closed so a malformed registry cannot accidentally widen the boundary.
+    """
+    names = set(_SAFE_CHILD_ENV)
+    for name in extra_names:
+        if not isinstance(name, str) or not _ENV_NAME_RE.fullmatch(name):
+            raise AgentSpawnError("pass_env must contain valid environment variable names")
+        names.add(name)
+    return {name: os.environ[name] for name in names if name in os.environ}
+
+
+def _api_key_env_names(argv: list[str]) -> list[str]:
+    """Return explicit provider env names declared by runner argv."""
+    names: list[str] = []
+    for index, arg in enumerate(argv):
+        if arg.startswith("--api-key-env="):
+            names.append(arg.partition("=")[2])
+        if arg == "--api-key-env":
+            names.append(argv[index + 1] if index + 1 < len(argv) else "")
+    return names
+
+
+def _spawn_environment(spec: SpawnSpec, argv: list[str] | None = None) -> dict[str, str]:
+    """Build a least-privilege child environment without exposing values."""
+    requested = spec.get("pass_env", [])
+    if not isinstance(requested, list):
+        raise AgentSpawnError("pass_env must be a list of environment variable names")
+    explicit_names = list(requested)
+    if argv is not None:
+        explicit_names.extend(_api_key_env_names(argv))
+
     if spec.get("profile") == _SUBSCRIPTION_OPUS_REVIEW_PROFILE:
         conflicting = sorted(name for name in (
             *_DIRECT_OPUS_REMOVED_ENV,
             "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS",
             "ANTHROPIC_DEFAULT_OPUS_MODEL", "CLAUDE_CODE_API_KEY_HELPER",
-        ) if env.get(name))
+        ) if os.environ.get(name))
         if conflicting:
             raise AgentSpawnError(
                 "subscription review refuses conflicting environment: " + ", ".join(conflicting)
             )
-        return env
+        return build_sanitized_environment()
     if spec.get("profile") != _DIRECT_OPUS_REVIEW_PROFILE:
-        return env
+        return build_sanitized_environment(explicit_names)
     required = (
         "ANTHROPIC_API_KEY",
         _DIRECT_OPUS_WORKSPACE_ENV,
         _DIRECT_OPUS_ENDPOINT_ENV,
     )
-    missing = [name for name in required if not env.get(name)]
+    missing = [name for name in required if not os.environ.get(name)]
     if missing:
         raise AgentSpawnError(
             f"{spec['name']} missing required environment: {', '.join(missing)}"
         )
-    for name in _DIRECT_OPUS_REMOVED_ENV:
-        env.pop(name, None)
+    env = build_sanitized_environment(list(required))
     env["ANTHROPIC_BASE_URL"] = "https://api.anthropic.com"
     env["ANTHROPIC_CUSTOM_HEADERS"] = env.pop(_DIRECT_OPUS_WORKSPACE_ENV)
     return env
@@ -1166,6 +1274,8 @@ def _schedule_delayed_spawn(
     on_spawn_fail=None,
     should_spawn=None,
     on_spawned=None,
+    owner_room_id: str = "",
+    process_handle: str | None = None,
 ) -> threading.Timer:
     """Fire spawn_agent(spec, ...) after `delay` seconds on a daemon timer
     thread, without blocking the caller. Spawn failures are logged/notified
@@ -1179,8 +1289,8 @@ def _schedule_delayed_spawn(
       into an unknown state).
     on_spawned: optional callable(pid) invoked (best-effort) with the newly
       spawned process's pid — lets the caller record it where the synchronous
-      path records pids (e.g. the room's spawned_pids, so close_room can kill
-      a staggered process instead of orphaning it).
+      path records diagnostic pids. Process termination still uses only the
+      exact registered local Popen, never this persisted number.
     """
     def _fire() -> None:
         if should_spawn is not None:
@@ -1197,7 +1307,10 @@ def _schedule_delayed_spawn(
                       f"the stagger window)", file=sys.stderr, flush=True)
                 return
         try:
-            pid, _, _ = spawn_agent(spec, brief, cwd, log_dir, on_exit=on_exit)
+            pid, _, _ = spawn_agent(
+                spec, brief, cwd, log_dir, on_exit=on_exit,
+                owner_room_id=owner_room_id, process_handle=process_handle,
+            )
         except (FileNotFoundError, PermissionError, AgentSpawnError, OSError) as exc:
             log_spawn_failure(spec, brief, cwd, log_dir, exc)
             _safe_notify_spawn_fail(on_spawn_fail, spec["name"], exc)
@@ -1210,10 +1323,73 @@ def _schedule_delayed_spawn(
                       f"for {spec['name']} (pid {pid}): {exc}",
                       file=sys.stderr, flush=True)
 
-    timer = threading.Timer(delay, _fire)
+    timer: threading.Timer
+
+    def _fire_tracked() -> None:
+        try:
+            _fire()
+        finally:
+            with _BACKGROUND_LOCK:
+                _SPAWN_TIMERS.discard(timer)
+
+    timer = threading.Timer(delay, _fire_tracked)
     timer.daemon = True
-    timer.start()
+    with _BACKGROUND_LOCK:
+        _SPAWN_TIMERS.add(timer)
+        timer.start()
     return timer
+
+
+def _drain_background_for_tests(timeout: float = 2.0) -> None:
+    """Reach background quiescence before a test fixture reloads the bus.
+
+    Callbacks may create another reaper/timer while an earlier snapshot is
+    being joined, so drain repeatedly until the tracked sets are empty. A
+    living remainder is a test failure rather than a hidden cross-fixture
+    write into a newly selected HUDDLE_HOME.
+    """
+    deadline = time.time() + timeout
+    while True:
+        with _BACKGROUND_LOCK:
+            timers = list(_SPAWN_TIMERS)
+            reapers = list(_REAPER_THREADS)
+        if not timers and not reapers:
+            return
+
+        for timer in timers:
+            cancel = getattr(timer, "cancel", None)
+            if cancel is not None:
+                cancel()
+        for background in [*timers, *reapers]:
+            join = getattr(background, "join", None)
+            if join is not None:
+                try:
+                    join(max(0.0, deadline - time.time()))
+                except RuntimeError:
+                    # A pre-existing/custom producer may still publish just
+                    # before start(). Keep it tracked and retry; if it never
+                    # starts, the deadline assertion below exposes the bug.
+                    pass
+
+        with _BACKGROUND_LOCK:
+            for timer in timers:
+                is_alive = getattr(timer, "is_alive", None)
+                if is_alive is None or not is_alive():
+                    _SPAWN_TIMERS.discard(timer)
+            for thread in reapers:
+                if thread.ident is not None and not thread.is_alive():
+                    _REAPER_THREADS.discard(thread)
+            remaining_timers = list(_SPAWN_TIMERS)
+            remaining_reapers = list(_REAPER_THREADS)
+        if not remaining_timers and not remaining_reapers:
+            return
+        if time.time() >= deadline:
+            names = [getattr(item, "name", type(item).__name__)
+                     for item in [*remaining_timers, *remaining_reapers]]
+            raise AssertionError(
+                "background spawn work did not quiesce before test teardown: "
+                + ", ".join(names)
+            )
 
 
 def _safe_notify_spawn_fail(on_spawn_fail, name: str, exc: BaseException) -> None:
@@ -1237,6 +1413,9 @@ def spawn_all(
     on_spawn_fail=None,
     delayed_spawn_gate=None,
     on_delayed_spawn=None,
+    owner_room_id: str = "",
+    process_handle_factory=None,
+    prepare_spawn=None,
 ) -> tuple[list[str], list[int], dict[str, dict[str, object]]]:
     """Spawn every enabled agent in the registry.
 
@@ -1255,8 +1434,11 @@ def spawn_all(
         (e.g. the room was closed/deleted inside the stagger window).
       on_delayed_spawn: optional callable(name, pid) invoked once a staggered
         spawn actually starts, so the caller can record the pid it could not
-        get from the return value (e.g. into the room's spawned_pids for
-        close_room's kill sweep).
+        get from the return value (e.g. into the room's diagnostic
+        spawned_pids; signalling still requires the exact local Popen).
+      prepare_spawn: optional callable(spec, handle, placeholder, delay) run
+        before scheduling/Popen. Returning False skips that generation. The
+        server uses it to persist the initial claim before a child can exist.
 
     spawn_all is the auto_spawn=True path (the only caller, server._spawn_agents'
     else-branch) — it honours each spec's optional "auto" flag: a spec with
@@ -1293,10 +1475,25 @@ def spawn_all(
     delays = compute_stagger_delays(specs)
     for spec in specs:
         agent_brief = briefs.get(spec["name"], brief)
+        process_handle = (
+            process_handle_factory(spec["name"])
+            if process_handle_factory is not None
+            else child_processes.new_handle()
+        )
         delay = delays.get(spec["name"], 0.0)
+        placeholder = _placeholder_agent_meta(spec, agent_brief, log_dir)
+        if prepare_spawn is not None:
+            try:
+                if prepare_spawn(
+                    spec, process_handle, dict(placeholder), delay,
+                ) is False:
+                    continue
+            except Exception as exc:
+                _safe_notify_spawn_fail(on_spawn_fail, spec["name"], exc)
+                continue
         if delay > 0:
             names.append(spec["name"])
-            agent_meta[spec["name"]] = _placeholder_agent_meta(spec, agent_brief, log_dir)
+            agent_meta[spec["name"]] = placeholder
             spawned_cb = None
             if on_delayed_spawn is not None:
                 spawned_cb = (lambda name_: lambda pid: on_delayed_spawn(name_, pid))(spec["name"])
@@ -1306,6 +1503,8 @@ def spawn_all(
                 on_spawn_fail=on_spawn_fail,
                 should_spawn=delayed_spawn_gate,
                 on_spawned=spawned_cb,
+                owner_room_id=owner_room_id,
+                process_handle=process_handle,
             )
             continue
         try:
@@ -1313,6 +1512,8 @@ def spawn_all(
                 spec, agent_brief, cwd, log_dir,
                 verify_alive_sec=verify_alive_sec,
                 on_exit=on_exit_factory(spec["name"]) if on_exit_factory else None,
+                owner_room_id=owner_room_id,
+                process_handle=process_handle,
             )
             pids.append(pid)
             names.append(spec["name"])
@@ -1337,6 +1538,44 @@ def spawn_all(
 
 # ── Phase 2: thread_id capture + Codex resume ────────────────────────────────
 
+_LOG_HEAD_BYTES = 256 * 1024
+_LOG_TAIL_BYTES = 512 * 1024
+
+
+def _read_log_bounded(log_path: str, limit: int, *, tail: bool) -> str | None:
+    try:
+        fd = os.open(
+            log_path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        with os.fdopen(fd, "rb") as fh:
+            if tail:
+                fh.seek(0, os.SEEK_END)
+                fh.seek(max(0, fh.tell() - limit), os.SEEK_SET)
+            return fh.read(limit).decode("utf-8", errors="replace")
+    except (FileNotFoundError, NotADirectoryError, OSError):
+        return None
+
+
+def parse_codex_thread_id_text(text: str) -> str | None:
+    """Parse a Codex thread id from already-authorized log content."""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict) or obj.get("type") != "thread.started":
+            continue
+        thread_id = obj.get("thread_id")
+        if isinstance(thread_id, str) and thread_id:
+            return thread_id
+    return None
+
+
 def parse_codex_thread_id(log_path: str, timeout: float = 10.0) -> str | None:
     """Tail the agent log file until we see a {"type":"thread.started",...} event.
     Returns thread_id (UUID string) or None on timeout / non-Codex agents.
@@ -1346,53 +1585,35 @@ def parse_codex_thread_id(log_path: str, timeout: float = 10.0) -> str | None:
     """
     import time
     deadline = time.time() + timeout
-    p = Path(log_path)
     while time.time() < deadline:
-        if p.exists() and p.stat().st_size > 0:
-            try:
-                with open(p, "rb") as f:
-                    for raw in f:
-                        line = raw.decode("utf-8", errors="replace").strip()
-                        if not line:
-                            continue
-                        try:
-                            obj = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        # A changed/non-Codex log format may yield a non-dict
-                        # (list, str, number) — skip it rather than crash.
-                        if not isinstance(obj, dict):
-                            continue
-                        if obj.get("type") == "thread.started":
-                            thread_id = obj.get("thread_id")
-                            if thread_id is not None:
-                                return thread_id
-            except OSError:
-                pass
+        text = _read_log_bounded(log_path, _LOG_HEAD_BYTES, tail=False)
+        if text:
+            thread_id = parse_codex_thread_id_text(text)
+            if thread_id:
+                return thread_id
         time.sleep(0.1)
     return None
 
 
+def codex_log_has_completed_turn_text(text: str) -> bool:
+    """Inspect already-authorized Codex log content for turn completion."""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and obj.get("type") == "turn.completed":
+            return True
+    return False
+
+
 def codex_log_has_completed_turn(log_path: str) -> bool:
     """Return True once Codex has persisted at least one completed turn."""
-    p = Path(log_path)
-    if not p.exists():
-        return False
-    try:
-        with open(p, "rb") as f:
-            for raw in f:
-                line = raw.decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if obj.get("type") == "turn.completed":
-                    return True
-    except OSError:
-        return False
-    return False
+    text = _read_log_bounded(log_path, _LOG_TAIL_BYTES, tail=True)
+    return bool(text and codex_log_has_completed_turn_text(text))
 
 
 # Substrings that mark a provider usage/rate-limit refusal. Matched
@@ -1449,6 +1670,38 @@ def _looks_like_rate_limit(text: str, *, require_hint: bool) -> bool:
     return any(hint in low for hint in _RATE_LIMIT_PLAINTEXT_HINTS)
 
 
+def detect_rate_limit_text(text: str) -> str | None:
+    """Detect a provider refusal in already-authorized log content."""
+    reason: str | None = None
+    for raw in text.splitlines():
+        line = _strip_ansi(raw).strip()
+        if not line:
+            continue
+        if line.startswith("{"):
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            etype = obj.get("type")
+            if etype == "error":
+                candidate = obj.get("message") or obj.get("error") or ""
+            elif etype == "turn.failed":
+                err = obj.get("error")
+                candidate = (err.get("message", "") if isinstance(err, dict)
+                             else err or "")
+            else:
+                continue
+            if not isinstance(candidate, str):
+                continue
+            if candidate and _looks_like_rate_limit(candidate, require_hint=False):
+                reason = candidate.strip()
+        elif _looks_like_rate_limit(line, require_hint=True):
+            reason = line
+    return reason
+
+
 def detect_rate_limit(log_path: str) -> str | None:
     """Scan an agent log for a provider usage/rate-limit refusal.
 
@@ -1464,48 +1717,17 @@ def detect_rate_limit(log_path: str) -> str | None:
         codes (OpenCode styles its plain-text output) are stripped first so
         they can't split or hide a marker/hint substring.
     """
-    p = Path(log_path)
-    if not p.exists():
-        return None
-    try:
-        with open(p, "rb") as f:
-            text = f.read().decode("utf-8", errors="replace")
-    except OSError:
+    text = _read_log_bounded(log_path, _LOG_TAIL_BYTES, tail=True)
+    if text is None:
         return None
 
-    reason: str | None = None
-    for raw in text.splitlines():
-        line = _strip_ansi(raw).strip()
-        if not line:
-            continue
-        if line.startswith("{"):
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            etype = obj.get("type")
-            if etype == "error":
-                # Codex --json uses "message"; the MiMo/openai-compatible
-                # runners write their own error events under "error".
-                candidate = obj.get("message") or obj.get("error") or ""
-            elif etype == "turn.failed":
-                err = obj.get("error")
-                candidate = (err.get("message", "") if isinstance(err, dict)
-                             else err or "")
-            else:
-                continue
-            if not isinstance(candidate, str):
-                continue
-            if candidate and _looks_like_rate_limit(candidate, require_hint=False):
-                reason = candidate.strip()
-        else:
-            if _looks_like_rate_limit(line, require_hint=True):
-                reason = line
-    return reason
+    return detect_rate_limit_text(text)
 
 
 def codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str,
-                 last_msg_path: str | None = None, on_exit=None) -> int:
+                 last_msg_path: str | None = None, on_exit=None,
+                 owner_room_id: str = "",
+                 process_handle: str | None = None) -> int:
     """Resume a Codex thread with a new prompt. Cheaper than fresh spawn —
     Codex remembers prior conversation via its rollout file.
 
@@ -1540,7 +1762,27 @@ def codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str,
         argv += ["-o", last_msg_path]                    # short form of --output-last-message
     argv.append(prompt)
 
-    log_file = open(log_path, "ab", buffering=0)
+    if owner_room_id:
+        expected_log, expected_last = bus._agent_paths(
+            owner_room_id, "Codex", create=False,
+        )
+        if Path(log_path).resolve(strict=False) != expected_log.resolve(strict=False):
+            raise AgentSpawnError("Codex resume log path is outside its owned room")
+        if (last_msg_path is not None
+                and Path(last_msg_path).resolve(strict=False)
+                != expected_last.resolve(strict=False)):
+            raise AgentSpawnError(
+                "Codex resume last-message path is outside its owned room"
+            )
+        if last_msg_path is not None:
+            last_msg_path = str(expected_last)
+            argv[argv.index("-o") + 1] = last_msg_path
+        log_fd = bus._safe_open_fd(
+            expected_log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600,
+        )
+        log_file = os.fdopen(log_fd, "ab", buffering=0)
+    else:
+        log_file = open(log_path, "ab", buffering=0)
     try:
         proc = subprocess.Popen(
             argv,
@@ -1548,8 +1790,12 @@ def codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str,
             stdin=subprocess.DEVNULL,
             stdout=log_file,
             stderr=subprocess.STDOUT,
+            env=build_sanitized_environment(),
         )
     finally:
         log_file.close()
-    _reap_in_background(proc, "Codex", on_exit=on_exit)
+    _reap_in_background(
+        proc, "Codex", on_exit=on_exit,
+        owner_room_id=owner_room_id, process_handle=process_handle,
+    )
     return proc.pid

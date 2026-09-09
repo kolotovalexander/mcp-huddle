@@ -35,6 +35,161 @@ function el(tag, attrs, children) {
   return node;
 }
 
+// ── Same-origin HTTP + dashboard authentication ──────────
+// The raw token is submitted once to /api/auth and is never placed in a URL,
+// cookie, log, or browser storage. Only the derived process-local credential is
+// retained in this page's JavaScript memory and attached to same-origin fetches.
+class HuddleHTTPError extends Error {
+  constructor(status, message) {
+    super(message || `HTTP ${status}`);
+    this.name = 'HuddleHTTPError';
+    this.status = status;
+  }
+}
+
+let authPromise = null;
+let dashboardCredential = null;
+let authNeedsUserAction = false;
+
+async function responseError(resp) {
+  const data = await resp.json().catch(() => ({}));
+  return new HuddleHTTPError(resp.status, data.error || `${resp.status} ${resp.statusText}`);
+}
+
+function hideAuthRequired() {
+  const banner = document.getElementById('auth-required');
+  if (banner) banner.remove();
+}
+
+function showDashboardNotice(message, buttonText, retryAction) {
+  let banner = document.getElementById('auth-required');
+  if (!banner) {
+    banner = el('div', {id: 'auth-required', class: 'lq-panel'});
+    Object.assign(banner.style, {
+      position: 'fixed', zIndex: '10000', top: '12px', left: '50%',
+      transform: 'translateX(-50%)', padding: '12px 16px', display: 'flex',
+      alignItems: 'center', gap: '12px', maxWidth: 'min(680px, calc(100vw - 24px))',
+      boxShadow: '0 8px 30px rgba(0,0,0,.35)',
+    });
+    const label = el('span', {id: 'auth-required-message'});
+    const retry = el('button', {id: 'auth-required-retry', class: 'lq-btn'});
+    banner.append(label, retry);
+    document.body.appendChild(banner);
+  }
+  const label = document.getElementById('auth-required-message');
+  if (label) label.textContent = message;
+  const retry = document.getElementById('auth-required-retry');
+  if (retry) {
+    retry.textContent = buttonText;
+    retry.onclick = retryAction;
+  }
+}
+
+function showAuthRequired(message = 'Authentication is required.') {
+  showDashboardNotice(message, 'Enter token', async () => {
+    authNeedsUserAction = false;
+    try {
+      await authenticateDashboard(true);
+      await loadRooms();
+      if (currentRoom) {
+        await fetchMessages(false);
+        closeAgentStreams();
+        await attachAgentPanels(currentRoom);
+      }
+    } catch(e) {
+      showAuthRequired(e && e.message ? e.message : 'Authentication failed.');
+    }
+  });
+}
+
+function showLoadError(error) {
+  const detail = error && error.message ? error.message : 'request failed';
+  showDashboardNotice(`Could not load rooms: ${detail}`, 'Retry', async () => {
+    hideAuthRequired();
+    await loadRooms();
+  });
+}
+
+async function authenticateDashboard(forcePrompt = false) {
+  if (authPromise) return authPromise;
+  authPromise = (async () => {
+    const stateResp = await fetch('/api/auth', {
+      credentials: 'omit', cache: 'no-store', headers: {'Accept': 'application/json'},
+    });
+    if (!stateResp.ok) throw await responseError(stateResp);
+    const state = await stateResp.json();
+    if (!state.required) {
+      dashboardCredential = null;
+      authNeedsUserAction = false;
+      hideAuthRequired();
+      return;
+    }
+    if (dashboardCredential && !forcePrompt) return;
+    if (authNeedsUserAction && !forcePrompt) {
+      throw new HuddleHTTPError(401, 'Authentication required — use Enter token.');
+    }
+    let tokenInput = window.prompt('MCP_HUDDLE_TOKEN is required for this dashboard:');
+    if (tokenInput === null) {
+      authNeedsUserAction = true;
+      showAuthRequired('Authentication cancelled. The dashboard has not loaded protected data.');
+      throw new HuddleHTTPError(401, 'Authentication cancelled — use Enter token to retry.');
+    }
+    try {
+      const authResp = await fetch('/api/auth', {
+        method: 'POST',
+        credentials: 'omit',
+        cache: 'no-store',
+        headers: {'Accept': 'application/json', 'Content-Type': 'application/json'},
+        body: JSON.stringify({token: tokenInput}),
+      });
+      if (!authResp.ok) {
+        authNeedsUserAction = true;
+        const error = await responseError(authResp);
+        showAuthRequired('Token rejected. Protected data was not loaded.');
+        throw error;
+      }
+      const data = await authResp.json();
+      if (typeof data.credential !== 'string' || !data.credential || data.credential.length > 256) {
+        authNeedsUserAction = true;
+        showAuthRequired('Authentication returned an invalid credential.');
+        throw new HuddleHTTPError(500, 'Invalid authentication response');
+      }
+      dashboardCredential = data.credential;
+      authNeedsUserAction = false;
+      hideAuthRequired();
+    } finally {
+      tokenInput = '';
+    }
+  })();
+  try {
+    return await authPromise;
+  } finally {
+    authPromise = null;
+  }
+}
+
+async function apiFetch(url, options = {}, retryAuth = true) {
+  const requestOptions = {...options, credentials: 'omit'};
+  requestOptions.headers = new Headers(options.headers || {});
+  if (!requestOptions.headers.has('Accept')) requestOptions.headers.set('Accept', 'application/json');
+  if (dashboardCredential) requestOptions.headers.set('X-Huddle-Credential', dashboardCredential);
+  let resp = await fetch(url, requestOptions);
+  if (resp.status === 401 && retryAuth) {
+    dashboardCredential = null;
+    await authenticateDashboard(false);
+    if (dashboardCredential) requestOptions.headers.set('X-Huddle-Credential', dashboardCredential);
+    else requestOptions.headers.delete('X-Huddle-Credential');
+    resp = await fetch(url, requestOptions);
+  }
+  if (!resp.ok) throw await responseError(resp);
+  return resp;
+}
+
+function showRequestError(action, error) {
+  const detail = error && error.message ? error.message : 'request failed';
+  alert(`${action}: ${detail}`);
+}
+
 // ── i18n: UI-chrome localisation across 10 languages ───────────────
 // Only the static chrome is translated (labels, buttons, hints, tooltips);
 // room names / agent messages are live data and stay as authored. Keys are
@@ -79,7 +234,7 @@ const I18N = {
     'var.claude': 'Enable the Claude spawn slot (off by default; metered).',
     'var.antigravity': 'Enable the Antigravity (agy) slot (off by default; needs a prior interactive `agy` login; not read-only-enforced).',
     'var.mimo': 'Disable the MiMo spawn slot (on by default; runs in a temp dir, never touches the project).',
-    'var.token': 'If set, require this bearer token on mutating HTTP/SSE endpoints.',
+    'var.token': 'If set, protect MCP plus all room data/actions. The dashboard keeps only a derived credential in page memory.',
     'var.home': 'Data directory (rooms, logs). Default ~/.mcp-huddle.',
     'var.port': 'HTTP port for the dashboard/MCP (default 8014).',
     'agentPrompt.text': 'Connect to the huddle MCP server at {origin}/mcp — e.g. run: claude mcp add --transport http huddle {origin}/mcp\nThen use: room_list (see rooms), room_create (start one), messages_read (catch up), message_post (reply). Reuse an existing room or create a new one.\nOnly answer kind=request addressed to you (to=YourName or to=all); never reply to comment/ack/result/final (anti-loop).',
@@ -123,7 +278,7 @@ const I18N = {
     'var.claude': 'Включить слот Claude (по умолчанию выкл.; тарифицируется).',
     'var.antigravity': 'Включить слот Antigravity (agy) (по умолчанию выкл.; нужен предварительный интерактивный вход `agy`; read-only не гарантируется).',
     'var.mimo': 'Выключить слот MiMo (по умолчанию вкл.; работает в temp-папке, проект не трогает).',
-    'var.token': 'Если задан — требовать этот bearer-токен на мутирующих HTTP/SSE-эндпоинтах.',
+    'var.token': 'Если задан — защищает MCP, чтение комнат и все действия. Дашборд хранит только производный credential в памяти страницы.',
     'var.home': 'Каталог данных (комнаты, логи). По умолчанию ~/.mcp-huddle.',
     'var.port': 'HTTP-порт дашборда/MCP (по умолчанию 8014).',
     'agentPrompt.text': 'Подключись к huddle MCP по адресу {origin}/mcp — например: claude mcp add --transport http huddle {origin}/mcp\nДалее: room_list (список комнат), room_create (создать), messages_read (прочитать), message_post (ответить). Переиспользуй существующую комнату или создай новую.\nОтвечай только на kind=request, адресованные тебе (to=ТвоёИмя или to=all); никогда не отвечай на comment/ack/result/final (анти-луп).',
@@ -489,11 +644,18 @@ function initSettings() {
 // ── Rooms ─────────────────────────────────────────────────
 async function loadRooms() {
   try {
-    const r = await fetch('/api/rooms');
-    rooms = await r.json();
+    const r = await apiFetch('/api/rooms');
+    const loaded = await r.json();
+    if (!Array.isArray(loaded)) throw new Error('invalid rooms response');
+    rooms = loaded;
     document.getElementById('room-count').textContent = rooms.length;
     renderRooms();
-  } catch(e) {}
+    hideAuthRequired();
+  } catch(e) {
+    // Preserve the last successfully rendered room list during auth/network errors.
+    if (e && e.status === 401) showAuthRequired(e.message);
+    else showLoadError(e);
+  }
 }
 
 // Collapsible tree state (which project/session groups are folded).
@@ -684,7 +846,7 @@ async function openRoom(id, owner) {
   lastId = 0;
   msgMap = {};
   agentMetaTotals = {};
-  closeAgentStreams();  // tear down EventSources from previous room
+  closeAgentStreams();  // abort authenticated fetch streams from previous room
   renderRooms();
   buildChatShell(rooms.find(x => x.id === id) || {id});
   await fetchMessages(true);
@@ -696,14 +858,176 @@ async function openRoom(id, owner) {
 
 // ── Phase 1: agent live event panels ─────────────────────────────────────────
 
-let agentStreams = {};  // {agentName: EventSource}
+let agentStreams = {};  // {agentName: reconnect state}
+let activityStreamGeneration = 0;
 
 function closeAgentStreams() {
+  activityStreamGeneration += 1;
   for (const k in agentStreams) {
-    try { agentStreams[k].close(); } catch(e) {}
+    const stream = agentStreams[k];
+    stream.cancelled = true;
+    try { stream.controller?.abort(); } catch(e) {}
+    if (stream.retryTimer) clearTimeout(stream.retryTimer);
+    if (stream.retryResolve) stream.retryResolve();
   }
   agentStreams = {};
   resetActivityPanel('Откроется при выборе комнаты со spawned-агентами');
+}
+
+function parseSSEText(state, text, finish = false) {
+  state.buffer += text;
+  const events = [];
+  const consumeLine = line => {
+    if (line.endsWith('\r')) line = line.slice(0, -1);
+    if (line === '') {
+      if (state.data.length) {
+        events.push({
+          event: state.event || 'message',
+          data: state.data.join('\n'),
+          id: state.lastEventId,
+          generation: state.fileGeneration,
+          cursor: state.fileCursor,
+        });
+      }
+      state.event = '';
+      state.data = [];
+      state.fileGeneration = '';
+      state.fileCursor = '';
+      return;
+    }
+    if (line.startsWith(':')) return;
+    const colon = line.indexOf(':');
+    const field = colon < 0 ? line : line.slice(0, colon);
+    let value = colon < 0 ? '' : line.slice(colon + 1);
+    if (value.startsWith(' ')) value = value.slice(1);
+    if (field === 'event') state.event = value;
+    else if (field === 'data') state.data.push(value);
+    else if (field === 'id' && !value.includes('\0')) state.lastEventId = value;
+    else if (field === 'generation') state.fileGeneration = value;
+    else if (field === 'cursor') state.fileCursor = value;
+  };
+  while (state.buffer) {
+    const lf = state.buffer.indexOf('\n');
+    const cr = state.buffer.indexOf('\r');
+    let newline = lf < 0 ? cr : cr < 0 ? lf : Math.min(lf, cr);
+    if (newline < 0) break;
+    // A CR at a chunk boundary may be the first half of CRLF.
+    if (!finish && state.buffer[newline] === '\r' && newline === state.buffer.length - 1) break;
+    consumeLine(state.buffer.slice(0, newline));
+    const width = state.buffer[newline] === '\r' && state.buffer[newline + 1] === '\n' ? 2 : 1;
+    state.buffer = state.buffer.slice(newline + width);
+  }
+  if (finish) {
+    // A transport EOF is not an SSE frame delimiter. Discard any pending
+    // partial event so its id/offset is not committed; reconnect resumes from
+    // the last event that ended with an actual blank line.
+    state.buffer = '';
+    state.event = '';
+    state.data = [];
+    state.lastEventId = '';
+    state.fileGeneration = '';
+    state.fileCursor = '';
+  }
+  return events;
+}
+
+function streamIsCurrent(name, stream) {
+  return !stream.cancelled && stream.generation === activityStreamGeneration
+    && stream.roomId === currentRoom && agentStreams[name] === stream;
+}
+
+function reconnectDelay(stream, delayMs) {
+  return new Promise(resolve => {
+    stream.retryResolve = resolve;
+    stream.retryTimer = setTimeout(resolve, delayMs);
+  }).finally(() => {
+    stream.retryTimer = null;
+    stream.retryResolve = null;
+  });
+}
+
+async function streamAgentEvents(baseUrl, name, stream) {
+  const status = () => document.getElementById(`agent-status-${name}`);
+  try {
+    while (streamIsCurrent(name, stream)) {
+      const controller = new AbortController();
+      stream.controller = controller;
+      try {
+      const separator = baseUrl.includes('?') ? '&' : '?';
+      let url = `${baseUrl}${separator}offset=${encodeURIComponent(stream.offset)}`;
+      if (stream.fileGeneration) {
+        url += `&generation=${encodeURIComponent(stream.fileGeneration)}`;
+      }
+      if (stream.fileCursor) {
+        url += `&cursor=${encodeURIComponent(stream.fileCursor)}`;
+      }
+        const resp = await apiFetch(url, {
+          headers: {'Accept': 'text/event-stream'},
+          cache: 'no-store',
+          signal: controller.signal,
+        });
+        if (!resp.body) throw new HuddleHTTPError(502, 'Streaming response has no body');
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder('utf-8');
+        const parser = {
+          buffer: '', event: '', data: [], lastEventId: '',
+          fileGeneration: '', fileCursor: '',
+        };
+        while (streamIsCurrent(name, stream)) {
+          const {value, done} = await reader.read();
+          const events = parseSSEText(
+            parser, decoder.decode(value || new Uint8Array(), {stream: !done}), done,
+          );
+          for (const event of events) {
+            if (!streamIsCurrent(name, stream)) return;
+            const parsedOffset = /^\d+$/.test(event.id || '') ? Number(event.id) : null;
+            if (event.event === 'open' || event.event === 'reset') {
+              if (/^[0-9a-f]{64}$/.test(event.generation || '')) {
+                stream.fileGeneration = event.generation;
+              }
+              if (/^[0-9a-f]{64}$/.test(event.cursor || '')) {
+                stream.fileCursor = event.cursor;
+              }
+              if (Number.isSafeInteger(parsedOffset)) stream.offset = parsedOffset;
+              const node = status();
+              if (node) node.textContent = event.event === 'open' ? '● live' : '↻ stream reset';
+            } else if (event.event === 'error') {
+              const node = status();
+              if (node) node.textContent = `× ${event.data || 'stream error'}`;
+            } else {
+              if (Number.isSafeInteger(parsedOffset)) {
+                if (parsedOffset <= stream.offset) continue;
+                stream.offset = parsedOffset;
+              }
+              if (/^[0-9a-f]{64}$/.test(event.cursor || '')) {
+                stream.fileCursor = event.cursor;
+              }
+              appendAgentEvent(name, event.data);
+              stream.attempt = 0;
+            }
+          }
+          if (done) break;
+        }
+      } catch(e) {
+        if (!streamIsCurrent(name, stream) || controller.signal.aborted
+            || (e && e.name === 'AbortError')) return;
+        if (e && e.status === 401) {
+          const node = status();
+          if (node) node.textContent = '× authentication required';
+          showAuthRequired('Authentication expired. Enter the token to reconnect.');
+          return;
+        }
+      }
+      if (!streamIsCurrent(name, stream)) return;
+      stream.attempt = Math.min((stream.attempt || 0) + 1, 5);
+      const delayMs = Math.min(1000 * (2 ** (stream.attempt - 1)), 10000);
+      const node = status();
+      if (node) node.textContent = `↻ reconnecting in ${delayMs / 1000}s`;
+      await reconnectDelay(stream, delayMs);
+    }
+  } finally {
+    if (agentStreams[name] === stream) delete agentStreams[name];
+  }
 }
 
 function resetActivityPanel(emptyHint) {
@@ -722,13 +1046,9 @@ function resetActivityPanel(emptyHint) {
 async function attachAgentPanels(roomId) {
   let resp;
   try {
-    resp = await fetch('/api/room_agents?room_id=' + encodeURIComponent(roomId));
+    resp = await apiFetch('/api/room_agents?room_id=' + encodeURIComponent(roomId));
   } catch(e) {
     resetActivityPanel('Не удалось загрузить агентов');
-    return;
-  }
-  if (!resp.ok) {
-    resetActivityPanel('Нет данных об агентах');
     return;
   }
   const {agents, health} = await resp.json();
@@ -787,17 +1107,14 @@ async function attachAgentPanels(roomId) {
       const hLabel = activityHealthLabel(healthMap[name]);
       if (hLabel) { healthSpan.textContent = hLabel; healthSpan.classList.add('warn'); }
       const url = `/agents/${encodeURIComponent(roomId)}/${encodeURIComponent(name)}/events`;
-      const es = new EventSource(url);
-      es.addEventListener('open', () => {
-        const s = document.getElementById(`agent-status-${name}`);
-        if (s) s.textContent = '● live';
-      });
-      es.addEventListener('error', () => {
-        const s = document.getElementById(`agent-status-${name}`);
-        if (s) s.textContent = '× closed';
-      });
-      es.onmessage = (ev) => appendAgentEvent(name, ev.data);
-      agentStreams[name] = es;
+      const stream = {
+        roomId, generation: activityStreamGeneration, offset: 0, attempt: 0,
+        fileGeneration: '',
+        fileCursor: '',
+        controller: null, retryTimer: null, retryResolve: null, cancelled: false,
+      };
+      agentStreams[name] = stream;
+      streamAgentEvents(url, name, stream);
     }
   }
 
@@ -808,6 +1125,7 @@ async function attachAgentPanels(roomId) {
 // Wake-health label for an agent panel (from /api/room_agents `health`).
 function activityHealthLabel(h) {
   if (!h) return '';
+  if (h.unowned_lease) return '⚠ unowned/unknown lease';
   if (h.stale_lease) return '⚠ stale lease';
   if (h.last_wake_failed) return `✗ wake failed (rc ${h.last_wake_rc})`;
   if (h.wake_fail_count > 0) return `⚠ ${h.wake_fail_count} wake fail(s)`;
@@ -958,9 +1276,8 @@ async function fetchMessages(initial) {
   if (!currentRoom) return;
   try {
     const url = `/api/messages_json?room_id=${encodeURIComponent(currentRoom)}&since_id=${lastId}`;
-    const resp = await fetch(url);
+    const resp = await apiFetch(url);
     const data = await resp.json();
-    if (data.error) return;
 
     if (data.room) {
       renderChatMeta(data.room, data.statuses);
@@ -989,13 +1306,15 @@ async function sendMsg() {
   if (!body) return;
   inp.disabled = true; btn.disabled = true;
   try {
-    await fetch('/api/message_post', {
+    await apiFetch('/api/message_post', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({room_id: currentRoom, agent: 'Human', body, kind: 'system', to: 'all'}),
     });
     inp.value = '';
     await fetchMessages(false);
+  } catch(e) {
+    showRequestError('Failed to send message', e);
   } finally {
     inp.disabled = false; btn.disabled = false;
     inp.focus();
@@ -1004,11 +1323,16 @@ async function sendMsg() {
 
 async function closeRoom() {
   if (!currentRoom || !confirm('Close this room?')) return;
-  await fetch('/api/room_close', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({room_id: currentRoom, owner: currentOwner}),
-  });
+  try {
+    await apiFetch('/api/room_close', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({room_id: currentRoom, owner: currentOwner}),
+    });
+  } catch(e) {
+    showRequestError('Failed to close room', e);
+    return;
+  }
   currentRoom = null;
   const chat = document.getElementById('chat-area');
   chat.innerHTML = '';
@@ -1023,17 +1347,17 @@ async function closeRoom() {
 async function deleteRoom() {
   if (!currentRoom) return;
   if (!confirm('Permanently delete this room from disk?\n\nAll messages, agent logs and metadata will be lost. This cannot be undone.')) return;
-  closeAgentStreams();
-  const resp = await fetch('/api/room_delete', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({room_id: currentRoom, owner: currentOwner}),
-  });
-  if (!resp.ok) {
-    const err = await resp.json().catch(() => ({error: 'unknown error'}));
-    alert(`Failed to delete: ${err.error || 'unknown error'}`);
+  try {
+    await apiFetch('/api/room_delete', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({room_id: currentRoom, owner: currentOwner}),
+    });
+  } catch(e) {
+    showRequestError('Failed to delete room', e);
     return;
   }
+  closeAgentStreams();
   currentRoom = null;
   const chat = document.getElementById('chat-area');
   chat.innerHTML = '';
@@ -1060,13 +1384,15 @@ function fmtBulkSummary(label, r) {
 
 async function bulkAction(endpoint, confirmMsg, label) {
   if (!confirm(confirmMsg)) return;
-  closeAgentStreams();
-  const resp = await fetch(endpoint, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
-  const data = await resp.json().catch(() => ({error: 'invalid response'}));
-  if (!resp.ok) {
-    alert(`${label} failed: ${data.error || resp.status}`);
+  let data;
+  try {
+    const resp = await apiFetch(endpoint, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+    data = await resp.json();
+  } catch(e) {
+    showRequestError(`${label} failed`, e);
     return;
   }
+  closeAgentStreams();
   if (currentRoom) {
     currentRoom = null;
     const chat = document.getElementById('chat-area');
@@ -1083,7 +1409,7 @@ async function bulkAction(endpoint, confirmMsg, label) {
 async function bulkCloseAll() {
   await bulkAction(
     '/api/rooms_close_all',
-    'Закрыть ВСЕ открытые комнаты?\n\nЖивые spawned агенты (кроме owner-ов) получат SIGTERM. Owner PIDs не трогаются. Мёртвые PIDs пропускаются.',
+    'Закрыть ВСЕ открытые комнаты?\n\nТекущий Huddle отправит SIGTERM только своим точно известным дочерним процессам. Другие живые экземпляры остановят собственные процессы при следующей проверке. Сохранённые PID и процессы владельцев напрямую не затрагиваются.',
     'Bulk close',
   );
 }
@@ -1099,7 +1425,7 @@ async function bulkDeleteClosed() {
 async function bulkNuke() {
   await bulkAction(
     '/api/rooms_nuke',
-    '🔥 NUKE ALL ROOMS?\n\n1. Kill живых spawned PIDs (кроме owner-ов всех комнат).\n2. Закрыть все open комнаты.\n3. Wipe всех комнат с диска.\n\nOwner PIDs не трогаются. Действие необратимо.',
+    '🔥 УДАЛИТЬ ВСЕ КОМНАТЫ?\n\n1. Закрыть все комнаты.\n2. Отправить SIGTERM только точно известным дочерним процессам текущего Huddle; другие живые экземпляры остановят свои процессы при следующей проверке.\n3. Безвозвратно удалить историю и логи.\n\nСохранённые PID и процессы владельцев напрямую не затрагиваются.',
     'Nuke all',
   );
 }
@@ -1358,5 +1684,7 @@ function initLayout() {
 
 initSettings();
 initLayout();
-loadRooms();
+authenticateDashboard(true)
+  .then(loadRooms)
+  .catch(e => showAuthRequired(e && e.message ? e.message : 'Authentication failed.'));
 setInterval(tick, 3000);
