@@ -3268,6 +3268,48 @@ def test_check_stuck_wakes_pidless_claim_has_clear_notice_and_keeps_lease(
     assert server._check_stuck_wakes() == []
 
 
+def test_check_stuck_wakes_labels_exact_exited_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    monkeypatch.setattr(server, "WAKE_STUCK_SECS", 60)
+    monkeypatch.setattr(server, "STUCK_KILL_ENABLED", True)
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+    monkeypatch.setattr(
+        server.child_processes, "state", lambda room_id, handle: "exited",
+    )
+    monkeypatch.setattr(
+        server.child_processes,
+        "terminate",
+        lambda *args, **kwargs: pytest.fail("exited process was signalled"),
+    )
+
+    room_id = isolated_bus.create_room(
+        "Wake", "Claude", 0, "/tmp/project", "session-1",
+    )
+    isolated_bus.invite_agent(room_id, "Codex")
+    wake_id = "wake-already-exited"
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {"Codex": {
+        "wake_id": wake_id,
+        "wake_claim_id": wake_id,
+        "wake_claimed_at": int(time.time()) - 3600,
+        "last_wake_pid": 424_242,
+        "last_wake_at": int(time.time()) - 3600,
+        "last_wake_msg_id": 1,
+    }}
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+    isolated_bus.set_status(room_id, "Codex", "busy", 300, "session-1")
+
+    assert server._check_stuck_wakes() == [f"Codex@{room_id}"]
+    comments = [m for m in isolated_bus._load_messages(room_id)
+                if m.get("kind") == "comment"]
+    assert len(comments) == 1
+    assert "процесс 424242: завершён" in comments[0]["body"]
+    assert "не принадлежит текущему серверу" not in comments[0]["body"]
+
+
 def test_check_stuck_wakes_kills_live_pid_when_enabled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

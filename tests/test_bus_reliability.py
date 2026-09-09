@@ -605,6 +605,29 @@ def test_close_tail_failure_still_finishes_closed_and_attempts_both_side_effects
     assert attempted == ["child-close", "terminal-marker"]
 
 
+def test_close_retries_transient_final_meta_write(
+    isolated_bus, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    room_id = _create_room(isolated_bus)
+    real_update = isolated_bus._update_meta_locked
+    calls = 0
+
+    def flaky_update(target_room_id: str, update_fn):
+        nonlocal calls
+        calls += 1
+        # The first call claims `closing`; the next two finalization writes fail.
+        if calls in (2, 3):
+            raise OSError("transient meta write failure")
+        return real_update(target_room_id, update_fn)
+
+    monkeypatch.setattr(isolated_bus, "_update_meta_locked", flaky_update)
+
+    isolated_bus.close_room(room_id, "Codex")
+
+    assert calls == 4
+    assert isolated_bus.get_room_info(room_id)["status"] == "closed"
+
+
 def test_delete_cannot_race_close_side_effects(
     isolated_bus, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

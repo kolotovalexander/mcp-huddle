@@ -23,6 +23,24 @@ NOTIFICATION_HOOKS = [
     ROOT / "examples/hooks/claude-check.sh",
     ROOT / "examples/hooks/gemini-check.sh",
 ]
+HOOK_PAIRS = [
+    (
+        ROOT / "src/mcp_huddle/hooks/claude-check.sh",
+        ROOT / "examples/hooks/claude-check.sh",
+    ),
+    (
+        ROOT / "src/mcp_huddle/hooks/gemini-check.sh",
+        ROOT / "examples/hooks/gemini-check.sh",
+    ),
+    (SESSION_HOOKS[0], SESSION_HOOKS[1]),
+]
+
+
+@pytest.mark.parametrize(("packaged", "example"), HOOK_PAIRS)
+def test_packaged_and_example_hooks_are_byte_identical(
+    packaged: Path, example: Path,
+) -> None:
+    assert packaged.read_bytes() == example.read_bytes()
 
 
 @pytest.fixture

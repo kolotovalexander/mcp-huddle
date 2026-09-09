@@ -48,6 +48,7 @@ MAX_STORED_MESSAGE_BYTES = 320 * 1024  # complete serialized JSONL entry cap
 # authority, and check+append happen under the same messages lock.
 ROOM_MESSAGE_RATE_LIMIT = 120
 ROOM_MESSAGE_RATE_WINDOW_SECS = 60
+ROOM_CLOSE_FINALIZE_ATTEMPTS = 3
 
 VALID_KINDS = {"request", "comment", "ack", "busy", "result", "final", "system", "close"}
 VALID_ROOM_STATUSES = {
@@ -469,7 +470,20 @@ def _close_room_once(
     except BaseException as exc:  # preserve the lifecycle invariant on shutdown
         close_errors.append(exc)
     try:
-        _update_meta_locked(room_id, lambda meta: {**meta, "status": "closed"})
+        finalize_error: BaseException | None = None
+        for _attempt in range(ROOM_CLOSE_FINALIZE_ATTEMPTS):
+            try:
+                _update_meta_locked(
+                    room_id, lambda meta: {**meta, "status": "closed"},
+                )
+                finalize_error = None
+                break
+            except Exception as exc:
+                # Retry a transient atomic-write/read failure, but keep the
+                # room fail-closed if storage remains unavailable.
+                finalize_error = exc
+        if finalize_error is not None:
+            raise finalize_error
     except BaseException as exc:  # do not mask an earlier teardown/marker error
         close_errors.append(exc)
     if close_errors:

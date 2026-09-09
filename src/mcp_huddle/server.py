@@ -2934,10 +2934,10 @@ def _check_dead_wakes() -> list[str]:
     registry. ``unknown`` may belong to another live stdio server instance, so
     it remains occupied and is never cleared, drained, or signalled.
 
-    Runs before _check_stuck_wakes in the sweep so a dead pid is announced
-    here, fast, instead of by the slow stuck-wake path; _check_stuck_wakes
-    only ever considers leases with a LIVE pid (_wake_in_progress requires
-    it), so the two checks never double-announce the same wake.
+    Runs before _check_stuck_wakes in the sweep so an exact exited child is
+    announced here, fast, instead of by the slow stuck-wake path. That path
+    can also observe active claims without a live pid; generation-scoped
+    markers keep the two checks from double-announcing the same wake.
 
     Returns the list of (agent, room) leases this sweep released — a lease
     is always released once its pid is confirmed dead, even when the agent
@@ -3123,10 +3123,11 @@ def _check_stuck_wakes() -> list[str]:
                             "зарезервированным) — возможно завис; "
                             "не ждите ответа.")
                 else:
-                    state_label = (
-                        "жив" if alive
-                        else "не принадлежит текущему серверу"
-                    )
+                    state_label = {
+                        "alive": "жив",
+                        "exited": "завершён",
+                        "unknown": "не принадлежит текущему серверу",
+                    }[process_state]
                     body = (f"⏳ {agent_name} не отвечает уже ~{mins} мин "
                             f"(процесс {pid}: {state_label}) — "
                             f"возможно завис; не ждите ответа.")
