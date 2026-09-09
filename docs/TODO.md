@@ -49,5 +49,6 @@ Open items, roughly by priority.
 ## Nice-to-have
 - [ ] Translate the dashboard env-var/spawn-rules strings into the 8 non-en/ru
   locales (currently fall back to English).
-- [ ] Make `test_spawn_agent_verify_alive_rejects_fast_exit` deterministic
-  (timing-sensitive; can flake under heavy CI load).
+- [x] Make `test_spawn_agent_verify_alive_rejects_confirmed_exit` deterministic
+  (the exit state and health-check boundary are synchronized with fakes; real
+  spawn/log/reaper coverage remains in separate tests).

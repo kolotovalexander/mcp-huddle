@@ -50,17 +50,19 @@ Phase 1 changes (2026-04-30):
     differently).
 """
 from __future__ import annotations
+import _thread
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import NotRequired, TypedDict
+from typing import BinaryIO, NamedTuple, NotRequired, TypedDict
 from urllib import error as urlerror
 from urllib import request as urlrequest
 from urllib.parse import urlparse
@@ -99,6 +101,13 @@ class SpawnSpec(TypedDict):
 
 class AgentSpawnError(RuntimeError):
     """Raised when a process starts but fails the optional health check."""
+
+
+class _RetainedChild(NamedTuple):
+    """Fallback lifecycle outcome used by post-spawn health checks."""
+
+    handle: str
+    registered: bool
 
 
 _DIRECT_OPUS_REVIEW_PROFILE = "claude-opus-direct-review"
@@ -150,8 +159,35 @@ _SAFE_CHILD_ENV = frozenset({
 })
 _ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _BACKGROUND_LOCK = threading.Lock()
-_REAPER_THREADS: set[threading.Thread] = set()
+_REAPER_THREADS: set[object] = set()
 _SPAWN_TIMERS: set[threading.Timer] = set()
+
+
+class _EmergencyReaper:
+    """Join-compatible low-level fallback when ``Thread.start`` is unavailable."""
+
+    def __init__(self, target, name: str):
+        self._target = target
+        self.name = name
+        self.ident: int | None = None
+        self._done = threading.Event()
+
+    def _run(self) -> None:
+        try:
+            self._target()
+        finally:
+            self._done.set()
+            with _BACKGROUND_LOCK:
+                _REAPER_THREADS.discard(self)
+
+    def start(self) -> None:
+        self.ident = _thread.start_new_thread(self._run, ())
+
+    def join(self, timeout: float | None = None) -> None:
+        self._done.wait(timeout)
+
+    def is_alive(self) -> bool:
+        return not self._done.is_set()
 
 
 def _reset_background_after_fork() -> None:
@@ -550,7 +586,7 @@ def _resolve_spawn_args(
     brief: str,
     log_dir: Path,
 ) -> tuple[list[str], str | None]:
-    name = spec["name"]
+    name = bus._safe_path_component(spec["name"], "agent_name")
     last_msg_path: str | None = None
     argv = []
     for arg in spec["cmd"]:
@@ -561,6 +597,67 @@ def _resolve_spawn_args(
             arg = arg.replace("{last_message}", last_msg_path)
         argv.append(arg)
     return argv, last_msg_path
+
+
+def _open_standalone_log(path: Path, *, create_parent: bool) -> BinaryIO:
+    """Open an explicitly supplied non-room log without following symlinks.
+
+    Room-owned paths use :func:`bus._safe_open_fd`. Standalone callers retain
+    the existing arbitrary-directory API, but the final directory and file
+    are opened through stable dirfds with ``O_NOFOLLOW`` and the target must
+    be a regular file. The path itself is never derived from room metadata.
+    """
+    path = Path(path)
+    if not path.name or path.name in {".", ".."}:
+        raise ValueError("Invalid standalone log path")
+    if create_parent:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    dir_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    parent_fd = os.open(path.parent, dir_flags)
+    fd: int | None = None
+    try:
+        safety_flags = getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        # O_NONBLOCK prevents an attacker-prepared FIFO from hanging the
+        # server before fstat can reject the non-regular target. It has no
+        # behavioral effect on the regular files accepted below.
+        flags = os.O_WRONLY | os.O_APPEND | getattr(os, "O_NONBLOCK", 0)
+        try:
+            fd = os.open(
+                path.name, flags | os.O_CREAT | os.O_EXCL | safety_flags,
+                0o600, dir_fd=parent_fd,
+            )
+        except FileExistsError:
+            fd = os.open(path.name, flags | safety_flags, dir_fd=parent_fd)
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+            raise ValueError("Standalone agent log must be a regular file")
+        return os.fdopen(fd, "ab", buffering=0)
+    except Exception:
+        if fd is not None:
+            os.close(fd)
+        raise
+    finally:
+        os.close(parent_fd)
+
+
+def _close_parent_log_safely(log_file: BinaryIO) -> None:
+    """Close the parent's duplicate without abandoning a spawned child.
+
+    Once ``Popen`` succeeds, a close error must not skip child registration:
+    callers would interpret that exception as a failed spawn and roll back its
+    persisted lease while the child is still alive. The file object remains
+    the sole descriptor owner: manually closing a number returned by
+    ``fileno()`` could let its later finalizer close an unrelated reused fd.
+    """
+    try:
+        log_file.close()
+    except BaseException:
+        return
 
 
 def _direct_opus_review_endpoint_config(raw_url: str | None) -> str:
@@ -731,18 +828,21 @@ def _reap_in_background(
 
     def wait_for_exit() -> None:
         returncode = None
+        completed = False
         try:
             returncode = child_processes.wait(owner_room_id, handle)
+            completed = returncode is not None
         except Exception:
-            pass
-        finally:
+            returncode = proc.poll()
+            completed = returncode is not None
+        if completed:
             if cleanup_dir is not None:
                 shutil.rmtree(cleanup_dir, ignore_errors=True)
-        if on_exit is not None:
-            try:
-                on_exit(returncode)
-            except Exception:
-                pass
+            if on_exit is not None:
+                try:
+                    on_exit(returncode)
+                except Exception:
+                    pass
         with _BACKGROUND_LOCK:
             _REAPER_THREADS.discard(threading.current_thread())
 
@@ -759,8 +859,209 @@ def _reap_in_background(
         # Publish and start atomically with respect to the test drain. Without
         # this ordering, teardown can snapshot the Thread after add() but
         # before start(), where join() raises RuntimeError.
-        thread.start()
+        try:
+            thread.start()
+        except BaseException:
+            _REAPER_THREADS.discard(thread)
+            raise
     return handle
+
+
+def _terminate_unregistered_child(
+    proc: subprocess.Popen,
+    owner_room_id: str,
+    process_handle: str,
+    timeout: float = 2.0,
+) -> bool:
+    """Stop and reap the exact child when ownership setup cannot complete.
+
+    This path uses only the just-created ``Popen`` object. It never consults
+    or signals a persisted PID. A stubborn child is escalated from terminate
+    to kill. It returns ``False`` if either signal/wait path is unavailable so
+    the caller can retain exact ownership plus a fallback reaper. An exact
+    registry record is discarded only after ``poll`` confirms exit.
+    """
+    try:
+        running = proc.poll() is None
+    except Exception:
+        running = True
+    if running:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            still_running = proc.poll() is None
+        except Exception:
+            still_running = True
+        if still_running:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            proc.wait(timeout=timeout)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    try:
+        exited = proc.poll() is not None
+    except Exception:
+        exited = False
+    if exited:
+        child_processes.discard_exited(proc, owner_room_id, process_handle)
+    return exited
+
+
+def _retain_failed_setup_child(
+    proc: subprocess.Popen,
+    name: str,
+    owner_room_id: str,
+    process_handle: str,
+    cleanup_dir: str | None,
+    on_exit=None,
+) -> _RetainedChild:
+    """Retain exact authority and lifecycle when normal reaper setup fails.
+
+    The outcome is a successful active-spawn contract: the fallback retains
+    the exact Popen, will clean the temporary cwd, and will invoke the original
+    callback once. ``registered=False`` tells health checks to inspect that
+    exact Popen rather than treating the intentionally unowned handle as dead.
+    """
+    handle = process_handle
+    registered = False
+    try:
+        registered = child_processes.owns_exact(proc, owner_room_id, handle)
+    except Exception:
+        registered = False
+    if not registered:
+        try:
+            child_processes.register(proc, owner_room_id, handle)
+        except Exception:
+            pass
+        try:
+            registered = child_processes.owns_exact(proc, owner_room_id, handle)
+        except Exception:
+            registered = False
+    if not registered:
+        # A caller-supplied handle may already belong to another exact child.
+        # Prefer a private cleanup handle, but registry failure must not turn a
+        # still-live exact Popen into a rollback-able spawn error.
+        try:
+            private_handle = child_processes.new_handle()
+        except Exception:
+            private_handle = None
+        if private_handle is not None:
+            try:
+                child_processes.register(proc, owner_room_id, private_handle)
+            except Exception:
+                pass
+            try:
+                registered = child_processes.owns_exact(
+                    proc, owner_room_id, private_handle,
+                )
+            except Exception:
+                registered = False
+            if registered:
+                handle = private_handle
+
+    lifecycle_lock = threading.Lock()
+    lifecycle_finished = False
+
+    def wait_for_failed_setup() -> None:
+        nonlocal lifecycle_finished
+        returncode = None
+        completed = False
+        if registered:
+            try:
+                returncode = child_processes.wait(owner_room_id, handle)
+                completed = returncode is not None
+            except Exception:
+                try:
+                    returncode = proc.poll()
+                except Exception:
+                    returncode = None
+                completed = returncode is not None
+        else:
+            # The registry itself is unavailable. Retain and reap the exact
+            # Popen directly; no persisted PID or foreign process is touched.
+            while returncode is None:
+                try:
+                    returncode = proc.poll()
+                except Exception:
+                    returncode = None
+                if returncode is None:
+                    time.sleep(0.05)
+            completed = True
+        if completed:
+            with lifecycle_lock:
+                if lifecycle_finished:
+                    return
+                lifecycle_finished = True
+            if cleanup_dir is not None:
+                shutil.rmtree(cleanup_dir, ignore_errors=True)
+            if on_exit is not None:
+                try:
+                    on_exit(returncode)
+                except Exception:
+                    pass
+
+    def wait_for_failed_setup_tracked() -> None:
+        try:
+            wait_for_failed_setup()
+        finally:
+            with _BACKGROUND_LOCK:
+                _REAPER_THREADS.discard(threading.current_thread())
+
+    try:
+        thread = threading.Thread(
+            target=wait_for_failed_setup_tracked,
+            name=f"mcp-huddle-reap-failed-setup-{name}-{proc.pid}",
+            daemon=True,
+        )
+    except BaseException:
+        thread = None
+    if thread is not None:
+        with _BACKGROUND_LOCK:
+            _REAPER_THREADS.add(thread)
+            try:
+                thread.start()
+            except BaseException:
+                _REAPER_THREADS.discard(thread)
+            else:
+                return _RetainedChild(handle, registered)
+
+    # ``threading.Thread`` can fail under process thread exhaustion. The
+    # low-level primitive provides an independent reserve while retaining the
+    # same join/is_alive bookkeeping used by deterministic test teardown.
+    try:
+        emergency = _EmergencyReaper(
+            wait_for_failed_setup,
+            f"mcp-huddle-emergency-reap-{name}-{proc.pid}",
+        )
+    except BaseException:
+        emergency = None
+    if emergency is not None:
+        with _BACKGROUND_LOCK:
+            _REAPER_THREADS.add(emergency)
+            try:
+                emergency.start()
+            except BaseException:
+                _REAPER_THREADS.discard(emergency)
+            else:
+                return _RetainedChild(handle, registered)
+
+    # No asynchronous execution facility remains. Waiting synchronously is
+    # deliberately fail-closed: it may delay the request, but the exact child
+    # cannot coexist with a rollback claim. Normal Popen polling either
+    # confirms exit (running cleanup/callback) or keeps the persisted lease.
+    wait_for_failed_setup()
+    return _RetainedChild(handle, registered)
 
 
 def _registry_file_path() -> Path:
@@ -1042,12 +1343,14 @@ def spawn_agent(
     Side effects: creates log_dir, opens log file, redirects stdout+stderr to it.
     """
     _validate_protected_profile_names([spec])
-    name = spec["name"]
+    name = bus._safe_path_component(spec["name"], "agent_name")
+    # Allocate the ownership generation before any resource or Popen: even
+    # handle generation failure must leave no child or profile temp cwd.
+    process_handle = process_handle or child_processes.new_handle()
     if owner_room_id:
         log_path, _ = bus._agent_paths(owner_room_id, name, create=True)
         log_dir = log_path.parent
     else:
-        log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"{name.lower()}.events.jsonl"
     cleanup_dir: str | None = None
     if name == "Codex":
@@ -1077,13 +1380,18 @@ def spawn_agent(
     else:
         argv, last_msg_path = _resolve_spawn_args(spec, brief, log_dir)
         env = _spawn_environment(spec, argv)
-    if owner_room_id:
-        log_fd = bus._safe_open_fd(
-            log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600,
-        )
-        log_file = os.fdopen(log_fd, "ab", buffering=0)
-    else:
-        log_file = open(log_path, "ab", buffering=0)
+    try:
+        if owner_room_id:
+            log_fd = bus._safe_open_fd(
+                log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600,
+            )
+            log_file = os.fdopen(log_fd, "ab", buffering=0)
+        else:
+            log_file = _open_standalone_log(log_path, create_parent=True)
+    except BaseException:
+        if cleanup_dir is not None:
+            shutil.rmtree(cleanup_dir, ignore_errors=True)
+        raise
     try:
         proc = subprocess.Popen(
             argv,
@@ -1093,21 +1401,51 @@ def spawn_agent(
             stderr=subprocess.STDOUT,
             env=env,
         )
-    except Exception:
+    except BaseException:
+        # Preserve the original Popen failure even if closing its unused log
+        # descriptor also fails.
+        _close_parent_log_safely(log_file)
         if cleanup_dir is not None:
             shutil.rmtree(cleanup_dir, ignore_errors=True)
         raise
-    finally:
-        # Popen dups the fd into the child; we can close ours so the parent
-        # process doesn't keep the log file held open after the child exits.
-        log_file.close()
-    handle = _reap_in_background(
-        proc, name, on_exit=on_exit, cleanup_dir=cleanup_dir,
-        owner_room_id=owner_room_id, process_handle=process_handle,
-    )
+    # Popen duplicated the fd into the child. A parent-close failure is not a
+    # spawn failure and must not bypass the ownership/reaper setup below.
+    _close_parent_log_safely(log_file)
+    direct_fallback = False
+    try:
+        handle = _reap_in_background(
+            proc, name, on_exit=on_exit, cleanup_dir=cleanup_dir,
+            owner_room_id=owner_room_id, process_handle=process_handle,
+        )
+    except BaseException:
+        stopped = _terminate_unregistered_child(
+            proc, owner_room_id, process_handle,
+        )
+        if stopped:
+            if cleanup_dir is not None:
+                shutil.rmtree(cleanup_dir, ignore_errors=True)
+            raise
+        retained = _retain_failed_setup_child(
+            proc, name, owner_room_id, process_handle, cleanup_dir,
+            on_exit=on_exit,
+        )
+        # A living exact child with a published fallback is a successful
+        # spawn. Raising here would make the server roll back its persisted
+        # claim while this child is still running, permitting a duplicate.
+        handle = retained.handle
+        direct_fallback = not retained.registered
     if verify_alive_sec > 0:
         time.sleep(verify_alive_sec)
-        if child_processes.state(owner_room_id, handle) != "alive":
+        if direct_fallback:
+            try:
+                alive = proc.poll() is None
+            except Exception:
+                # Loss of local polling is not proof that an exact retained
+                # child exited. Keep the claim fail-closed.
+                alive = True
+        else:
+            alive = child_processes.state(owner_room_id, handle) == "alive"
+        if not alive:
             returncode = proc.returncode
             exc = AgentSpawnError(
                 f"{name} exited within {verify_alive_sec:.3g}s with status {returncode}"
@@ -1761,6 +2099,9 @@ def codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str,
     if last_msg_path:
         argv += ["-o", last_msg_path]                    # short form of --output-last-message
     argv.append(prompt)
+    # Allocate exact ownership before Popen so failure cannot leave an
+    # unregistered child behind.
+    process_handle = process_handle or child_processes.new_handle()
 
     if owner_room_id:
         expected_log, expected_last = bus._agent_paths(
@@ -1782,7 +2123,7 @@ def codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str,
         )
         log_file = os.fdopen(log_fd, "ab", buffering=0)
     else:
-        log_file = open(log_path, "ab", buffering=0)
+        log_file = _open_standalone_log(Path(log_path), create_parent=False)
     try:
         proc = subprocess.Popen(
             argv,
@@ -1792,10 +2133,25 @@ def codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str,
             stderr=subprocess.STDOUT,
             env=build_sanitized_environment(),
         )
-    finally:
-        log_file.close()
-    _reap_in_background(
-        proc, "Codex", on_exit=on_exit,
-        owner_room_id=owner_room_id, process_handle=process_handle,
-    )
+    except BaseException:
+        _close_parent_log_safely(log_file)
+        raise
+    _close_parent_log_safely(log_file)
+    try:
+        _reap_in_background(
+            proc, "Codex", on_exit=on_exit,
+            owner_room_id=owner_room_id, process_handle=process_handle,
+        )
+    except BaseException:
+        stopped = _terminate_unregistered_child(
+            proc, owner_room_id, process_handle,
+        )
+        if stopped:
+            raise
+        _retain_failed_setup_child(
+            proc, "Codex", owner_room_id, process_handle, None,
+            on_exit=on_exit,
+        )
+        # See spawn_agent: fallback ownership is active success, not a reason
+        # for the caller to roll back the wake claim.
     return proc.pid

@@ -121,7 +121,13 @@ def register(
 
 
 def state(room_id: str, handle: str | None) -> ProcessState:
-    """Return exact current-instance state; absent ownership is ``unknown``."""
+    """Return exact current-instance state; absent ownership is ``unknown``.
+
+    Only a bounded tail of exited handles is retained. Once an old exit is
+    evicted it deliberately degrades to ``unknown``, never to ``exited``:
+    callers must keep a persisted lease fail-closed rather than infer that an
+    unowned (or foreign-instance) process is dead.
+    """
     _ensure_owner_process()
     if not handle:
         return "unknown"
@@ -207,8 +213,39 @@ def wait(room_id: str, handle: str, poll_interval: float = 0.05) -> int | None:
         time.sleep(poll_interval)
 
 
+def discard_exited(proc: subprocess.Popen, room_id: str, handle: str) -> bool:
+    """Forget one exact, already-exited record after spawn setup rolled back.
+
+    This grants no signalling authority: the caller must first terminate and
+    wait on the same ``Popen`` object. Identity and exit are rechecked under
+    the registry lock so a reused handle or live child cannot be discarded.
+    """
+    _ensure_owner_process()
+    key = _key(room_id, handle)
+    with _LOCK:
+        record = _RECORDS.get(key)
+        if record is None or record.proc is not proc or proc.poll() is None:
+            return False
+        del _RECORDS[key]
+        _remember_exited(key)
+        return True
+
+
+def owns_exact(proc: subprocess.Popen, room_id: str, handle: str) -> bool:
+    """Return whether this process owns this exact Popen/room/handle tuple."""
+    _ensure_owner_process()
+    with _LOCK:
+        record = _RECORDS.get(_key(room_id, handle))
+        return record is not None and record.proc is proc
+
+
 def _reset_for_tests() -> None:
-    """Forget ownership without signalling. Tests must own their fake children."""
+    """Forget process-local state without signalling any child.
+
+    Test fixtures must first drain spawn-owned reapers and explicitly reap any
+    directly registered real children. Resetting is isolation, not cleanup,
+    and therefore can never turn stale test metadata into signalling authority.
+    """
     _ensure_owner_process()
     with _LOCK:
         _RECORDS.clear()

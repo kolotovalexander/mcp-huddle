@@ -47,6 +47,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Concurrent post admission, close/delete/retention transitions, late child
   registration and bulk-close lifecycle races. Terminal rooms now stop owned
   children before their data is removed.
+- Zombie cleanup now revalidates owner PID, session, lifecycle and activity in
+  the atomic close claim, so a concurrent room reclaim or fresh message cannot
+  be closed from a stale watchdog snapshot.
 - Duplicate agent launches from simultaneous server instances, from requests
   arriving during initial auto-spawn, and after a stuck foreign wake warning.
 - HTTP access is default-deny outside the dashboard assets and token exchange;
@@ -56,8 +59,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transient EOF/network failures without replaying already displayed events.
 - API and MiMo runners publish only validated non-empty terminal results; error
   messages no longer echo provider payloads or secret values.
-- Bundled notification hooks no longer interpolate filenames as Python source
-  and do not delete a concurrently replaced notification.
+- Spawn setup failures stop and reap the exact new child or retain an exact
+  fallback reaper; standalone logs reject traversal, symlinks and hardlinks.
+- Bundled notification hooks recover abandoned bounded claims without deleting
+  a live or concurrently replaced notification. The SessionEnd hook now
+  consumes the caller's session id, supports authenticated loopback HTTP, and
+  no longer depends on a shared predictable `/tmp` file or a non-exported MCP
+  tool.
 - `mcp-huddle --version` reports the checked-out source version in editable
   development trees instead of stale installed-package metadata.
 

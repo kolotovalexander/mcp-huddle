@@ -1123,6 +1123,64 @@ def test_zombie_reaps_open_room_after_grace(isolated_bus) -> None:
     assert room_id in closed
 
 
+def test_zombie_probe_cannot_close_concurrently_reclaimed_room(
+    isolated_bus, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old_pid = 999_999_999
+    room_id = isolated_bus.create_room(
+        "Reclaimed during probe", "Codex", old_pid, "/tmp", "old-session"
+    )
+    old = int(time.time()) - isolated_bus.ZOMBIE_GRACE_SECS - 10
+    isolated_bus._update_meta_locked(
+        room_id, lambda meta: {**meta, "last_activity": old}
+    )
+
+    def probe(pid: int, signal: int) -> None:
+        assert (pid, signal) == (old_pid, 0)
+        isolated_bus.reclaim_room(room_id, "Codex", 222, "new-session")
+        raise ProcessLookupError
+
+    monkeypatch.setattr(isolated_bus.os, "kill", probe)
+
+    assert isolated_bus.check_zombie_rooms() == []
+    meta = isolated_bus._read_meta(room_id)
+    assert meta["status"] == "open"
+    assert meta["owner_pid"] == 222
+    assert meta["session_id"] == "new-session"
+
+
+def test_zombie_probe_cannot_close_room_with_concurrent_activity(
+    isolated_bus, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old_pid = 999_999_999
+    room_id = isolated_bus.create_room(
+        "Active during probe", "Codex", old_pid, "/tmp", "session"
+    )
+    old = int(time.time()) - isolated_bus.ZOMBIE_GRACE_SECS - 10
+    isolated_bus._update_meta_locked(
+        room_id,
+        lambda meta: {
+            **meta,
+            "last_activity": old,
+            "last_activity_at": old,
+        },
+    )
+
+    def probe(pid: int, signal: int) -> None:
+        assert (pid, signal) == (old_pid, 0)
+        isolated_bus.post_message(
+            room_id, "Codex", "owner is still active", "comment"
+        )
+        raise ProcessLookupError
+
+    monkeypatch.setattr(isolated_bus.os, "kill", probe)
+
+    assert isolated_bus.check_zombie_rooms() == []
+    meta = isolated_bus._read_meta(room_id)
+    assert meta["status"] == "open"
+    assert meta["last_activity"] > old
+
+
 def test_reclaim_room_restamps_owner_pid(isolated_bus) -> None:
     room_id = isolated_bus.create_room("Resumed", "Codex", 111, "/tmp", "old")
 
@@ -1138,6 +1196,40 @@ def test_reclaim_room_rejects_non_owner(isolated_bus) -> None:
 
     with pytest.raises(ValueError):
         isolated_bus.reclaim_room(room_id, "Mallory", 222)
+
+
+def test_close_session_revalidates_against_concurrent_reclaim(
+    isolated_bus, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    room_id = isolated_bus.create_room(
+        "Reclaimed before session close", "Codex", 111, "/tmp", "old-session",
+    )
+    real_list_rooms = isolated_bus.list_rooms
+
+    def stale_snapshot_then_reclaim():
+        snapshot = real_list_rooms()
+        isolated_bus.reclaim_room(room_id, "Codex", 222, "new-session")
+        return snapshot
+
+    monkeypatch.setattr(isolated_bus, "list_rooms", stale_snapshot_then_reclaim)
+
+    assert isolated_bus.close_session_rooms("old-session") == []
+    meta = isolated_bus._read_meta(room_id)
+    assert meta["status"] == "open"
+    assert meta["owner_pid"] == 222
+    assert meta["session_id"] == "new-session"
+
+
+def test_close_session_atomically_closes_matching_idle_room(isolated_bus) -> None:
+    room_id = isolated_bus.create_room(
+        "Idle at session end", "Codex", 0, "/tmp", "ending-session",
+    )
+    isolated_bus._update_meta_locked(
+        room_id, lambda meta: {**meta, "status": "idle"},
+    )
+
+    assert isolated_bus.close_session_rooms("ending-session") == [room_id]
+    assert isolated_bus._read_meta(room_id)["status"] == "closed"
 
 
 def test_advance_round_stamps_and_filters(isolated_bus) -> None:

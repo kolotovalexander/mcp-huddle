@@ -53,6 +53,16 @@ def _cross_process_wake_worker(
         results.put(("error", repr(exc)))
 
 
+def _standalone_fifo_open_probe(path: str, results) -> None:
+    """Run the FIFO open in a killable process so a regression cannot hang pytest."""
+    try:
+        spawn._open_standalone_log(Path(path), create_parent=False)
+    except BaseException as exc:
+        results.put(type(exc).__name__)
+    else:
+        results.put("opened")
+
+
 @pytest.fixture(autouse=True)
 def drain_spawn_background_before_fixture_reload(monkeypatch):
     """Keep reapers/timers on the test's HUDDLE_HOME until they finish."""
@@ -830,15 +840,30 @@ def test_binary_resolution_uses_absolute_fallback(
     assert resolved == str(fake_codex)
 
 
-def test_spawn_agent_verify_alive_rejects_fast_exit(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+def test_spawn_agent_verify_alive_rejects_confirmed_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Optional health check logs and rejects processes that die immediately."""
+    """Optional health check deterministically rejects a confirmed exit."""
     spec: spawn.SpawnSpec = {
         "name": "FastExit",
         "cmd": ["/bin/sh", "-c", "exit 42"],
         "enabled": True,
     }
+    closed_log: dict[str, object] = {}
+
+    class FakeProc:
+        pid = 42_042
+        returncode = 42
+
+    def fake_popen(argv, cwd, stdin, stdout, stderr, env):
+        closed_log["file"] = stdout
+        return FakeProc()
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(spawn, "_reap_in_background", lambda *a, **kw: "fast-exit")
+    monkeypatch.setattr(spawn.child_processes, "state", lambda *a, **kw: "exited")
+    monkeypatch.setattr(spawn.time, "sleep", lambda _seconds: None)
 
     with pytest.raises(spawn.AgentSpawnError):
         spawn.spawn_agent(
@@ -849,11 +874,376 @@ def test_spawn_agent_verify_alive_rejects_fast_exit(
             verify_alive_sec=0.05,
         )
 
+    assert closed_log["file"].closed
     err = capsys.readouterr().err
     assert "failed to spawn FastExit" in err
     assert "AgentSpawnError" in err
     assert "exited within" not in err
     assert "status 42" not in err
+
+
+def test_standalone_spawn_rejects_unsafe_agent_name_before_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec: spawn.SpawnSpec = {
+        "name": "../escape",
+        "cmd": ["echo", "{brief}"],
+        "enabled": True,
+    }
+    monkeypatch.setattr(
+        spawn.subprocess, "Popen", lambda *a, **kw: pytest.fail("must not spawn"),
+    )
+
+    with pytest.raises(ValueError, match="agent_name"):
+        spawn.spawn_agent(spec, "brief", str(tmp_path), tmp_path / "logs")
+
+    assert not (tmp_path / "escape.events.jsonl").exists()
+
+
+def test_standalone_spawn_refuses_symlink_log_and_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec: spawn.SpawnSpec = {
+        "name": "Safe",
+        "cmd": ["echo", "{brief}"],
+        "enabled": True,
+    }
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+    target_file = tmp_path / "outside.txt"
+    target_file.write_text("sentinel")
+    (target_dir / "safe.events.jsonl").symlink_to(target_file)
+    monkeypatch.setattr(
+        spawn.subprocess, "Popen", lambda *a, **kw: pytest.fail("must not spawn"),
+    )
+
+    with pytest.raises(OSError):
+        spawn.spawn_agent(spec, "brief", str(tmp_path), target_dir)
+    assert target_file.read_text() == "sentinel"
+
+    link_dir = tmp_path / "logs-link"
+    link_dir.symlink_to(target_dir, target_is_directory=True)
+    with pytest.raises(OSError):
+        spawn.spawn_agent(spec, "brief", str(tmp_path), link_dir)
+    assert target_file.read_text() == "sentinel"
+
+    hardlink_dir = tmp_path / "hardlink-logs"
+    hardlink_dir.mkdir()
+    os.link(target_file, hardlink_dir / "safe.events.jsonl")
+    with pytest.raises(ValueError, match="regular file"):
+        spawn.spawn_agent(spec, "brief", str(tmp_path), hardlink_dir)
+    assert target_file.read_text() == "sentinel"
+
+
+def test_standalone_log_fifo_is_rejected_without_blocking(tmp_path: Path) -> None:
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("requires multiprocessing fork")
+    fifo = tmp_path / "agent.events.jsonl"
+    os.mkfifo(fifo)
+    context = multiprocessing.get_context("fork")
+    results = context.Queue()
+    worker = context.Process(
+        target=_standalone_fifo_open_probe, args=(str(fifo), results),
+    )
+    worker.start()
+    worker.join(timeout=2)
+    if worker.is_alive():
+        worker.terminate()
+        worker.join(timeout=2)
+        pytest.fail("standalone FIFO open blocked before target validation")
+
+    assert worker.exitcode == 0
+    assert results.get(timeout=1) in {"OSError", "ValueError"}
+
+
+def test_registration_failure_reaps_exact_child_closes_log_and_temp_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child cannot escape if exact ownership registration fails."""
+    profile = spawn._claude_opus_review_spec()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv(
+        "MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER", "workspace-header",
+    )
+    monkeypatch.setenv(
+        "MCP_HUDDLE_DIRECT_REVIEW_MCP_URL", "http://127.0.0.1:45111/mcp",
+    )
+    project = tmp_path / "project"
+    project.mkdir()
+    captured: dict[str, object] = {}
+    real_popen = subprocess.Popen
+    popen_type = subprocess.Popen
+
+    def sleeping_popen(argv, cwd, stdin, stdout, stderr, env):
+        captured["log"] = stdout
+        captured["cwd"] = cwd
+        proc = real_popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            cwd=cwd, stdin=stdin, stdout=stdout, stderr=stderr, env=env,
+        )
+        captured["proc"] = proc
+        return proc
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", sleeping_popen)
+    monkeypatch.setattr(
+        child_processes, "register",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("register failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="register failed"):
+        spawn.spawn_agent(profile, "review", str(project), tmp_path / "logs")
+
+    proc = captured["proc"]
+    assert isinstance(proc, popen_type)
+    assert proc.poll() is not None
+    assert captured["log"].closed
+    assert not Path(captured["cwd"]).exists()
+    assert child_processes.owned_room_ids() == set()
+
+
+def test_fallback_reaper_is_success_and_runs_original_lifecycle_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retained live child must keep its lease instead of raising to server."""
+    profile = spawn._claude_opus_review_spec()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv(
+        "MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER", "workspace-header",
+    )
+    monkeypatch.setenv(
+        "MCP_HUDDLE_DIRECT_REVIEW_MCP_URL", "http://127.0.0.1:45111/mcp",
+    )
+    project = tmp_path / "project"
+    project.mkdir()
+    captured: dict[str, object] = {}
+    callbacks: list[int | None] = []
+    removals: list[str] = []
+    real_rmtree = shutil.rmtree
+
+    class LiveProc:
+        pid = 55_001
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+    proc = LiveProc()
+
+    class UnstartableThread:
+        def __init__(self, *, target, name, daemon):
+            self.name = name
+
+        def start(self):
+            raise RuntimeError("fallback Thread.start failed")
+
+    def fake_popen(argv, cwd, stdin, stdout, stderr, env):
+        captured["cwd"] = cwd
+        captured["log"] = stdout
+        return proc
+
+    def tracked_rmtree(path, ignore_errors=False):
+        removals.append(str(path))
+        return real_rmtree(path, ignore_errors=ignore_errors)
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(spawn.threading, "Thread", UnstartableThread)
+    monkeypatch.setattr(
+        spawn, "_reap_in_background",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("reaper setup failed")),
+    )
+    monkeypatch.setattr(spawn, "_terminate_unregistered_child", lambda *a, **kw: False)
+    monkeypatch.setattr(spawn.shutil, "rmtree", tracked_rmtree)
+
+    pid, _, _ = spawn.spawn_agent(
+        profile, "review", str(project), tmp_path / "logs",
+        on_exit=callbacks.append, process_handle="wake-fallback",
+    )
+
+    cleanup_dir = str(captured["cwd"])
+    assert pid == proc.pid
+    assert Path(cleanup_dir).is_dir()
+    assert captured["log"].closed
+    assert child_processes.owns_exact(proc, "", "wake-fallback") is True
+    assert callbacks == []
+
+    proc.returncode = 0
+    spawn._drain_background_for_tests(timeout=1)
+
+    assert callbacks == [0]
+    assert removals == [cleanup_dir]
+    assert not Path(cleanup_dir).exists()
+    assert child_processes.state("", "wake-fallback") == "exited"
+
+
+def test_registry_failure_uses_direct_popen_lifecycle_without_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = spawn._claude_opus_review_spec()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv(
+        "MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER", "workspace-header",
+    )
+    monkeypatch.setenv(
+        "MCP_HUDDLE_DIRECT_REVIEW_MCP_URL", "http://127.0.0.1:45111/mcp",
+    )
+    project = tmp_path / "project"
+    project.mkdir()
+    callbacks: list[int | None] = []
+    captured: dict[str, object] = {}
+    register_calls: list[str] = []
+    removals: list[str] = []
+    real_rmtree = shutil.rmtree
+
+    class LiveProc:
+        pid = 55_002
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+    proc = LiveProc()
+
+    def fake_popen(argv, cwd, stdin, stdout, stderr, env):
+        captured["cwd"] = cwd
+        return proc
+
+    def failed_register(_proc, _room_id, handle=None):
+        register_calls.append(str(handle))
+        raise RuntimeError("registry unavailable")
+
+    def tracked_rmtree(path, ignore_errors=False):
+        removals.append(str(path))
+        return real_rmtree(path, ignore_errors=ignore_errors)
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(child_processes, "register", failed_register)
+    monkeypatch.setattr(spawn, "_terminate_unregistered_child", lambda *a, **kw: False)
+    monkeypatch.setattr(spawn.shutil, "rmtree", tracked_rmtree)
+
+    pid, _, _ = spawn.spawn_agent(
+        profile, "review", str(project), tmp_path / "logs",
+        on_exit=callbacks.append, process_handle="unowned-fallback",
+        verify_alive_sec=0.01,
+    )
+
+    cleanup_dir = str(captured["cwd"])
+    assert pid == proc.pid
+    assert len(register_calls) == 3  # normal, exact retry, private retry
+    assert callbacks == []
+    assert Path(cleanup_dir).is_dir()
+    assert child_processes.owns_exact(proc, "", "unowned-fallback") is False
+
+    proc.returncode = 0
+    spawn._drain_background_for_tests(timeout=1)
+
+    assert callbacks == [0]
+    assert removals == [cleanup_dir]
+    assert not Path(cleanup_dir).exists()
+
+
+def test_popen_failure_closes_log_and_removes_profile_temp_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = spawn._claude_opus_review_spec()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv(
+        "MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER", "workspace-header",
+    )
+    monkeypatch.setenv(
+        "MCP_HUDDLE_DIRECT_REVIEW_MCP_URL", "http://127.0.0.1:45111/mcp",
+    )
+    project = tmp_path / "project"
+    project.mkdir()
+    captured: dict[str, object] = {}
+    cleanup_observed_closed: list[bool] = []
+    real_rmtree = shutil.rmtree
+
+    def failed_popen(argv, cwd, stdin, stdout, stderr, env):
+        captured["cwd"] = cwd
+        captured["log"] = stdout
+        raise RuntimeError("Popen failed")
+
+    def tracked_rmtree(path, ignore_errors=False):
+        cleanup_observed_closed.append(bool(captured["log"].closed))
+        return real_rmtree(path, ignore_errors=ignore_errors)
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", failed_popen)
+    monkeypatch.setattr(spawn.shutil, "rmtree", tracked_rmtree)
+
+    with pytest.raises(RuntimeError, match="Popen failed"):
+        spawn.spawn_agent(profile, "review", str(project), tmp_path / "logs")
+
+    assert captured["log"].closed
+    assert cleanup_observed_closed == [True]
+    assert not Path(captured["cwd"]).exists()
+
+
+def test_parent_log_close_failure_cannot_skip_child_lifecycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A close error after successful Popen is not a failed spawn."""
+    spec: spawn.SpawnSpec = {
+        "name": "CloseFailure",
+        "cmd": ["echo", "{brief}"],
+        "enabled": True,
+    }
+    lifecycle_calls: list[object] = []
+
+    class BrokenCloseLog:
+        fileno_calls = 0
+
+        def close(self):
+            raise OSError("close failed")
+
+        def fileno(self):
+            self.fileno_calls += 1
+            raise OSError("descriptor unavailable")
+
+    class LiveProc:
+        pid = 55_003
+
+    log = BrokenCloseLog()
+    proc = LiveProc()
+    monkeypatch.setattr(spawn, "_open_standalone_log", lambda *a, **kw: log)
+    monkeypatch.setattr(spawn.subprocess, "Popen", lambda *a, **kw: proc)
+
+    def retain(child, name, **kwargs):
+        lifecycle_calls.append((child, name, kwargs))
+        return "close-failure-handle"
+
+    monkeypatch.setattr(spawn, "_reap_in_background", retain)
+
+    pid, _, _ = spawn.spawn_agent(
+        spec, "brief", str(tmp_path), tmp_path / "logs",
+        process_handle="close-failure-handle",
+    )
+
+    assert pid == proc.pid
+    assert len(lifecycle_calls) == 1
+    assert lifecycle_calls[0][0] is proc
+    assert log.fileno_calls == 0
+
+
+def test_ownership_handle_failure_happens_before_popen_or_temp_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec: spawn.SpawnSpec = {
+        "name": "Echo",
+        "cmd": ["echo", "{brief}"],
+        "enabled": True,
+    }
+    monkeypatch.setattr(
+        child_processes, "new_handle",
+        lambda: (_ for _ in ()).throw(RuntimeError("handle failed")),
+    )
+    monkeypatch.setattr(
+        spawn.subprocess, "Popen", lambda *a, **kw: pytest.fail("must not spawn"),
+    )
+
+    with pytest.raises(RuntimeError, match="handle failed"):
+        spawn.spawn_agent(spec, "brief", str(tmp_path), tmp_path / "logs")
+
+    assert not (tmp_path / "logs").exists()
 
 
 def test_spawn_agent_registers_background_reaper(
@@ -2320,6 +2710,9 @@ def test_direct_anthropic_opus_reaper_removes_only_its_owned_temp_cwd(
 
     class FakeProc:
         pid = 12345
+
+        def poll(self):
+            return 0
 
         def wait(self):
             return 0

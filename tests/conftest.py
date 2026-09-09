@@ -4,7 +4,7 @@ import importlib
 
 import pytest
 
-from mcp_huddle import bus, spawn
+from mcp_huddle import bus, child_processes, spawn
 
 
 @pytest.fixture(autouse=True)
@@ -19,7 +19,9 @@ def isolate_huddle_storage(tmp_path, monkeypatch):
     # onto a different storage root.  Otherwise its late lifecycle callback can
     # write into the next test's room namespace and make the suite order-racy.
     spawn._drain_background_for_tests()
+    child_processes._reset_for_tests()
     monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path / "huddle"))
     importlib.reload(bus)
     yield
     spawn._drain_background_for_tests()
+    child_processes._reset_for_tests()

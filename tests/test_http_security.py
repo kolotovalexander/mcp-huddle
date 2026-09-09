@@ -77,6 +77,44 @@ def test_rest_origin_host_media_type_and_json_mutator(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_close_session_route_is_guarded_and_calls_bus_only_when_valid(monkeypatch):
+    token = "session-hook-secret"
+    monkeypatch.setenv("MCP_HUDDLE_TOKEN", token)
+    calls = []
+    monkeypatch.setattr(
+        server.bus, "close_session_rooms",
+        lambda session_id: calls.append(session_id) or ["room_one"],
+    )
+    app = server.build_app()
+
+    async def scenario():
+        async with _client(app) as client:
+            no_auth = await client.post(
+                "/api/rooms_close_session", json={"session_id": "session-a"},
+            )
+            assert no_auth.status_code == 401
+            assert calls == []
+
+            invalid = await client.post(
+                "/api/rooms_close_session", json={"session_id": ""},
+                headers={"X-Huddle-Token": token},
+            )
+            assert invalid.status_code == 400
+            assert calls == []
+
+            accepted = await client.post(
+                "/api/rooms_close_session", json={"session_id": " session-a "},
+                # The bundled SessionEnd hook is a non-browser client and
+                # therefore intentionally sends no Origin/Sec-Fetch headers.
+                headers={"X-Huddle-Token": token},
+            )
+            assert accepted.status_code == 200
+            assert accepted.json() == {"closed": ["room_one"]}
+            assert calls == ["session-a"]
+
+    asyncio.run(scenario())
+
+
 def test_derived_header_has_no_cookie_or_cross_port_ambient_leak(monkeypatch):
     token = "integration-secret"
     monkeypatch.setenv("MCP_HUDDLE_TOKEN", token)

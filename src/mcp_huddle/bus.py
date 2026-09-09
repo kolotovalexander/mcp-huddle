@@ -15,7 +15,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from . import child_processes
 
@@ -426,6 +426,7 @@ def _close_room_once(
     room_id: str,
     terminal_text: str,
     expected_owner: str | None = None,
+    claim_if: Callable[[dict], bool] | None = None,
 ) -> tuple[bool, dict[str, int], dict]:
     """One shared closing -> terminate -> marker -> closed transition."""
     leader: dict = {}
@@ -435,6 +436,11 @@ def _close_room_once(
             raise ValueError(f"{expected_owner!r} is not the owner of {room_id}")
         if meta.get("status") in ("closed", "closing"):
             leader["close"] = False
+            leader["meta"] = dict(meta)
+            return meta
+        if claim_if is not None and not claim_if(meta):
+            leader["close"] = False
+            leader["meta"] = dict(meta)
             return meta
         # The intermediate state is the single-winner claim. delete_room only
         # accepts `closed`, so it cannot remove the directory while termination
@@ -461,10 +467,22 @@ def close_room(room_id: str, owner: str) -> None:
 
 
 def close_session_rooms(session_id: str) -> list[str]:
+    if not isinstance(session_id, str) or not session_id:
+        return []
     closed = []
     for meta in list_rooms():
-        if meta.get("session_id") == session_id and meta["status"] in ("open", "closing_requested"):
-            close_room(meta["id"], meta["owner"])
+        if meta.get("session_id") != session_id:
+            continue
+
+        def _still_owned_by_session(current: dict) -> bool:
+            return (current.get("session_id") == session_id
+                    and current.get("status") in ("open", "closing_requested", "idle"))
+
+        claimed, _, _ = _close_room_once(
+            meta["id"], "Чат закрыт.", expected_owner=meta["owner"],
+            claim_if=_still_owned_by_session,
+        )
+        if claimed:
             closed.append(meta["id"])
     return closed
 
@@ -963,7 +981,13 @@ def register_notify(room_id: str, agent: str, notify_file: str) -> None:
 # ── Zombie watchdog (called by server background task) ────────────────────────
 
 def check_zombie_rooms() -> list[str]:
-    """Return list of room_ids that were auto-closed due to dead owner."""
+    """Return room ids atomically claimed closed after a dead-owner probe.
+
+    ``list_rooms`` and ``kill(pid, 0)`` are necessarily snapshots.  The final
+    close claim therefore revalidates the observed owner identity, lifecycle
+    and activity under the room's meta lock.  A concurrent ``room_reclaim`` or
+    fresh message wins and keeps the room open.
+    """
     closed = []
     now = int(time.time())
     for meta in list_rooms():
@@ -985,8 +1009,35 @@ def check_zombie_rooms() -> list[str]:
             last = int(meta.get("last_activity") or meta.get("created_at") or 0)
             if meta["status"] != "idle" and now - last <= ZOMBIE_GRACE_SECS:
                 continue
-            close_room(meta["id"], meta["owner"])
-            closed.append(meta["id"])
+
+            observed = {
+                key: meta.get(key)
+                for key in (
+                    "owner", "owner_pid", "session_id", "status",
+                    "last_activity", "last_activity_at",
+                )
+            }
+
+            def _still_same_zombie(current: dict) -> bool:
+                if any(current.get(key) != value
+                       for key, value in observed.items()):
+                    return False
+                current_last = int(
+                    current.get("last_activity")
+                    or current.get("created_at")
+                    or 0
+                )
+                return (current.get("status") == "idle"
+                        or now - current_last > ZOMBIE_GRACE_SECS)
+
+            claimed, _, _ = _close_room_once(
+                meta["id"],
+                "Чат закрыт.",
+                expected_owner=meta["owner"],
+                claim_if=_still_same_zombie,
+            )
+            if claimed:
+                closed.append(meta["id"])
         except PermissionError:
             pass  # process exists, we just can't signal it
     return closed
@@ -1462,19 +1513,6 @@ def _notify_agents(room_id: str, participants: list[str], sender: str,
                 _write_json(target, payload)
         except Exception:
             pass
-
-
-def _pid_alive(pid: int) -> bool:
-    """Legacy diagnostic only; never use this as authority to signal a PID."""
-    if not pid or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
 
 
 def close_all_rooms() -> dict:

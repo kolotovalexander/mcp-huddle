@@ -141,8 +141,11 @@ All configuration is via environment variables (defaults shown):
 |---------|---------|---------|
 | `PORT` | `8014` | HTTP port the server listens on (only used with `--http`). |
 | `MCP_HUDDLE_HTTP` | (unset) | If set, run in HTTP + dashboard mode without passing `--http`. |
+| `MCP_HUDDLE_HTTP_BASE_URL` | `http://127.0.0.1:$PORT` | Literal loopback HTTP base used by the bundled SessionEnd hook. May include a local ASGI path prefix; non-loopback URLs are rejected. |
 | `MCP_HUDDLE_HOME` | `~/.mcp-huddle` | Storage root. Rooms are stored in `$MCP_HUDDLE_HOME/rooms`. |
 | `MCP_HUDDLE_TOKEN` | (unset) | Optional HTTP/MCP token. When set, every data/action/MCP endpoint requires it; the dashboard exchanges it once for a process-local credential kept only in page memory. |
+| `MCP_HUDDLE_SESSION_ID` | (unset) | Explicit session-id fallback for non-Claude SessionEnd runners. Claude Code instead supplies `hook_event_name=SessionEnd` and `session_id` in hook JSON on stdin. |
+| `MCP_HUDDLE_SESSION_FILE` | (unset) | Optional compatibility fallback containing a session id. The SessionEnd hook accepts only an owned, non-symlink, non-group/world-writable regular file; it no longer reads a shared `/tmp/claude-session-id`. |
 | `MCP_HUDDLE_READONLY` | `1` | Apply Huddle's reviewed read-only command transform to supported CLIs (currently Claude and Codex). `0` requests full-access workers; it does not change unsupported CLIs such as Antigravity. |
 | `MCP_HUDDLE_SPAWN_REGISTRY` | built-in reviewed slots | Path to a JSON file replacing the registry. Without it, `~/.mcp-huddle/registry.json` is merged by name over the built-in Codex, Antigravity, MiMo, OpenCode, Claude and fixed Opus profiles. See [`examples/registry.json`](examples/registry.json). |
 | `MCP_HUDDLE_CLAUDE_ENABLED` | `0` | Set to `1` to allow the legacy Claude slot. Opt-in avoids unsolicited usage; native account/API authentication determines the billing route. |

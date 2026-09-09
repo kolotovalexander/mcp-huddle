@@ -82,7 +82,7 @@ def _port_arg(value: str) -> int:
 
 
 def _install_hooks(dest: "str | None") -> None:
-    """Copy the bundled example hooks (Claude Code PostToolUse / Stop) to a
+    """Copy the bundled example hooks (Claude Code PostToolUse / SessionEnd) to a
     directory and print how to wire them in. pip can't run post-install code
     safely, so this is the explicit opt-in step a user runs after installing.
     """
@@ -105,9 +105,10 @@ def _install_hooks(dest: "str | None") -> None:
 Wire them into Claude Code (~/.claude/settings.json), e.g.:
   "hooks": {
     "PostToolUse": [{"hooks": [{"type":"command","command":"__T__/claude-check.sh"}]}],
-    "Stop":        [{"hooks": [{"type":"command","command":"__T__/session-end.sh"}]}]
+    "SessionEnd":  [{"hooks": [{"type":"command","command":"__T__/session-end.sh"}]}]
   }
-claude-check.sh surfaces pending huddle requests; session-end.sh closes this session's rooms on exit."""
+claude-check.sh surfaces pending huddle requests; session-end.sh closes this
+session's rooms at SessionEnd."""
     print(example.replace("__T__", str(target)))
 
 

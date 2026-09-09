@@ -338,7 +338,7 @@ def room_delete(room_id: str, owner: str) -> str:
 
 
 def room_close_session(session_id: str) -> list:
-    """Close all open rooms belonging to a session (called by Stop hook)."""
+    """Close all open rooms belonging to a session (called at SessionEnd)."""
     return bus.close_session_rooms(session_id)
 
 
@@ -1331,6 +1331,24 @@ async def api_room_close(request: Request) -> JSONResponse:
         data = await request.json()
         bus.close_room(data["room_id"], data["owner"])
         return JSONResponse({"status": "closed"})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@mcp.custom_route("/api/rooms_close_session", methods=["POST"])
+async def api_rooms_close_session(request: Request) -> JSONResponse:
+    """Close rooms owned by one client session (used by the SessionEnd hook)."""
+    denied = _require_local(request)
+    if denied is not None:
+        return denied
+    try:
+        data = await request.json()
+        session_id = data.get("session_id") if isinstance(data, dict) else None
+        if (not isinstance(session_id, str) or not session_id.strip()
+                or len(session_id) > 1024 or "\x00" in session_id):
+            raise ValueError("invalid session_id")
+        closed = bus.close_session_rooms(session_id.strip())
+        return JSONResponse({"closed": closed})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 

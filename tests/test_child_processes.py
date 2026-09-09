@@ -220,6 +220,120 @@ def test_background_test_drain_reaches_callback_created_quiescence() -> None:
         assert spawn._SPAWN_TIMERS == set()
 
 
+def test_reaper_start_failure_rolls_back_background_bookkeeping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proc = FakeProc(9_393, returncode=0)
+
+    class UnstartableThread:
+        def __init__(self, *, target, name, daemon):
+            self.name = name
+
+        def start(self):
+            raise RuntimeError("thread start failed")
+
+    monkeypatch.setattr(spawn.threading, "Thread", UnstartableThread)
+
+    with pytest.raises(RuntimeError, match="thread start failed"):
+        spawn._reap_in_background(
+            proc, "Reviewer", owner_room_id="room", process_handle="handle",
+        )
+
+    with spawn._BACKGROUND_LOCK:
+        assert spawn._REAPER_THREADS == set()
+    assert child_processes.wait("room", "handle") == 0
+
+
+def test_failed_immediate_cleanup_retains_exact_fallback_reaper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cleanup_dir = tmp_path / "cleanup"
+    cleanup_dir.mkdir()
+
+    class StubbornProc(FakeProc):
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired("stubborn", timeout)
+
+        def terminate(self):
+            raise OSError("terminate denied")
+
+        def kill(self):
+            raise OSError("kill denied")
+
+    proc = StubbornProc(9_394)
+    assert spawn._terminate_unregistered_child(
+        proc, "room", "fallback", timeout=0,
+    ) is False
+    callbacks: list[int | None] = []
+    removals: list[str] = []
+    real_rmtree = shutil.rmtree
+
+    def tracked_rmtree(path, ignore_errors=False):
+        removals.append(str(path))
+        return real_rmtree(path, ignore_errors=ignore_errors)
+
+    monkeypatch.setattr(spawn.shutil, "rmtree", tracked_rmtree)
+    retained = spawn._retain_failed_setup_child(
+        proc, "Reviewer", "room", "fallback", str(cleanup_dir),
+        on_exit=callbacks.append,
+    )
+    assert retained == spawn._RetainedChild("fallback", True)
+    assert child_processes.owns_exact(proc, "room", "fallback") is True
+
+    proc.returncode = 0
+    spawn._drain_background_for_tests(timeout=1)
+
+    assert child_processes.state("room", "fallback") == "exited"
+    assert callbacks == [0]
+    assert removals == [str(cleanup_dir)]
+    assert not cleanup_dir.exists()
+
+
+def test_double_reaper_start_failure_waits_fail_closed_without_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cleanup_dir = tmp_path / "cleanup-sync"
+    cleanup_dir.mkdir()
+    callbacks: list[int | None] = []
+
+    class EventuallyExitedProc(FakeProc):
+        def __init__(self):
+            super().__init__(9_395)
+            self.poll_calls = 0
+
+        def poll(self):
+            self.poll_calls += 1
+            if self.poll_calls >= 3:
+                self.returncode = 0
+            return self.returncode
+
+    class UnstartableThread:
+        def __init__(self, *, target, name, daemon):
+            self.name = name
+
+        def start(self):
+            raise RuntimeError("Thread.start failed")
+
+    proc = EventuallyExitedProc()
+    monkeypatch.setattr(spawn.threading, "Thread", UnstartableThread)
+    monkeypatch.setattr(
+        spawn._thread, "start_new_thread",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("_thread failed")),
+    )
+
+    retained = spawn._retain_failed_setup_child(
+        proc, "Reviewer", "room", "sync-fallback", str(cleanup_dir),
+        on_exit=callbacks.append,
+    )
+
+    assert retained == spawn._RetainedChild("sync-fallback", True)
+    assert callbacks == [0]
+    assert not cleanup_dir.exists()
+    assert child_processes.state("room", "sync-fallback") == "exited"
+    with spawn._BACKGROUND_LOCK:
+        assert spawn._REAPER_THREADS == set()
+
+
 def test_exited_child_is_not_terminated() -> None:
     proc = FakeProc(9494, returncode=7)
     child_processes.register(proc, "room", "done")
@@ -241,6 +355,29 @@ def test_recent_exited_handle_history_is_bounded(
     assert len(child_processes._EXITED_HANDLES) == 3
     assert child_processes.state("room", "done-0") == "unknown"
     assert child_processes.state("room", "done-7") == "exited"
+
+    # Eviction loses only the process-local exact-exit optimization. A stale
+    # persisted lease degrades visibly and fail-closed to unowned/active; it is
+    # never silently treated as dead merely because the bounded tail rotated.
+    stale = {
+        "wake_id": "done-0",
+        "wake_claim_id": "done-0",
+        "last_wake_pid": 20_000,
+    }
+    assert server._wake_in_progress(stale, "busy", "room") is True
+    health = server._agent_wake_health(stale, "busy", "room")
+    assert health["process_state"] == "unknown"
+    assert health["unowned_lease"] is True
+
+
+def test_reset_for_tests_forgets_authority_without_signalling() -> None:
+    proc = FakeProc(20_100)
+    child_processes.register(proc, "room", "owned")
+
+    child_processes._reset_for_tests()
+
+    assert child_processes.state("room", "owned") == "unknown"
+    assert proc.terminate_calls == 0
 
 
 def test_registration_immediately_stops_child_if_room_already_terminal(
