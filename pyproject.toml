@@ -18,20 +18,21 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Operating System :: OS Independent",
     "Topic :: Software Development",
     "Topic :: Communications :: Chat",
 ]
 dependencies = [
-    "mcp>=1.27.0,<2",
-    "starlette>=0.40.0",
-    "uvicorn>=0.32.0",
+    "mcp>=1.28.1,<2",
+    "starlette>=1.0.1,<2",
+    "uvicorn>=0.32.0,<1",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
-    "httpx>=0.27",
+    "httpx>=0.27.1,<1",
 ]
 
 [project.scripts]

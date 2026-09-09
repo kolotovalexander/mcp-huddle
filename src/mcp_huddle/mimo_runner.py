@@ -18,6 +18,7 @@ import tempfile
 import time
 
 from . import bus
+from .spawn import build_sanitized_environment
 from .openai_compatible_runner import (
     _event,
     extract_request_id,
@@ -97,7 +98,8 @@ def call_mimo(mimo_bin: str, prompt: str, timeout: float, model: str | None = No
         argv += ["--model", model]
     argv.append(prompt)
     os.makedirs(_ISOLATED_CONFIG_DIR, exist_ok=True)
-    env = {**os.environ, **_MCP_KILL_SWITCHES}
+    env = build_sanitized_environment()
+    env.update(_MCP_KILL_SWITCHES)
     started = time.time()
     proc = subprocess.run(
         argv,

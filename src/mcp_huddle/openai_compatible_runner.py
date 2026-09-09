@@ -42,7 +42,12 @@ def extract_request_id(text: str) -> int | None:
 
 
 def _already_replied(messages: list[dict], agent: str, msg_id: int) -> bool:
-    return any(msg.get("agent") == agent and msg.get("reply_to") == msg_id for msg in messages)
+    return any(
+        msg.get("agent") == agent
+        and msg.get("reply_to") == msg_id
+        and msg.get("kind") in {"result", "final"}
+        for msg in messages
+    )
 
 
 def select_request(room_id: str, agent: str, requested_id: int | None) -> dict | None:
@@ -116,6 +121,26 @@ def completion_payload(model: str, messages: list[dict], reasoning: str, include
     return payload
 
 
+def _completion_content(data: object) -> str:
+    """Validate the response shape before any room-visible post.
+
+    Do not include response data in exceptions: provider payloads can contain
+    private prompt or completion text and the caller logs exception strings.
+    """
+    if not isinstance(data, dict):
+        raise RuntimeError("OpenAI-compatible completion returned an invalid response")
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        raise RuntimeError("OpenAI-compatible completion returned an invalid response")
+    message = choices[0].get("message")
+    if not isinstance(message, dict):
+        raise RuntimeError("OpenAI-compatible completion returned an invalid response")
+    content = message.get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError("OpenAI-compatible completion returned an empty response")
+    return content.strip()
+
+
 def call_openai_compatible(
     base_url: str,
     model: str,
@@ -141,9 +166,11 @@ def call_openai_compatible(
         try:
             with urlrequest.urlopen(req, timeout=timeout) as response:
                 data = json.loads(response.read().decode("utf-8"))
-            content = data["choices"][0]["message"]["content"]
+            content = _completion_content(data)
             usage = data.get("usage") or {}
-            return content.strip(), {
+            if not isinstance(usage, dict):
+                usage = {}
+            return content, {
                 "model": data.get("model") or model,
                 "reasoning": reasoning if include_reasoning else f"{reasoning}:fallback-no-reasoning-fields",
                 "tokens_in": usage.get("prompt_tokens") or usage.get("input_tokens"),
@@ -156,10 +183,12 @@ def call_openai_compatible(
             if exc.code not in (400, 422):
                 break
             _event("reasoning_fields_rejected", status=exc.code, retry_without_reasoning=True)
-        except (OSError, KeyError, ValueError) as exc:
+        except (OSError, ValueError) as exc:
             last_error = exc
             break
-    raise RuntimeError(f"OpenAI-compatible completion failed: {last_error}")
+    # Never surface request headers or provider response payloads through the
+    # runner event log. HTTP status is emitted separately above when useful.
+    raise RuntimeError("OpenAI-compatible completion failed") from last_error
 
 
 def run(argv: list[str] | None = None) -> int:

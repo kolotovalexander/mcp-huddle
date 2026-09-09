@@ -1,6 +1,9 @@
 """Tests for Phase 1 (per-agent brief, log capture) and Phase 2 (Codex
 thread_id parsing, codex_resume helper, /api/room_agents and SSE endpoint)."""
 import json
+import asyncio
+import gc
+import multiprocessing
 import os
 import shutil
 import subprocess
@@ -13,8 +16,58 @@ from pathlib import Path
 
 import pytest
 
-from mcp_huddle import bus, spawn
+from mcp_huddle import bus, child_processes, spawn
 from mcp_huddle import server
+
+
+def _cross_process_wake_worker(
+    huddle_home: str,
+    room_id: str,
+    msg_id: int,
+    start_event,
+    results,
+) -> None:
+    """Independent server-process contender used by the persisted-claim test."""
+    os.environ["MCP_HUDDLE_HOME"] = huddle_home
+    from mcp_huddle import bus as worker_bus
+    from mcp_huddle import server as worker_server
+
+    isolated_bus = importlib.reload(worker_bus)
+    worker_server.bus = isolated_bus
+    worker_server.spawn.codex_log_has_completed_turn = lambda path: True
+
+    def fake_resume(*args, **kwargs):
+        # Widen the pre-PID interval: without the persisted meta claim both
+        # processes deterministically reach this fake spawn.
+        time.sleep(0.2)
+        return os.getpid()
+
+    worker_server.spawn.codex_resume = fake_resume
+    try:
+        start_event.wait(5)
+        wakes = worker_server._wake_agents_for_request(
+            room_id, "Claude", "review", "Codex", None, msg_id,
+        )
+        results.put(("ok", len(wakes)))
+    except Exception as exc:
+        results.put(("error", repr(exc)))
+
+
+def _standalone_fifo_open_probe(path: str, results) -> None:
+    """Run the FIFO open in a killable process so a regression cannot hang pytest."""
+    try:
+        spawn._open_standalone_log(Path(path), create_parent=False)
+    except BaseException as exc:
+        results.put(type(exc).__name__)
+    else:
+        results.put("opened")
+
+
+@pytest.fixture(autouse=True)
+def drain_spawn_background_before_fixture_reload(monkeypatch):
+    """Keep reapers/timers on the test's HUDDLE_HOME until they finish."""
+    yield
+    spawn._drain_background_for_tests()
 
 
 # ── Phase 1: spawn.py ─────────────────────────────────────────────────────────
@@ -434,7 +487,7 @@ def test_spawn_all_logs_unexpected_oserror(
     err = capsys.readouterr().err
     assert "failed to spawn Gemini" in err
     assert "BlockingIOError" in err
-    assert "daemon spawn pipe blocked" in err
+    assert "daemon spawn pipe blocked" not in err
 
 
 # ── Same-binary spawn stagger (spawn.compute_stagger_delays) ────────────────
@@ -598,6 +651,52 @@ def test_dict_auto_spawn_ignores_auto_false_flag(
     assert "Excluded" in (info.get("agent_meta") or {})
 
 
+def test_live_dict_initial_spawn_blocks_immediate_request_wake(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """invite_agent must not make a live initial child look available."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+    spec: spawn.SpawnSpec = {
+        "name": "Reviewer", "cmd": ["reviewer", "{brief}"],
+        "enabled": True,
+    }
+    monkeypatch.setattr(server.spawn, "load_registry", lambda: [dict(spec)])
+    calls = []
+
+    def fake_spawn_agent(*args, **kwargs):
+        calls.append((args, kwargs))
+        before_popen = isolated_bus.get_room_info(room_id)["agent_meta"]["Reviewer"]
+        assert before_popen["initial_spawn_active"] is True
+        assert before_popen["initial_spawn_id"] == kwargs["process_handle"]
+        assert before_popen["last_wake_pid"] is None
+        log_dir = args[3]
+        log_dir.mkdir(parents=True, exist_ok=True)
+        return 61_616, str(log_dir / "reviewer.events.jsonl"), None
+
+    monkeypatch.setattr(server.spawn, "spawn_agent", fake_spawn_agent)
+    room_id = isolated_bus.create_room(
+        "Initial", "Human", 0, str(tmp_path), "session-1",
+    )
+    server._spawn_agents(
+        room_id, "Initial", "review", str(tmp_path), "Human",
+        {"Reviewer": "review"},
+    )
+
+    info = isolated_bus.get_room_info(room_id)["agent_meta"]["Reviewer"]
+    assert info["initial_spawn_active"] is True
+    assert isolated_bus.get_status(room_id)["Reviewer"] == "busy"
+    request_id = isolated_bus.post_message(
+        room_id, "Human", "another task", "request", to="Reviewer",
+    )
+
+    assert server._wake_agents_for_request(
+        room_id, "Human", "another task", "Reviewer", None, request_id,
+    ) == []
+    assert len(calls) == 1
+
+
 class _CapturedTimer:
     """threading.Timer stand-in: records the fire fn instead of scheduling it,
     so a test can drive 'the stagger window elapsed' deterministically."""
@@ -659,12 +758,11 @@ def test_delayed_spawn_pid_recorded_in_spawned_pids(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Regression: a staggered spawn's pid (unknown at _spawn_agents return
-    time) must land in meta['spawned_pids'] once the timer fires — otherwise
-    close_room's kill sweep (_kill_spawned iterates spawned_pids) would
-    orphan a process started during the stagger window."""
+    time) lands in the bounded diagnostic PID history once the timer fires.
+    Exact Popen ownership, not this persisted PID, controls termination."""
     fake_registry: list[spawn.SpawnSpec] = [
-        {"name": "First",  "cmd": ["echo", "first={brief}"],  "enabled": True},
-        {"name": "Second", "cmd": ["echo", "second={brief}"], "enabled": True},
+        {"name": "First", "cmd": [sys.executable, "-c", "import time; time.sleep(.5)", "{brief}"], "enabled": True},
+        {"name": "Second", "cmd": [sys.executable, "-c", "import time; time.sleep(.5)", "{brief}"], "enabled": True},
     ]
     monkeypatch.setattr(spawn, "load_registry", lambda: fake_registry)
     monkeypatch.setenv("MCP_HUDDLE_SAME_BIN_STAGGER_SEC", "20")
@@ -685,7 +783,7 @@ def test_delayed_spawn_pid_recorded_in_spawned_pids(
     _CapturedTimer.fired[0][1]()  # room still open — the delayed spawn fires
 
     pids_after = list(bus._read_meta(room_id).get("spawned_pids") or [])
-    assert len(pids_after) == 2  # Second's pid merged in → killable by close_room
+    assert len(pids_after) == 2  # Second's pid merged into diagnostics.
     assert set(pids_before) < set(pids_after)
 
 
@@ -693,10 +791,10 @@ def test_delayed_spawn_dict_branch_gates_and_records_pid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The explicit-dict auto_spawn branch mirrors the spawn_all path: its
-    staggered spawn is gated on room status at fire time and records its pid."""
+        staggered spawn is gated on room status at fire time and records its pid."""
     fake_registry: list[spawn.SpawnSpec] = [
-        {"name": "First",  "cmd": ["echo", "first={brief}"],  "enabled": True},
-        {"name": "Second", "cmd": ["echo", "second={brief}"], "enabled": True},
+        {"name": "First", "cmd": [sys.executable, "-c", "import time; time.sleep(.5)", "{brief}"], "enabled": True},
+        {"name": "Second", "cmd": [sys.executable, "-c", "import time; time.sleep(.5)", "{brief}"], "enabled": True},
     ]
     monkeypatch.setattr(spawn, "load_registry", lambda: fake_registry)
     monkeypatch.setenv("MCP_HUDDLE_SAME_BIN_STAGGER_SEC", "20")
@@ -742,15 +840,30 @@ def test_binary_resolution_uses_absolute_fallback(
     assert resolved == str(fake_codex)
 
 
-def test_spawn_agent_verify_alive_rejects_fast_exit(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+def test_spawn_agent_verify_alive_rejects_confirmed_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Optional health check logs and rejects processes that die immediately."""
+    """Optional health check deterministically rejects a confirmed exit."""
     spec: spawn.SpawnSpec = {
         "name": "FastExit",
         "cmd": ["/bin/sh", "-c", "exit 42"],
         "enabled": True,
     }
+    closed_log: dict[str, object] = {}
+
+    class FakeProc:
+        pid = 42_042
+        returncode = 42
+
+    def fake_popen(argv, cwd, stdin, stdout, stderr, env):
+        closed_log["file"] = stdout
+        return FakeProc()
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(spawn, "_reap_in_background", lambda *a, **kw: "fast-exit")
+    monkeypatch.setattr(spawn.child_processes, "state", lambda *a, **kw: "exited")
+    monkeypatch.setattr(spawn.time, "sleep", lambda _seconds: None)
 
     with pytest.raises(spawn.AgentSpawnError):
         spawn.spawn_agent(
@@ -761,10 +874,376 @@ def test_spawn_agent_verify_alive_rejects_fast_exit(
             verify_alive_sec=0.05,
         )
 
+    assert closed_log["file"].closed
     err = capsys.readouterr().err
     assert "failed to spawn FastExit" in err
-    assert "exited within" in err
-    assert "status 42" in err
+    assert "AgentSpawnError" in err
+    assert "exited within" not in err
+    assert "status 42" not in err
+
+
+def test_standalone_spawn_rejects_unsafe_agent_name_before_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec: spawn.SpawnSpec = {
+        "name": "../escape",
+        "cmd": ["echo", "{brief}"],
+        "enabled": True,
+    }
+    monkeypatch.setattr(
+        spawn.subprocess, "Popen", lambda *a, **kw: pytest.fail("must not spawn"),
+    )
+
+    with pytest.raises(ValueError, match="agent_name"):
+        spawn.spawn_agent(spec, "brief", str(tmp_path), tmp_path / "logs")
+
+    assert not (tmp_path / "escape.events.jsonl").exists()
+
+
+def test_standalone_spawn_refuses_symlink_log_and_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec: spawn.SpawnSpec = {
+        "name": "Safe",
+        "cmd": ["echo", "{brief}"],
+        "enabled": True,
+    }
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+    target_file = tmp_path / "outside.txt"
+    target_file.write_text("sentinel")
+    (target_dir / "safe.events.jsonl").symlink_to(target_file)
+    monkeypatch.setattr(
+        spawn.subprocess, "Popen", lambda *a, **kw: pytest.fail("must not spawn"),
+    )
+
+    with pytest.raises(OSError):
+        spawn.spawn_agent(spec, "brief", str(tmp_path), target_dir)
+    assert target_file.read_text() == "sentinel"
+
+    link_dir = tmp_path / "logs-link"
+    link_dir.symlink_to(target_dir, target_is_directory=True)
+    with pytest.raises(OSError):
+        spawn.spawn_agent(spec, "brief", str(tmp_path), link_dir)
+    assert target_file.read_text() == "sentinel"
+
+    hardlink_dir = tmp_path / "hardlink-logs"
+    hardlink_dir.mkdir()
+    os.link(target_file, hardlink_dir / "safe.events.jsonl")
+    with pytest.raises(ValueError, match="regular file"):
+        spawn.spawn_agent(spec, "brief", str(tmp_path), hardlink_dir)
+    assert target_file.read_text() == "sentinel"
+
+
+def test_standalone_log_fifo_is_rejected_without_blocking(tmp_path: Path) -> None:
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("requires multiprocessing fork")
+    fifo = tmp_path / "agent.events.jsonl"
+    os.mkfifo(fifo)
+    context = multiprocessing.get_context("fork")
+    results = context.Queue()
+    worker = context.Process(
+        target=_standalone_fifo_open_probe, args=(str(fifo), results),
+    )
+    worker.start()
+    worker.join(timeout=2)
+    if worker.is_alive():
+        worker.terminate()
+        worker.join(timeout=2)
+        pytest.fail("standalone FIFO open blocked before target validation")
+
+    assert worker.exitcode == 0
+    assert results.get(timeout=1) in {"OSError", "ValueError"}
+
+
+def test_registration_failure_reaps_exact_child_closes_log_and_temp_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child cannot escape if exact ownership registration fails."""
+    profile = spawn._claude_opus_review_spec()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv(
+        "MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER", "workspace-header",
+    )
+    monkeypatch.setenv(
+        "MCP_HUDDLE_DIRECT_REVIEW_MCP_URL", "http://127.0.0.1:45111/mcp",
+    )
+    project = tmp_path / "project"
+    project.mkdir()
+    captured: dict[str, object] = {}
+    real_popen = subprocess.Popen
+    popen_type = subprocess.Popen
+
+    def sleeping_popen(argv, cwd, stdin, stdout, stderr, env):
+        captured["log"] = stdout
+        captured["cwd"] = cwd
+        proc = real_popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            cwd=cwd, stdin=stdin, stdout=stdout, stderr=stderr, env=env,
+        )
+        captured["proc"] = proc
+        return proc
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", sleeping_popen)
+    monkeypatch.setattr(
+        child_processes, "register",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("register failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="register failed"):
+        spawn.spawn_agent(profile, "review", str(project), tmp_path / "logs")
+
+    proc = captured["proc"]
+    assert isinstance(proc, popen_type)
+    assert proc.poll() is not None
+    assert captured["log"].closed
+    assert not Path(captured["cwd"]).exists()
+    assert child_processes.owned_room_ids() == set()
+
+
+def test_fallback_reaper_is_success_and_runs_original_lifecycle_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retained live child must keep its lease instead of raising to server."""
+    profile = spawn._claude_opus_review_spec()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv(
+        "MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER", "workspace-header",
+    )
+    monkeypatch.setenv(
+        "MCP_HUDDLE_DIRECT_REVIEW_MCP_URL", "http://127.0.0.1:45111/mcp",
+    )
+    project = tmp_path / "project"
+    project.mkdir()
+    captured: dict[str, object] = {}
+    callbacks: list[int | None] = []
+    removals: list[str] = []
+    real_rmtree = shutil.rmtree
+
+    class LiveProc:
+        pid = 55_001
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+    proc = LiveProc()
+
+    class UnstartableThread:
+        def __init__(self, *, target, name, daemon):
+            self.name = name
+
+        def start(self):
+            raise RuntimeError("fallback Thread.start failed")
+
+    def fake_popen(argv, cwd, stdin, stdout, stderr, env):
+        captured["cwd"] = cwd
+        captured["log"] = stdout
+        return proc
+
+    def tracked_rmtree(path, ignore_errors=False):
+        removals.append(str(path))
+        return real_rmtree(path, ignore_errors=ignore_errors)
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(spawn.threading, "Thread", UnstartableThread)
+    monkeypatch.setattr(
+        spawn, "_reap_in_background",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("reaper setup failed")),
+    )
+    monkeypatch.setattr(spawn, "_terminate_unregistered_child", lambda *a, **kw: False)
+    monkeypatch.setattr(spawn.shutil, "rmtree", tracked_rmtree)
+
+    pid, _, _ = spawn.spawn_agent(
+        profile, "review", str(project), tmp_path / "logs",
+        on_exit=callbacks.append, process_handle="wake-fallback",
+    )
+
+    cleanup_dir = str(captured["cwd"])
+    assert pid == proc.pid
+    assert Path(cleanup_dir).is_dir()
+    assert captured["log"].closed
+    assert child_processes.owns_exact(proc, "", "wake-fallback") is True
+    assert callbacks == []
+
+    proc.returncode = 0
+    spawn._drain_background_for_tests(timeout=1)
+
+    assert callbacks == [0]
+    assert removals == [cleanup_dir]
+    assert not Path(cleanup_dir).exists()
+    assert child_processes.state("", "wake-fallback") == "exited"
+
+
+def test_registry_failure_uses_direct_popen_lifecycle_without_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = spawn._claude_opus_review_spec()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv(
+        "MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER", "workspace-header",
+    )
+    monkeypatch.setenv(
+        "MCP_HUDDLE_DIRECT_REVIEW_MCP_URL", "http://127.0.0.1:45111/mcp",
+    )
+    project = tmp_path / "project"
+    project.mkdir()
+    callbacks: list[int | None] = []
+    captured: dict[str, object] = {}
+    register_calls: list[str] = []
+    removals: list[str] = []
+    real_rmtree = shutil.rmtree
+
+    class LiveProc:
+        pid = 55_002
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+    proc = LiveProc()
+
+    def fake_popen(argv, cwd, stdin, stdout, stderr, env):
+        captured["cwd"] = cwd
+        return proc
+
+    def failed_register(_proc, _room_id, handle=None):
+        register_calls.append(str(handle))
+        raise RuntimeError("registry unavailable")
+
+    def tracked_rmtree(path, ignore_errors=False):
+        removals.append(str(path))
+        return real_rmtree(path, ignore_errors=ignore_errors)
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(child_processes, "register", failed_register)
+    monkeypatch.setattr(spawn, "_terminate_unregistered_child", lambda *a, **kw: False)
+    monkeypatch.setattr(spawn.shutil, "rmtree", tracked_rmtree)
+
+    pid, _, _ = spawn.spawn_agent(
+        profile, "review", str(project), tmp_path / "logs",
+        on_exit=callbacks.append, process_handle="unowned-fallback",
+        verify_alive_sec=0.01,
+    )
+
+    cleanup_dir = str(captured["cwd"])
+    assert pid == proc.pid
+    assert len(register_calls) == 3  # normal, exact retry, private retry
+    assert callbacks == []
+    assert Path(cleanup_dir).is_dir()
+    assert child_processes.owns_exact(proc, "", "unowned-fallback") is False
+
+    proc.returncode = 0
+    spawn._drain_background_for_tests(timeout=1)
+
+    assert callbacks == [0]
+    assert removals == [cleanup_dir]
+    assert not Path(cleanup_dir).exists()
+
+
+def test_popen_failure_closes_log_and_removes_profile_temp_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = spawn._claude_opus_review_spec()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv(
+        "MCP_HUDDLE_CLAUDE_OPUS_WORKSPACE_HEADER", "workspace-header",
+    )
+    monkeypatch.setenv(
+        "MCP_HUDDLE_DIRECT_REVIEW_MCP_URL", "http://127.0.0.1:45111/mcp",
+    )
+    project = tmp_path / "project"
+    project.mkdir()
+    captured: dict[str, object] = {}
+    cleanup_observed_closed: list[bool] = []
+    real_rmtree = shutil.rmtree
+
+    def failed_popen(argv, cwd, stdin, stdout, stderr, env):
+        captured["cwd"] = cwd
+        captured["log"] = stdout
+        raise RuntimeError("Popen failed")
+
+    def tracked_rmtree(path, ignore_errors=False):
+        cleanup_observed_closed.append(bool(captured["log"].closed))
+        return real_rmtree(path, ignore_errors=ignore_errors)
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", failed_popen)
+    monkeypatch.setattr(spawn.shutil, "rmtree", tracked_rmtree)
+
+    with pytest.raises(RuntimeError, match="Popen failed"):
+        spawn.spawn_agent(profile, "review", str(project), tmp_path / "logs")
+
+    assert captured["log"].closed
+    assert cleanup_observed_closed == [True]
+    assert not Path(captured["cwd"]).exists()
+
+
+def test_parent_log_close_failure_cannot_skip_child_lifecycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A close error after successful Popen is not a failed spawn."""
+    spec: spawn.SpawnSpec = {
+        "name": "CloseFailure",
+        "cmd": ["echo", "{brief}"],
+        "enabled": True,
+    }
+    lifecycle_calls: list[object] = []
+
+    class BrokenCloseLog:
+        fileno_calls = 0
+
+        def close(self):
+            raise OSError("close failed")
+
+        def fileno(self):
+            self.fileno_calls += 1
+            raise OSError("descriptor unavailable")
+
+    class LiveProc:
+        pid = 55_003
+
+    log = BrokenCloseLog()
+    proc = LiveProc()
+    monkeypatch.setattr(spawn, "_open_standalone_log", lambda *a, **kw: log)
+    monkeypatch.setattr(spawn.subprocess, "Popen", lambda *a, **kw: proc)
+
+    def retain(child, name, **kwargs):
+        lifecycle_calls.append((child, name, kwargs))
+        return "close-failure-handle"
+
+    monkeypatch.setattr(spawn, "_reap_in_background", retain)
+
+    pid, _, _ = spawn.spawn_agent(
+        spec, "brief", str(tmp_path), tmp_path / "logs",
+        process_handle="close-failure-handle",
+    )
+
+    assert pid == proc.pid
+    assert len(lifecycle_calls) == 1
+    assert lifecycle_calls[0][0] is proc
+    assert log.fileno_calls == 0
+
+
+def test_ownership_handle_failure_happens_before_popen_or_temp_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec: spawn.SpawnSpec = {
+        "name": "Echo",
+        "cmd": ["echo", "{brief}"],
+        "enabled": True,
+    }
+    monkeypatch.setattr(
+        child_processes, "new_handle",
+        lambda: (_ for _ in ()).throw(RuntimeError("handle failed")),
+    )
+    monkeypatch.setattr(
+        spawn.subprocess, "Popen", lambda *a, **kw: pytest.fail("must not spawn"),
+    )
+
+    with pytest.raises(RuntimeError, match="handle failed"):
+        spawn.spawn_agent(spec, "brief", str(tmp_path), tmp_path / "logs")
+
+    assert not (tmp_path / "logs").exists()
 
 
 def test_spawn_agent_registers_background_reaper(
@@ -790,7 +1269,7 @@ def test_spawn_agent_registers_background_reaper(
     monkeypatch.setattr(
         spawn,
         "_reap_in_background",
-        lambda proc, name, on_exit=None: reaped.append((proc.pid, name)),
+        lambda proc, name, on_exit=None, **kwargs: reaped.append((proc.pid, name)),
     )
 
     spec: spawn.SpawnSpec = {
@@ -852,6 +1331,43 @@ def test_codex_log_has_completed_turn(tmp_path: Path) -> None:
     assert spawn.codex_log_has_completed_turn(str(log))
 
 
+def test_server_confined_log_reader_rejects_external_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tail, rate-limit detection and Codex lifecycle parsing share the same
+    room-confined O_NOFOLLOW reader and cannot consume a meta/symlink target."""
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path / "huddle"))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+    room_id = isolated_bus.create_room(
+        "Logs", "Claude", 0, str(tmp_path), "session-1",
+    )
+    isolated_bus.invite_agent(room_id, "Codex")
+    log_path, _ = isolated_bus._agent_paths(room_id, "Codex", create=True)
+    secret = tmp_path / "external-secret.log"
+    secret.write_text(
+        'DO_NOT_LEAK\n'
+        '{"type":"thread.started","thread_id":"attacker-thread"}\n'
+        '{"type":"turn.completed"}\n'
+        '{"type":"error","message":"rate limit try again"}\n'
+    )
+    log_path.symlink_to(secret)
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {"Codex": {
+        "log_path": str(secret),
+        "last_wake_pid": 123,
+    }}
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+
+    assert server._read_owned_agent_log(room_id, "Codex") is None
+    assert server._log_tail(room_id, "Codex") == ""
+    assert server._parse_owned_codex_thread_id(
+        room_id, "Codex", timeout=0.01,
+    ) is None
+    assert not server._owned_codex_log_has_completed_turn(room_id, "Codex")
+    assert server._handle_rate_limit_on_exit(room_id, "Codex") is False
+
+
 # ── ACP Phase 2.5 stub ────────────────────────────────────────────────────────
 
 def test_acp_stub_raises_clear_error() -> None:
@@ -873,13 +1389,16 @@ def test_request_message_wakes_existing_codex_thread(tmp_path: Path, monkeypatch
 
     calls: list[dict] = []
 
-    def fake_codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str, last_msg_path: str | None = None, on_exit=None) -> int:
+    def fake_codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str,
+                          last_msg_path: str | None = None, on_exit=None,
+                          **kwargs) -> int:
         calls.append({
             "thread_id": thread_id,
             "prompt": prompt,
             "cwd": cwd,
             "log_path": log_path,
             "last_msg_path": last_msg_path,
+            "spawn_kwargs": kwargs,
         })
         return 4242
 
@@ -923,6 +1442,8 @@ def test_request_message_wakes_existing_codex_thread(tmp_path: Path, monkeypatch
     assert 'idempotency_key="codex-wake:' in calls[0]["prompt"]
 
     updated = isolated_bus.get_room_info(room_id)["agent_meta"]["Codex"]
+    assert calls[0]["spawn_kwargs"]["owner_room_id"] == room_id
+    assert calls[0]["spawn_kwargs"]["process_handle"] == updated["wake_id"]
     assert updated["thread_id"] == "thread-123"
     assert updated["last_wake_msg_id"] == 2
     assert updated["last_seen_id"] == 2
@@ -938,6 +1459,58 @@ def test_request_message_wakes_existing_codex_thread(tmp_path: Path, monkeypatch
     )
     assert duplicate_id == 2
     assert len(calls) == 1
+
+
+def test_persisted_claim_allows_exactly_one_cross_process_wake(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two independent server processes racing before PID persistence must
+    produce exactly one spawn for the same room+agent+message."""
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("deterministic cross-process regression requires fork")
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    room_id = isolated_bus.create_room(
+        "Claim", "Claude", 0, str(tmp_path), "session-1",
+    )
+    isolated_bus.invite_agent(room_id, "Codex")
+    log_path, last_path = isolated_bus._agent_paths(room_id, "Codex", create=True)
+    log_path.write_text('{"type":"turn.completed"}\n')
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {"Codex": {
+        "thread_id": "thread-claim",
+        "log_path": str(log_path),
+        "last_message_path": str(last_path),
+    }}
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+    msg_id = isolated_bus.post_message(
+        room_id, "Claude", "review", "request", to="Codex",
+    )
+
+    context = multiprocessing.get_context("fork")
+    start_event = context.Event()
+    results = context.Queue()
+    contenders = [
+        context.Process(
+            target=_cross_process_wake_worker,
+            args=(str(tmp_path), room_id, msg_id, start_event, results),
+        )
+        for _ in range(2)
+    ]
+    for contender in contenders:
+        contender.start()
+    start_event.set()
+    for contender in contenders:
+        contender.join(timeout=10)
+        assert contender.exitcode == 0
+
+    outcomes = [results.get(timeout=2) for _ in contenders]
+    assert all(kind == "ok" for kind, _ in outcomes), outcomes
+    assert sum(count for _, count in outcomes) == 1
+    claim = isolated_bus.get_room_info(room_id)["agent_meta"]["Codex"]
+    assert claim["wake_claim_msg_id"] == msg_id
 
 
 def test_room_status_reports_waiting_agent_and_pending_request(
@@ -973,8 +1546,39 @@ def test_room_status_reports_waiting_agent_and_pending_request(
     assert snapshot["pending_requests"][0]["waiting_for"] == ["Antigravity"]
     agent = snapshot["agents"]["Antigravity"]
     assert agent["phase"] == "working"
-    assert agent["process_alive"] is True
+    assert agent["process_alive"] is False
+    assert agent["process_state"] == "unknown"
+    assert agent["health"]["unowned_lease"] is True
     assert agent["task_id"] == 1
+
+
+def test_api_health_counts_unowned_cross_instance_leases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+
+    room_id = isolated_bus.create_room(
+        "Health", "Claude", 0, "/tmp/project", "session-1",
+    )
+    isolated_bus.invite_agent(room_id, "Codex")
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {"Codex": {
+        "wake_id": "owned-by-another-server",
+        "last_wake_pid": _DEAD_PID,
+        "last_wake_at": int(time.time()),
+        "last_wake_msg_id": 1,
+    }}
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+    isolated_bus.set_status(room_id, "Codex", "busy", 300, "session-1")
+
+    response = asyncio.run(server.api_health(None))
+    payload = json.loads(response.body)
+
+    assert payload["stale_leases"] == 0
+    assert payload["unowned_leases"] == 1
+    assert payload["rooms"][0]["agents"]["Codex"]["unowned_lease"] is True
 
 
 def test_agent_reported_phase_does_not_require_server_wake_pid(
@@ -995,7 +1599,8 @@ def test_agent_reported_phase_does_not_require_server_wake_pid(
     agent = server.room_status(room_id)["agents"]["ExternalAgent"]
     assert agent["phase"] == "working"
     assert agent["process_alive"] is False
-    assert agent["health"]["stale_lease"] is True
+    assert agent["health"]["stale_lease"] is False
+    assert agent["health"]["unowned_lease"] is False
 
 
 def test_terminal_agent_failure_closes_pending_request(
@@ -1237,7 +1842,8 @@ def test_respond_via_agent_fresh_spawns_non_codex_with_transcript(
 
     calls: list[dict] = []
 
-    def fake_spawn_agent(spec, brief, cwd, log_dir, verify_alive_sec=0.0, on_exit=None):
+    def fake_spawn_agent(spec, brief, cwd, log_dir, verify_alive_sec=0.0,
+                         on_exit=None, **kwargs):
         calls.append({"spec": spec, "brief": brief, "cwd": cwd, "log_dir": log_dir})
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / "gemini.events.jsonl"
@@ -1287,8 +1893,10 @@ def test_request_message_wakes_registry_agent_without_uuid_resume(
 
     calls: list[dict] = []
 
-    def fake_spawn_agent(spec, brief, cwd, log_dir, verify_alive_sec=0.0, on_exit=None):
-        calls.append({"spec": spec, "brief": brief, "cwd": cwd})
+    def fake_spawn_agent(spec, brief, cwd, log_dir, verify_alive_sec=0.0,
+                         on_exit=None, **kwargs):
+        calls.append({"spec": spec, "brief": brief, "cwd": cwd,
+                      "spawn_kwargs": kwargs})
         log_dir.mkdir(parents=True, exist_ok=True)
         return 6161, str(log_dir / "gemini.events.jsonl"), None
 
@@ -1320,6 +1928,9 @@ def test_request_message_wakes_registry_agent_without_uuid_resume(
     assert msg_id == 2
     assert len(calls) == 1
     assert calls[0]["cwd"] == "/tmp/project"
+    updated = isolated_bus.get_room_info(room_id)["agent_meta"]["Gemini"]
+    assert calls[0]["spawn_kwargs"]["owner_room_id"] == room_id
+    assert calls[0]["spawn_kwargs"]["process_handle"] == updated["wake_id"]
     assert "New request id: 2" in calls[0]["brief"]
     assert "Current full transcript:" in calls[0]["brief"]
     assert "[001] CodexMain" in calls[0]["brief"]
@@ -1390,7 +2001,8 @@ def test_wake_pending_agents_wakes_idle_room(tmp_path: Path, monkeypatch: pytest
 
     calls: list[dict] = []
 
-    def fake_spawn_agent(spec, brief, cwd, log_dir, verify_alive_sec=0.0, on_exit=None):
+    def fake_spawn_agent(spec, brief, cwd, log_dir, verify_alive_sec=0.0,
+                         on_exit=None, **kwargs):
         calls.append({"spec": spec, "brief": brief, "cwd": cwd})
         log_dir.mkdir(parents=True, exist_ok=True)
         return 7171, str(log_dir / "gemini.events.jsonl"), None
@@ -1963,6 +2575,9 @@ def test_direct_anthropic_opus_spawn_uses_only_direct_api_environment(
     monkeypatch.setenv("CLAUDE_CODE_USE_VERTEX", "1")
     monkeypatch.setenv("CLAUDE_CODE_USE_FOUNDRY", "1")
     monkeypatch.setenv("ANTHROPIC_MODEL", "other-model")
+    monkeypatch.setenv("AUDIT_UNRELATED_SECRET", "must-not-pass")
+    monkeypatch.setenv("GH_TOKEN", "must-not-pass")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "must-not-pass")
     captured: dict[str, object] = {}
 
     class FakeProc:
@@ -1997,6 +2612,9 @@ def test_direct_anthropic_opus_spawn_uses_only_direct_api_environment(
     assert "CLAUDE_CODE_USE_VERTEX" not in env
     assert "CLAUDE_CODE_USE_FOUNDRY" not in env
     assert "ANTHROPIC_MODEL" not in env
+    assert "AUDIT_UNRELATED_SECRET" not in env
+    assert "GH_TOKEN" not in env
+    assert "AWS_SECRET_ACCESS_KEY" not in env
     assert "9router" not in " ".join(captured["argv"])
     assert Path(captured["cwd"]).name.startswith("mcp-huddle-opus-review-")
     assert Path(captured["cwd"]).is_dir()
@@ -2092,6 +2710,9 @@ def test_direct_anthropic_opus_reaper_removes_only_its_owned_temp_cwd(
 
     class FakeProc:
         pid = 12345
+
+        def poll(self):
+            return 0
 
         def wait(self):
             return 0
@@ -2201,7 +2822,8 @@ def test_spawn_agents_dict_branch_announces_failure_to_room(
     ]
     monkeypatch.setattr(server.spawn, "load_registry", lambda: fake_registry)
 
-    def broken_spawn_agent(spec, brief, cwd, log_dir, verify_alive_sec=0.0, on_exit=None):
+    def broken_spawn_agent(spec, brief, cwd, log_dir, verify_alive_sec=0.0,
+                           on_exit=None, **kwargs):
         raise FileNotFoundError("codex binary not found")
 
     monkeypatch.setattr(server.spawn, "spawn_agent", broken_spawn_agent)
@@ -2236,7 +2858,8 @@ def test_spawn_agents_bool_branch_announces_failure_to_room(
     ]
     monkeypatch.setattr(server.spawn, "load_registry", lambda: fake_registry)
 
-    def broken_spawn_agent(spec, brief, cwd, log_dir, verify_alive_sec=0.0, on_exit=None):
+    def broken_spawn_agent(spec, brief, cwd, log_dir, verify_alive_sec=0.0,
+                           on_exit=None, **kwargs):
         raise FileNotFoundError("codex binary not found")
 
     monkeypatch.setattr(server.spawn, "spawn_agent", broken_spawn_agent)
@@ -2303,6 +2926,8 @@ def test_fresh_spawn_failure_announces_once_and_is_idempotent_on_repeat_wake(
     assert "Gemini" in comments[0]["body"]
     assert "не заспавнился" in comments[0]["body"]
     assert "RuntimeError" in comments[0]["body"]
+    failed_info = isolated_bus.get_room_info(room_id)["agent_meta"]["Gemini"]
+    assert "wake_claim_id" not in failed_info
 
     # Simulate a second wake attempt for the SAME request (e.g. the watchdog
     # fallback retry) — must not post a second comment.
@@ -2540,6 +3165,9 @@ def test_check_stuck_wakes_announces_once(
     monkeypatch.setattr(server, "STUCK_KILL_ENABLED", False)
     isolated_bus = importlib.reload(bus)
     monkeypatch.setattr(server, "bus", isolated_bus)
+    monkeypatch.setattr(
+        server.child_processes, "state", lambda room_id, handle: "alive",
+    )
 
     room_id = isolated_bus.create_room("Wake", "Claude", 0, "/tmp/project", "session-1")
     isolated_bus.invite_agent(room_id, "Codex")
@@ -2596,6 +3224,92 @@ def test_check_stuck_wakes_disabled_by_zero(
     assert server._check_stuck_wakes() == []
 
 
+def test_check_stuck_wakes_pidless_claim_has_clear_notice_and_keeps_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    monkeypatch.setattr(server, "WAKE_STUCK_SECS", 60)
+    monkeypatch.setattr(server, "STUCK_KILL_ENABLED", True)
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+    monkeypatch.setattr(
+        server.child_processes,
+        "terminate",
+        lambda *args, **kwargs: pytest.fail("pid-less claim was signalled"),
+    )
+
+    room_id = isolated_bus.create_room(
+        "Wake", "Claude", 0, "/tmp/project", "session-1",
+    )
+    isolated_bus.invite_agent(room_id, "Codex")
+    wake_id = "wake-without-pid"
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {"Codex": {
+        "wake_id": wake_id,
+        "wake_claim_id": wake_id,
+        "wake_claimed_at": int(time.time()) - 3600,
+        "last_wake_at": int(time.time()) - 3600,
+        "last_wake_msg_id": 1,
+    }}
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+    isolated_bus.set_status(room_id, "Codex", "busy", 300, "session-1")
+
+    assert server._check_stuck_wakes() == [f"Codex@{room_id}"]
+    comments = [m for m in isolated_bus._load_messages(room_id)
+                if m.get("kind") == "comment"]
+    assert len(comments) == 1
+    assert "PID ещё не опубликован" in comments[0]["body"]
+    assert "запуск остаётся зарезервированным" in comments[0]["body"]
+    assert "None" not in comments[0]["body"]
+
+    updated = isolated_bus.get_room_info(room_id)["agent_meta"]["Codex"]
+    assert updated["wake_claim_id"] == wake_id
+    assert isolated_bus.get_status(room_id)["Codex"] == "busy"
+    assert server._check_stuck_wakes() == []
+
+
+def test_check_stuck_wakes_labels_exact_exited_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    monkeypatch.setattr(server, "WAKE_STUCK_SECS", 60)
+    monkeypatch.setattr(server, "STUCK_KILL_ENABLED", True)
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+    monkeypatch.setattr(
+        server.child_processes, "state", lambda room_id, handle: "exited",
+    )
+    monkeypatch.setattr(
+        server.child_processes,
+        "terminate",
+        lambda *args, **kwargs: pytest.fail("exited process was signalled"),
+    )
+
+    room_id = isolated_bus.create_room(
+        "Wake", "Claude", 0, "/tmp/project", "session-1",
+    )
+    isolated_bus.invite_agent(room_id, "Codex")
+    wake_id = "wake-already-exited"
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {"Codex": {
+        "wake_id": wake_id,
+        "wake_claim_id": wake_id,
+        "wake_claimed_at": int(time.time()) - 3600,
+        "last_wake_pid": 424_242,
+        "last_wake_at": int(time.time()) - 3600,
+        "last_wake_msg_id": 1,
+    }}
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+    isolated_bus.set_status(room_id, "Codex", "busy", 300, "session-1")
+
+    assert server._check_stuck_wakes() == [f"Codex@{room_id}"]
+    comments = [m for m in isolated_bus._load_messages(room_id)
+                if m.get("kind") == "comment"]
+    assert len(comments) == 1
+    assert "процесс 424242: завершён" in comments[0]["body"]
+    assert "не принадлежит текущему серверу" not in comments[0]["body"]
+
+
 def test_check_stuck_wakes_kills_live_pid_when_enabled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2615,6 +3329,7 @@ def test_check_stuck_wakes_kills_live_pid_when_enabled(
     proc = subprocess.Popen(["sleep", "30"])
     try:
         wake_id = "wake-kill"
+        child_processes.register(proc, room_id, wake_id)
         meta = isolated_bus.get_room_info(room_id)
         meta["agent_meta"] = {"Codex": {
             "wake_id": wake_id,
@@ -2634,7 +3349,9 @@ def test_check_stuck_wakes_kills_live_pid_when_enabled(
         messages = isolated_bus._load_messages(room_id)
         comments = [m for m in messages if m.get("kind") == "comment"]
         assert len(comments) == 1
-        assert "остановлен" in comments[0]["body"]
+        assert "SIGTERM отправлен" in comments[0]["body"]
+        assert "ожидается завершение" in comments[0]["body"]
+        assert "остановлен" not in comments[0]["body"]
 
         info = isolated_bus.get_room_info(room_id)["agent_meta"]["Codex"]
         assert info["stuck_killed_wake_id"] == wake_id
@@ -2642,6 +3359,70 @@ def test_check_stuck_wakes_kills_live_pid_when_enabled(
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
+        child_processes._reset_for_tests()
+
+
+@pytest.mark.parametrize("mode", ["unknown", "denied", "announce_only"])
+def test_stuck_warning_keeps_lease_and_blocks_next_request(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    monkeypatch.setattr(server, "WAKE_STUCK_SECS", 60)
+    monkeypatch.setattr(server, "STUCK_KILL_ENABLED", mode != "announce_only")
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+    if mode in {"denied", "announce_only"}:
+        monkeypatch.setattr(
+            server.child_processes, "state",
+            lambda room_id, handle: "alive",
+        )
+    if mode == "denied":
+        monkeypatch.setattr(
+            server.child_processes, "terminate",
+            lambda room_id, handle: "denied",
+        )
+
+    room_id = isolated_bus.create_room(
+        "Wake", "Claude", 0, "/tmp/project", "session-1",
+    )
+    isolated_bus.invite_agent(room_id, "Codex")
+    first_request = isolated_bus.post_message(
+        room_id, "Claude", "first", "request", to="Codex",
+    )
+    wake_id = "foreign-wake"
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {"Codex": {
+        "wake_id": wake_id,
+        "wake_claim_id": wake_id,
+        "wake_claim_msg_id": first_request,
+        "wake_claimed_at": int(time.time()) - 3600,
+        "last_wake_pid": 424_242,
+        "last_wake_at": int(time.time()) - 3600,
+        "last_wake_msg_id": first_request,
+    }}
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+    isolated_bus.set_status(room_id, "Codex", "busy", 300, "session-1")
+
+    assert server._check_stuck_wakes() == [f"Codex@{room_id}"]
+
+    comments = [m for m in isolated_bus._load_messages(room_id)
+                if m.get("kind") == "comment"]
+    assert len(comments) == 1
+    assert "остановлен" not in comments[0]["body"]
+    info = isolated_bus.get_room_info(room_id)["agent_meta"]["Codex"]
+    assert "stuck_killed_wake_id" not in info
+    assert isolated_bus.get_status(room_id)["Codex"] == "busy"
+
+    isolated_bus.post_message(
+        room_id, "Claude", "second", "request", to="Codex",
+    )
+    monkeypatch.setattr(
+        server, "_wake_agents_for_request",
+        lambda *args, **kwargs: pytest.fail(
+            f"{mode} stuck lease allowed a duplicate spawn"
+        ),
+    )
+    assert server._wake_pending_agents() == []
 
 
 def test_check_stuck_wakes_disabled_flag_announces_only_no_kill(
@@ -2654,6 +3435,9 @@ def test_check_stuck_wakes_disabled_flag_announces_only_no_kill(
     monkeypatch.setattr(server, "STUCK_KILL_ENABLED", False)
     isolated_bus = importlib.reload(bus)
     monkeypatch.setattr(server, "bus", isolated_bus)
+    monkeypatch.setattr(
+        server.child_processes, "state", lambda room_id, handle: "alive",
+    )
 
     room_id = isolated_bus.create_room("Wake", "Claude", 0, "/tmp/project", "session-1")
     isolated_bus.invite_agent(room_id, "Codex")
@@ -2730,12 +3514,11 @@ def test_on_wake_exit_after_stuck_kill_suppresses_noreply(
 _DEAD_PID = 999_999_999  # convention used across the suite: no such process
 
 
-def test_check_dead_wakes_announces_and_clears_lease(
+def test_check_dead_wakes_never_clears_unowned_multi_instance_lease(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A 'busy' lease whose pid is dead, past the grace window, with no
-    reply posted, gets exactly one deadwake notice and its lease is cleared
-    (status back to online) — a repeat sweep does not duplicate it."""
+    """A persisted lease unknown to this process may belong to another stdio
+    server instance. It must remain busy: no signal, clear, or duplicate wake."""
     monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
     monkeypatch.setattr(server, "DEAD_WAKE_GRACE_SECS", 60)
     isolated_bus = importlib.reload(bus)
@@ -2756,24 +3539,35 @@ def test_check_dead_wakes_announces_and_clears_lease(
     isolated_bus.set_status(room_id, "Codex", "busy", 300, "session-1")
 
     announced = server._check_dead_wakes()
-    assert announced == [f"Codex@{room_id}"]
+    assert announced == []
 
     messages = isolated_bus._load_messages(room_id)
     comments = [m for m in messages if m.get("kind") == "comment"]
-    assert len(comments) == 1
-    assert "умер" in comments[0]["body"]
-    assert str(_DEAD_PID) in comments[0]["body"]
+    assert comments == []
 
     statuses = isolated_bus.get_status(room_id)
-    assert statuses.get("Codex") == "online"
+    assert statuses.get("Codex") == "busy"
+    assert server._wake_in_progress(
+        isolated_bus.get_room_info(room_id)["agent_meta"]["Codex"],
+        "busy", room_id,
+    ) is True
 
-    # Repeat sweep: lease already cleared (status no longer 'busy') — no
-    # second comment.
+    # A newer queued request must remain behind the foreign instance's lease;
+    # fallback drain must not create a duplicate child.
+    isolated_bus.post_message(
+        room_id, "Claude", "second request", "request", to="Codex",
+    )
+    monkeypatch.setattr(
+        server, "_wake_agents_for_request",
+        lambda *args, **kwargs: pytest.fail("unowned lease was duplicated"),
+    )
+    assert server._wake_pending_agents() == []
+
     announced_again = server._check_dead_wakes()
     assert announced_again == []
     messages_after = isolated_bus._load_messages(room_id)
     comments_after = [m for m in messages_after if m.get("kind") == "comment"]
-    assert len(comments_after) == 1
+    assert comments_after == []
 
 
 def test_check_dead_wakes_respects_grace_window(
@@ -2785,6 +3579,9 @@ def test_check_dead_wakes_respects_grace_window(
     monkeypatch.setattr(server, "DEAD_WAKE_GRACE_SECS", 3600)
     isolated_bus = importlib.reload(bus)
     monkeypatch.setattr(server, "bus", isolated_bus)
+    monkeypatch.setattr(
+        server.child_processes, "state", lambda room_id, handle: "exited",
+    )
 
     room_id = isolated_bus.create_room("Wake", "Claude", 0, "/tmp/project", "session-1")
     isolated_bus.invite_agent(room_id, "Codex")
@@ -2815,6 +3612,9 @@ def test_check_dead_wakes_skips_notice_but_still_clears_lease_if_agent_replied(
     monkeypatch.setattr(server, "DEAD_WAKE_GRACE_SECS", 60)
     isolated_bus = importlib.reload(bus)
     monkeypatch.setattr(server, "bus", isolated_bus)
+    monkeypatch.setattr(
+        server.child_processes, "state", lambda room_id, handle: "exited",
+    )
 
     room_id = isolated_bus.create_room("Wake", "Claude", 0, "/tmp/project", "session-1")
     isolated_bus.invite_agent(room_id, "Codex")
@@ -2853,6 +3653,9 @@ def test_check_dead_wakes_skips_notice_for_already_stuck_killed_wake(
     monkeypatch.setattr(server, "DEAD_WAKE_GRACE_SECS", 60)
     isolated_bus = importlib.reload(bus)
     monkeypatch.setattr(server, "bus", isolated_bus)
+    monkeypatch.setattr(
+        server.child_processes, "state", lambda room_id, handle: "exited",
+    )
 
     room_id = isolated_bus.create_room("Wake", "Claude", 0, "/tmp/project", "session-1")
     isolated_bus.invite_agent(room_id, "Codex")
@@ -2890,6 +3693,9 @@ def test_check_dead_wakes_ignores_alive_pid(
     monkeypatch.setattr(server, "DEAD_WAKE_GRACE_SECS", 60)
     isolated_bus = importlib.reload(bus)
     monkeypatch.setattr(server, "bus", isolated_bus)
+    monkeypatch.setattr(
+        server.child_processes, "state", lambda room_id, handle: "alive",
+    )
 
     room_id = isolated_bus.create_room("Wake", "Claude", 0, "/tmp/project", "session-1")
     isolated_bus.invite_agent(room_id, "Codex")
@@ -2956,11 +3762,11 @@ def test_on_initial_spawn_exit_nonzero_no_post_announces_noreply_once(
     log_path = isolated_bus._room_dir(room_id) / "agents" / "opencode.events.jsonl"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text('{"type":"error","error":"database is locked"}\n')
-    meta = isolated_bus.get_room_info(room_id)
-    meta["agent_meta"] = {"OpenCode": {"log_path": str(log_path)}}
-    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+    assert server._reserve_initial_spawn(
+        room_id, "OpenCode", "legacy-init", {"log_path": str(log_path)},
+    )
 
-    server._on_initial_spawn_exit(room_id, "OpenCode", 1)
+    server._on_initial_spawn_exit(room_id, "OpenCode", "legacy-init", 1)
 
     messages = isolated_bus._load_messages(room_id)
     comments = [m for m in messages if m.get("kind") == "comment"]
@@ -2969,7 +3775,7 @@ def test_on_initial_spawn_exit_nonzero_no_post_announces_noreply_once(
     assert "exit 1" in comments[0]["body"]
 
     # Repeat exit callback (e.g. reaper fires twice) — idempotent, no duplicate.
-    server._on_initial_spawn_exit(room_id, "OpenCode", 1)
+    server._on_initial_spawn_exit(room_id, "OpenCode", "legacy-init", 1)
     messages_after = isolated_bus._load_messages(room_id)
     comments_after = [m for m in messages_after if m.get("kind") == "comment"]
     assert len(comments_after) == 1
@@ -2988,8 +3794,11 @@ def test_on_initial_spawn_exit_posted_message_no_noreply(
     room_id = isolated_bus.create_room("Init", "Claude", 0, "/tmp/project", "session-1")
     isolated_bus.invite_agent(room_id, "OpenCode")
     isolated_bus.post_message(room_id, "OpenCode", "reviewing now", "comment")
+    assert server._reserve_initial_spawn(
+        room_id, "OpenCode", "legacy-init", {},
+    )
 
-    server._on_initial_spawn_exit(room_id, "OpenCode", 1)
+    server._on_initial_spawn_exit(room_id, "OpenCode", "legacy-init", 1)
 
     messages = isolated_bus._load_messages(room_id)
     comments = [m for m in messages if m.get("kind") == "comment"]
@@ -3016,11 +3825,11 @@ def test_on_initial_spawn_exit_rate_limit_suppresses_noreply(
     log_path.write_text(
         '{"type":"turn.failed","error":{"message":"You\'ve hit your usage limit. Try again later."}}\n'
     )
-    meta = isolated_bus.get_room_info(room_id)
-    meta["agent_meta"] = {"Codex": {"log_path": str(log_path)}}
-    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+    assert server._reserve_initial_spawn(
+        room_id, "Codex", "legacy-init", {"log_path": str(log_path)},
+    )
 
-    server._on_initial_spawn_exit(room_id, "Codex", 1)
+    server._on_initial_spawn_exit(room_id, "Codex", "legacy-init", 1)
 
     messages = isolated_bus._load_messages(room_id)
     comments = [m for m in messages if m.get("kind") == "comment"]
@@ -3047,7 +3856,8 @@ def test_spawn_agents_dict_branch_wires_noreply_callback_on_exit(
 
     captured_on_exit = {}
 
-    def fake_spawn_agent(spec, brief, cwd, log_dir, verify_alive_sec=0.0, on_exit=None):
+    def fake_spawn_agent(spec, brief, cwd, log_dir, verify_alive_sec=0.0,
+                         on_exit=None, **kwargs):
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / "opencode.events.jsonl"
         log_path.write_text('{"type":"error","error":"database is locked"}\n')
@@ -3270,3 +4080,453 @@ def test_wakeup_prompt_format_unchanged_after_refactor() -> None:
     assert ('message_post(room_id="room_test", agent="Codex", kind="result", '
             'to="Claude", reply_to=7, '
             'idempotency_key="codex-wake:room_test:7")') in codex_prompt
+
+
+# ── Persisted generation / resource-bound regressions ───────────────────────
+
+def _isolated_room(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, agent: str = "Reviewer",
+) -> tuple[object, str]:
+    monkeypatch.setenv("MCP_HUDDLE_HOME", str(tmp_path))
+    isolated_bus = importlib.reload(bus)
+    monkeypatch.setattr(server, "bus", isolated_bus)
+    room_id = isolated_bus.create_room(
+        "Lifecycle", "Human", 0, str(tmp_path), "session-1",
+    )
+    isolated_bus.invite_agent(room_id, agent)
+    return isolated_bus, room_id
+
+
+def test_stale_post_spawn_publish_cannot_overwrite_new_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    isolated_bus, room_id = _isolated_room(tmp_path, monkeypatch)
+    first = isolated_bus.post_message(
+        room_id, "Human", "first", "request", to="Reviewer",
+    )
+    second = isolated_bus.post_message(
+        room_id, "Human", "second", "request", to="Reviewer",
+    )
+    assert server._claim_wake(room_id, "Reviewer", first, "old-generation")
+    assert server._clear_wake_claim(room_id, "Reviewer", "old-generation")
+    assert server._claim_wake(room_id, "Reviewer", second, "new-generation")
+    server._set_agent_phase(
+        room_id, "Reviewer", "starting", task_id=second,
+    )
+
+    assert not server._publish_wake_started(
+        room_id, "Reviewer", "old-generation", {
+            "wake_id": "old-generation",
+            "last_wake_msg_id": first,
+            "last_seen_id": first,
+            "last_wake_pid": 111,
+        },
+    )
+
+    info = isolated_bus.get_room_info(room_id)["agent_meta"]["Reviewer"]
+    assert info["wake_claim_id"] == "new-generation"
+    assert info["wake_id"] == "new-generation"
+    assert info["last_wake_msg_id"] == second
+    assert info["last_wake_pid"] is None
+    status = isolated_bus.get_status_details(room_id)["Reviewer"]
+    assert status["task_id"] == second
+    assert status["phase"] == "starting"
+
+
+def test_successful_publish_serializes_working_before_terminal_callback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    isolated_bus, room_id = _isolated_room(tmp_path, monkeypatch, "Codex")
+    log_path, last_path = isolated_bus._agent_paths(
+        room_id, "Codex", create=True,
+    )
+    log_path.write_text('{"type":"turn.completed"}\n')
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {"Codex": {
+        "thread_id": "thread-status-cas",
+        "log_path": str(log_path),
+        "last_message_path": str(last_path),
+    }}
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+
+    allow_exit = threading.Event()
+    callback_attempted = threading.Event()
+    callback_done = threading.Event()
+    callback_threads: list[threading.Thread] = []
+
+    def fake_resume(*args, **kwargs):
+        def finish() -> None:
+            allow_exit.wait(2)
+            callback_attempted.set()
+            kwargs["on_exit"](0)
+            callback_done.set()
+
+        thread = threading.Thread(target=finish, daemon=True)
+        callback_threads.append(thread)
+        thread.start()
+        return 55_555
+
+    real_set_phase = server._set_agent_phase
+
+    def interleaved_set_phase(room, agent, phase, *args, **kwargs):
+        if phase == "working":
+            # The callback reaches the generation lock after meta publication
+            # but before the working status write. It must wait until the
+            # publish protocol completes, then its terminal phase wins.
+            allow_exit.set()
+            assert callback_attempted.wait(1)
+        return real_set_phase(room, agent, phase, *args, **kwargs)
+
+    monkeypatch.setattr(server.spawn, "codex_resume", fake_resume)
+    monkeypatch.setattr(server, "_set_agent_phase", interleaved_set_phase)
+
+    result = server.respond_via_agent(room_id, "Codex", "follow-up")
+    assert result["pid"] == 55_555
+    assert callback_done.wait(2)
+    for thread in callback_threads:
+        thread.join(timeout=1)
+
+    info = isolated_bus.get_room_info(room_id)["agent_meta"]["Codex"]
+    assert "wake_claim_id" not in info
+    status = isolated_bus.get_status_details(room_id)["Codex"]
+    assert status["phase"] == "unavailable"
+    assert status["status"] == "online"
+
+
+def test_delayed_early_exit_wins_over_late_pid_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    isolated_bus, room_id = _isolated_room(tmp_path, monkeypatch)
+    generation = "initial-generation"
+    assert server._reserve_initial_spawn(
+        room_id, "Reviewer", generation, {"log_path": "ignored"},
+    )
+    server._on_initial_spawn_exit(room_id, "Reviewer", generation, 1)
+
+    assert not server._record_spawned_pid(
+        room_id, 222, "Reviewer", generation,
+    )
+    info = isolated_bus.get_room_info(room_id)["agent_meta"]["Reviewer"]
+    assert info["initial_spawn_active"] is False
+    assert info.get("last_wake_pid") is None
+    assert isolated_bus.get_status(room_id)["Reviewer"] == "online"
+
+
+def test_stale_initial_exit_callback_does_not_clobber_new_wake_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    isolated_bus, room_id = _isolated_room(tmp_path, monkeypatch)
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {"Reviewer": {
+        "initial_spawn_id": "new-initial",
+        "initial_spawn_active": True,
+    }}
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+    isolated_bus.set_status(
+        room_id, "Reviewer", "busy", 0, "session-1",
+        phase="working", task_id="new", source="server",
+    )
+
+    server._on_initial_spawn_exit(room_id, "Reviewer", "old-initial", 1)
+
+    info = isolated_bus.get_room_info(room_id)["agent_meta"]["Reviewer"]
+    assert info["initial_spawn_id"] == "new-initial"
+    assert info["initial_spawn_active"] is True
+    status = isolated_bus.get_status_details(room_id)["Reviewer"]
+    assert status["phase"] == "working"
+    assert status["task_id"] == "new"
+
+
+def test_respond_via_agent_rejects_active_claim_without_mutation_or_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    isolated_bus, room_id = _isolated_room(tmp_path, monkeypatch)
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {"Reviewer": {
+        "wake_claim_id": "active",
+        "wake_id": "active",
+        "wake_claim_msg_id": 7,
+        "last_wake_msg_id": 7,
+    }}
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+    before = dict(meta["agent_meta"]["Reviewer"])
+    monkeypatch.setattr(
+        server, "_spawn_fresh_room_agent",
+        lambda *a, **k: pytest.fail("active claim reached spawn"),
+    )
+
+    with pytest.raises(ValueError, match="active process claim"):
+        server.respond_via_agent(room_id, "Reviewer", "follow-up")
+
+    after = isolated_bus.get_room_info(room_id)["agent_meta"]["Reviewer"]
+    assert after == before
+
+
+def test_repeat_room_invite_preserves_active_lifecycle_and_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    isolated_bus, room_id = _isolated_room(tmp_path, monkeypatch)
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {"Reviewer": {
+        "wake_claim_id": "active-generation",
+        "wake_claim_msg_id": 17,
+        "wake_id": "active-generation",
+        "last_wake_msg_id": 17,
+        "last_wake_pid": 44_444,
+        "initial_spawn_active": False,
+        "thread_id": "existing-thread",
+    }}
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+    isolated_bus.set_status(
+        room_id, "Reviewer", "busy", 0, "session-1",
+        phase="working", task_id=17, source="server",
+    )
+    monkeypatch.setattr(
+        server.spawn, "get_enabled_spec",
+        lambda name: {"name": name, "cmd": ["reviewer"], "enabled": True},
+    )
+
+    assert server.room_invite(room_id, "Reviewer", by="Human") == "ok"
+
+    info = isolated_bus.get_room_info(room_id)["agent_meta"]["Reviewer"]
+    assert info["wake_claim_id"] == "active-generation"
+    assert info["wake_claim_msg_id"] == 17
+    assert info["wake_id"] == "active-generation"
+    assert info["last_wake_pid"] == 44_444
+    assert info["thread_id"] == "existing-thread"
+    assert info["external"] is True
+    assert Path(info["log_path"]).parent == isolated_bus._room_dir(room_id) / "agents"
+    status = isolated_bus.get_status_details(room_id)["Reviewer"]
+    assert status["status"] == "busy"
+    assert status["phase"] == "working"
+    assert status["task_id"] == 17
+
+
+def test_reverse_order_wake_attempt_cannot_skip_oldest_persisted_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    isolated_bus, room_id = _isolated_room(tmp_path, monkeypatch)
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {"Reviewer": {}}
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+    first = isolated_bus.post_message(
+        room_id, "Human", "first", "request", to="Reviewer",
+    )
+    second = isolated_bus.post_message(
+        room_id, "Human", "second", "request", to="Reviewer",
+    )
+    spawned: list[int | None] = []
+
+    def fake_spawn(*args, **kwargs):
+        spawned.append(kwargs.get("msg_id"))
+        return 333, "/tmp/reviewer.log", None
+
+    monkeypatch.setattr(server, "_spawn_fresh_room_agent", fake_spawn)
+
+    assert server._wake_agents_for_request(
+        room_id, "Human", "second", "Reviewer", None, second,
+    ) == []
+    wakes = server._wake_agents_for_request(
+        room_id, "Human", "first", "Reviewer", None, first,
+    )
+    assert len(wakes) == 1
+    assert spawned == [first]
+    info = isolated_bus.get_room_info(room_id)["agent_meta"]["Reviewer"]
+    assert info["wake_claim_msg_id"] == first
+    assert info["last_wake_msg_id"] == first
+
+
+def test_claim_only_crash_is_visible_and_recommends_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    isolated_bus, room_id = _isolated_room(tmp_path, monkeypatch)
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {"Reviewer": {}}
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+    request_id = isolated_bus.post_message(
+        room_id, "Human", "review", "request", to="Reviewer",
+    )
+    assert server._claim_wake(
+        room_id, "Reviewer", request_id, "claim-before-popen-crash",
+    )
+
+    snapshot = server.room_status(room_id)
+    reviewer = snapshot["agents"]["Reviewer"]
+    assert reviewer["phase"] == "starting"
+    assert reviewer["health"]["claim_active"] is True
+    assert reviewer["health"]["unowned_lease"] is True
+    assert reviewer["health"]["last_wake_pid"] is None
+    assert snapshot["wait_recommended"] is True
+    assert snapshot["all_terminal"] is False
+
+
+def test_spawned_pid_and_wake_lock_histories_are_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server, "_SPAWNED_PID_HISTORY_MAX", 4)
+    assert server._bounded_spawned_pids(list(range(1, 20)), 20) == [17, 18, 19, 20]
+
+    with server._wake_locks_guard:
+        server._wake_locks.clear()
+    # A returned-but-not-yet-entered lock is held strongly by the caller and
+    # therefore cannot be evicted/replaced by churn on other room keys.
+    first = server._wake_lock("room-race", "Reviewer")
+    for index in range(20):
+        transient = server._wake_lock(f"room-{index}", "Reviewer")
+    same = server._wake_lock("room-race", "Reviewer")
+    assert same is first
+
+    del same, first, transient
+    gc.collect()
+    with server._wake_locks_guard:
+        assert len(server._wake_locks) == 0
+
+
+def test_spawn_failure_log_does_not_expose_brief_argv_or_exception_values(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    sentinel_brief = "AUDIT_SECRET_BRIEF_47391"
+    sentinel_arg = "AUDIT_SECRET_ARG_82914"
+    sentinel_error = "AUDIT_SECRET_ERROR_61007"
+    spec: spawn.SpawnSpec = {
+        "name": "SafeFailure",
+        "cmd": ["runner", f"--token={sentinel_arg}", "{brief}"],
+        "enabled": True,
+    }
+
+    spawn.log_spawn_failure(
+        spec, sentinel_brief, str(tmp_path), tmp_path,
+        OSError(sentinel_error),
+    )
+
+    stderr = capsys.readouterr().err
+    assert "SafeFailure" in stderr
+    assert "error_type=OSError" in stderr
+    assert "arg_count=3" in stderr
+    assert sentinel_brief not in stderr
+    assert sentinel_arg not in stderr
+    assert sentinel_error not in stderr
+
+
+def test_room_spawn_does_not_create_unused_brief_tempfile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    isolated_bus, room_id = _isolated_room(tmp_path, monkeypatch)
+    monkeypatch.setattr(spawn, "load_registry", lambda: [])
+    monkeypatch.setattr(
+        tempfile, "mkstemp",
+        lambda *a, **k: pytest.fail("unused room brief tempfile created"),
+    )
+
+    server._spawn_agents(
+        room_id, "Lifecycle", "goal", str(tmp_path), "Human", True,
+    )
+
+
+def test_owned_and_standalone_log_reads_are_bounded_and_find_edge_markers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    isolated_bus, room_id = _isolated_room(tmp_path, monkeypatch, "Codex")
+    log_path, _ = isolated_bus._agent_paths(room_id, "Codex", create=True)
+    head = b'{"type":"thread.started","thread_id":"thread-bounded"}\n'
+    filler = b"x" * (server._OWNED_LOG_HEAD_BYTES + server._OWNED_LOG_TAIL_BYTES)
+    tail = (
+        b'\n{"type":"turn.completed"}\n'
+        b'{"type":"error","message":"rate limit exceeded"}\n'
+    )
+    log_path.write_bytes(head + filler + tail)
+
+    owned_head = server._read_owned_agent_log(
+        room_id, "Codex", limit=server._OWNED_LOG_HEAD_BYTES, tail=False,
+    )
+    owned_tail = server._read_owned_agent_log(
+        room_id, "Codex", limit=server._OWNED_LOG_TAIL_BYTES, tail=True,
+    )
+    assert owned_head is not None and len(owned_head) <= server._OWNED_LOG_HEAD_BYTES
+    assert owned_tail is not None and len(owned_tail) <= server._OWNED_LOG_TAIL_BYTES
+    assert server._parse_owned_codex_thread_id(room_id, "Codex", .01) == "thread-bounded"
+    assert server._owned_codex_log_has_completed_turn(room_id, "Codex")
+    assert spawn.detect_rate_limit_text(owned_tail)
+
+    assert spawn.parse_codex_thread_id(str(log_path), .01) == "thread-bounded"
+    assert spawn.codex_log_has_completed_turn(str(log_path))
+    assert spawn.detect_rate_limit(str(log_path))
+
+
+def test_stuck_sweep_stale_snapshot_cannot_mark_new_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    isolated_bus, room_id = _isolated_room(tmp_path, monkeypatch, "Codex")
+    first = isolated_bus.post_message(
+        room_id, "Human", "first", "request", to="Codex",
+    )
+    second = isolated_bus.post_message(
+        room_id, "Human", "second", "request", to="Codex",
+    )
+    old_wake = "old-stuck-generation"
+    new_wake = "new-active-generation"
+    meta = isolated_bus.get_room_info(room_id)
+    meta["agent_meta"] = {"Codex": {
+        "wake_id": old_wake,
+        "wake_claim_id": old_wake,
+        "wake_claim_msg_id": first,
+        "last_wake_msg_id": first,
+        "last_wake_pid": 77_001,
+        "last_wake_at": int(time.time()) - 3600,
+    }}
+    isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
+    isolated_bus.set_status(
+        room_id, "Codex", "busy", 0, "session-1",
+        phase="working", task_id=first, source="server",
+    )
+    monkeypatch.setattr(server, "WAKE_STUCK_SECS", 60)
+    monkeypatch.setattr(
+        server.child_processes, "state", lambda room, handle: "alive",
+    )
+    monkeypatch.setattr(
+        server.child_processes, "terminate",
+        lambda *a, **k: pytest.fail("stale stuck sweep tried to terminate"),
+    )
+
+    real_update = isolated_bus._update_meta_locked
+    interleaved = False
+
+    def update_with_new_claim_before_old_cas(room, update_fn):
+        nonlocal interleaved
+        if not interleaved:
+            interleaved = True
+
+            def install_new_generation(current):
+                info = current["agent_meta"]["Codex"]
+                info.update({
+                    "wake_id": new_wake,
+                    "wake_claim_id": new_wake,
+                    "wake_claim_msg_id": second,
+                    "last_wake_msg_id": second,
+                    "last_wake_pid": 77_002,
+                    "last_wake_at": int(time.time()),
+                })
+                return current
+
+            real_update(room, install_new_generation)
+            isolated_bus.set_status(
+                room, "Codex", "busy", 0, "session-1",
+                phase="working", task_id=second, source="server",
+            )
+        return real_update(room, update_fn)
+
+    monkeypatch.setattr(
+        isolated_bus, "_update_meta_locked", update_with_new_claim_before_old_cas,
+    )
+
+    assert server._check_stuck_wakes() == []
+
+    info = isolated_bus.get_room_info(room_id)["agent_meta"]["Codex"]
+    assert info["wake_id"] == new_wake
+    assert info["wake_claim_id"] == new_wake
+    assert "stuck_announced_wake_id" not in info
+    status = isolated_bus.get_status_details(room_id)["Codex"]
+    assert status["phase"] == "working"
+    assert status["task_id"] == second
+    assert not [m for m in isolated_bus._load_messages(room_id)
+                if m.get("idempotency_key", "").startswith("stuck:")]

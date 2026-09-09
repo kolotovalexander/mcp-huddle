@@ -7,12 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- CI on Python 3.11–3.14, including the declared dependency floors, dashboard
+  syntax, dependency consistency, source compilation, CLI version and wheel
+  build checks. Third-party GitHub Actions are pinned to immutable commits.
+- Persisted per-room write admission (120 messages per 60 seconds), a 256 KiB
+  body cap and a 320 KiB complete serialized-message cap.
+- Process-local exact-child ownership plus persisted, atomic wake claims for
+  safe coordination between simultaneous stdio and HTTP server instances.
+- Dashboard token entry and authenticated fetch-based live event streams with
+  reconnect support. The raw token is exchanged once and retained only as a
+  process-local derived credential in page memory.
+
 ### Changed
 
 - Releases starting with v0.7.0 are licensed under PolyForm Noncommercial
   1.0.0. Commercial use requires a separate written license from Alexander
   Kolotov. Previously
   released versions through v0.6.0 remain under the MIT License.
+- Runtime minimums now stay on patched compatible lines: MCP SDK 1.28.1+,
+  Starlette 1.0.1+, Uvicorn 0.32+, with upper bounds for their next breaking
+  major releases.
+- Spawned processes receive a small non-secret environment allowlist. Registry
+  entries opt in additional names with `pass_env`; `--api-key-env` opts in only
+  the named provider key. Fixed subscription/direct-review profiles fail closed
+  when their authentication contract is not satisfied.
+- Notification files are confined to direct children of
+  `$MCP_HUDDLE_HOME/notifications/`; hook consumers atomically claim them before
+  reading.
+- Persisted PIDs are diagnostic only. Huddle signals only exact `Popen` objects
+  owned by the current server; foreign/unknown leases stay occupied and live
+  owners cooperatively stop their own children when room state becomes terminal.
+
+### Fixed
+
+- Direct and symlink path traversal, final-component swaps and unsafe file
+  opens across room metadata, messages, locks, agent logs and notifications.
+- Concurrent post admission, close/delete/retention transitions, late child
+  registration and bulk-close lifecycle races. Terminal rooms now stop owned
+  children before their data is removed, and a failed close side effect no
+  longer leaves an otherwise recoverable room stranded in `closing`.
+- Zombie cleanup now revalidates owner PID, session, lifecycle and activity in
+  the atomic close claim, so a concurrent room reclaim or fresh message cannot
+  be closed from a stale watchdog snapshot.
+- Duplicate agent launches from simultaneous server instances, from requests
+  arriving during initial auto-spawn, and after a stuck foreign wake warning.
+- HTTP access is default-deny outside the dashboard assets and token exchange;
+  loopback Host/Origin, body type/size, root-path and malformed credential cases
+  fail closed. Authentication covers REST, SSE and MCP transport data/actions.
+- Agent-event SSE refuses symlinked room/log paths and reconnects after
+  transient EOF/network failures without replaying already displayed events.
+- API and MiMo runners publish only validated non-empty terminal results; error
+  messages no longer echo provider payloads or secret values.
+- Spawn setup failures stop and reap the exact new child or retain an exact
+  fallback reaper; standalone logs reject traversal, symlinks and hardlinks.
+- Bundled notification hooks recover abandoned bounded claims without deleting
+  a live or concurrently replaced notification. The SessionEnd hook now
+  consumes the caller's session id only for a verified SessionEnd event, safely
+  bounds delayed or partial stdin and the complete loopback request, supports
+  authenticated HTTP, and no longer depends on a shared predictable `/tmp`
+  file or a non-exported MCP tool.
+- `mcp-huddle --version` reports the checked-out source version in editable
+  development trees instead of stale installed-package metadata.
 
 ## [0.6.0] - 2026-08-01
 

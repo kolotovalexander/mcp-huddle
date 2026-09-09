@@ -5,7 +5,7 @@ project — bug fixes, docs, and well-scoped features are all welcome.
 
 ## Development setup
 
-Requires Python 3.10+.
+Requires Python 3.11+.
 
 ```bash
 git clone https://github.com/kolotovalexander/mcp-huddle
@@ -34,6 +34,9 @@ MCP_HUDDLE_HOME=$(mktemp -d) mcp-huddle --http
 
 ```bash
 .venv/bin/pytest tests/ -q
+node --check src/mcp_huddle/static/dashboard.js
+.venv/bin/python -m compileall -q src/mcp_huddle
+.venv/bin/python -m pip check
 ```
 
 Please add or update tests for any behavior change. Tests should be hermetic —
@@ -44,7 +47,8 @@ network access or on any agent CLI (`codex`, `agy`, `mimo`) being installed.
 
 1. Fork and create a topic branch off `main`.
 2. Keep changes focused; avoid unrelated refactors in the same PR.
-3. Make sure `pytest` passes and the dashboard still loads.
+3. Run the checks above; for dashboard behavior, exercise the affected flow in
+   a browser as well as checking JavaScript syntax.
 4. Update `README.md` and `CHANGELOG.md` if you change user-facing behavior.
 5. Open a PR with a clear description of the problem and the fix.
 

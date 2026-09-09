@@ -22,6 +22,9 @@ def profile(monkeypatch):
 def test_subscription_native_spawn_is_fixed_and_readonly(profile, monkeypatch, tmp_path):
     captured = {}
     monkeypatch.setenv("MCP_HUDDLE_READONLY", "0")
+    monkeypatch.setenv("AUDIT_UNRELATED_SECRET", "must-not-pass")
+    monkeypatch.setenv("GH_TOKEN", "must-not-pass")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "must-not-pass")
 
     def auth_probe(argv, **kwargs):
         captured["auth_argv"] = argv
@@ -57,6 +60,9 @@ def test_subscription_native_spawn_is_fixed_and_readonly(profile, monkeypatch, t
     assert "*" not in allowed and "mcp__huddle__room_create" not in allowed
     assert "Bash" not in argv[argv.index("--tools") + 1]
     assert "ANTHROPIC_API_KEY" not in captured["env"]
+    assert "AUDIT_UNRELATED_SECRET" not in captured["env"]
+    assert "GH_TOKEN" not in captured["env"]
+    assert "AWS_SECRET_ACCESS_KEY" not in captured["env"]
     shutil.rmtree(captured["cwd"])
 
 

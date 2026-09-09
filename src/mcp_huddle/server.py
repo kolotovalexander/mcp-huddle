@@ -6,22 +6,26 @@ HTTP mode (`--http`): uvicorn + Liquid Glass dashboard on :8014.
 
 import asyncio
 import contextlib
+import hashlib
+import hmac
 import json
 import os
-import signal
+import stat
 import sys
-import tempfile
 import threading
 import time
 import uuid
+import weakref
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
 from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, StreamingResponse
 
 from . import bus
+from . import child_processes
 from . import spawn
 
 # Shown to LLM clients in the `initialize` response. Keep tight — every agent
@@ -311,7 +315,11 @@ def room_request_close(room_id: str, agent: str) -> str:
 
 
 def room_close(room_id: str, owner: str) -> str:
-    """Permanently close a room (owner only). Kills spawned agents."""
+    """Permanently close a room (owner only).
+
+    The current server terminates only its exact locally owned child processes;
+    persisted PIDs remain diagnostic and are never signalled directly.
+    """
     bus.close_room(room_id, owner)
     return "closed"
 
@@ -330,7 +338,7 @@ def room_delete(room_id: str, owner: str) -> str:
 
 
 def room_close_session(session_id: str) -> list:
-    """Close all open rooms belonging to a session (called by Stop hook)."""
+    """Close all open rooms belonging to a session (called at SessionEnd)."""
     return bus.close_session_rooms(session_id)
 
 
@@ -467,6 +475,8 @@ def respond_via_agent(
     Returns: {"pid": int, "thread_id": str, "log_path": str, "agent": str}.
     """
     meta = bus._read_meta(room_id)
+    if meta.get("status") not in ("open", "idle"):
+        raise ValueError("Room does not accept agent responses")
     agent_meta = meta.setdefault("agent_meta", {})
     info = agent_meta.get(agent_name)
     if not info and agent_name not in meta.get("participants", []):
@@ -475,6 +485,10 @@ def respond_via_agent(
         info = {}
         agent_meta[agent_name] = info
 
+    status = bus.get_status(room_id).get(agent_name)
+    if _wake_in_progress(info, status, room_id):
+        raise ValueError(f"Agent {agent_name} already has an active process claim")
+
     if _is_thread_resumable(agent_name):
         thread_id = info.get("thread_id")
         if not thread_id:
@@ -482,10 +496,32 @@ def respond_via_agent(
                 f"No thread_id captured for Codex in room {room_id} — "
                 "spawn may have failed or thread.started event was missed."
             )
-        log_path = info["log_path"]
-        last_msg_path = info.get("last_message_path")
+        canonical_log, canonical_last = bus._agent_paths(
+            room_id, agent_name, create=False,
+        )
+        log_path = str(canonical_log)
+        last_msg_path = str(canonical_last)
         cwd = meta.get("cwd", "") or ""
-        pid = spawn.codex_resume(thread_id, prompt, cwd, log_path, last_msg_path)
+        wake_id = uuid.uuid4().hex[:12]
+        if not _claim_explicit_wake(room_id, agent_name, wake_id):
+            raise ValueError(f"Agent {agent_name} already has an active process claim")
+        _set_agent_phase(room_id, agent_name, "starting")
+        try:
+            pid = spawn.codex_resume(
+                thread_id, prompt, cwd, log_path, last_msg_path,
+                on_exit=_make_wake_done_callback(
+                    room_id, agent_name, wake_id),
+                owner_room_id=room_id, process_handle=wake_id,
+            )
+        except Exception:
+            _set_agent_phase(room_id, agent_name, "unavailable")
+            _clear_wake_claim(room_id, agent_name, wake_id, rollback=True)
+            raise
+        _publish_wake_started(room_id, agent_name, wake_id, {
+            "last_wake_pid": pid,
+            "last_wake_at": int(time.time()),
+            "wake_id": wake_id,
+        })
         return {
             "pid": pid,
             "thread_id": thread_id,
@@ -502,13 +538,18 @@ def respond_via_agent(
     # degrading to Codex-only rooms.
     transcript = bus.read_messages(room_id, since_id=0, limit=50)
     full_prompt = _build_fresh_agent_prompt(room_id, agent_name, prompt, transcript)
-    pid, log_path, last_msg_path = _spawn_fresh_room_agent(
-        room_id,
-        agent_name,
-        full_prompt,
-        meta,
-        msg_id=None,
-    )
+    wake_id = uuid.uuid4().hex[:12]
+    if not _claim_explicit_wake(room_id, agent_name, wake_id):
+        raise ValueError(f"Agent {agent_name} already has an active process claim")
+    _set_agent_phase(room_id, agent_name, "starting")
+    try:
+        pid, log_path, last_msg_path = _spawn_fresh_room_agent(
+            room_id, agent_name, full_prompt, meta,
+            msg_id=None, wake_id=wake_id,
+        )
+    except Exception:
+        _clear_wake_claim(room_id, agent_name, wake_id, rollback=True)
+        raise
     return {
         "pid": pid,
         "thread_id": "",
@@ -567,11 +608,15 @@ def status_get(room_id: str) -> dict:
     return bus.get_status(room_id)
 
 
-def _agent_phase_snapshot(status_info: dict, wake_info: dict) -> tuple[str, dict]:
+def _agent_phase_snapshot(
+    status_info: dict, wake_info: dict, room_id: str = "",
+) -> tuple[str, dict]:
     status = status_info.get("status", "offline")
-    health = _agent_wake_health(wake_info, status)
+    health = _agent_wake_health(wake_info, status, room_id)
     phase = status_info.get("phase", "online")
-    if health.get("rate_limited"):
+    if health.get("claim_active") and phase not in _ACTIVE_PHASES:
+        phase = "starting"
+    elif health.get("rate_limited"):
         phase = "rate_limited"
     elif (health.get("stale_lease") and phase in _ACTIVE_PHASES
           and status_info.get("source") != "agent"):
@@ -678,17 +723,23 @@ def room_status(room_id: str) -> dict:
             "status": "offline", "phase": "unavailable", "updated_at": 0,
         })
         pid = info.get("last_wake_pid")
-        process_alive = bool(pid) and bus._pid_alive(pid)
-        phase, health = _agent_phase_snapshot(status_info, info)
+        process_state = _owned_process_state(room_id, info) if pid else "unknown"
+        process_alive = process_state == "alive"
+        phase, health = _agent_phase_snapshot(status_info, info, room_id)
         agents[name] = {
             **status_info,
             "phase": phase,
             "process_alive": process_alive,
+            "process_state": process_state,
             "pending_request_ids": pending_by_agent[name],
             "health": health,
         }
 
-    active = any(agent.get("phase") in _ACTIVE_PHASES for agent in agents.values())
+    active = any(
+        agent.get("phase") in _ACTIVE_PHASES
+        or (agent.get("health") or {}).get("claim_active")
+        for agent in agents.values()
+    )
     waiting = bool(pending) or active
     return {
         "room_id": room_id,
@@ -768,6 +819,14 @@ async def _background_watchdog():
     while True:
         await asyncio.sleep(bus.ZOMBIE_CHECK_SECS)
         try:
+            reconciled = _reconcile_owned_children()
+            if reconciled:
+                print(f"[watchdog] Reconciled terminal-room children: "
+                      f"{reconciled}", flush=True)
+        except Exception as e:
+            print(f"[watchdog] child reconciliation error: {e}", flush=True)
+
+        try:
             closed = bus.check_zombie_rooms()
             if closed:
                 print(f"[watchdog] Zombie-closed rooms: {closed}", flush=True)
@@ -821,6 +880,41 @@ async def _background_watchdog():
             print(f"[watchdog] stuck-wake check error: {e}", flush=True)
 
 
+def _reconcile_owned_children() -> list[str]:
+    """Stop this instance's exact children when shared room state is terminal.
+
+    Another stdio/HTTP server instance cannot safely signal our children: its
+    only shared evidence is a persisted PID, which may have been reused. Each
+    live owner therefore cooperatively observes the shared room metadata and
+    terminates its own registered ``Popen`` objects. A missing directory is
+    terminal too (for example, close+delete completed between watchdog ticks).
+
+    Unreadable/corrupt metadata is not treated as deletion: that is ambiguous,
+    so this check fails closed and retries on the next watchdog tick.
+    """
+    reconciled: list[str] = []
+    for room_id in child_processes.owned_room_ids():
+        missing = False
+        try:
+            meta = bus.get_room_info(room_id)
+        except Exception as exc:
+            try:
+                missing = not bus._room_dir(room_id).exists()
+            except Exception:
+                missing = False
+            if not missing:
+                print(f"[watchdog] cannot reconcile children for {room_id}: "
+                      f"{exc}", flush=True)
+                continue
+            meta = {}
+        status = meta.get("status")
+        if missing or status in {"closing", "closed", "resolved"}:
+            counts = child_processes.close_room(room_id)
+            if counts["sent"] or counts["exited"] or counts["denied"]:
+                reconciled.append(room_id)
+    return reconciled
+
+
 def _mark_idle_rooms() -> list[str]:
     idled = []
     now = int(time.time())
@@ -846,25 +940,147 @@ _NO_CACHE_HDRS = {"Cache-Control": "no-cache, no-store, must-revalidate",
 # Hosts treated as loopback for the local-only guard below.
 _LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 
+_AUTH_CREDENTIAL_KEY = os.urandom(32)
+_MAX_HTTP_JSON_BYTES = 1024 * 1024
+_MAX_AGENT_EVENT_LINE_BYTES = 1024 * 1024
+_EVENT_CURSOR_WINDOW_BYTES = 4096
 
-def _require_local(request: Request) -> Optional[JSONResponse]:
-    """Guard for mutating / log-streaming HTTP endpoints.
+
+def _split_loopback_host(value: str) -> Optional[tuple[str, Optional[int]]]:
+    """Parse a Host/Origin authority and accept loopback names only."""
+    value = value.strip().lower()
+    if (not value or len(value) > 255
+            or any(ch in value for ch in ("/", "\\", "@", ",", "#", "?"))):
+        return None
+    port: Optional[int] = None
+    if value.startswith("["):
+        end = value.find("]")
+        if end < 0:
+            return None
+        host = value[1:end]
+        suffix = value[end + 1:]
+        if suffix:
+            raw_port = suffix[1:]
+            if (not suffix.startswith(":") or not raw_port.isdigit()
+                    or len(raw_port) > 5):
+                return None
+            port = int(raw_port)
+    elif value.count(":") == 1:
+        host, raw_port = value.rsplit(":", 1)
+        if not raw_port.isdigit() or len(raw_port) > 5:
+            return None
+        port = int(raw_port)
+    else:
+        host = value
+    if host not in _LOOPBACK_HOSTS or (port is not None and not 0 < port < 65536):
+        return None
+    return host, port
+
+
+def _dashboard_credential(token: str) -> str:
+    """Create the process-local credential returned to dashboard JavaScript."""
+    return hmac.new(
+        _AUTH_CREDENTIAL_KEY,
+        b"mcp-huddle-dashboard-v1\0" + token.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _constant_equal(left: str, right: str) -> bool:
+    try:
+        return hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
+    except UnicodeError:
+        return False
+
+
+def _event_file_generation(info: os.stat_result) -> str:
+    """Return an opaque process-local identity for one event-log inode.
+
+    macOS birth time distinguishes a rapidly reused inode without changing on
+    append. Platforms without birth time fall back to device+inode, whose reuse
+    window is much smaller but cannot be eliminated through portable stat().
+    """
+    birth_ns = getattr(info, "st_birthtime_ns", None)
+    if birth_ns is None:
+        birth = getattr(info, "st_birthtime", None)
+        birth_ns = int(birth * 1_000_000_000) if birth is not None else 0
+    identity = f"{info.st_dev}:{info.st_ino}:{birth_ns}".encode("ascii")
+    return hmac.new(
+        _AUTH_CREDENTIAL_KEY, b"mcp-huddle-event-file-v1\0" + identity,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _event_file_cursor(fd: int, generation: str, offset: int) -> str:
+    """Bind an acknowledged offset to bounded file-content sentinels.
+
+    Validation reads at most 8 KiB regardless of offset. The HMAC reveals no
+    log bytes and stays stable on append, while detecting common same-inode
+    truncate/rewrite cases at the start or immediately before the cursor.
+    """
+    head_size = min(offset, _EVENT_CURSOR_WINDOW_BYTES)
+    tail_start = max(0, offset - _EVENT_CURSOR_WINDOW_BYTES)
+    tail_size = offset - tail_start
+    head = os.pread(fd, head_size, 0)
+    tail = os.pread(fd, tail_size, tail_start)
+    payload = (
+        b"mcp-huddle-event-cursor-v1\0" + generation.encode("ascii")
+        + b":" + str(offset).encode("ascii") + b":" + head + b"\0" + tail
+    )
+    return hmac.new(_AUTH_CREDENTIAL_KEY, payload, hashlib.sha256).hexdigest()
+
+
+def _credential_valid(request: Request, token: str) -> bool:
+    derived = request.headers.get("x-huddle-credential", "")
+    if derived:
+        if len(derived) > 256:
+            return False
+        return _constant_equal(derived, _dashboard_credential(token))
+    provided = request.headers.get("x-huddle-token", "")
+    if not provided:
+        auth = request.headers.get("authorization", "")
+        if auth.lower().startswith("bearer "):
+            provided = auth[7:].strip()
+    if not provided or len(provided) > max(1024, len(token)):
+        return False
+    return _constant_equal(provided, token)
+
+
+def _same_origin(request: Request) -> bool:
+    """Reject browser cross-origin requests while allowing non-browser clients."""
+    fetch_site = request.headers.get("sec-fetch-site", "").lower()
+    if fetch_site and fetch_site not in {"same-origin", "none"}:
+        return False
+    origin = request.headers.get("origin")
+    if not origin:
+        return True
+    try:
+        parsed = urlsplit(origin)
+        origin_port = parsed.port
+    except ValueError:
+        return False
+    if (parsed.scheme not in {"http", "https"} or parsed.username or parsed.password
+            or parsed.path not in {"", "/"} or parsed.query or parsed.fragment):
+        return False
+    host = _split_loopback_host(request.headers.get("host", ""))
+    origin_host = _split_loopback_host(parsed.netloc)
+    if host is None or origin_host is None or parsed.scheme != request.url.scheme:
+        return False
+    request_port = host[1] or (443 if request.url.scheme == "https" else 80)
+    source_port = origin_port or (443 if parsed.scheme == "https" else 80)
+    return host[0] == origin_host[0] and request_port == source_port
+
+
+def _require_local(request: Request, *, require_auth: bool = True) -> Optional[JSONResponse]:
+    """Apply loopback-client and optional credential policy.
 
     The server binds 127.0.0.1 and the dashboard is served from loopback, so
     this is non-breaking for normal local use. Returns a JSONResponse to
     short-circuit the calling handler when the request must be rejected, or
     None when the handler may proceed.
 
-    1. Loopback only — reject any non-loopback client with HTTP 403.
-    2. Optional shared secret — if MCP_HUDDLE_TOKEN is set in the environment,
-       additionally require ``Authorization: Bearer <token>`` (or the
-       ``X-Huddle-Token: <token>`` header); HTTP 401 if missing/wrong. When the
-       env var is unset (the default) no token is required, so there is no
-       behavior change.
-
-    NOTE: when MCP_HUDDLE_TOKEN is set, the dashboard's own fetch() calls must
-    send the matching header. That lives in dashboard.js (owned elsewhere); the
-    server side stays correct and tolerant when the token is unset.
+    MCP clients may supply the raw token as Bearer/X-Huddle-Token. The dashboard
+    supplies only the derived, process-local X-Huddle-Credential from /api/auth.
     """
     client = request.client
     host = client.host if client else None
@@ -872,15 +1088,138 @@ def _require_local(request: Request) -> Optional[JSONResponse]:
         return JSONResponse({"error": "forbidden: loopback only"}, status_code=403)
 
     token = os.environ.get("MCP_HUDDLE_TOKEN")
-    if token:
-        provided = request.headers.get("x-huddle-token")
-        if not provided:
-            auth = request.headers.get("authorization", "")
-            if auth.lower().startswith("bearer "):
-                provided = auth[7:].strip()
-        if provided != token:
+    if require_auth and token:
+        if not _credential_valid(request, token):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
     return None
+
+
+def _require_http_origin(request: Request) -> Optional[JSONResponse]:
+    """Validate the authority and browser provenance of an HTTP request."""
+    if _split_loopback_host(request.headers.get("host", "")) is None:
+        return JSONResponse({"error": "forbidden: invalid Host"}, status_code=403)
+    if not _same_origin(request):
+        return JSONResponse({"error": "forbidden: cross-origin request"}, status_code=403)
+    return None
+
+
+def _public_route_path(scope: dict) -> Optional[str]:
+    """Return an app-relative, traversal-free path for public classification.
+
+    ``root_path`` differs between ASGI servers: some include it in ``path`` and
+    some already strip it. Support either representation, but use this result
+    only to decide whether a route is public; routing itself keeps the ASGI
+    scope untouched.
+    """
+    path = scope.get("path", "")
+    root_path = scope.get("root_path", "") or ""
+    if not isinstance(path, str) or not path.startswith("/") or len(path) > 4096:
+        return None
+    if not isinstance(root_path, str) or len(root_path) > 1024:
+        return None
+    if root_path and root_path != "/":
+        if (not root_path.startswith("/") or root_path.endswith("/")
+                or "\\" in root_path or "//" in root_path or "\x00" in root_path
+                or any(segment in {".", ".."} for segment in root_path.split("/"))):
+            return None
+        if path == root_path:
+            path = "/"
+        elif path.startswith(root_path + "/"):
+            path = path[len(root_path):]
+    if "\\" in path or "//" in path or "\x00" in path:
+        return None
+    if any(segment in {".", ".."} for segment in path.split("/")):
+        return None
+    return path
+
+
+def _is_public_http_request(scope: dict) -> bool:
+    path = _public_route_path(scope)
+    method = scope.get("method", "GET").upper()
+    if path == "/api/auth":
+        return method in {"GET", "POST", "HEAD"}
+    if method not in {"GET", "HEAD"}:
+        return False
+    return path == "/dashboard" or bool(path and path.startswith("/static/"))
+
+
+class _HTTPGuardMiddleware:
+    """Security boundary shared by custom HTTP routes and MCP transport."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        path = scope.get("path", "")
+        request = Request(scope)
+        public = _is_public_http_request(scope)
+        denied = _require_http_origin(request)
+        if denied is None:
+            denied = _require_local(request, require_auth=not public)
+        if denied is not None:
+            await denied(scope, receive, send)
+            return
+
+        method = scope.get("method", "GET").upper()
+        # Every valid POST surface in this app (REST auth/mutators and MCP) is JSON.
+        # Applying the rule to all POSTs also stays correct behind ASGI root_path.
+        json_body = method == "POST"
+        if json_body:
+            media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+            if media_type != "application/json":
+                response = JSONResponse(
+                    {"error": "unsupported media type: application/json required"},
+                    status_code=415,
+                )
+                await response(scope, receive, send)
+                return
+            raw_length = request.headers.get("content-length")
+            if raw_length:
+                try:
+                    length = int(raw_length)
+                except ValueError:
+                    length = -1
+                if length < 0:
+                    response = JSONResponse({"error": "invalid Content-Length"}, status_code=400)
+                    await response(scope, receive, send)
+                    return
+                if length > _MAX_HTTP_JSON_BYTES:
+                    response = JSONResponse({"error": "request body too large"}, status_code=413)
+                    await response(scope, receive, send)
+                    return
+
+            chunks = []
+            size = 0
+            more = True
+            while more:
+                message = await receive()
+                if message.get("type") == "http.disconnect":
+                    return
+                chunk = message.get("body", b"")
+                size += len(chunk)
+                if size > _MAX_HTTP_JSON_BYTES:
+                    response = JSONResponse({"error": "request body too large"}, status_code=413)
+                    await response(scope, receive, send)
+                    return
+                chunks.append(chunk)
+                more = message.get("more_body", False)
+            body = b"".join(chunks)
+            delivered = False
+            original_receive = receive
+
+            async def replay_receive():
+                nonlocal delivered
+                if delivered:
+                    return await original_receive()
+                delivered = True
+                return {"type": "http.request", "body": body, "more_body": False}
+
+            receive = replay_receive
+
+        await self.app(scope, receive, send)
 
 
 @mcp.custom_route("/dashboard", methods=["GET"])
@@ -899,6 +1238,39 @@ async def dashboard_css(request: Request):
 async def dashboard_js(request: Request):
     return FileResponse(_STATIC_DIR / "dashboard.js",
                         media_type="application/javascript", headers=_NO_CACHE_HDRS)
+
+
+@mcp.custom_route("/api/auth", methods=["GET", "POST"])
+async def api_auth(request: Request) -> JSONResponse:
+    """Exchange the raw token for a process-local dashboard credential.
+
+    The raw token exists only in the POST body and is never copied into a URL,
+    cookie or browser storage. The returned derived credential is kept only in
+    dashboard JavaScript memory and becomes invalid when this server restarts.
+    """
+    denied = _require_local(request, require_auth=False)
+    if denied is not None:
+        return denied
+    token = os.environ.get("MCP_HUDDLE_TOKEN")
+    if request.method == "GET":
+        return JSONResponse(
+            {"required": bool(token)},
+            headers=_NO_CACHE_HDRS,
+        )
+    if not token:
+        return JSONResponse({"required": False}, headers=_NO_CACHE_HDRS)
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400, headers=_NO_CACHE_HDRS)
+    provided = data.get("token") if isinstance(data, dict) else None
+    if not isinstance(provided, str) or not _constant_equal(provided, token):
+        return JSONResponse(
+            {"error": "unauthorized"}, status_code=401, headers=_NO_CACHE_HDRS)
+    return JSONResponse(
+        {"required": True, "credential": _dashboard_credential(token)},
+        headers=_NO_CACHE_HDRS,
+    )
 
 
 @mcp.custom_route("/api/rooms", methods=["GET"])
@@ -963,6 +1335,24 @@ async def api_room_close(request: Request) -> JSONResponse:
         return JSONResponse({"error": str(e)}, status_code=400)
 
 
+@mcp.custom_route("/api/rooms_close_session", methods=["POST"])
+async def api_rooms_close_session(request: Request) -> JSONResponse:
+    """Close rooms owned by one client session (used by the SessionEnd hook)."""
+    denied = _require_local(request)
+    if denied is not None:
+        return denied
+    try:
+        data = await request.json()
+        session_id = data.get("session_id") if isinstance(data, dict) else None
+        if (not isinstance(session_id, str) or not session_id.strip()
+                or len(session_id) > 1024 or "\x00" in session_id):
+            raise ValueError("invalid session_id")
+        closed = bus.close_session_rooms(session_id.strip())
+        return JSONResponse({"closed": closed})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
 @mcp.custom_route("/api/room_delete", methods=["POST"])
 async def api_room_delete(request: Request) -> JSONResponse:
     """Wipe a closed room from disk. Backed by bus.delete_room() — only works
@@ -986,8 +1376,11 @@ async def api_room_delete(request: Request) -> JSONResponse:
 
 @mcp.custom_route("/api/rooms_close_all", methods=["POST"])
 async def api_rooms_close_all(request: Request) -> JSONResponse:
-    """Bulk close: every non-closed room. Kills alive spawned PIDs only,
-    excluding owner PIDs of any room. Dead PIDs skipped."""
+    """Bulk-close every non-terminal room.
+
+    Only exact child handles owned by this server are eligible for termination;
+    persisted or foreign PIDs are reported but never signalled directly.
+    """
     denied = _require_local(request)
     if denied is not None:
         return denied
@@ -1032,7 +1425,7 @@ async def api_room_agents(request: Request) -> JSONResponse:
         meta = bus._read_meta(room_id)
         agent_meta = meta.get("agent_meta", {})
         statuses = bus.get_status(room_id)
-        health = {name: _agent_wake_health(info, statuses.get(name))
+        health = {name: _agent_wake_health(info, statuses.get(name), room_id)
                   for name, info in agent_meta.items()}
         return JSONResponse({"agents": agent_meta, "health": health})
     except Exception as e:
@@ -1053,7 +1446,7 @@ async def api_health(request: Request) -> JSONResponse:
             if not agent_meta:
                 continue
             statuses = bus.get_status(room_id)
-            agents = {name: _agent_wake_health(info, statuses.get(name))
+            agents = {name: _agent_wake_health(info, statuses.get(name), room_id)
                       for name, info in agent_meta.items()}
             rooms_health.append({
                 "room_id": room_id,
@@ -1063,11 +1456,14 @@ async def api_health(request: Request) -> JSONResponse:
             })
         stale = sum(1 for r in rooms_health for h in r["agents"].values()
                     if h["stale_lease"])
+        unowned = sum(1 for r in rooms_health for h in r["agents"].values()
+                      if h["unowned_lease"])
         failed = sum(1 for r in rooms_health for h in r["agents"].values()
                      if h["last_wake_failed"])
         return JSONResponse({
             "rooms": rooms_health,
             "stale_leases": stale,
+            "unowned_leases": unowned,
             "failed_wakes": failed,
         })
     except Exception as e:
@@ -1087,23 +1483,86 @@ async def api_agent_events(request: Request) -> StreamingResponse:
     if denied is not None:
         return denied
     room_id = request.path_params["room_id"]
-    agent_name = request.path_params["agent_name"].lower()
-    log_path = bus._room_dir(room_id) / "agents" / f"{agent_name}.events.jsonl"
+    agent_name = request.path_params["agent_name"]
+    raw_offset = request.query_params.get("offset", "0")
+    requested_generation = request.query_params.get("generation", "")
+    requested_cursor = request.query_params.get("cursor", "")
+    try:
+        if len(raw_offset) > 20:
+            raise ValueError
+        requested_offset = int(raw_offset)
+        if requested_offset < 0:
+            raise ValueError
+        if requested_generation and (
+                len(requested_generation) != 64
+                or any(ch not in "0123456789abcdef" for ch in requested_generation)):
+            raise ValueError
+        if requested_cursor and (
+                len(requested_cursor) != 64
+                or any(ch not in "0123456789abcdef" for ch in requested_cursor)):
+            raise ValueError
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "invalid event offset"}, status_code=400)
+    try:
+        # Validates both components and rejects existing room/agents/final-file
+        # symlinks without creating a room or agents directory.
+        log_path, _ = bus._agent_paths(room_id, agent_name, create=False)
+    except (ValueError, OSError):
+        return JSONResponse({"error": "unsafe or unavailable event log"}, status_code=400)
 
     async def event_stream():
         import asyncio
-        # Wait briefly for the log file to exist (spawn race).
+        fd = None
+        # Wait briefly for the log file to exist (spawn race). Each attempt is
+        # relative to stable no-follow directory fds and opens the final file
+        # with O_NOFOLLOW, closing validation/open swap races.
         for _ in range(20):
-            if log_path.exists():
+            try:
+                fd = bus._safe_open_fd(
+                    log_path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
                 break
+            except FileNotFoundError:
+                pass
+            except (ValueError, OSError):
+                yield "event: error\ndata: event log unavailable\n\n"
+                return
             await asyncio.sleep(0.1)
-        if not log_path.exists():
-            yield f"event: error\ndata: log file not found at {log_path}\n\n"
+        if fd is None:
+            yield "event: error\ndata: event log unavailable\n\n"
             return
 
-        with open(log_path, "rb") as f:
+        opened_stat = os.fstat(fd)
+        if not stat.S_ISREG(opened_stat.st_mode) or opened_stat.st_nlink != 1:
+            os.close(fd)
+            yield "event: error\ndata: event log unavailable\n\n"
+            return
+        with os.fdopen(fd, "rb") as f:
+            file_generation = _event_file_generation(opened_stat)
+            # A stale client offset after truncation starts at the new file's
+            # beginning. An offset is meaningful only for the exact inode
+            # generation that produced it; atomic replacement forces offset 0.
+            same_generation = bool(requested_generation) and _constant_equal(
+                requested_generation, file_generation)
+            valid_cursor = False
+            if (same_generation and requested_cursor
+                    and requested_offset <= opened_stat.st_size):
+                current_cursor = _event_file_cursor(
+                    f.fileno(), file_generation, requested_offset)
+                valid_cursor = _constant_equal(requested_cursor, current_cursor)
+            stream_offset = (
+                requested_offset
+                if valid_cursor
+                else 0
+            )
+            f.seek(stream_offset)
+            stream_cursor = _event_file_cursor(
+                f.fileno(), file_generation, stream_offset)
             # Send a marker so the client knows the stream is alive.
-            yield "event: open\ndata: streaming\n\n"
+            yield (
+                f"event: open\ngeneration: {file_generation}\n"
+                f"cursor: {stream_cursor}\nid: {stream_offset}\n"
+                "data: streaming\n\n"
+            )
             buf = b""
             while True:
                 if await request.is_disconnected():
@@ -1113,15 +1572,43 @@ async def api_agent_events(request: Request) -> StreamingResponse:
                     buf += chunk
                     while b"\n" in buf:
                         line, buf = buf.split(b"\n", 1)
+                        if len(line) > _MAX_AGENT_EVENT_LINE_BYTES:
+                            yield "event: error\ndata: event log line too large\n\n"
+                            return
+                        stream_offset += len(line) + 1
                         if line.strip():
                             text = line.decode("utf-8", errors="replace")
                             # SSE: replace internal newlines (shouldn't be any in JSONL)
                             text = text.replace("\n", "\\n")
-                            yield f"data: {text}\n\n"
+                            stream_cursor = _event_file_cursor(
+                                f.fileno(), file_generation, stream_offset)
+                            yield (
+                                f"cursor: {stream_cursor}\nid: {stream_offset}\n"
+                                f"data: {text}\n\n"
+                            )
+                    if len(buf) > _MAX_AGENT_EVENT_LINE_BYTES:
+                        yield "event: error\ndata: event log line too large\n\n"
+                        return
                 else:
                     # No new data — tail-follow with short sleep.
-                    if not log_path.exists():
+                    try:
+                        current_stat = bus._safe_stat(log_path)
+                    except (FileNotFoundError, ValueError, OSError):
                         break
+                    if (current_stat.st_dev, current_stat.st_ino) != (
+                            opened_stat.st_dev, opened_stat.st_ino):
+                        break
+                    if current_stat.st_size < stream_offset:
+                        f.seek(0)
+                        buf = b""
+                        stream_offset = 0
+                        stream_cursor = _event_file_cursor(
+                            f.fileno(), file_generation, stream_offset)
+                        yield (
+                            f"event: reset\ngeneration: {file_generation}\n"
+                            f"cursor: {stream_cursor}\nid: 0\n"
+                            "data: stream reset\n\n"
+                        )
                     await asyncio.sleep(0.5)
 
     return StreamingResponse(
@@ -1143,6 +1630,7 @@ def _set_agent_phase(
     task_id: int | str = "",
     detail: str = "",
     source: str = "server",
+    preserve_busy: bool = False,
 ) -> None:
     """Persist one lifecycle transition without disturbing wake metadata."""
     if phase not in bus.VALID_AGENT_PHASES:
@@ -1150,7 +1638,7 @@ def _set_agent_phase(
     try:
         meta = bus.get_room_info(room_id)
         current = (bus.get_status_details(room_id).get(agent_name) or {})
-        operational = "busy" if phase in _ACTIVE_PHASES else "online"
+        operational = "busy" if preserve_busy or phase in _ACTIVE_PHASES else "online"
         bus.set_status(
             room_id,
             agent_name,
@@ -1204,29 +1692,151 @@ def _room_open_for_spawn(room_id: str) -> bool:
     return bool(info) and info.get("status") in ("open", "idle")
 
 
-def _record_spawned_pid(room_id: str, pid: int, agent_name: str = "") -> None:
+_SPAWNED_PID_HISTORY_MAX = 64
+
+
+def _bounded_spawned_pids(pids: list, *new_pids: int) -> list[int]:
+    values = [int(pid) for pid in pids if isinstance(pid, int) and pid > 0]
+    for pid in new_pids:
+        if pid > 0 and pid not in values:
+            values.append(pid)
+    return values[-_SPAWNED_PID_HISTORY_MAX:]
+
+
+def _record_spawned_pid(
+    room_id: str, pid: int, agent_name: str = "",
+    initial_spawn_id: str = "",
+) -> bool:
     """Merge one late-known pid into the room's spawned_pids (locked RMW).
-    Used by staggered spawns, whose pid isn't known at _spawn_agents time —
-    without this, close_room's kill sweep (_kill_spawned reads spawned_pids)
-    would orphan a process spawned during the stagger window."""
+    Persisted PIDs are diagnostics only. Termination authority remains the
+    exact in-memory Popen registered by spawn's child-process registry."""
+    published = False
+
     def _upd(m: dict) -> dict:
-        pids = m.get("spawned_pids") or []
-        if pid not in pids:
-            pids.append(pid)
-        m["spawned_pids"] = pids
+        nonlocal published
         if agent_name:
             info = (m.setdefault("agent_meta", {}).get(agent_name) or {})
+            if (info.get("initial_spawn_id") != initial_spawn_id
+                    or not info.get("initial_spawn_active")):
+                return m
             info["last_wake_pid"] = pid
             info["last_wake_at"] = int(time.time())
             m["agent_meta"][agent_name] = info
+        m["spawned_pids"] = _bounded_spawned_pids(
+            m.get("spawned_pids") or [], pid,
+        )
+        published = True
         return m
     try:
         bus._update_meta_locked(room_id, _upd)
     except Exception as exc:
         print(f"[huddle] failed to record delayed-spawn pid {pid} "
               f"({room_id}): {exc}", flush=True)
-    if agent_name:
-        _set_agent_phase(room_id, agent_name, "working")
+    return published
+
+
+def _reserve_initial_spawn(
+    room_id: str,
+    agent_name: str,
+    initial_spawn_id: str,
+    fields: dict,
+) -> bool:
+    """Persist an initial generation before its timer/Popen can run.
+
+    The claim is the cross-process authority. A crash after this write is
+    deliberately visible as an unowned active lease instead of allowing a
+    second server instance to start a duplicate child.
+    """
+    reserved = False
+
+    def _update(meta: dict) -> dict:
+        nonlocal reserved
+        if meta.get("status") not in ("open", "idle"):
+            return meta
+        am = meta.setdefault("agent_meta", {})
+        info = am.get(agent_name)
+        if not isinstance(info, dict):
+            info = {}
+        if info.get("wake_claim_id") or info.get("initial_spawn_active"):
+            return meta
+        info.update(fields)
+        info.update({
+            "initial_spawn_id": initial_spawn_id,
+            "initial_spawn_active": True,
+            "last_wake_pid": None,
+        })
+        am[agent_name] = info
+        reserved = True
+        return meta
+
+    bus._update_meta_locked(room_id, _update)
+    return reserved
+
+
+def _begin_initial_spawn_exit(
+    room_id: str, agent_name: str, initial_spawn_id: str,
+) -> bool:
+    """Claim the exit/failure transition for one exact initial generation."""
+    begun = False
+
+    def _update(meta: dict) -> dict:
+        nonlocal begun
+        info = (meta.get("agent_meta") or {}).get(agent_name)
+        if (not isinstance(info, dict)
+                or info.get("initial_spawn_id") != initial_spawn_id
+                or not info.get("initial_spawn_active")
+                or info.get("initial_spawn_exiting")):
+            return meta
+        info["initial_spawn_exiting"] = True
+        begun = True
+        return meta
+
+    bus._update_meta_locked(room_id, _update)
+    return begun
+
+
+def _mark_initial_spawn_finished(
+    room_id: str, agent_name: str, initial_spawn_id: str,
+) -> None:
+    """Clear the persisted initial-spawn guard, including an early-exit race."""
+    def _update(meta: dict) -> dict:
+        am = meta.setdefault("agent_meta", {})
+        info = am.get(agent_name)
+        if not isinstance(info, dict):
+            info = {}
+        if info.get("initial_spawn_id") != initial_spawn_id:
+            return meta
+        info["initial_spawn_id"] = initial_spawn_id
+        info["initial_spawn_active"] = False
+        info.pop("initial_spawn_exiting", None)
+        am[agent_name] = info
+        return meta
+    bus._update_meta_locked(room_id, _update)
+
+
+def _clear_existing_initial_spawn(
+    room_id: str, agent_name: str, initial_spawn_id: str,
+) -> None:
+    """Rollback a delayed initial claim after spawn failure, if persisted."""
+    def _update(meta: dict) -> dict:
+        info = (meta.get("agent_meta") or {}).get(agent_name)
+        if (isinstance(info, dict)
+                and info.get("initial_spawn_id") == initial_spawn_id):
+            info["initial_spawn_active"] = False
+        return meta
+    try:
+        bus._update_meta_locked(room_id, _update)
+    except Exception:
+        pass
+
+
+def _handle_initial_spawn_failure(
+    room_id: str, agent_name: str, initial_spawn_id: str, exc: BaseException,
+) -> None:
+    if not _begin_initial_spawn_exit(room_id, agent_name, initial_spawn_id):
+        return
+    _announce_spawn_failure(room_id, agent_name, exc, "init")
+    _mark_initial_spawn_finished(room_id, agent_name, initial_spawn_id)
 
 
 def _spawn_agents(
@@ -1246,21 +1856,11 @@ def _spawn_agents(
                       Ignores each spec's "auto" flag.
 
     Side effects:
-      * Builds a default brief and writes it to a secure temp file
-        (huddle-room-<id>-*-brief.md in the system temp dir) so users can
-        `cat` it for debugging (always written, also when dict is used).
       * Creates ~/.mcp-huddle/rooms/<id>/agents/ for log files.
       * Updates meta.json: spawned_pids + agent_meta {name: {log_path, last_message_path}}.
       * Adds each spawned agent to participants.
     """
     default_brief = _build_default_brief(room_id, name, goal, cwd)
-    # Secure unique temp file instead of a predictable /tmp/room-<id>-brief.md
-    # (guessable + symlink/TOCTOU-attackable in a shared /tmp). mkstemp creates
-    # the file atomically with 0600 perms.
-    fd, brief_path = tempfile.mkstemp(
-        prefix=f"huddle-room-{room_id}-", suffix="-brief.md")
-    with os.fdopen(fd, "w") as fh:
-        fh.write(default_brief)
 
     log_dir = bus._room_dir(room_id) / "agents"
 
@@ -1302,6 +1902,10 @@ def _spawn_agents(
         pids: list[int] = []
         agent_meta: dict[str, dict] = {}
         enabled_specs = [spec for spec in registry if spec.get("enabled")]
+        initial_generations = {
+            spec["name"]: child_processes.new_handle()
+            for spec in enabled_specs
+        }
         # Same-binary stagger (see spawn.compute_stagger_delays): a dict
         # auto_spawn naming two agents that resolve to the same underlying
         # binary (e.g. two OpenCode-backed slots) must not start at the same
@@ -1309,26 +1913,48 @@ def _spawn_agents(
         # this branch mirrors it for the explicit-dict path.
         delays = spawn.compute_stagger_delays(enabled_specs)
         for spec in enabled_specs:
+            initial_spawn_id = initial_generations[spec["name"]]
             agent_brief = _wrap_user_brief(room_id, spec["name"], briefs_arg[spec["name"]])
             delay = delays.get(spec["name"], 0.0)
+            bus.invite_agent(room_id, spec["name"])
+            placeholder = spawn._placeholder_agent_meta(
+                spec, agent_brief, log_dir,
+            )
+            if not _reserve_initial_spawn(
+                room_id, spec["name"], initial_spawn_id, placeholder,
+            ):
+                continue
             if delay > 0:
                 names.append(spec["name"])
-                agent_meta[spec["name"]] = spawn._placeholder_agent_meta(
-                    spec, agent_brief, log_dir)
+                agent_meta[spec["name"]] = dict(placeholder)
+                agent_meta[spec["name"]]["initial_spawn_active"] = True
+                agent_meta[spec["name"]]["initial_spawn_id"] = initial_spawn_id
                 _set_agent_phase(room_id, spec["name"], "queued")
                 spawn._schedule_delayed_spawn(
                     delay, spec, agent_brief, cwd, log_dir,
-                    on_exit=_make_initial_spawn_callback(room_id, spec["name"]),
-                    on_spawn_fail=lambda n, exc: _announce_spawn_failure(room_id, n, exc, "init"),
+                    on_exit=_make_initial_spawn_callback(
+                        room_id, spec["name"], initial_spawn_id),
+                    on_spawn_fail=(lambda generation: lambda n, exc:
+                        _handle_initial_spawn_failure(
+                            room_id, n, generation, exc))(initial_spawn_id),
                     should_spawn=lambda: _room_open_for_spawn(room_id),
-                    on_spawned=(lambda n: lambda pid: _record_spawned_pid(room_id, pid, n))(spec["name"]),
+                    on_spawned=(lambda n, generation: lambda pid:
+                        _record_spawned_pid(
+                            room_id, pid, n, generation,
+                        ))(spec["name"], initial_spawn_id),
+                    owner_room_id=room_id,
+                    process_handle=initial_spawn_id,
                 )
                 continue
             try:
                 _set_agent_phase(room_id, spec["name"], "starting")
                 pid, log_path, last_msg = spawn.spawn_agent(
                     spec, agent_brief, cwd, log_dir,
-                    on_exit=_make_initial_spawn_callback(room_id, spec["name"]))
+                    on_exit=_make_initial_spawn_callback(
+                        room_id, spec["name"], initial_spawn_id),
+                    owner_room_id=room_id,
+                    process_handle=initial_spawn_id,
+                )
                 pids.append(pid)
                 names.append(spec["name"])
                 agent_meta[spec["name"]] = {
@@ -1336,31 +1962,58 @@ def _spawn_agents(
                     "last_message_path": last_msg,
                     "last_wake_pid": pid,
                     "last_wake_at": int(time.time()),
+                    "initial_spawn_active": True,
+                    "initial_spawn_id": initial_spawn_id,
                 }
-                _set_agent_phase(room_id, spec["name"], "working")
             except (FileNotFoundError, PermissionError) as exc:
                 spawn.log_spawn_failure(spec, agent_brief, cwd, log_dir, exc)
-                _announce_spawn_failure(room_id, spec["name"], exc, "init")
+                _handle_initial_spawn_failure(
+                    room_id, spec["name"], initial_spawn_id, exc,
+                )
             except spawn.AgentSpawnError as exc:
-                _announce_spawn_failure(room_id, spec["name"], exc, "init")
+                _handle_initial_spawn_failure(
+                    room_id, spec["name"], initial_spawn_id, exc,
+                )
             except OSError as exc:
                 spawn.log_spawn_failure(spec, agent_brief, cwd, log_dir, exc)
-                _announce_spawn_failure(room_id, spec["name"], exc, "init")
+                _handle_initial_spawn_failure(
+                    room_id, spec["name"], initial_spawn_id, exc,
+                )
                 raise
     else:
-        for agent_name in per_agent_default_briefs:
-            _set_agent_phase(room_id, agent_name, "starting")
+        initial_generations = {
+            agent_name: child_processes.new_handle()
+            for agent_name in per_agent_default_briefs
+        }
+        def _prepare_initial_spawn(spec, generation, placeholder, delay):
+            agent_name = spec["name"]
+            bus.invite_agent(room_id, agent_name)
+            if not _reserve_initial_spawn(
+                room_id, agent_name, generation, placeholder,
+            ):
+                return False
+            _set_agent_phase(
+                room_id, agent_name, "queued" if delay > 0 else "starting",
+            )
+            return True
+
         names, pids, agent_meta = spawn.spawn_all(
             default_brief, cwd, log_dir,
             briefs=per_agent_default_briefs,
-            on_exit_factory=lambda n: _make_initial_spawn_callback(room_id, n),
+            on_exit_factory=lambda n: _make_initial_spawn_callback(
+                room_id, n, initial_generations[n]),
             skip_names=skip_owner,
-            on_spawn_fail=lambda n, exc: _announce_spawn_failure(room_id, n, exc, "init"),
+            on_spawn_fail=lambda n, exc: _handle_initial_spawn_failure(
+                room_id, n, initial_generations[n], exc),
             delayed_spawn_gate=lambda: _room_open_for_spawn(room_id),
-            on_delayed_spawn=lambda n, pid: _record_spawned_pid(room_id, pid, n))
-
-    for n in names:
-        bus.invite_agent(room_id, n)
+            on_delayed_spawn=lambda n, pid: _record_spawned_pid(
+                room_id, pid, n, initial_generations[n]),
+            owner_room_id=room_id,
+            process_handle_factory=lambda n: initial_generations[n],
+            prepare_spawn=_prepare_initial_spawn,
+        )
+        for agent_name, info in agent_meta.items():
+            info["initial_spawn_id"] = initial_generations[agent_name]
 
     # Phase 2: capture Codex thread_id from "thread.started" event in log,
     # so we can do `codex exec resume <id>` for follow-ups instead of spawning fresh.
@@ -1371,61 +2024,96 @@ def _spawn_agents(
             continue  # Only Codex has UUID-based resume; Antigravity has none.
         log_path = info.get("log_path")
         if log_path:
-            tid = spawn.parse_codex_thread_id(log_path, timeout=10.0)
+            tid = _parse_owned_codex_thread_id(
+                room_id, agent_name, timeout=10.0,
+            )
             if tid:
                 info["thread_id"] = tid
 
-    # Save PIDs + log paths for dashboard / zombie cleanup — locked
+    # Save diagnostic PIDs + log paths for dashboard / lifecycle visibility — locked
     # read-modify-write so a concurrent meta.json update isn't clobbered.
     # Merge (don't overwrite): extend any pre-existing spawned_pids and
     # deep-merge per-agent meta so a concurrent wake-thread update survives.
     def _save_spawn_meta(m: dict) -> dict:
-        existing_pids = m.get("spawned_pids") or []
-        m["spawned_pids"] = existing_pids + [p for p in pids if p not in existing_pids]
         merged = m.get("agent_meta") or {}
+        published_pids: list[int] = list(pids)
         for name_, info_ in agent_meta.items():
             info_ = dict(info_)
+            # Every returned entry represents either a running child or a
+            # scheduled delayed child. This persisted guard is authoritative
+            # even if invite_agent temporarily reset operational status.
+            info_.setdefault("initial_spawn_active", True)
             pid = info_.pop("pid", None)
             if pid:
                 info_["last_wake_pid"] = pid
                 info_["last_wake_at"] = int(time.time())
-                agent_meta[name_]["last_wake_pid"] = pid
-                agent_meta[name_]["last_wake_at"] = info_["last_wake_at"]
+                info_["initial_spawn_active"] = True
             slot = merged.get(name_)
             if isinstance(slot, dict):
+                expected_id = info_.get("initial_spawn_id")
+                current_id = slot.get("initial_spawn_id")
+                if slot.get("wake_claim_id"):
+                    continue
+                if current_id not in (None, expected_id):
+                    continue
+                # An extremely short-lived child callback may have recorded
+                # completion before this final metadata merge. Never revive
+                # its initial guard in that race.
+                if (current_id == expected_id
+                        and slot.get("initial_spawn_active") is False):
+                    info_.pop("initial_spawn_active", None)
+                    info_.pop("last_wake_pid", None)
+                    info_.pop("last_wake_at", None)
+                    pid = None
                 slot.update(info_)
             else:
                 merged[name_] = dict(info_)
+            if pid:
+                published_pids.append(pid)
+        m["spawned_pids"] = _bounded_spawned_pids(
+            m.get("spawned_pids") or [], *published_pids,
+        )
         m["agent_meta"] = merged
         return m
     bus._update_meta_locked(room_id, _save_spawn_meta)
-    for agent_name, info in agent_meta.items():
-        pid = info.get("last_wake_pid")
-        current = bus.get_status_details(room_id).get(agent_name) or {}
-        if pid and bus._pid_alive(pid) and current.get("phase") in ("starting", "queued"):
-            _set_agent_phase(room_id, agent_name, "working")
 
 
 # ── Wake lease helpers ────────────────────────────────────────────────────────
 #
-# A wake records a `wake_id` (generation token) + `last_wake_pid` in agent_meta
-# and sets status=busy. The agent counts as busy ONLY while that pid is alive —
-# a 'busy' whose pid is dead is a stale lease and must not block the next
-# request. When the wake process exits, its reaper callback releases the lease
-# and drains the next queued request (event-driven); the watchdog is a fallback.
+# A wake records a persisted generation claim before Popen and later publishes
+# its `wake_id` + diagnostic `last_wake_pid`.  The claim remains authoritative
+# until this server observes exact-child exit.  An unknown/foreign child is not
+# assumed dead, so another server cannot reuse the lease or signal a recycled
+# PID.  The exact child's reaper releases the claim and drains the next queued
+# request; the watchdog is a fallback and observability path.
 
 # Per-(room, agent) in-process lock: serialises wake attempts coming from this
 # process's own threads (MCP request handler, watchdog, reaper callbacks).
-_wake_locks: dict = {}
+_wake_locks: weakref.WeakValueDictionary[
+    tuple[str, str], threading.RLock
+] = weakref.WeakValueDictionary()
 _wake_locks_guard = threading.Lock()
 
 
-def _wake_lock(room_id: str, agent_name: str) -> threading.Lock:
+def _reset_wake_locks_after_fork() -> None:
+    """Discard locks inherited from vanished parent threads after fork."""
+    global _wake_locks, _wake_locks_guard
+    _wake_locks = weakref.WeakValueDictionary()
+    _wake_locks_guard = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_wake_locks_after_fork)
+
+
+def _wake_lock(room_id: str, agent_name: str) -> threading.RLock:
     key = (room_id, agent_name)
     with _wake_locks_guard:
         lock = _wake_locks.get(key)
         if lock is None:
-            lock = threading.Lock()
+            # Re-entrant because a synchronous test/fake Popen may invoke its
+            # exit callback before the spawn call returns on the same thread.
+            lock = threading.RLock()
             _wake_locks[key] = lock
     return lock
 
@@ -1444,28 +2132,185 @@ def _merge_agent_meta(room_id: str, agent_name: str, fields: dict) -> None:
     bus._update_meta_locked(room_id, _update)
 
 
-def _wake_in_progress(info: dict, status: Optional[str]) -> bool:
-    """True if the agent has a LIVE wake process — do not wake it again. A
-    'busy' status whose last_wake_pid is dead is a stale lease (the process
-    already exited) and must NOT block a fresh wake."""
+def _claim_wake(
+    room_id: str, agent_name: str, msg_id: int, wake_id: str,
+) -> bool:
+    """Atomically reserve one room+agent+message before starting a process.
+
+    This uses only the room meta lock. Status/message reads happen before or
+    after it, never while it is held. A process crash after this write leaves
+    a persisted claim, deliberately failing closed instead of spawning the
+    same turn from a second server instance.
+    """
+    claimed = False
+
+    def _update(meta: dict) -> dict:
+        nonlocal claimed
+        if meta.get("status") not in ("open", "idle"):
+            return meta
+        am = meta.setdefault("agent_meta", {})
+        info = am.get(agent_name)
+        if not isinstance(info, dict):
+            info = {}
+        if info.get("wake_claim_id") or info.get("initial_spawn_active"):
+            return meta
+        if int(info.get("last_wake_msg_id", 0) or 0) >= msg_id:
+            return meta
+        info.update({
+            "wake_claim_id": wake_id,
+            "wake_claim_msg_id": msg_id,
+            "wake_claimed_at": int(time.time()),
+            "wake_id": wake_id,
+            "last_wake_msg_id": msg_id,
+            "last_seen_id": max(int(info.get("last_seen_id", 0) or 0), msg_id),
+            "last_wake_pid": None,
+        })
+        am[agent_name] = info
+        claimed = True
+        return meta
+
+    bus._update_meta_locked(room_id, _update)
+    return claimed
+
+
+def _claim_explicit_wake(
+    room_id: str, agent_name: str, wake_id: str,
+) -> bool:
+    """Atomically reserve a public respond_via_agent turn without a msg id."""
+    claimed = False
+
+    def _update(meta: dict) -> dict:
+        nonlocal claimed
+        if meta.get("status") not in ("open", "idle"):
+            return meta
+        am = meta.setdefault("agent_meta", {})
+        info = am.get(agent_name)
+        if not isinstance(info, dict):
+            info = {}
+        if info.get("wake_claim_id") or info.get("initial_spawn_active"):
+            return meta
+        info.update({
+            "wake_claim_id": wake_id,
+            "wake_claim_msg_id": None,
+            "wake_claimed_at": int(time.time()),
+            "wake_id": wake_id,
+            "last_wake_pid": None,
+        })
+        am[agent_name] = info
+        claimed = True
+        return meta
+
+    bus._update_meta_locked(room_id, _update)
+    return claimed
+
+
+def _clear_wake_claim(
+    room_id: str, agent_name: str, wake_id: str, *, rollback: bool = False,
+) -> bool:
+    """Conditionally release only this generation's persisted wake claim."""
+    cleared = False
+
+    def _update(meta: dict) -> dict:
+        nonlocal cleared
+        info = (meta.get("agent_meta") or {}).get(agent_name)
+        if not isinstance(info, dict) or info.get("wake_claim_id") != wake_id:
+            return meta
+        for field in ("wake_claim_id", "wake_claim_msg_id", "wake_claimed_at"):
+            info.pop(field, None)
+        if rollback and info.get("wake_id") == wake_id:
+            info.pop("wake_id", None)
+            info.pop("last_wake_pid", None)
+        cleared = True
+        return meta
+
+    bus._update_meta_locked(room_id, _update)
+    return cleared
+
+
+def _publish_wake_started(
+    room_id: str,
+    agent_name: str,
+    wake_id: str,
+    fields: dict,
+    task_id: int | str = "",
+) -> bool:
+    """Generation-CAS publish after Popen returns.
+
+    A very short child may exit, release its claim and let another server
+    claim a newer request before the original Popen call returns. The stale
+    caller must then leave both metadata and operational status untouched.
+    """
+    published = False
+
+    def _update(meta: dict) -> dict:
+        nonlocal published
+        info = (meta.get("agent_meta") or {}).get(agent_name)
+        if not isinstance(info, dict) or info.get("wake_claim_id") != wake_id:
+            return meta
+        info.update(fields)
+        published = True
+        return meta
+
+    # The exact child's reaper uses this same process-local lock. Since a
+    # foreign process has no Popen authority, this serializes every legitimate
+    # terminal callback with the meta-CAS + operational status publication.
+    with _wake_lock(room_id, agent_name):
+        bus._update_meta_locked(room_id, _update)
+        if published:
+            _set_agent_phase(
+                room_id, agent_name, "working", task_id=task_id,
+            )
+    return published
+
+
+def _owned_process_state(room_id: str, info: dict) -> child_processes.ProcessState:
+    handle = info.get("wake_id")
+    if handle:
+        return child_processes.state(room_id, handle)
+    return child_processes.state_for_pid(room_id, info.get("last_wake_pid"))
+
+
+def _wake_in_progress(info: dict, status: Optional[str], room_id: str = "") -> bool:
+    """True when a persisted claim or active child makes a wake unsafe.
+
+    Claims are authoritative independently of process-local status. This is
+    what closes the pre-Popen cross-process race and also protects an initial
+    auto-spawn whose invite/status write raced with its live child.
+    """
+    if info.get("wake_claim_id") or info.get("initial_spawn_active"):
+        return True
     if status != "busy":
         return False
-    pid = info.get("last_wake_pid")
-    return bool(pid) and bus._pid_alive(pid)
+    if not info.get("last_wake_pid"):
+        return False
+    # An unknown persisted lease is not proof of death. Keep it occupied until
+    # the dead-wake grace path reports ownership loss and releases it.
+    return _owned_process_state(room_id, info) in {"alive", "unknown"}
 
 
-def _agent_wake_health(info: dict, status: Optional[str]) -> dict:
+def _agent_wake_health(
+    info: dict, status: Optional[str], room_id: str = "",
+) -> dict:
     """Computed wake-health for one agent — surfaces stale leases / failed
     wakes for the dashboard health view."""
     pid = info.get("last_wake_pid")
-    pid_alive = bool(pid) and bus._pid_alive(pid)
+    claim_active = bool(
+        info.get("wake_claim_id") or info.get("initial_spawn_active")
+    )
+    process_state = _owned_process_state(room_id, info) if pid else "unknown"
+    pid_alive = process_state == "alive"
     rc = info.get("last_wake_rc")
     return {
         "status": status or "offline",
         "wake_id": info.get("wake_id"),
         "last_wake_pid": pid,
         "pid_alive": pid_alive,
-        "stale_lease": status == "busy" and not pid_alive,
+        "process_state": process_state,
+        "claim_active": claim_active,
+        "stale_lease": status == "busy" and process_state == "exited",
+        "unowned_lease": process_state == "unknown" and (
+            claim_active or (bool(pid) and status == "busy")
+        ),
         "last_wake_msg_id": info.get("last_wake_msg_id"),
         "last_wake_at": info.get("last_wake_at"),
         "last_wake_rc": rc,
@@ -1482,21 +2327,26 @@ def _make_wake_done_callback(room_id: str, agent_name: str, wake_id: str):
     next queued request the moment the agent turn ends."""
     def _callback(returncode) -> None:
         try:
-            _on_wake_exit(room_id, agent_name, wake_id, returncode)
+            with _wake_lock(room_id, agent_name):
+                _on_wake_exit(room_id, agent_name, wake_id, returncode)
         except Exception as exc:  # never let a callback kill the reaper thread
             print(f"[huddle] wake-exit callback error "
                   f"({agent_name}@{room_id}): {exc}", flush=True)
     return _callback
 
 
-def _make_initial_spawn_callback(room_id: str, agent_name: str):
+def _make_initial_spawn_callback(
+    room_id: str, agent_name: str, initial_spawn_id: str,
+):
     """Reaper on_exit callback for the room_create spawn: no busy lease to
     release — explain the silence the same way a wake exit does (rate-limit
     detection, else a noreply notice) and drain any request queued during
     the agent's first turn."""
     def _callback(returncode) -> None:
         try:
-            _on_initial_spawn_exit(room_id, agent_name, returncode)
+            _on_initial_spawn_exit(
+                room_id, agent_name, initial_spawn_id, returncode,
+            )
         except Exception as exc:
             print(f"[huddle] initial-spawn exit callback error "
                   f"({agent_name}@{room_id}): {exc}", flush=True)
@@ -1526,10 +2376,10 @@ def _handle_rate_limit_on_exit(room_id: str, agent_name: str) -> bool:
     except Exception:
         return False
     info = (meta.get("agent_meta") or {}).get(agent_name) or {}
-    log_path = info.get("log_path")
-    if not log_path:
+    if not info.get("log_path"):
         return False
-    reason = spawn.detect_rate_limit(log_path)
+    text = _read_owned_agent_log(room_id, agent_name)
+    reason = spawn.detect_rate_limit_text(text) if text is not None else None
     if not reason:
         return False
     if _agent_in_rate_limit_cooldown(info):
@@ -1580,17 +2430,60 @@ def _agent_result_posted_after(room_id: str, agent_name: str, msg_id: int) -> bo
     )
 
 
-def _log_tail(log_path: Optional[str], max_len: int = 200) -> str:
-    """Short ANSI-stripped tail of an agent log, for a failure notice."""
-    if not log_path:
-        return ""
+_OWNED_LOG_HEAD_BYTES = 256 * 1024
+_OWNED_LOG_TAIL_BYTES = 512 * 1024
+_OWNED_LOG_NOTICE_BYTES = 64 * 1024
+
+
+def _read_owned_agent_log(
+    room_id: str,
+    agent_name: str,
+    *,
+    limit: int = _OWNED_LOG_TAIL_BYTES,
+    tail: bool = True,
+) -> str | None:
+    """Read only the canonical room-owned log through confined O_NOFOLLOW IO."""
     try:
-        p = Path(log_path)
-        if not p.exists():
-            return ""
-        with open(p, "rb") as f:
-            text = f.read().decode("utf-8", errors="replace")
-    except OSError:
+        log_path, _ = bus._agent_paths(room_id, agent_name, create=False)
+        fd = bus._safe_open_fd(log_path, os.O_RDONLY)
+        with os.fdopen(fd, "rb") as fh:
+            if tail:
+                fh.seek(0, os.SEEK_END)
+                fh.seek(max(0, fh.tell() - limit), os.SEEK_SET)
+            return fh.read(limit).decode("utf-8", errors="replace")
+    except (FileNotFoundError, NotADirectoryError, OSError, ValueError):
+        return None
+
+
+def _parse_owned_codex_thread_id(
+    room_id: str, agent_name: str, timeout: float,
+) -> str | None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        text = _read_owned_agent_log(
+            room_id, agent_name, limit=_OWNED_LOG_HEAD_BYTES, tail=False,
+        )
+        if text:
+            thread_id = spawn.parse_codex_thread_id_text(text)
+            if thread_id:
+                return thread_id
+        time.sleep(0.1)
+    return None
+
+
+def _owned_codex_log_has_completed_turn(room_id: str, agent_name: str) -> bool:
+    text = _read_owned_agent_log(
+        room_id, agent_name, limit=_OWNED_LOG_TAIL_BYTES, tail=True,
+    )
+    return bool(text and spawn.codex_log_has_completed_turn_text(text))
+
+
+def _log_tail(room_id: str, agent_name: str, max_len: int = 200) -> str:
+    """Short ANSI-stripped tail of an agent log, for a failure notice."""
+    text = _read_owned_agent_log(
+        room_id, agent_name, limit=_OWNED_LOG_NOTICE_BYTES, tail=True,
+    )
+    if text is None:
         return ""
     lines = [spawn._strip_ansi(line).strip() for line in text.splitlines()]
     lines = [line for line in lines if line]
@@ -1621,7 +2514,7 @@ def _announce_noreply_on_exit(room_id: str, agent_name: str, msg_id: int,
         body = (f"⚠️ {agent_name} завершился без ответа в комнату "
                  f"(exit 0) — не ждите ответа.")
     else:
-        tail = _log_tail(log_path)
+        tail = _log_tail(room_id, agent_name)
         suffix = f" {tail}" if tail else ""
         body = (f"⚠️ {agent_name} завершился с ошибкой (exit {rc}) и не "
                  f"ответил — не ждите ответа.{suffix}")
@@ -1656,7 +2549,7 @@ def _announce_noreply_on_initial_exit(room_id: str, agent_name: str, rc: int,
         body = (f"⚠️ {agent_name} завершился без ответа в комнату "
                  f"(exit 0) — не ждите ответа.")
     else:
-        tail = _log_tail(log_path)
+        tail = _log_tail(room_id, agent_name)
         suffix = f" {tail}" if tail else ""
         body = (f"⚠️ {agent_name} завершился с ошибкой (exit {rc}) и не "
                  f"ответил — не ждите ответа.{suffix}")
@@ -1671,12 +2564,18 @@ def _announce_noreply_on_initial_exit(room_id: str, agent_name: str, rc: int,
               f"({agent_name}@{room_id}): {exc}", flush=True)
 
 
-def _on_initial_spawn_exit(room_id: str, agent_name: str, returncode) -> None:
+def _on_initial_spawn_exit(
+    room_id: str, agent_name: str, initial_spawn_id: str, returncode,
+) -> None:
     """Reaction to a room_create auto_spawn agent's process exit: unlike a
     wake, there is no busy lease to release — but the same no-silent-failure
     guarantee applies: detect a provider rate-limit, else post a noreply
     notice if the agent exited without posting anything at all, then drain
     any request that queued during the agent's first turn."""
+    # Keep the exact generation's persisted guard throughout status/notices.
+    # A stale callback must not overwrite a newer wake's phase or metadata.
+    if not _begin_initial_spawn_exit(room_id, agent_name, initial_spawn_id):
+        return
     rc = -999 if returncode is None else int(returncode)
     rate_limit_announced = False
     if rc != 0:
@@ -1705,6 +2604,13 @@ def _on_initial_spawn_exit(room_id: str, agent_name: str, returncode) -> None:
             print(f"[huddle] noreply check error (init) "
                   f"({agent_name}@{room_id}): {exc}", flush=True)
     try:
+        # Status has already reached its terminal phase. Clear the persisted
+        # initial guard last so a concurrent request can only start afterwards.
+        _mark_initial_spawn_finished(room_id, agent_name, initial_spawn_id)
+    except Exception as exc:
+        print(f"[huddle] initial-spawn claim release error "
+              f"({agent_name}@{room_id}): {exc}", flush=True)
+    try:
         _drain_pending_wakes(room_id, agent_name)
     except Exception as exc:
         print(f"[huddle] wake drain error ({agent_name}@{room_id}): {exc}",
@@ -1730,10 +2636,13 @@ def _on_wake_exit(room_id: str, agent_name: str, wake_id: str,
     # superseded us (then it owns the busy state and the drain).
     if info.get("wake_id") != wake_id:
         return
-    if not already_announced and info.get("stuck_killed_wake_id") == wake_id:
-        # _check_stuck_wakes already posted the "⏳ ... остановлен" notice and
-        # SIGTERMed this wake's process — this exit is that kill landing, not
-        # a fresh silent failure. Don't post noreply/rate-limit on top of it.
+    if (not already_announced and (
+        info.get("stuck_announced_wake_id") == wake_id
+        or info.get("stuck_killed_wake_id") == wake_id
+    )):
+        # The stuck watchdog already explained this wake's silence. Whether
+        # SIGTERM was sent, denied, or disabled, don't add a second noreply
+        # notice when the exact child eventually exits.
         already_announced = True
     rc = -999 if returncode is None else int(returncode)
     fail_count = int(info.get("wake_fail_count", 0) or 0)
@@ -1756,7 +2665,8 @@ def _on_wake_exit(room_id: str, agent_name: str, wake_id: str,
                   f"({agent_name}@{room_id}): {exc}", flush=True)
     posted_result = _agent_result_posted_after(
         room_id, agent_name, int(info.get("last_wake_msg_id", 0) or 0))
-    if info.get("stuck_killed_wake_id") == wake_id:
+    if (info.get("stuck_announced_wake_id") == wake_id
+            or info.get("stuck_killed_wake_id") == wake_id):
         final_phase = "stuck"
     elif rate_limit_announced:
         final_phase = "rate_limited"
@@ -1774,6 +2684,13 @@ def _on_wake_exit(room_id: str, agent_name: str, wake_id: str,
         except Exception as exc:
             print(f"[huddle] noreply check error "
                   f"({agent_name}@{room_id}): {exc}", flush=True)
+    try:
+        # Operational status is terminal now. Release only this exact
+        # generation, then allow the queued-drain path to claim the next turn.
+        _clear_wake_claim(room_id, agent_name, wake_id)
+    except Exception as exc:
+        print(f"[huddle] wake-claim release error "
+              f"({agent_name}@{room_id}): {exc}", flush=True)
     try:
         _drain_pending_wakes(room_id, agent_name)
     except Exception as exc:
@@ -1853,12 +2770,18 @@ def _wake_agents_for_request(
             info = (fresh.get("agent_meta") or {}).get(agent_name) or {}
             status = bus.get_status(room_id).get(agent_name)
 
-            if _wake_in_progress(info, status):
+            if _wake_in_progress(info, status, room_id):
                 continue  # live wake → request stays queued, drained on exit
             if _agent_in_rate_limit_cooldown(info):
                 continue  # provider limit hit → a fresh spawn would instantly fail
             last_wake = int(info.get("last_wake_msg_id", 0) or 0)
             if last_wake >= msg_id:
+                continue
+            # Message and meta locks must never be nested. Read the persisted
+            # queue first, then let the meta-lock CAS below serialize the
+            # claim. A caller for request #2 cannot skip an older eligible #1.
+            oldest = _next_pending_request(room_id, agent_name, info)
+            if oldest is None or int(oldest.get("id", 0) or 0) != msg_id:
                 continue
             if _agent_replied_to_request(room_id, agent_name, msg_id):
                 _merge_agent_meta(room_id, agent_name, {
@@ -1872,37 +2795,57 @@ def _wake_agents_for_request(
             wake_id = uuid.uuid4().hex[:12]
 
             if _is_thread_resumable(agent_name):
-                thread_id = info.get("thread_id")
-                if not log_path:
+                try:
+                    canonical_log, canonical_last = bus._agent_paths(
+                        room_id, agent_name, create=False,
+                    )
+                except (OSError, ValueError):
                     continue
+                log_path = str(canonical_log)
+                thread_id = info.get("thread_id")
                 if not thread_id:
-                    thread_id = spawn.parse_codex_thread_id(log_path, timeout=1.0)
+                    thread_id = _parse_owned_codex_thread_id(
+                        room_id, agent_name, timeout=1.0,
+                    )
                     if not thread_id:
                         continue
                     _merge_agent_meta(room_id, agent_name, {"thread_id": thread_id})
-                if not spawn.codex_log_has_completed_turn(log_path):
+                if not _owned_codex_log_has_completed_turn(room_id, agent_name):
                     continue
                 prompt = _build_codex_wakeup_prompt(
                     room_id, sender, body, to, msg_id, last_seen)
+                if not _claim_wake(room_id, agent_name, msg_id, wake_id):
+                    continue
                 _set_agent_phase(room_id, agent_name, "starting", task_id=msg_id)
                 try:
                     pid = spawn.codex_resume(
                         thread_id, prompt, cwd, log_path,
-                        info.get("last_message_path"),
+                        str(canonical_last),
                         on_exit=_make_wake_done_callback(room_id, agent_name, wake_id),
+                        owner_room_id=room_id,
+                        process_handle=wake_id,
                     )
                 except Exception as exc:
                     _set_agent_phase(room_id, agent_name, "unavailable", msg_id, str(exc))
+                    try:
+                        _clear_wake_claim(
+                            room_id, agent_name, wake_id, rollback=True,
+                        )
+                    except Exception as rollback_exc:
+                        print(f"[huddle] wake-claim rollback failed "
+                              f"({agent_name}@{room_id}): {rollback_exc}",
+                              flush=True)
                     print(f"[huddle] codex_resume failed ({room_id}): {exc}",
                           flush=True)
                     _announce_spawn_failure(room_id, agent_name, exc, str(msg_id))
                     continue
-                _merge_agent_meta(room_id, agent_name, {
+                published = _publish_wake_started(room_id, agent_name, wake_id, {
                     "last_wake_msg_id": msg_id, "last_seen_id": msg_id,
                     "last_wake_pid": pid, "last_wake_at": int(time.time()),
                     "wake_id": wake_id,
-                })
-                _set_agent_phase(room_id, agent_name, "working", task_id=msg_id)
+                }, task_id=msg_id)
+                if not published:
+                    continue
                 wakes.append({"agent": agent_name, "pid": pid,
                               "thread_id": thread_id})
                 continue
@@ -1912,11 +2855,21 @@ def _wake_agents_for_request(
             prompt = _build_registry_agent_wakeup_prompt(
                 room_id, agent_name, sender, body, to, msg_id, last_seen,
                 transcript)
+            if not _claim_wake(room_id, agent_name, msg_id, wake_id):
+                continue
             try:
                 pid, _, _ = _spawn_fresh_room_agent(
                     room_id, agent_name, prompt, fresh, msg_id=msg_id,
                     wake_id=wake_id)
             except Exception as exc:
+                try:
+                    _clear_wake_claim(
+                        room_id, agent_name, wake_id, rollback=True,
+                    )
+                except Exception as rollback_exc:
+                    print(f"[huddle] wake-claim rollback failed "
+                          f"({agent_name}@{room_id}): {rollback_exc}",
+                          flush=True)
                 print(f"[huddle] fresh spawn failed for {agent_name} "
                       f"({room_id}): {exc}", flush=True)
                 _announce_spawn_failure(room_id, agent_name, exc, str(msg_id))
@@ -1963,7 +2916,7 @@ def _wake_pending_agents() -> list[dict]:
             continue
         statuses = bus.get_status(room_id)
         for agent_name, info in agent_meta.items():
-            if _wake_in_progress(info, statuses.get(agent_name)):
+            if _wake_in_progress(info, statuses.get(agent_name), room_id):
                 continue
             pending = _next_pending_request(room_id, agent_name, info)
             if pending is None:
@@ -1975,16 +2928,16 @@ def _wake_pending_agents() -> list[dict]:
 
 
 def _check_dead_wakes() -> list[str]:
-    """Watchdog sweep: fast-path for a 'busy' lease whose last_wake_pid has
-    already DIED without its reaper on_exit callback ever running (e.g. a
-    server restart killed the reaper thread, or the callback raised before
-    reaching bus.set_status). A dead pid is a certain fact — unlike a hang,
-    there is no need to wait out WAKE_STUCK_SECS to know no reply is coming.
+    """Release only exact current-instance exited leases after a short grace.
 
-    Runs before _check_stuck_wakes in the sweep so a dead pid is announced
-    here, fast, instead of by the slow stuck-wake path; _check_stuck_wakes
-    only ever considers leases with a LIVE pid (_wake_in_progress requires
-    it), so the two checks never double-announce the same wake.
+    Ownership state comes only from this server instance's exact Popen
+    registry. ``unknown`` may belong to another live stdio server instance, so
+    it remains occupied and is never cleared, drained, or signalled.
+
+    Runs before _check_stuck_wakes in the sweep so an exact exited child is
+    announced here, fast, instead of by the slow stuck-wake path. That path
+    can also observe active claims without a live pid; generation-scoped
+    markers keep the two checks from double-announcing the same wake.
 
     Returns the list of (agent, room) leases this sweep released — a lease
     is always released once its pid is confirmed dead, even when the agent
@@ -2008,8 +2961,9 @@ def _check_dead_wakes() -> list[str]:
             if statuses.get(agent_name) != "busy":
                 continue
             pid = info.get("last_wake_pid")
-            if not pid or bus._pid_alive(pid):
-                continue  # alive, or nothing to check — not this sweep's job
+            process_state = _owned_process_state(room_id, info)
+            if not pid or process_state != "exited":
+                continue
             last_wake_at = int(info.get("last_wake_at", 0) or 0)
             if not last_wake_at or now - last_wake_at < DEAD_WAKE_GRACE_SECS:
                 continue  # give the reaper callback a chance to fire first
@@ -2020,19 +2974,20 @@ def _check_dead_wakes() -> list[str]:
             # regardless — an agent that posted something before dying (e.g.
             # a reply that raced its own crash) already explained the
             # silence, so skip only the redundant notice, not the release.
-            # Same for a wake _check_stuck_wakes already killed and announced
+            # Same for a wake _check_stuck_wakes already signalled/announced
             # (e.g. its reaper thread never fired to release the lease on its
-            # own) — the room already has the "⏳ ... остановлен" notice.
+            # own) — the room already has the stuck-process notice.
             msg_id = int(info.get("last_wake_msg_id", 0) or 0)
             already_explained = (
                 (bool(msg_id) and _agent_posted_after(room_id, agent_name, msg_id))
+                or info.get("stuck_announced_wake_id") == wake_id
                 or info.get("stuck_killed_wake_id") == wake_id
             )
             if not already_explained:
                 try:
                     _post_message_checked(
                         room_id, agent_name,
-                        f"⚠️ {agent_name}: процесс {pid} умер, не ответив — "
+                        f"⚠️ {agent_name}: процесс {pid} завершился, не ответив — "
                         f"ответа не будет.",
                         kind="comment",
                         idempotency_key=f"deadwake:{room_id}:{agent_name}:{wake_id}",
@@ -2041,8 +2996,9 @@ def _check_dead_wakes() -> list[str]:
                     print(f"[huddle] dead-wake notice post failed "
                           f"({agent_name}@{room_id}): {exc}", flush=True)
             try:
-                _on_wake_exit(room_id, agent_name, wake_id, None,
-                               already_announced=True)
+                with _wake_lock(room_id, agent_name):
+                    _on_wake_exit(room_id, agent_name, wake_id, None,
+                                  already_announced=True)
             except Exception as exc:
                 print(f"[huddle] dead-wake lease-clear error "
                       f"({agent_name}@{room_id}): {exc}", flush=True)
@@ -2050,25 +3006,42 @@ def _check_dead_wakes() -> list[str]:
     return announced
 
 
-def _kill_stuck_wake_pid(pid: int, agent_name: str, room_id: str) -> bool:
-    """Best-effort SIGTERM of a hung wake's process. Returns True if a kill
-    signal was actually delivered (pid existed and we had permission) —
-    False for a pid that was already gone or we couldn't touch, in which
-    case the reaper/dead-wake sweep will clean up the lease on its own.
+def _terminate_stuck_wake(
+    wake_id: str, pid: int, agent_name: str, room_id: str,
+) -> bool:
+    """Terminate only the exact current-instance child for this wake.
 
     NB: for a `timeout N <cli> ...`-wrapped spec the tracked pid is the
     timeout wrapper's — we rely on GNU/coreutils timeout forwarding SIGTERM
     to its child (its documented default behavior), so the real CLI dies too.
     """
-    try:
-        os.kill(pid, signal.SIGTERM)
-        return True
-    except ProcessLookupError:
-        return False  # already dead — nothing to kill
-    except PermissionError as exc:
+    result = child_processes.terminate(room_id, wake_id)
+    if result == "denied":
         print(f"[huddle] stuck-wake kill denied ({agent_name}@{room_id}, "
-              f"pid={pid}): {exc}", flush=True)
-        return False
+              f"pid={pid})", flush=True)
+    return result == "sent"
+
+
+def _mark_wake_generation(
+    room_id: str, agent_name: str, wake_id: str, fields: dict,
+) -> bool:
+    """CAS fields onto an exact still-active wake generation."""
+    marked = False
+
+    def _update(meta: dict) -> dict:
+        nonlocal marked
+        info = (meta.get("agent_meta") or {}).get(agent_name)
+        claim_id = info.get("wake_claim_id") if isinstance(info, dict) else None
+        if (not isinstance(info, dict)
+                or info.get("wake_id") != wake_id
+                or claim_id not in (None, wake_id)):
+            return meta
+        info.update(fields)
+        marked = True
+        return meta
+
+    bus._update_meta_locked(room_id, _update)
+    return marked
 
 
 def _check_stuck_wakes() -> list[str]:
@@ -2080,8 +3053,10 @@ def _check_stuck_wakes() -> list[str]:
     exits, so nothing else in this file will ever tell the organizer to stop
     waiting on it.
 
-    When STUCK_KILL_ENABLED (default on), after announcing it also SIGTERMs
-    the still-alive process — the resulting exit runs the normal reaper
+    When STUCK_KILL_ENABLED (default on), it first asks the exact owned Popen
+    to terminate and then accurately reports whether SIGTERM was sent. Sending
+    a signal is not proof of exit: the operational lease stays busy until the
+    exact child is observed exited by its normal reaper
     on_exit → _on_wake_exit, which checks stuck_killed_wake_id and skips its
     own noreply/rate-limit announcement (this notice already explained the
     silence). Set MCP_HUDDLE_STUCK_KILL=0 to fall back to announce-only.
@@ -2099,7 +3074,7 @@ def _check_stuck_wakes() -> list[str]:
             continue
         statuses = bus.get_status(room_id)
         for agent_name, info in agent_meta.items():
-            if not _wake_in_progress(info, statuses.get(agent_name)):
+            if not _wake_in_progress(info, statuses.get(agent_name), room_id):
                 continue
             last_wake_at = int(info.get("last_wake_at", 0) or 0)
             if not last_wake_at or now - last_wake_at < WAKE_STUCK_SECS:
@@ -2111,32 +3086,55 @@ def _check_stuck_wakes() -> list[str]:
             if msg_id and _agent_posted_after(room_id, agent_name, msg_id):
                 continue  # it has been talking — a slow lease release, not a hang
             pid = info.get("last_wake_pid")
-            alive = bool(pid) and bus._pid_alive(pid)
+            pid_available = (
+                isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+            )
+            process_state = _owned_process_state(room_id, info)
+            alive = process_state == "alive"
             mins = max(1, (now - last_wake_at) // 60)
-            will_kill = STUCK_KILL_ENABLED and alive
-            if will_kill:
-                body = (f"⏳ {agent_name} не отвечает уже ~{mins} мин "
-                        f"(процесс {pid}) — возможно завис; процесс "
-                        f"остановлен, ответа не будет.")
-            else:
-                body = (f"⏳ {agent_name} не отвечает уже ~{mins} мин "
-                        f"(процесс {pid} {'жив' if alive else 'мёртв'}) — "
-                        f"возможно завис; не ждите ответа.")
             try:
+                # The list_rooms snapshot may already be obsolete: the old
+                # child can exit and another server can claim a new request.
+                # Mark only the exact still-active generation. Warning alone
+                # is not a terminal transition; exact exit/reaper owns the
+                # eventual phase=stuck + operational release.
+                if not _mark_wake_generation(room_id, agent_name, wake_id, {
+                    "stuck_announced_wake_id": wake_id,
+                }):
+                    continue
+                kill_sent = (
+                    STUCK_KILL_ENABLED
+                    and alive
+                    and pid_available
+                    and _terminate_stuck_wake(
+                        wake_id, pid, agent_name, room_id,
+                    )
+                )
+                if kill_sent:
+                    _mark_wake_generation(room_id, agent_name, wake_id, {
+                        "stuck_killed_wake_id": wake_id,
+                    })
+                    body = (f"⏳ {agent_name} не отвечает уже ~{mins} мин "
+                            f"(процесс {pid}) — возможно завис; "
+                            f"SIGTERM отправлен, ожидается завершение.")
+                elif not pid_available:
+                    body = (f"⏳ {agent_name} не отвечает уже ~{mins} мин "
+                            "(PID ещё не опубликован; запуск остаётся "
+                            "зарезервированным) — возможно завис; "
+                            "не ждите ответа.")
+                else:
+                    state_label = {
+                        "alive": "жив",
+                        "exited": "завершён",
+                        "unknown": "не принадлежит текущему серверу",
+                    }[process_state]
+                    body = (f"⏳ {agent_name} не отвечает уже ~{mins} мин "
+                            f"(процесс {pid}: {state_label}) — "
+                            f"возможно завис; не ждите ответа.")
                 _post_message_checked(
                     room_id, agent_name, body,
                     kind="comment",
                     idempotency_key=f"stuck:{room_id}:{agent_name}:{wake_id}",
-                )
-                fields = {"stuck_announced_wake_id": wake_id}
-                if will_kill and _kill_stuck_wake_pid(pid, agent_name, room_id):
-                    # Tells _on_wake_exit (fired by the normal reaper once the
-                    # SIGTERM lands) this wake's silence is already explained.
-                    fields["stuck_killed_wake_id"] = wake_id
-                _merge_agent_meta(room_id, agent_name, fields)
-                _set_agent_phase(
-                    room_id, agent_name, "stuck", task_id=msg_id,
-                    detail=f"no reply for ~{mins} min",
                 )
                 announced.append(f"{agent_name}@{room_id}")
             except Exception as exc:
@@ -2176,6 +3174,8 @@ def _spawn_fresh_room_agent(
             meta.get("cwd", "") or "",
             bus._room_dir(room_id) / "agents",
             on_exit=_make_wake_done_callback(room_id, agent_name, wake_id),
+            owner_room_id=room_id,
+            process_handle=wake_id,
         )
     except Exception as exc:
         _set_agent_phase(room_id, agent_name, "unavailable", detail=str(exc))
@@ -2191,8 +3191,9 @@ def _spawn_fresh_room_agent(
     if msg_id is not None:
         fields["last_wake_msg_id"] = msg_id
         fields["last_seen_id"] = msg_id
-    _merge_agent_meta(room_id, agent_name, fields)
-    _set_agent_phase(room_id, agent_name, "working", task_id=msg_id or "")
+    _publish_wake_started(
+        room_id, agent_name, wake_id, fields, task_id=msg_id or "",
+    )
     return pid, log_path, last_msg_path
 
 
@@ -2487,6 +3488,7 @@ def build_app():
     watchdog starts once for the whole HTTP app's lifetime, not per session.
     """
     app = mcp.streamable_http_app()
+    app.add_middleware(_HTTPGuardMiddleware)
     mcp_lifespan = app.router.lifespan_context
 
     @contextlib.asynccontextmanager
