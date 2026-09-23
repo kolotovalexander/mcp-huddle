@@ -206,3 +206,49 @@ and produced the reporter final. It did not fully confirm the requested
 process-lifecycle timing; use a per-wake exit history and a terminal outcome
 that distinguishes an intentional stop from an execution failure to verify
 that target reliably.
+
+## Post-fix stop telemetry check — room_854fa51f
+
+After the main checkout reported commit `c61be97cc2c6fce5fa0a901e32b782df9b9b9e5e`,
+the live HTTP MCP endpoint returned `mcp-huddle` 1.28.1 and all six
+`swarm_pilot_*` tools. One disposable Swarm used the enabled free profiles
+`OpenCode-cohere` (`openrouter/cohere/north-mini-code:free`) and
+`OpenCode-nvidia` (`openrouter/nvidia/nemotron-3-super-120b-a12b:free`). The
+goal was `27 + 15`; participants were told to use Huddle pilot tools only and
+make no shell, file, or system actions. No organizer correction was sent.
+
+Timeline (Unix timestamps; wall times are Indochina Time, UTC+7):
+
+- `room_854fa51f` and requests #1/#2 were created at `1790207392`
+  (2026-09-24 06:49:52).
+- Cohere result #3 replied to #1 at `1790207414` (06:50:14); its durable
+  `round_done` timestamp is `1790207418` (06:50:18).
+- Cohere PID `60738` exited at `1790207419` (06:50:19), one second after
+  `round_done`, with `last_wake_rc=-15`, `wake_fail_count=0`, and its wake
+  claim cleared. This is the requested normal SIGTERM stop telemetry.
+- Nvidia result #4 replied to #2 at `1790207450` (06:50:50); its durable
+  `round_done` timestamp is `1790207452` (06:50:52). PID `60741` exited at
+  `1790207464` (06:51:04) with `last_wake_rc=0` and `wake_fail_count=0`.
+- Standard system final request #5 went to Cohere at `1790207452`; Cohere
+  published combined result #6 and final #7 (`42`) at `1790207487`
+  (06:51:27). Its reporter PID `61297` exited at `1790207488` (06:51:28),
+  with `last_wake_rc=-15` and `wake_fail_count=0`.
+- Final state: `phase="completed"`; both agents are in `done`;
+  `final.member="OpenCode-cohere"`; both `wake_claim_id` values are null;
+  both `wake_fail_count` values are zero. The room completed 95 seconds after
+  creation.
+
+No system error message appeared in the room; #5 is the ordinary pilot final
+request. Nvidia's event log does contain two participant-side validation
+errors: it first omitted the required `member` argument to
+`swarm_pilot_record`, then tried `status_set(phase="completed")`, which is
+not an allowed phase. It retried its responsibility call correctly, posted
+result #4, and completed `round_done`; neither error produced a system room
+message or blocked the final. No files or system actions were performed by
+the pilot participants.
+
+Conclusion: the requested telemetry behavior is live-proven in this room:
+the normal stop after a completed member turn recorded `rc=-15` with
+`wake_fail_count=0`, both wake claims were cleared, both members completed,
+and the reporter published a final. This is one run, using these two free
+OpenCode profiles.
