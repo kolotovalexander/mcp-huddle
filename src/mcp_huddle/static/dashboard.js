@@ -18,6 +18,16 @@ const AGENT_LETTER = {Claude:'C', Codex:'X', Antigravity:'A', Qwen:'Q', MiMo:'M'
 
 function agentCls(a)  { return AGENT_CLS[a]  || 'agent-other'; }
 function avatarCls(a) { return AVATAR_CLS[a] || 'avatar-other'; }
+// Identity colour as a CSS value: the skin's --c-<agent> for known agents, a
+// stable hashed --c-dyn-N slot for dynamic names (e.g. OpenCode-nvidia).
+const AGENT_DYN_SLOTS = 6;
+function agentColor(a) {
+  const cls = AGENT_CLS[a];
+  if (cls) return `var(--c-${cls.slice('agent-'.length)})`;
+  let h = 0;
+  for (const ch of String(a || '')) h = (h * 31 + ch.codePointAt(0)) >>> 0;
+  return `var(--c-dyn-${h % AGENT_DYN_SLOTS}, var(--text-muted))`;
+}
 function agentLetter(a) { return AGENT_LETTER[a] || (String(a||'?')[0] || '?').toUpperCase(); }
 
 function el(tag, attrs, children) {
@@ -1452,7 +1462,7 @@ async function attachAgentPanels(roomId) {
 
     const detailsEl = el('details', {
       class: 'agent-panel' + (isSpawned ? '' : ' static'),
-      dataset: {agent: name}, open: '',
+      dataset: {agent: name}, open: '', style: `--agent-c:${agentColor(name)}`,
     }, [summary, body]);
     scroll.appendChild(detailsEl);
 
@@ -1680,7 +1690,7 @@ function renderOne(m) {
   if (m.reply_to != null) {
     const q = msgMap[m.reply_to];
     const replyName = q ? q.agent : `#${m.reply_to}`;
-    const replyAgentColor = q ? `var(--c-${(q.agent||'').toLowerCase()}, var(--text-muted))` : 'var(--text-muted)';
+    const replyAgentColor = q ? agentColor(q.agent) : 'var(--text-muted)';
     const preview = q
       ? (q.body.length > 90 ? q.body.slice(0,90) + '…' : q.body)
       : `(message #${m.reply_to})`;
@@ -1702,7 +1712,7 @@ function renderOne(m) {
 
   const div = el('div', {
     class: `msg ${agentCls(m.agent)} kind-${m.kind}`,
-    dataset: {id: String(m.id)},
+    dataset: {id: String(m.id)}, style: `--agent-c:${agentColor(m.agent)}`,
   }, [
     el('div', {class: 'msg-content'}, [line, el('div', {class: 'msg-main'}, [kindLine, bubble])]),
   ]);
@@ -1782,7 +1792,7 @@ function renderRoomLanes(room, statuses) {
       b.onclick = () => { const m = relevant[i]; const target = document.querySelector(`#messages .msg[data-id="${m.id}"]`);
         if (target) target.scrollIntoView({block: 'center'}); };
     });
-    root.appendChild(el('div', {class: 'lane-row'}, [
+    root.appendChild(el('div', {class: 'lane-row', style: `--agent-c:${agentColor(name)}`}, [
       log,
       el('span', {class: `lane-phase phase-${phase}`, text: phaseLabel}),
       track,
