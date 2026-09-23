@@ -1485,8 +1485,12 @@ async def api_messages_json(request: Request) -> JSONResponse:
         if since > 0:
             msgs = [m for m in msgs if m["id"] > since]
         room_meta = bus._read_meta(room_id)
-        statuses = bus.get_status(room_id)
-        return JSONResponse({"messages": msgs, "room": room_meta, "statuses": statuses})
+        status_details = bus.get_status_details(room_id)
+        statuses = {name: info["status"] for name, info in status_details.items()}
+        phases = {name: info.get("phase", "online")
+                  for name, info in status_details.items()}
+        return JSONResponse({"messages": msgs, "room": room_meta,
+                             "statuses": statuses, "phases": phases})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 

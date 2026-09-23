@@ -200,6 +200,24 @@ const I18N = {
     'btn.closeAll': 'Close all', 'btn.deleteClosed': 'Delete closed', 'btn.nukeAll': 'Nuke all',
     'btn.view': 'View', 'btn.live': 'live', 'btn.copy': 'Copy', 'btn.send': 'Send',
     'btn.search': 'Search',
+    'room.owner': 'Owner', 'room.round': 'Round', 'room.noRound': 'No recorded round', 'room.messages': 'messages',
+    'room.updated': 'Updated', 'room.copyName': 'Copy name',
+    'lanes.title': 'Agents', 'lanes.collapse': 'Collapse', 'lanes.expand': 'Expand',
+    'lanes.waiting': 'Waiting', 'lanes.working': 'Working', 'lanes.done': 'Finished',
+    'lanes.offline': 'Offline', 'lanes.online': 'Online', 'lanes.unknown': 'No status',
+    'lanes.thinking': 'Thinking', 'lanes.responding': 'Writing an answer',
+    'lanes.starting': 'Starting', 'lanes.queued': 'Queued',
+    'lanes.limited': 'Rate limited', 'lanes.stuck': 'Stalled',
+    'lanes.messages': 'messages', 'round.discussion': 'Discussion', 'round.label': 'Round',
+    'lanes.legend': '□ request  ■ answer  • comment',
+    'compose.as': 'From Human', 'compose.request': 'Request', 'compose.comment': 'Comment',
+    'compose.system': 'Important', 'compose.to': 'To', 'compose.all': 'Everyone',
+    'compose.hint': 'A request wakes its recipients. A comment does not.',
+    'compose.placeholder': 'Write to the room… Ctrl+Enter to send',
+    'footer.noRoom': 'Choose a room to view the discussion', 'footer.search': 'search',
+    'footer.theme': 'Theme', 'footer.text': 'Text', 'footer.rows': 'Rows',
+    'footer.paper': 'paper', 'footer.ink': 'ink',
+    'footer.spacious': 'Spacious', 'footer.dense': 'Compact',
     'search.placeholder': 'Search room titles and messages',
     'search.hint': 'Type a room name or words from a conversation',
     'search.pending': 'Searching…', 'search.empty': 'No matching rooms or messages',
@@ -279,6 +297,24 @@ const I18N = {
     'btn.closeAll': 'Закрыть все', 'btn.deleteClosed': 'Удалить закрытые', 'btn.nukeAll': 'Снести всё',
     'btn.view': 'Вид', 'btn.live': 'онлайн', 'btn.copy': 'Копировать', 'btn.send': 'Отправить',
     'btn.search': 'Поиск', 'search.placeholder': 'Название комнаты или слова из переписки',
+    'room.owner': 'Владелец', 'room.round': 'Раунд', 'room.noRound': 'Раунд не задан', 'room.messages': 'сообщений',
+    'room.updated': 'Обновлена', 'room.copyName': 'Копировать имя',
+    'lanes.title': 'Агенты', 'lanes.collapse': 'Свернуть', 'lanes.expand': 'Развернуть',
+    'lanes.waiting': 'Ждёт', 'lanes.working': 'Работает', 'lanes.done': 'Закончил',
+    'lanes.offline': 'Не в сети', 'lanes.online': 'На связи', 'lanes.unknown': 'Нет статуса',
+    'lanes.thinking': 'Думает', 'lanes.responding': 'Пишет ответ',
+    'lanes.starting': 'Запускается', 'lanes.queued': 'В очереди',
+    'lanes.limited': 'Уперся в лимит', 'lanes.stuck': 'Завис',
+    'lanes.messages': 'сообщений', 'round.discussion': 'Обсуждение', 'round.label': 'Раунд',
+    'lanes.legend': '□ запрос  ■ ответ  • реплика',
+    'compose.as': 'От имени Human', 'compose.request': 'Запрос', 'compose.comment': 'Комментарий',
+    'compose.system': 'Важное', 'compose.to': 'Кому', 'compose.all': 'Всем',
+    'compose.hint': 'Запрос разбудит адресатов. Комментарий — нет.',
+    'compose.placeholder': 'Написать в комнату… Ctrl+Enter — отправить',
+    'footer.noRoom': 'Выберите комнату, чтобы читать обсуждение', 'footer.search': 'поиск',
+    'footer.theme': 'Тема', 'footer.text': 'Текст', 'footer.rows': 'Строки',
+    'footer.paper': 'бумага', 'footer.ink': 'чернила',
+    'footer.spacious': 'Просторно', 'footer.dense': 'Плотно',
     'search.hint': 'Введите название комнаты или слова из переписки',
     'search.pending': 'Ищу…', 'search.empty': 'Совпадений нет',
     'chat.selectRoom': 'Выберите комнату',
@@ -473,12 +509,25 @@ function fmtTime(ts) {
   return new Date((ts || 0) * 1000).toLocaleTimeString('ru', {hour:'2-digit', minute:'2-digit'});
 }
 
+function messageCount(n) {
+  if (LANG === 'ru') {
+    const word = n % 10 === 1 && n % 100 !== 11 ? 'сообщение'
+      : n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 12 || n % 100 > 14)
+        ? 'сообщения' : 'сообщений';
+    return `${n} ${word}`;
+  }
+  return `${n} ${n === 1 ? 'message' : t('room.messages')}`;
+}
+
 // ── State ─────────────────────────────────────────────────
 let currentRoom = null, currentOwner = null, lastId = 0;
 let rooms = [], msgMap = {};
 let searchResults = null, searchPending = false, searchTimer = null, searchSequence = 0;
 let agentMetaTotals = {}; // {agentName: {tokens_total, tokens_in, tokens_out, msgs, models:Set, last_reasoning}}
 let lastStatuses = {};    // {agentName: 'online'|'busy'|...} — latest room status snapshot
+let lastPhases = {};      // lifecycle phase explicitly reported by agent/server
+let roomMessages = [], laneCollapsed = false, composerKind = 'request', lastRenderedRound = null;
+let roomData = null;
 
 function metaBadge(meta) {
   if (!meta) return null;
@@ -959,21 +1008,22 @@ function buildChatShell(room) {
     : el('button', {class: 'lq-btn danger', id: 'btn-close', text: 'Close'});
 
   const header = el('div', {class: 'chat-header'}, [
-    el('div', {}, [
+    el('div', {class: 'room-heading'}, [
+      el('div', {class: 'room-crumb', id: 'room-crumb', text: room.cwd || room.project || ''}),
       el('div', {class: 'chat-title'}, titleChildren),
       el('div', {class: 'chat-meta', id: 'chat-meta', text: 'Loading…'}),
     ]),
-    el('div', {class: 'topbar-actions'}, [
-      el('div', {class: 'avatar-stack', id: 'avatar-stack'}),
+    el('div', {class: 'room-actions'}, [
+      el('button', {class: 'room-text-action', id: 'copy-room-name', text: t('room.copyName')}),
       actionBtn,
     ]),
   ]);
 
+  const lanes = el('section', {class: 'room-lanes', id: 'room-lanes', 'aria-label': t('lanes.title')});
   const messages = el('div', {class: 'messages', id: 'messages'});
 
   const inputAttrs = {
     id: 'human-inp',
-    type: 'text',
     // A bare <input type="text"> with no name makes Safari/Chrome offer
     // contact autofill (phone number etc.). Opt out explicitly: it is a
     // free-text chat field, not a contact form.
@@ -984,25 +1034,45 @@ function buildChatShell(room) {
     spellcheck: 'false',
     'data-1p-ignore': '',
     'data-lpignore': 'true',
-    placeholder: isReadOnly
-      ? (isClosed ? t('chat.closed') : t('chat.resolved'))
-      : t('chat.placeholder'),
+    placeholder: isReadOnly ? (isClosed ? t('chat.closed') : t('chat.resolved')) : t('compose.placeholder'),
   };
   if (isReadOnly) inputAttrs.disabled = '';
-  const input = el('input', inputAttrs);
+  const input = el('textarea', inputAttrs);
 
-  const sendAttrs = {class: 'send-btn', id: 'btn-send', text: t('btn.send') + ' ↵'};
+  const sendAttrs = {class: 'send-btn', id: 'btn-send', text: t('btn.send')};
   if (isReadOnly) sendAttrs.disabled = '';
   const send = el('button', sendAttrs);
 
-  const inputWrap = el('div', {class: 'input-wrap'}, [
+  const participants = (room.participants || []).filter(p => p !== 'Human' && p !== 'System');
+  const recipient = el('select', {id: 'human-to', 'aria-label': t('compose.to')}, [
+    el('option', {value: 'all', text: t('compose.all')}),
+    ...participants.map(p => el('option', {value: p, text: p})),
+  ]);
+  const kindButtons = ['request', 'comment', 'system'].map(kind => {
+    const b = el('button', {type: 'button', class: 'composer-kind', dataset: {kind},
+      'aria-pressed': String(composerKind === kind), text: t(`compose.${kind}`)});
+    b.onclick = () => {
+      composerKind = kind;
+      document.querySelectorAll('.composer-kind').forEach(x => x.setAttribute('aria-pressed', String(x.dataset.kind === kind)));
+      const hint = document.getElementById('composer-hint');
+      if (hint) hint.textContent = kind === 'request' ? t('compose.hint') : '';
+    };
+    return b;
+  });
+  const inputWrap = el('div', {class: 'input-wrap room-composer'}, [
+    el('div', {class: 'composer-controls'}, [
+      el('span', {text: t('compose.as')}),
+      el('span', {class: 'composer-kinds'}, kindButtons),
+      el('label', {}, [t('compose.to') + ' ', recipient]),
+      el('span', {class: 'composer-hint', id: 'composer-hint', text: composerKind === 'request' ? t('compose.hint') : ''}),
+    ]),
     el('div', {class: 'input-row'}, [
-      avatar('Human', 'avatar-sm'),
       input, send,
     ]),
   ]);
 
   chat.appendChild(header);
+  chat.appendChild(lanes);
   chat.appendChild(messages);
   chat.appendChild(inputWrap);
 
@@ -1013,8 +1083,9 @@ function buildChatShell(room) {
   }
   if (!isReadOnly) {
     send.onclick = sendMsg;
-    input.onkeydown = e => { if (e.key === 'Enter') sendMsg(); };
+    input.onkeydown = e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendMsg(); } };
   }
+  document.getElementById('copy-room-name').onclick = () => navigator.clipboard.writeText(room.name || room.id || '');
 }
 
 async function openRoom(id, owner) {
@@ -1023,6 +1094,10 @@ async function openRoom(id, owner) {
   history.replaceState(null, '', `${location.pathname}${location.search}#room=${encodeURIComponent(id)}`);
   lastId = 0;
   msgMap = {};
+  roomMessages = [];
+  roomData = null;
+  lastPhases = {};
+  lastRenderedRound = null;
   agentMetaTotals = {};
   closeAgentStreams();  // abort authenticated fetch streams from previous room
   renderRooms();
@@ -1567,11 +1642,18 @@ function renderOne(m) {
   const list = document.getElementById('messages');
   if (!list) return;
   msgMap[m.id] = {body: m.body, agent: m.agent};
+  const round = Number(m.round) > 0 ? Number(m.round) : 0;
+  if (round !== lastRenderedRound) {
+    const label = round ? `${t('round.label')} ${round}` : t('round.discussion');
+    list.appendChild(el('div', {class: 'round-divider'}, [el('span', {text: label})]));
+    lastRenderedRound = round;
+  }
 
   const isSystem = (m.agent === 'System' || m.kind === 'system' || m.kind === 'close');
 
   if (isSystem) {
     const div = el('div', {class: 'msg is-system', dataset: {id: String(m.id)}}, [
+      el('div', {class: 'msg-system-when', text: `${fmtTime(m.timestamp)} · #${m.id}`}),
       el('div', {class: 'msg-body', text: m.body}),
     ]);
     list.appendChild(div);
@@ -1585,11 +1667,12 @@ function renderOne(m) {
     renderAgentTotalsBadge(m.agent);
   }
   const line = el('div', {class: 'msg-line'}, [
-    avatar(m.agent, 'avatar-inline'),
-    el('span', {class: 'msg-name', text: m.agent}),
-    m.to ? el('span', {class: 'msg-to', text: '→ ' + m.to}) : null,
+    el('span', {class: 'msg-agent-ident'}, [avatar(m.agent, 'avatar-inline'), el('span', {class: 'msg-name', text: m.agent})]),
+    el('span', {class: 'msg-time', text: `${fmtTime(m.timestamp)} · #${m.id}`}),
+  ]);
+  const kindLine = el('div', {class: 'msg-kind-line'}, [
     el('span', {class: `kind kind-${m.kind}`, text: m.kind}),
-    el('span', {class: 'msg-time', text: fmtTime(m.timestamp)}),
+    m.to ? el('span', {class: 'msg-to', text: '→ ' + m.to}) : null,
     badge,
   ]);
 
@@ -1621,11 +1704,128 @@ function renderOne(m) {
     class: `msg ${agentCls(m.agent)} kind-${m.kind}`,
     dataset: {id: String(m.id)},
   }, [
-    el('div', {class: 'msg-content'}, [line, bubble]),
+    el('div', {class: 'msg-content'}, [line, el('div', {class: 'msg-main'}, [kindLine, bubble])]),
   ]);
 
   list.appendChild(div);
   list.scrollTop = list.scrollHeight;
+}
+
+function renderRoomLanes(room, statuses) {
+  const root = document.getElementById('room-lanes');
+  if (!root || !room) return;
+  const signature = JSON.stringify([room.id, room.status, roomMessages.length,
+    roomMessages.length && roomMessages[roomMessages.length - 1].id, statuses, lastPhases, laneCollapsed]);
+  if (root.dataset.signature === signature) return;
+  root.dataset.signature = signature;
+  const expanded = new Set([...root.querySelectorAll('.lane-log[open]')].map(x => x.dataset.agent));
+  const people = [...new Set((room.participants || []).filter(p => p !== 'Human' && p !== 'System'))];
+  const state = name => {
+    const st = statuses && statuses[name];
+    const phase = lastPhases[name];
+    const known = {
+      thinking: ['thinking', 'lanes.thinking'], responding: ['responding', 'lanes.responding'],
+      working: ['working', 'lanes.working'], starting: ['starting', 'lanes.starting'],
+      queued: ['queued', 'lanes.queued'], completed: ['done', 'lanes.done'],
+      rate_limited: ['limited', 'lanes.limited'], stuck: ['stuck', 'lanes.stuck'],
+      unavailable: ['offline', 'lanes.offline'],
+    };
+    if (known[phase]) return [known[phase][0], t(known[phase][1])];
+    if (st === 'busy') return ['working', t('lanes.working')];
+    if (st === 'online') return ['online', t('lanes.online')];
+    if (room.status === 'closed' || room.status === 'resolved') return ['done', t('lanes.done')];
+    if (st === 'offline') return ['offline', t('lanes.offline')];
+    return ['unknown', t('lanes.unknown')];
+  };
+  const tally = {};
+  for (const name of people) { const key = state(name)[1]; tally[key] = (tally[key] || 0) + 1; }
+  root.innerHTML = '';
+  const summary = Object.entries(tally).map(([key, n]) => `${key} — ${n}`).join(' · ');
+  const toggle = el('button', {class: 'lane-toggle', type: 'button', text: t(laneCollapsed ? 'lanes.expand' : 'lanes.collapse')});
+  toggle.onclick = () => { laneCollapsed = !laneCollapsed; renderRoomLanes(roomData, lastStatuses); };
+  root.appendChild(el('div', {class: 'lanes-head'}, [
+    el('span', {text: `${t('lanes.title')}: ${summary || '—'}`}),
+    el('span', {class: 'lanes-legend', text: t('lanes.legend')}),
+    toggle,
+  ]));
+  if (laneCollapsed) return;
+  for (const name of people) {
+    const authored = roomMessages.filter(m => m.agent === name);
+    const relevant = roomMessages.filter(m => m.agent === name || m.to === name || (m.kind === 'request' && m.to === 'all'));
+    const [phase, phaseLabel] = state(name);
+    const track = el('div', {class: 'lane-track'});
+    const maxId = roomMessages.length ? roomMessages[roomMessages.length - 1].id : 1;
+    const minId = roomMessages.length ? roomMessages[0].id : 0;
+    for (const m of authored) {
+      const tick = el('button', {class: `lane-tick kind-${m.kind}`, type: 'button',
+        title: `#${m.id} · ${m.kind} · ${fmtTime(m.timestamp)}`,
+        'aria-label': `${name} #${m.id}`});
+      tick.style.left = `${Math.max(2, Math.min(98, (m.id - minId) / Math.max(1, maxId - minId) * 96 + 2))}%`;
+      tick.onclick = () => {
+        const target = document.querySelector(`#messages .msg[data-id="${m.id}"]`);
+        if (target) { target.scrollIntoView({block: 'center'}); target.classList.add('lane-flash');
+          setTimeout(() => target.classList.remove('lane-flash'), 1500); }
+      };
+      track.appendChild(tick);
+    }
+    const log = el('details', {class: 'lane-log', dataset: {agent: name}}, [
+      el('summary', {text: name}),
+      el('div', {class: 'lane-log-body'}, relevant.length
+        ? relevant.map(m => el('button', {type: 'button'}, [
+          el('span', {class: 'lane-log-meta', text: `${fmtTime(m.timestamp)} · #${m.id} · ${m.agent} · ${m.kind}`}),
+          el('span', {class: 'lane-log-message', text: m.body || ''}),
+        ]))
+        : [el('span', {text: '—'})]),
+    ]);
+    if (expanded.has(name)) log.open = true;
+    log.querySelectorAll('.lane-log-body button').forEach((b, i) => {
+      b.onclick = () => { const m = relevant[i]; const target = document.querySelector(`#messages .msg[data-id="${m.id}"]`);
+        if (target) target.scrollIntoView({block: 'center'}); };
+    });
+    root.appendChild(el('div', {class: 'lane-row'}, [
+      log,
+      el('span', {class: `lane-phase phase-${phase}`, text: phaseLabel}),
+      track,
+      el('span', {class: 'lane-detail', text: messageCount(authored.length)}),
+    ]));
+  }
+}
+
+function updateFooterStatus() {
+  const target = document.getElementById('footer-room-status');
+  if (!target) return;
+  target.textContent = roomData
+    ? `${roomData.name || roomData.id} · ${t(`status.${roomData.status}`)} · ${messageCount(roomMessages.length)}`
+    : t('footer.noRoom');
+}
+
+function initStatusBar() {
+  const bind = (id, fn) => { const b = document.getElementById(id); if (b) b.onclick = fn; };
+  const setFooterTheme = mode => {
+    localStorage.setItem('agentbus-theme', mode);
+    localStorage.setItem('agentbus-palette', 'default');
+    applyPalette('default');
+  };
+  bind('footer-theme-light', () => setFooterTheme('light'));
+  bind('footer-theme-dark', () => setFooterTheme('dark'));
+  const saved = Number(localStorage.getItem('agentbus-reading-size') || 100);
+  let size = Number.isFinite(saved) ? Math.max(85, Math.min(125, saved)) : 100;
+  const applySize = () => {
+    document.documentElement.style.setProperty('--reading-scale', String(size / 100));
+    document.getElementById('footer-font-value').textContent = `${size}%`;
+    localStorage.setItem('agentbus-reading-size', String(size));
+  };
+  bind('footer-font-down', () => { size = Math.max(85, size - 5); applySize(); });
+  bind('footer-font-up', () => { size = Math.min(125, size + 5); applySize(); });
+  applySize();
+  const applyDensity = dense => {
+    document.documentElement.classList.toggle('dense-rows', dense);
+    localStorage.setItem('agentbus-density', dense ? 'dense' : 'normal');
+  };
+  bind('footer-density-normal', () => applyDensity(false));
+  bind('footer-density-dense', () => applyDensity(true));
+  applyDensity(localStorage.getItem('agentbus-density') === 'dense');
+  updateFooterStatus();
 }
 
 function renderAvatarStack(participants) {
@@ -1641,18 +1841,15 @@ function renderChatMeta(room, statuses) {
   const meta = document.getElementById('chat-meta');
   if (!meta) return;
   meta.innerHTML = '';
-  const parts = (room.participants || []);
-  meta.appendChild(document.createTextNode(parts.join(' · ') + ' · '));
-  meta.appendChild(el('span', {class: 'msg-time', text: t(`status.${room.status}`)}));
-  if (room.session_id) {
-    meta.appendChild(document.createTextNode(' · '));
-    meta.appendChild(el('span', {class: 'msg-meta', text: 'sid: ' + room.session_id, title: 'session_id'}));
-  }
-  for (const [agent, st] of Object.entries(statuses || {})) {
-    if (!st || st === 'online') continue;
-    meta.appendChild(document.createTextNode(' '));
-    meta.appendChild(el('span', {class: `kind kind-${st === 'busy' ? 'busy' : 'comment'}`, text: `${agent}: ${t(`status.${st}`)}`}));
-  }
+  const activeRound = room.swarm_pilot && room.swarm_pilot.round || room.current_round;
+  const details = [t(`status.${room.status}`)];
+  details.push(activeRound ? `${t('room.round')} ${activeRound}` : t('room.noRound'));
+  if (room.owner) details.push(`${t('room.owner')} ${room.owner}`);
+  details.push(messageCount(roomMessages.length));
+  if (room.last_activity) details.push(`${t('room.updated')} ${fmtTime(room.last_activity)}`);
+  meta.textContent = details.join('  /  ');
+  const crumb = document.getElementById('room-crumb');
+  if (crumb) crumb.textContent = room.cwd || room.project || '';
 }
 
 async function fetchMessages(initial) {
@@ -1662,22 +1859,28 @@ async function fetchMessages(initial) {
     const resp = await apiFetch(url);
     const data = await resp.json();
 
-    if (data.room) {
-      renderChatMeta(data.room, data.statuses);
-      renderAvatarStack(data.room.participants);
-    }
+    if (data.room) roomData = data.room;
     lastStatuses = data.statuses || {};
+    lastPhases = data.phases || {};
     updateActivityStatuses(lastStatuses);
 
     if (initial) {
       const list = document.getElementById('messages');
       if (list) list.innerHTML = '';
       msgMap = {};
+      roomMessages = [];
+      lastRenderedRound = null;
     }
 
     const msgs = data.messages || [];
     for (const m of msgs) renderOne(m);
+    roomMessages.push(...msgs);
     if (msgs.length) lastId = msgs[msgs.length-1].id;
+    if (roomData) {
+      renderChatMeta(roomData, lastStatuses);
+      renderRoomLanes(roomData, lastStatuses);
+      updateFooterStatus();
+    }
   } catch(e) {}
 }
 
@@ -1687,12 +1890,14 @@ async function sendMsg() {
   const btn = document.getElementById('btn-send');
   const body = inp && inp.value ? inp.value.trim() : '';
   if (!body) return;
+  const recipient = document.getElementById('human-to');
+  const to = recipient ? recipient.value : 'all';
   inp.disabled = true; btn.disabled = true;
   try {
     await apiFetch('/api/message_post', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({room_id: currentRoom, agent: 'Human', body, kind: 'system', to: 'all'}),
+      body: JSON.stringify({room_id: currentRoom, agent: 'Human', body, kind: composerKind, to}),
     });
     inp.value = '';
     await fetchMessages(false);
@@ -1702,6 +1907,19 @@ async function sendMsg() {
     inp.disabled = false; btn.disabled = false;
     inp.focus();
   }
+}
+
+function clearSelectedRoom() {
+  closeAgentStreams();
+  currentRoom = null;
+  currentOwner = null;
+  roomData = null;
+  roomMessages = [];
+  lastStatuses = {};
+  lastPhases = {};
+  lastId = 0;
+  history.replaceState(null, '', `${location.pathname}${location.search}`);
+  updateFooterStatus();
 }
 
 async function closeRoom() {
@@ -1716,7 +1934,7 @@ async function closeRoom() {
     showRequestError('Failed to close room', e);
     return;
   }
-  currentRoom = null;
+  clearSelectedRoom();
   const chat = document.getElementById('chat-area');
   chat.innerHTML = '';
   chat.appendChild(el('div', {class: 'empty'}, [
@@ -1740,14 +1958,14 @@ async function deleteRoom() {
     showRequestError('Failed to delete room', e);
     return;
   }
-  closeAgentStreams();
-  currentRoom = null;
+  clearSelectedRoom();
   const chat = document.getElementById('chat-area');
   chat.innerHTML = '';
   chat.appendChild(el('div', {class: 'empty'}, [
     el('div', {class: 'empty-title', text: 'Room deleted'}),
     el('div', {class: 'empty-hint', text: 'Pick another room from the sidebar'}),
   ]));
+  relayout();
   await loadRooms();
 }
 
@@ -1775,15 +1993,15 @@ async function bulkAction(endpoint, confirmMsg, label) {
     showRequestError(`${label} failed`, e);
     return;
   }
-  closeAgentStreams();
   if (currentRoom) {
-    currentRoom = null;
+    clearSelectedRoom();
     const chat = document.getElementById('chat-area');
     chat.innerHTML = '';
     chat.appendChild(el('div', {class: 'empty'}, [
       el('div', {class: 'empty-title', text: label}),
       el('div', {class: 'empty-hint', text: 'Pick another room from the sidebar'}),
     ]));
+    relayout();
   }
   await loadRooms();
   alert(fmtBulkSummary(label, data));
@@ -2075,6 +2293,7 @@ function initLayout() {
 initSettings();
 initLayout();
 initRoomSearch();
+initStatusBar();
 authenticateDashboard(true)
   .then(loadRooms)
   .catch(e => showAuthRequired(e && e.message ? e.message : 'Authentication failed.'));
