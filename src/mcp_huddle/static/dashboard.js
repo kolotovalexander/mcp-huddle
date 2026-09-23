@@ -1847,8 +1847,8 @@ function renderRoomLanes(room, statuses) {
     const track = el('div', {class: 'lane-track'});
     for (const m of authored) {
       const tick = el('button', {class: `lane-tick kind-${m.kind}`, type: 'button',
-        title: `#${m.id} · ${m.kind} · ${fmtTime(m.timestamp)}`,
-        'aria-label': `${name} #${m.id}`});
+        title: `#${m.id} · ${messageKindLabel(m.kind)} · ${fmtTime(m.timestamp)}`,
+        'aria-label': `${name}: ${messageKindLabel(m.kind)} #${m.id}`});
       tick.style.left = pos(m.timestamp);
       tick.onclick = () => {
         const target = document.querySelector(`#messages .msg[data-id="${m.id}"]`);
@@ -1865,7 +1865,7 @@ function renderRoomLanes(room, statuses) {
       el('summary', {text: name}),
       el('div', {class: 'lane-log-body'}, relevant.length
         ? relevant.map(m => el('button', {type: 'button'}, [
-          el('span', {class: 'lane-log-meta', text: `${fmtTime(m.timestamp)} · #${m.id} · ${m.agent} · ${m.kind}`}),
+          el('span', {class: 'lane-log-meta', text: `${fmtTime(m.timestamp)} · #${m.id} · ${m.agent} · ${messageKindLabel(m.kind)}`}),
           el('span', {class: 'lane-log-message', text: m.body || ''}),
         ]))
         : [el('span', {text: '—'})]),
@@ -2136,7 +2136,13 @@ document.addEventListener('click', e => {
   if (item) {
     openRoom(item.dataset.id, item.dataset.owner).then(() => {
       if (item.dataset.messageId) {
-        document.querySelector(`#messages .msg[data-id="${item.dataset.messageId}"]`)?.scrollIntoView({block: 'center'});
+        const match = document.querySelector(`#messages .msg[data-id="${item.dataset.messageId}"]`);
+        if (match) {
+          document.querySelectorAll('#messages .msg.is-search-hit').forEach(x => x.classList.remove('is-search-hit'));
+          match.classList.add('is-search-hit', 'lane-flash');
+          match.scrollIntoView({block: 'center'});
+          setTimeout(() => match.classList.remove('lane-flash'), 1500);
+        }
       }
     });
     return;
