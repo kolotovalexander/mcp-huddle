@@ -73,6 +73,35 @@ def test_council_server_pump_waits_for_real_result(isolated_home, monkeypatch):
     assert swarm_pilot.status(room)["done"]["A"]["summary"] == "done"
 
 
+def test_round_done_accepts_result_to_organizer_recovery_request(
+    isolated_home, monkeypatch,
+):
+    monkeypatch.setattr(server.spawn, "get_enabled_spec", lambda name: {"name": name})
+    monkeypatch.setattr(server, "_wake_agents_for_request", lambda *args: [])
+    created = server.swarm_pilot_create(
+        "retry after provider failure", "Organizer", "Decide", "swarm",
+        ["A", "B"], start=True,
+    )
+    room = created["room_id"]
+    original_id = swarm_pilot.status(room)["dispatched"]["A"]
+    retry_id = server.message_post(
+        room, "Organizer", "Retry A after its CLI failed before replying.",
+        "request", to="A",
+    )
+
+    with pytest.raises(ValueError, match="organizer's direct recovery request"):
+        server.swarm_pilot_round_done(room, "A", "done")
+
+    server.message_post(
+        room, "A", "Recovered result", "result", to="Organizer",
+        reply_to=retry_id,
+    )
+    response = server.swarm_pilot_round_done(room, "A", "recovered")
+    assert original_id != retry_id
+    assert response["state"]["done"]["A"]["summary"] == "recovered"
+    assert response["next_dispatch"] == []
+
+
 def test_pilot_room_survives_organizer_session_close(isolated_home):
     room = swarm_pilot.create("pilot", "Organizer", "Decide", "team", ["A"])
     assert bus.close_session_rooms("some-session") == []
@@ -118,6 +147,13 @@ def test_public_pilot_workflow_in_all_modes(isolated_home, monkeypatch, mode):
     assert result["phase"] == "completed"
     finals = [m for m in bus._load_messages(room) if m["kind"] == "final"]
     assert len(finals) == 1 and finals[0]["agent"] == author
+    before_late_reply = len(bus._load_messages(room))
+    with pytest.raises(ValueError, match="late final-request result discarded"):
+        server.message_post(
+            room, author, "Late final-request response", "result",
+            to="Organizer", reply_to=final_request,
+        )
+    assert len(bus._load_messages(room)) == before_late_reply
 
 
 def test_new_codex_pilot_member_gets_initial_fresh_spawn(isolated_home, monkeypatch):

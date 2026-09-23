@@ -515,13 +515,32 @@ def swarm_pilot_round_done(room_id: str, member: str, summary: str) -> dict:
     request_id = state["dispatched"].get(member)
     if request_id is None:
         raise ValueError("member has no dispatched request")
+    messages = bus._load_messages(room_id)
+    valid_request_ids = {request_id}
+    # An organizer may issue a direct recovery request after a provider error
+    # (for example, retrying a wake that failed before the member could use
+    # Huddle tools). The member's result belongs to that retry request, not the
+    # original dispatch. Only organizer-authored requests explicitly addressed
+    # to this member qualify; peer chatter cannot complete another task.
+    valid_request_ids.update(
+        int(msg["id"])
+        for msg in messages
+        if int(msg.get("id", 0) or 0) > int(request_id)
+        and msg.get("kind") == "request"
+        and msg.get("reply_to") is None
+        and msg.get("agent") == state["organizer"]
+        and msg.get("to") == member
+    )
     delivered = any(
         msg.get("agent") == member and msg.get("kind") == "result"
-        and msg.get("reply_to") == request_id
-        for msg in bus._load_messages(room_id)
+        and msg.get("reply_to") in valid_request_ids
+        for msg in messages
     )
     if not delivered:
-        raise ValueError("member must post a result for their request first")
+        raise ValueError(
+            "member must post a result for the pilot request or an organizer's "
+            "direct recovery request first"
+        )
     updated = swarm_pilot.round_done(room_id, member, summary)
     next_dispatch = swarm_pilot_pump(room_id)
     final_request = None
@@ -974,6 +993,21 @@ def _post_message_checked(
     meta: Optional[dict] = None,
 ) -> int:
     info = bus.get_room_info(room_id)
+    pilot = info.get("swarm_pilot")
+    if (kind == "result" and isinstance(pilot, dict)
+            and pilot.get("phase") == "completed" and reply_to is not None):
+        # Final requests can wake a member just as another member publishes
+        # the room final. Discard only a late answer to one of those automatic
+        # pilot-final requests; ordinary follow-up requests in a completed
+        # room remain usable.
+        final_request = next((msg for msg in bus._load_messages(room_id)
+                              if msg.get("id") == reply_to), None)
+        if (isinstance(final_request, dict)
+                and ":final-request" in str(
+                    final_request.get("idempotency_key") or "")):
+            raise ValueError(
+                "pilot is already completed; late final-request result discarded"
+            )
     if info.get("status") == "idle" and kind == "request":
         bus.revive(room_id)
     # reply_to is validated inside bus.post_message under the messages lock —
