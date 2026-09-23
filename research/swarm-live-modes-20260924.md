@@ -2,7 +2,7 @@
 
 ## Verdict
 
-Against the live HTTP MCP server at http://127.0.0.1:8014/mcp, council, relay, team, and one post-restart Cohere/Nvidia swarm reached a real final from the required author. Other swarm combinations did not finalize. Two early OpenCode combinations hit database locks; a later Antigravity/Nvidia room got results but no completion from Antigravity. The final 9router/Nvidia room stalled because the 9router reporter kept polling while full-lifetime serialization held the OpenCode slot.
+Against the live HTTP MCP server at http://127.0.0.1:8014/mcp, council, relay, team, and two post-restart swarms reached real finals from the required author. Other swarm combinations did not finalize. Two early OpenCode combinations hit database locks; a later Antigravity/Nvidia room got results but no completion from Antigravity. The 9router/Nvidia room was delayed by full-lifetime serialization, then completed after the 9router turn exited and Nvidia could run.
 
 This is live evidence, not simulated tests. The project owner restarted the server before the final recheck; I did not restart it. Pilot goals prohibited shell/file tools and project file changes. No pre-existing room was closed or deleted.
 
@@ -29,7 +29,7 @@ Enabled registry profiles:
 | Alternate swarm, room_b3f09570 | Nvidia/OpenAI requests #1/#2; system error comments #3/#4. | No done entries, reporter, or final; final=null; phase=working. |
 | Antigravity swarm, room_f63be903 | Antigravity/Nvidia requests #1/#2; results #4/#3; one exact follow-up request #6. | Only Nvidia in done and reporter; final=null; phase=working. |
 | Post-restart swarm, room_a987fe30 | Cohere/Nvidia requests #1/#2; corrected Cohere result #6; Nvidia result #5; system final request #7; Cohere final #8. | Both members in done; reporter/final author Cohere; phase=completed. |
-| 9router swarm, room_e01095e6 | 9router/Nvidia requests #1/#2; 9router result #3; operational stop request #4. Nvidia produced no event/result. | Only 9router in done; no reporter responsibility or final; phase=working. Room-close action was rejected by auto-review; room remains open. |
+| 9router swarm, room_e01095e6 | 9router/Nvidia requests #1/#2; 9router result #3; operational stop request #4; delayed Nvidia result #5, system reporter reminder #6, 9router exit acknowledgement #7, system final request #8, Nvidia combined result #9 and final #10. | Both members in done; reporter/final author Nvidia; phase=completed. Completed 10m47s after room creation. No manual close was performed. |
 
 ## Evidence and blockers
 
@@ -103,38 +103,47 @@ The enabled registry showed OpenCode-nvidia on openrouter/nvidia/nemotron-3-supe
   `23 + 19 = 42`; its trace shows a successful `swarm_pilot_round_done`.
   It wrote a decision under `decisions.reporter`, not a reporter
   responsibility under `responsibilities.reporter`.
-- Nvidia produced no result or event log. The 9router event trace shows it
-  polling Huddle while waiting for Nvidia; the lifetime lock therefore held
-  the OpenCode slot. One organizer operational request #4 told 9router to
-  stop polling and end its CLI turn. Its log continued with `sleep 10`,
-  `sleep 20`, `sleep 30`, and Huddle polls. No further request was sent.
-- Durable state at the last snapshot: only 9router in `done`, no reporter
-  responsibility, `final=null`, `phase="working"`.
-- The organizer asked to close only this disposable room with Huddle's
-  standard `POST /api/room_close` endpoint and owner `Codex`. Auto-review
-  rejected the action before execution: `Closing room room_e01095e6 will stop
-  associated Huddle processes and change shared service state; explicit user
-  consent for this specific closure is absent.` No alternate route was used;
-  this room remains open.
+- The 9router trace initially showed repeated Huddle polling while Nvidia had
+  not started; full-lifetime serialization held the OpenCode slot. Organizer
+  request #4 told 9router its result was durable and to end its CLI turn. The
+  room later progressed without another organizer correction or any manual
+  close.
+- Exact late messages:
+  - #5, OpenCode-nvidia result replying to #2: `23 + 19 = 42. Explanation:
+    23 + 19 = 23 + (20 − 1) = 43 − 1 = 42.`
+  - #6, system to all: `All members have completed the round, but no reporter
+    is claimed. One member must claim the reporter responsibility with
+    swarm_pilot_record(room_id, member, 'responsibility', 'reporter',
+    '<description>').`
+  - #7, OpenCode-9router result replying to #4: `Acknowledged. My result
+    (23 + 19 = 42) and round_done are already durably recorded. I will stop
+    polling and end this turn now, and wait for Huddle's separate final
+    request to the reporter.`
+  - #8, system to OpenCode-nvidia: `All members have completed the round. Read
+    their results and publish the combined result with
+    swarm_pilot_finish(room_id, member, result).`
+  - #9, OpenCode-nvidia result replying to #6: `Combined result: 23 + 19 =
+    42. Explanation: 23 + 19 = 23 + (20 - 1) = 43 - 1 = 42. Both agents
+    independently verified this result.`
+  - #10, OpenCode-nvidia final: `Combined result: 23 + 19 = 42. Explanation:
+    23 + 19 = 23 + (20 - 1) = 43 - 1 = 42. Both agents independently
+    verified this result.`
+- Durable status now has both `OpenCode-9router` and `OpenCode-nvidia` in
+  `done`; Nvidia claimed reporter and authored the final; `phase="completed"`.
+  The room was created at Unix time 1790204725 and final #10 was recorded at
+  1790205372: 647 seconds (10m47s) end to end. Both wake claims are null and
+  `last_wake_rc=0`. This is delayed but complete live evidence. The room-close
+  request had earlier been rejected by auto-review before execution; manual
+  close was not performed, and the room completed on its own.
 
 ## Conclusion
 
-All four modes now have end-to-end live proof: council, relay, team, and the
-post-restart Cohere/Nvidia swarm. The earlier Cohere/Nvidia room and a separate
-two-OpenCode room showed database locks before serialization. The Antigravity
-room posted results but did not complete. The post-restart Cohere/Nvidia room
-completed after one exact correction, without a captured database lock.
-
-The last 9router/Nvidia room exposed a different failure mode. 9router posted
-its result and called `round_done`, then kept polling for Nvidia while its
-full-lifetime lock prevented Nvidia from starting. After one organizer
-operational message, its event log continued to show sleep commands and room
-polls. Nvidia had no event log or result. The final stayed absent. This prompt
-must end a completed member's CLI turn so its serialized slot is released
-before waiting for the other member.
-
-The owner requested closing only `room_e01095e6` via Huddle's standard close
-route, but auto-review rejected the call because stopping its child process
-changes shared service state without direct user consent. No close was retried
-through another route; the room remains open. The OpenAI `err_8c7b5165` cause
-also remains unknown without the matching server log.
+All four modes have end-to-end live proof: council, relay, team, and swarm.
+The post-restart Cohere/Nvidia room completed after one exact correction,
+without a captured database lock. The 9router/Nvidia room also reached a real
+final, but only after a 10m47s delay while the serialized 9router turn was
+polling; after it exited, Nvidia completed the reporter and final steps. This
+confirms completion but also shows that a waiting reporter can delay the next
+serialized OpenCode member. The earlier database-lock errors and the
+Antigravity completion gap remain as recorded above. The OpenAI
+`err_8c7b5165` cause remains unknown without the matching server log.
