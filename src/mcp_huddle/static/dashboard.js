@@ -211,6 +211,7 @@ const I18N = {
     'sidebar.empty': 'No rooms yet. Call room_create() from an agent.',
     'set.appearance': 'Appearance', 'set.theme': 'Theme', 'set.skin': 'Design',
     'set.palette': 'Palette', 'set.lang': 'Language', 'set.mcp': 'MCP connection',
+    'set.roomView': 'Room list', 'roomView.latest': 'Latest activity', 'roomView.projects': 'By project',
     'theme.auto': 'Auto', 'theme.dark': 'Dark', 'theme.light': 'Light',
     'mcp.endpoint': 'HTTP endpoint', 'mcp.claude': 'Claude Code', 'mcp.codex': 'Codex (config.toml)',
     'mcp.stdio': 'stdio (any client)',
@@ -255,6 +256,7 @@ const I18N = {
     'sidebar.empty': 'Пока нет комнат. Вызовите room_create() из агента.',
     'set.appearance': 'Оформление', 'set.theme': 'Тема', 'set.skin': 'Дизайн',
     'set.palette': 'Палитра', 'set.lang': 'Язык', 'set.mcp': 'MCP-подключение',
+    'set.roomView': 'Список комнат', 'roomView.latest': 'По последней активности', 'roomView.projects': 'По проектам',
     'theme.auto': 'Авто', 'theme.dark': 'Тёмная', 'theme.light': 'Светлая',
     'mcp.endpoint': 'HTTP endpoint', 'mcp.claude': 'Claude Code', 'mcp.codex': 'Codex (config.toml)',
     'mcp.stdio': 'stdio (любой клиент)',
@@ -558,6 +560,15 @@ function buildPromptRow(value) {
   return el('div', {class: 'set-prompt-wrap'}, [ta, btn]);
 }
 
+function getRoomView() {
+  return localStorage.getItem('agentbus-room-view') === 'projects' ? 'projects' : 'latest';
+}
+
+function applyRoomView(view) {
+  if (view !== 'projects') view = 'latest';
+  renderRooms();
+}
+
 // Theme labels are localised (emoji + word); skin/palette/lang labels are proper nouns.
 function themeOpts() {
   return [
@@ -578,6 +589,10 @@ function buildSettingsPopover(pop) {
     () => localStorage.getItem('agentbus-skin') || 'glass', applySkin, 'tip.skin'));
   pop.appendChild(buildSettingsRow('set.palette', PALETTE_OPTS, 'agentbus-palette',
     () => localStorage.getItem('agentbus-palette') || 'default', applyPalette, 'tip.palette'));
+  pop.appendChild(buildSettingsRow('set.roomView', [
+    {v: 'latest', label: t('roomView.latest')},
+    {v: 'projects', label: t('roomView.projects')},
+  ], 'agentbus-room-view', getRoomView, applyRoomView));
   pop.appendChild(el('div', {class: 'set-sep'}));
   pop.appendChild(el('div', {class: 'set-title'}, [el('span', {text: t('set.mcp')})]));
   pop.appendChild(buildCopyRow(t('mcp.endpoint'), origin + '/mcp'));
@@ -669,11 +684,35 @@ function toggleTree(key) {
   renderRooms();
 }
 
+function roomItem(r, label, indent = 46) {
+  const active = r.id === currentRoom;
+  return el('div', {
+    class: 'room-item' + (active ? ' active' : ''),
+    dataset: {id: r.id, owner: r.owner},
+    style: `padding-left:${indent}px`,
+  }, [
+    el('div', {class: 'room-name'}, [
+      el('span', {class: `dot dot-${r.status}` + (r.status === 'open' ? ' pulse' : '')}),
+      el('span', {text: label}),
+    ]),
+    el('div', {class: 'room-meta', text: `${(r.participants || []).length}·${fmtTime(r.last_activity || r.created_at)}`}),
+  ]);
+}
+
 function renderRooms() {
   const sidebar = document.getElementById('room-list');
   sidebar.innerHTML = '';
   if (!rooms.length) {
     sidebar.appendChild(el('div', {class: 'empty-sidebar', text: t('sidebar.empty')}));
+    return;
+  }
+
+  if (getRoomView() === 'latest') {
+    const sorted = rooms.slice().sort((a, b) => {
+      const activity = (b.last_activity || b.created_at || 0) - (a.last_activity || a.created_at || 0);
+      return activity || String(a.name || a.id).localeCompare(String(b.name || b.id));
+    });
+    sorted.forEach(r => sidebar.appendChild(roomItem(r, r.name || r.id, 18)));
     return;
   }
 
@@ -736,19 +775,8 @@ function renderRooms() {
         db.appendChild(og);
 
         rs.forEach((r, i) => {
-          const active = r.id === currentRoom;
           const label = rs.length > 1 ? `${i + 1}. ${r.name}` : r.name;
-          ob.appendChild(el('div', {
-            class: 'room-item' + (active ? ' active' : ''),
-            dataset: {id: r.id, owner: r.owner},
-            style: 'padding-left:46px',
-          }, [
-            el('div', {class: 'room-name'}, [
-              el('span', {class: `dot dot-${r.status}` + (r.status === 'open' ? ' pulse' : '')}),
-              el('span', {text: label}),
-            ]),
-            el('div', {class: 'room-meta', text: `${(r.participants || []).length}·${fmtTime(r.last_activity || r.created_at)}`}),
-          ]));
+          ob.appendChild(roomItem(r, label));
         });
       }
     }
