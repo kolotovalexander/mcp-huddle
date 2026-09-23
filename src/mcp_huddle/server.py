@@ -464,6 +464,79 @@ def _swarm_pilot_request(room_id: str, member: str) -> str:
     )
 
 
+_PILOT_MEMBER_EXIT_DELAY_SECONDS = 1.5
+
+
+def _stop_completed_pilot_turn(
+    room_id: str, member: str, wake_id: str, completion: str,
+) -> None:
+    """Stop only this room/member wake after its pilot completion is durable.
+
+    The child registry is the authority to signal. ``agent_meta.external`` is
+    intentionally ignored: room_invite sets it even for registry-backed agents
+    which Huddle later launches itself.
+    """
+    try:
+        state = swarm_pilot.status(room_id)
+        if completion == "round_done":
+            if member not in state["done"]:
+                return
+        elif completion == "final":
+            final = state.get("final") or {}
+            if state.get("phase") != "completed" or final.get("member") != member:
+                return
+        else:
+            return
+        info = (bus.get_room_info(room_id).get("agent_meta") or {}).get(member) or {}
+    except Exception:
+        return
+    if info.get("wake_id") != wake_id:
+        return
+    if info.get("wake_claim_id") not in (None, wake_id):
+        return
+    if child_processes.state(room_id, wake_id) != "alive":
+        return
+    result = child_processes.terminate(room_id, wake_id)
+    if result == "denied":
+        print(f"[huddle] could not stop completed pilot turn "
+              f"({member}@{room_id}, wake={wake_id})", flush=True)
+
+
+def _schedule_completed_pilot_turn_exit(
+    room_id: str, member: str, state: dict, completion: str,
+) -> None:
+    """Defer SIGTERM until after the MCP tool has had time to return its reply.
+
+    The round state and any final request are written before this is called.
+    The exact-child reaper callback remains responsible for releasing claims.
+    """
+    if completion == "round_done" and len(state["done"]) >= len(state["members"]):
+        return
+    if completion == "final":
+        final = state.get("final") or {}
+        if state.get("phase") != "completed" or final.get("member") != member:
+            return
+    try:
+        info = (bus.get_room_info(room_id).get("agent_meta") or {}).get(member) or {}
+    except Exception:
+        return
+    wake_id = info.get("wake_id")
+    if (not wake_id or child_processes.state(room_id, wake_id) != "alive"
+            or info.get("wake_claim_id") not in (None, wake_id)):
+        return
+    try:
+        timer = threading.Timer(
+            _PILOT_MEMBER_EXIT_DELAY_SECONDS,
+            _stop_completed_pilot_turn,
+            args=(room_id, member, wake_id, completion),
+        )
+        timer.daemon = True
+        timer.start()
+    except Exception as exc:
+        print(f"[huddle] could not schedule completed pilot turn exit "
+              f"({member}@{room_id}): {exc}", flush=True)
+
+
 @mcp.tool()
 def swarm_pilot_pump(room_id: str) -> list[dict]:
     """Dispatch the next pilot turn(s) according to the room mode.
@@ -584,6 +657,7 @@ def swarm_pilot_round_done(room_id: str, member: str, summary: str) -> dict:
                         f"swarm-pilot:{room_id}:{updated.get('round', 1)}:final-request-missing-reporter"
                     ),
                 )
+    _schedule_completed_pilot_turn_exit(room_id, member, updated, "round_done")
     return {"state": updated, "next_dispatch": next_dispatch,
             "final_request": final_request}
 
@@ -606,6 +680,7 @@ def swarm_pilot_finish(room_id: str, member: str, result: str) -> dict:
         room_id, member, result, "final", to=updated["organizer"],
         idempotency_key=f"swarm-pilot:{room_id}:final",
     )
+    _schedule_completed_pilot_turn_exit(room_id, member, updated, "final")
     return updated
 
 

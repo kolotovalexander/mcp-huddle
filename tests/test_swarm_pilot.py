@@ -81,6 +81,200 @@ def test_member_brief_exits_after_round_done_instead_of_polling(isolated_home):
     assert "separate addressed final request" in brief
 
 
+def test_round_done_stops_only_exact_local_generation_after_reply(
+    isolated_home, monkeypatch,
+):
+    monkeypatch.setattr(server.spawn, "get_enabled_spec", lambda name: {"name": name})
+    monkeypatch.setattr(server, "_wake_agents_for_request", lambda *args: [])
+    timers = []
+    terminated = []
+
+    class DeferredTimer:
+        def __init__(self, delay, callback, args=(), kwargs=None):
+            self.delay = delay
+            self.callback = callback
+            self.args = args
+            self.kwargs = kwargs or {}
+            timers.append(self)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(server.threading, "Timer", DeferredTimer)
+    monkeypatch.setattr(server.child_processes, "state",
+                        lambda room, handle: "alive" if handle == "wake-A-1"
+                        else "unknown")
+    monkeypatch.setattr(server.child_processes, "terminate",
+                        lambda room, handle: terminated.append((room, handle)) or "sent")
+
+    created = server.swarm_pilot_create(
+        "pilot", "Organizer", "Decide", "swarm", ["A", "B"], start=True,
+    )
+    room = created["room_id"]
+    request_id = swarm_pilot.status(room)["dispatched"]["A"]
+    server._merge_agent_meta(room, "A", {
+        "wake_id": "wake-A-1", "external": True,
+    })
+    server.message_post(room, "A", "My result", "result", to="Organizer",
+                        reply_to=request_id)
+
+    response = server.swarm_pilot_round_done(room, "A", "done")
+
+    assert response["state"]["done"]["A"]["summary"] == "done"
+    assert swarm_pilot.status(room)["phase"] == "working"
+    assert len(timers) == 1
+    assert timers[0].delay == server._PILOT_MEMBER_EXIT_DELAY_SECONDS
+    assert not terminated
+    server._merge_agent_meta(room, "A", {"wake_id": "new-generation"})
+    timers[0].callback(*timers[0].args, **timers[0].kwargs)
+    assert not terminated
+    server._merge_agent_meta(room, "A", {"wake_id": "wake-A-1"})
+    timers[0].callback(*timers[0].args, **timers[0].kwargs)
+    assert terminated == [(room, "wake-A-1")]
+
+
+def test_round_done_timer_still_releases_reporter_after_peers_finish(
+    isolated_home, monkeypatch,
+):
+    monkeypatch.setattr(server.spawn, "get_enabled_spec", lambda name: {"name": name})
+    monkeypatch.setattr(server, "_wake_agents_for_request", lambda *args: [])
+    timers = []
+    terminated = []
+
+    class DeferredTimer:
+        def __init__(self, delay, callback, args=(), kwargs=None):
+            self.callback = callback
+            self.args = args
+            self.kwargs = kwargs or {}
+            timers.append(self)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(server.threading, "Timer", DeferredTimer)
+    monkeypatch.setattr(server.child_processes, "state",
+                        lambda room, handle: "alive" if handle == "wake-A-1"
+                        else "unknown")
+    monkeypatch.setattr(server.child_processes, "terminate",
+                        lambda room, handle: terminated.append((room, handle)) or "sent")
+
+    created = server.swarm_pilot_create(
+        "pilot", "Organizer", "Decide", "team", ["A", "B"], start=True,
+    )
+    room = created["room_id"]
+    server.swarm_pilot_record(room, "A", "responsibility", "reporter", "Synthesize")
+    a_request = swarm_pilot.status(room)["dispatched"]["A"]
+    server._merge_agent_meta(room, "A", {"wake_id": "wake-A-1"})
+    server.message_post(room, "A", "A result", "result", to="Organizer",
+                        reply_to=a_request)
+    a_done = server.swarm_pilot_round_done(room, "A", "done")
+    assert "B" in a_done["state"]["dispatched"]
+    assert len(timers) == 1
+
+    b_request = swarm_pilot.status(room)["dispatched"]["B"]
+    server.message_post(room, "B", "B result", "result", to="Organizer",
+                        reply_to=b_request)
+    b_done = server.swarm_pilot_round_done(room, "B", "done")
+    assert b_done["final_request"] is not None
+    final_request = next(m for m in bus._load_messages(room)
+                         if m["id"] == b_done["final_request"])
+    assert final_request["to"] == "A"
+    assert not terminated
+
+    timers[0].callback(*timers[0].args, **timers[0].kwargs)
+
+    assert terminated == [(room, "wake-A-1")]
+
+
+def test_round_done_does_not_stop_last_member_or_unowned_process(
+    isolated_home, monkeypatch,
+):
+    monkeypatch.setattr(server.spawn, "get_enabled_spec", lambda name: {"name": name})
+    monkeypatch.setattr(server, "_wake_agents_for_request", lambda *args: [])
+    timers = []
+    terminated = []
+
+    class DeferredTimer:
+        def __init__(self, delay, callback, args=(), kwargs=None):
+            self.callback = callback
+            self.args = args
+            self.kwargs = kwargs or {}
+            timers.append(self)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(server.threading, "Timer", DeferredTimer)
+    monkeypatch.setattr(server.child_processes, "state", lambda *args: "unknown")
+    monkeypatch.setattr(server.child_processes, "terminate",
+                        lambda *args: terminated.append(args) or "sent")
+
+    created = server.swarm_pilot_create(
+        "pilot", "Organizer", "Decide", "team", ["A"], start=True,
+    )
+    room = created["room_id"]
+    request_id = swarm_pilot.status(room)["dispatched"]["A"]
+    server._merge_agent_meta(room, "A", {"wake_id": "foreign-wake"})
+    server.message_post(room, "A", "My result", "result", to="Organizer",
+                        reply_to=request_id)
+
+    response = server.swarm_pilot_round_done(room, "A", "done")
+
+    assert "A" in response["state"]["done"]
+    assert isinstance(response["final_request"], int)
+    assert not timers
+    assert not terminated
+
+
+def test_final_stops_reporter_only_after_final_message_is_durable(
+    isolated_home, monkeypatch,
+):
+    monkeypatch.setattr(server.spawn, "get_enabled_spec", lambda name: {"name": name})
+    monkeypatch.setattr(server, "_wake_agents_for_request", lambda *args: [])
+    timers = []
+    terminated = []
+
+    class DeferredTimer:
+        def __init__(self, delay, callback, args=(), kwargs=None):
+            self.callback = callback
+            self.args = args
+            self.kwargs = kwargs or {}
+            timers.append(self)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(server.threading, "Timer", DeferredTimer)
+    monkeypatch.setattr(server.child_processes, "state",
+                        lambda room, handle: "alive" if handle == "wake-A-1"
+                        else "unknown")
+    monkeypatch.setattr(server.child_processes, "terminate",
+                        lambda room, handle: terminated.append((room, handle)) or "sent")
+
+    created = server.swarm_pilot_create(
+        "pilot", "Organizer", "Decide", "team", ["A"], start=True,
+    )
+    room = created["room_id"]
+    server.swarm_pilot_record(room, "A", "responsibility", "reporter", "Synthesize")
+    request_id = swarm_pilot.status(room)["dispatched"]["A"]
+    server._merge_agent_meta(room, "A", {"wake_id": "wake-A-1"})
+    server.message_post(room, "A", "My result", "result", to="Organizer",
+                        reply_to=request_id)
+    round_response = server.swarm_pilot_round_done(room, "A", "done")
+    assert isinstance(round_response["final_request"], int)
+    assert not timers  # The last member is kept alive through final routing.
+
+    finished = server.swarm_pilot_finish(room, "A", "Combined result")
+
+    assert finished["phase"] == "completed"
+    finals = [m for m in bus._load_messages(room) if m["kind"] == "final"]
+    assert len(finals) == 1 and finals[0]["agent"] == "A"
+    assert len(timers) == 1
+    assert not terminated
+    timers[0].callback(*timers[0].args, **timers[0].kwargs)
+    assert terminated == [(room, "wake-A-1")]
+
+
 def test_round_done_accepts_result_to_organizer_recovery_request(
     isolated_home, monkeypatch,
 ):
