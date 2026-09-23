@@ -1730,8 +1730,22 @@ function renderOne(m) {
     replyEl.querySelector('.reply-name').style.color = replyAgentColor;
     bubble.appendChild(replyEl);
   }
+  // Opus skin: book-style head (large initial, name, tiny caption) floated
+  // right before the text, below any reply quote, so the text wraps beside it.
+  // The skin hides `line` instead; every other skin hides this head, so the
+  // author is never exposed twice. "Name (note)" splits into name and caption.
+  const nameParts = /^(.+?)\s+\(([^()]+)\)$/.exec(m.agent);
+  const drophead = el('div', {class: 'msg-drophead'}, [
+    el('span', {class: 'msg-dropcap', 'aria-hidden': 'true', text: agentLetter(m.agent)}),
+    el('span', {class: 'msg-drophead-text'}, [
+      el('span', {class: 'msg-name', text: nameParts ? nameParts[1] : m.agent}),
+      nameParts ? el('span', {class: 'msg-model-note', text: nameParts[2]}) : null,
+      el('span', {class: 'msg-time', text: `${fmtTime(m.timestamp)} · #${m.id}`}),
+    ]),
+  ]);
   const bodyEl = el('div', {class: 'msg-body md'});
   bodyEl.innerHTML = renderMarkdown(m.body);
+  bubble.appendChild(drophead);
   bubble.appendChild(bodyEl);
 
   const div = el('div', {
