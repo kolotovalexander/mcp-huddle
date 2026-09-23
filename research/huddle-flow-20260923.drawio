@@ -1,0 +1,192 @@
+<?xml version='1.0' encoding='utf-8'?>
+<mxfile host="app.diagrams.net" modified="2026-09-23T16:39:08.858603+00:00" agent="Codex" version="24.7.17" type="device">
+  <diagram id="01-сейчас-—-обычная-комната" name="01 Сейчас — обычная комната">
+    <mxGraphModel dx="1600" dy="1000" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="900" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="h1" value="СЕЙЧАС · обычная комната Huddle" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3F5F7;strokeColor=#576574;strokeWidth=2;fontColor=#18212B;fontSize=22;align=center;verticalAlign=middle;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="40" y="25" width="1510" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="owner" value="Организатор&lt;br&gt;Codex / Claude / другой агент" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DDF5E9;strokeColor=#278052;strokeWidth=2;fontColor=#18212B;fontSize=15;align=center;verticalAlign=middle;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="40" y="135" width="210" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="mcp" value="MCP-инструменты Huddle&lt;br&gt;room_create · room_invite&lt;br&gt;message_post · messages_read" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EAF3FF;strokeColor=#2563A6;strokeWidth=2;fontColor=#18212B;fontSize=15;align=center;verticalAlign=middle;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="305" y="135" width="260" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="server" value="Сервер Huddle&lt;br&gt;комната · маршрутизация&lt;br&gt;адресные запросы и пробуждение" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EAF3FF;strokeColor=#2563A6;strokeWidth=2;fontColor=#18212B;fontSize=15;align=center;verticalAlign=middle;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="620" y="135" width="270" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="store" value="Хранилище комнаты&lt;br&gt;meta.json · messages.jsonl&lt;br&gt;логи агентов" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EAF3FF;strokeColor=#2563A6;strokeWidth=2;fontColor=#18212B;fontSize=15;align=center;verticalAlign=middle;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="945" y="135" width="265" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="dash" value="Дашборд человека&lt;br&gt;смотрит комнаты и сообщения&lt;br&gt;может вмешаться" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DDF5E9;strokeColor=#278052;strokeWidth=2;fontColor=#18212B;fontSize=15;align=center;verticalAlign=middle;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="1265" y="135" width="265" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="registry" value="Реестр профилей&lt;br&gt;CLI, команда, разрешения" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EAF3FF;strokeColor=#2563A6;strokeWidth=2;fontColor=#18212B;fontSize=15;align=center;verticalAlign=middle;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="620" y="340" width="270" height="95" as="geometry" />
+        </mxCell>
+        <mxCell id="cli" value="Процесс агента&lt;br&gt;Claude / Codex / agy / OpenCode&lt;br&gt;один запуск на ход" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EAF3FF;strokeColor=#2563A6;strokeWidth=2;fontColor=#18212B;fontSize=15;align=center;verticalAlign=middle;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="945" y="340" width="265" height="95" as="geometry" />
+        </mxCell>
+        <mxCell id="reply" value="Ответ агента&lt;br&gt;message_post(result)&lt;br&gt;следующий запрос → новый wake" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EAF3FF;strokeColor=#2563A6;strokeWidth=2;fontColor=#18212B;fontSize=15;align=center;verticalAlign=middle;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="1265" y="340" width="265" height="95" as="geometry" />
+        </mxCell>
+        <mxCell id="limit" value="Текущая граница: stdin=DEVNULL; Huddle не управляет живым терминалом агента.&lt;br&gt;Codex может продолжить native session, но входящие сообщения не вкладываются в уже идущий ход." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3F5F7;strokeColor=#576574;strokeWidth=2;fontColor=#18212B;fontSize=15;align=center;verticalAlign=middle;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="620" y="505" width="910" height="95" as="geometry" />
+        </mxCell>
+        <mxCell id="sandbox" value="Кто решает о доступе&lt;br&gt;Текущий Codex: агент запрашивает обычный доступ к конкретной команде; платформа проверяет запрос.&lt;br&gt;Huddle: профиль выбирает параметры дочернего CLI; его собственные разрешения остаются в силе." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3F5F7;strokeColor=#576574;strokeWidth=2;fontColor=#18212B;fontSize=15;align=center;verticalAlign=middle;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="40" y="665" width="1490" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="e1" value="вызов" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2563A6;strokeWidth=2;endArrow=block;endFill=1;fontSize=13;fontColor=#18212B;" edge="1" parent="1" source="owner" target="mcp">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2" value="MCP" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2563A6;strokeWidth=2;endArrow=block;endFill=1;fontSize=13;fontColor=#18212B;" edge="1" parent="1" source="mcp" target="server">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e3" value="запись" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2563A6;strokeWidth=2;endArrow=block;endFill=1;fontSize=13;fontColor=#18212B;" edge="1" parent="1" source="server" target="store">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e4" value="чтение" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2563A6;strokeWidth=2;endArrow=block;endFill=1;fontSize=13;fontColor=#18212B;" edge="1" parent="1" source="store" target="dash">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e5" value="выбор" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2563A6;strokeWidth=2;endArrow=block;endFill=1;fontSize=13;fontColor=#18212B;" edge="1" parent="1" source="server" target="registry">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e6" value="spawn / wake" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2563A6;strokeWidth=2;endArrow=block;endFill=1;fontSize=13;fontColor=#18212B;" edge="1" parent="1" source="registry" target="cli">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e7" value="публикует" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2563A6;strokeWidth=2;endArrow=block;endFill=1;fontSize=13;fontColor=#18212B;" edge="1" parent="1" source="cli" target="reply">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e8" value="сохраняется" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2563A6;strokeWidth=2;endArrow=block;endFill=1;fontSize=13;fontColor=#18212B;" edge="1" parent="1" source="reply" target="store">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+  <diagram id="02-пилот-и-развитие" name="02 Пилот и развитие">
+    <mxGraphModel dx="1600" dy="1000" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="1130" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="h2" value="ПИЛОТ И ПЛАН · четыре политики одной комнаты" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3F5F7;strokeColor=#576574;strokeWidth=2;fontColor=#18212B;fontSize=22;align=center;verticalAlign=middle;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="40" y="25" width="1510" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="owner2" value="Организатор&lt;br&gt;цель + требования пользователя&lt;br&gt;состав и режим" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DDF5E9;strokeColor=#278052;strokeWidth=2;fontColor=#18212B;fontSize=15;align=center;verticalAlign=middle;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="45" y="125" width="260" height="105" as="geometry" />
+        </mxCell>
+        <mxCell id="create" value="swarm_pilot_create&lt;br&gt;room_id · mode · members&lt;br&gt;общий cwd · права" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF1D6;strokeColor=#B76B00;strokeWidth=2;fontColor=#18212B;fontSize=15;align=center;verticalAlign=middle;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="390" y="125" width="280" height="105" as="geometry" />
+        </mxCell>
+        <mxCell id="pump" value="Huddle: pump&lt;br&gt;адресные request&lt;br&gt;запуск профилей CLI" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF1D6;strokeColor=#B76B00;strokeWidth=2;fontColor=#18212B;fontSize=15;align=center;verticalAlign=middle;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="755" y="125" width="280" height="105" as="geometry" />
+        </mxCell>
+        <mxCell id="record" value="meta.json + messages.jsonl&lt;br&gt;обязанности · задачи · факты&lt;br&gt;решения · раунд · итог" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF1D6;strokeColor=#B76B00;strokeWidth=2;fontColor=#18212B;fontSize=15;align=center;verticalAlign=middle;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="1120" y="125" width="320" height="105" as="geometry" />
+        </mxCell>
+        <mxCell id="p1" value="MCP" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#B76B00;strokeWidth=2;endArrow=block;endFill=1;fontSize=13;fontColor=#18212B;" edge="1" parent="1" source="owner2" target="create">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2" value="создать" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#B76B00;strokeWidth=2;endArrow=block;endFill=1;fontSize=13;fontColor=#18212B;" edge="1" parent="1" source="create" target="pump">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p3" value="состояние" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#B76B00;strokeWidth=2;endArrow=block;endFill=1;fontSize=13;fontColor=#18212B;" edge="1" parent="1" source="pump" target="record">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="council" value="СОВЕТ&lt;br&gt;строго по очереди&lt;br&gt;каждый читает всю беседу&lt;br&gt;последнее слово — организатор" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF1D6;strokeColor=#B76B00;strokeWidth=2;fontColor=#18212B;fontSize=15;align=center;verticalAlign=middle;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="45" y="335" width="335" height="155" as="geometry" />
+        </mxCell>
+        <mxCell id="team" value="КОМАНДА&lt;br&gt;независимые части параллельно&lt;br&gt;ответственность объявляют участники&lt;br&gt;итог — участник reporter" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF1D6;strokeColor=#B76B00;strokeWidth=2;fontColor=#18212B;fontSize=15;align=center;verticalAlign=middle;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="420" y="335" width="335" height="155" as="geometry" />
+        </mxCell>
+        <mxCell id="relay" value="ЭСТАФЕТА&lt;br&gt;следующий после round_done&lt;br&gt;явная передача состояния&lt;br&gt;итог — последний / reporter" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF1D6;strokeColor=#B76B00;strokeWidth=2;fontColor=#18212B;fontSize=15;align=center;verticalAlign=middle;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="795" y="335" width="335" height="155" as="geometry" />
+        </mxCell>
+        <mxCell id="swarm" value="РОЙ&lt;br&gt;общая цель, работа параллельно&lt;br&gt;участники сами делят части&lt;br&gt;итог — участник reporter" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF1D6;strokeColor=#B76B00;strokeWidth=2;fontColor=#18212B;fontSize=15;align=center;verticalAlign=middle;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="1170" y="335" width="335" height="155" as="geometry" />
+        </mxCell>
+        <mxCell id="p_mode1" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#B76B00;strokeWidth=2;endArrow=block;endFill=1;fontSize=13;fontColor=#18212B;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="pump" target="council">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="895" y="275" />
+              <mxPoint x="212" y="275" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="p_mode2" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#B76B00;strokeWidth=2;endArrow=block;endFill=1;fontSize=13;fontColor=#18212B;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="pump" target="team">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="895" y="275" />
+              <mxPoint x="587" y="275" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="p_mode3" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#B76B00;strokeWidth=2;endArrow=block;endFill=1;fontSize=13;fontColor=#18212B;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="pump" target="relay">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="895" y="275" />
+              <mxPoint x="962" y="275" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="p_mode4" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#B76B00;strokeWidth=2;endArrow=block;endFill=1;fontSize=13;fontColor=#18212B;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="pump" target="swarm">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="895" y="275" />
+              <mxPoint x="1337" y="275" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="done" value="Каждый: message_post(result) → swarm_pilot_round_done&lt;br&gt;Затем следующий адресный запрос или итоговый запрос reporter; для Совета — итог организатора." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF1D6;strokeColor=#B76B00;strokeWidth=2;fontColor=#18212B;fontSize=15;align=center;verticalAlign=middle;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="220" y="550" width="1160" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="p_done1" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#B76B00;strokeWidth=2;endArrow=block;endFill=1;fontSize=13;fontColor=#18212B;exitX=0.5;exitY=1;entryX=0.15;entryY=0;" edge="1" parent="1" source="council" target="done">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p_done2" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#B76B00;strokeWidth=2;endArrow=block;endFill=1;fontSize=13;fontColor=#18212B;exitX=0.5;exitY=1;entryX=0.38;entryY=0;" edge="1" parent="1" source="team" target="done">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p_done3" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#B76B00;strokeWidth=2;endArrow=block;endFill=1;fontSize=13;fontColor=#18212B;exitX=0.5;exitY=1;entryX=0.62;entryY=0;" edge="1" parent="1" source="relay" target="done">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p_done4" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#B76B00;strokeWidth=2;endArrow=block;endFill=1;fontSize=13;fontColor=#18212B;exitX=0.5;exitY=1;entryX=0.85;entryY=0;" edge="1" parent="1" source="swarm" target="done">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="pilot_status" value="Статус: механика четырёх режимов есть в коде; полный живой цикл с моделями ещё не подтверждён." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3F5F7;strokeColor=#576574;strokeWidth=2;fontColor=#18212B;fontSize=15;align=center;verticalAlign=middle;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="220" y="665" width="1160" height="65" as="geometry" />
+        </mxCell>
+        <mxCell id="future_title" value="ПОСЛЕ ПИЛОТА · запланировано, пока не работает как единый поток" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1E9FF;strokeColor=#7655AF;strokeWidth=2;fontColor=#18212B;fontSize=19;align=center;verticalAlign=middle;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="40" y="790" width="1510" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="jev" value="Jev советует&lt;br&gt;режим · модели · роли" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1E9FF;strokeColor=#7655AF;strokeWidth=2;fontColor=#18212B;fontSize=15;align=center;verticalAlign=middle;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="40" y="895" width="260" height="105" as="geometry" />
+        </mxCell>
+        <mxCell id="preflight" value="Проверка той же среды&lt;br&gt;CLI · auth · модель · усилие&lt;br&gt;короткий реальный ответ" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1E9FF;strokeColor=#7655AF;strokeWidth=2;fontColor=#18212B;fontSize=15;align=center;verticalAlign=middle;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="345" y="895" width="260" height="105" as="geometry" />
+        </mxCell>
+        <mxCell id="pty" value="Управляемый PTY&lt;br&gt;живой CLI · вопросы доступа&lt;br&gt;доставка сообщений" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1E9FF;strokeColor=#7655AF;strokeWidth=2;fontColor=#18212B;fontSize=15;align=center;verticalAlign=middle;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="650" y="895" width="260" height="105" as="geometry" />
+        </mxCell>
+        <mxCell id="workspace" value="Общее рабочее дерево&lt;br&gt;объекты комнаты · sub-worktree&lt;br&gt;конфликты решают участники" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1E9FF;strokeColor=#7655AF;strokeWidth=2;fontColor=#18212B;fontSize=15;align=center;verticalAlign=middle;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="955" y="895" width="260" height="105" as="geometry" />
+        </mxCell>
+        <mxCell id="recover" value="Восстановление&lt;br&gt;зависания · лимиты&lt;br&gt;замена участника" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1E9FF;strokeColor=#7655AF;strokeWidth=2;fontColor=#18212B;fontSize=15;align=center;verticalAlign=middle;spacing=10;" vertex="1" parent="1">
+          <mxGeometry x="1260" y="895" width="260" height="105" as="geometry" />
+        </mxCell>
+        <mxCell id="f1" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#7655AF;strokeWidth=2;endArrow=block;endFill=1;fontSize=13;fontColor=#18212B;dashed=1;dashPattern=8 5;" edge="1" parent="1" source="jev" target="preflight">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="f2" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#7655AF;strokeWidth=2;endArrow=block;endFill=1;fontSize=13;fontColor=#18212B;dashed=1;dashPattern=8 5;" edge="1" parent="1" source="preflight" target="pty">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="f3" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#7655AF;strokeWidth=2;endArrow=block;endFill=1;fontSize=13;fontColor=#18212B;dashed=1;dashPattern=8 5;" edge="1" parent="1" source="pty" target="workspace">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="f4" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#7655AF;strokeWidth=2;endArrow=block;endFill=1;fontSize=13;fontColor=#18212B;dashed=1;dashPattern=8 5;" edge="1" parent="1" source="workspace" target="recover">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
