@@ -474,6 +474,7 @@ const THEME_OPTS = [
   {v: 'auto', label: '🌓 Auto'}, {v: 'dark', label: '🌙 Dark'}, {v: 'light', label: '☀️ Light'},
 ];
 const SKIN_OPTS = [
+  {v: 'opus', label: '✦ Editorial'},
   {v: 'glass', label: '🪟 Glass'}, {v: 'web', label: '💬 Web'}, {v: 'code', label: '⌨️ Code'},
 ];
 const PALETTE_OPTS = [
@@ -497,7 +498,7 @@ function applyTheme(mode) {
   document.documentElement.setAttribute('data-theme-mode', mode);
 }
 function applySkin(skin) {
-  if (!SKIN_OPTS.some(o => o.v === skin)) skin = 'glass';
+  if (!SKIN_OPTS.some(o => o.v === skin)) skin = 'opus';
   document.documentElement.setAttribute('data-skin', skin);
 }
 function applyPalette(pal) {
@@ -568,6 +569,29 @@ function buildPromptRow(value) {
   return el('div', {class: 'set-prompt-wrap'}, [ta, btn]);
 }
 
+// Keep the everyday view controls visible and put connection/spawn reference
+// material behind explicit disclosures. This keeps the popover useful on a
+// laptop without removing any existing configuration or copy actions.
+function buildSettingsSection(title, children, open = false) {
+  const section = el('details', {class: 'set-section'});
+  if (open) section.open = true;
+  section.appendChild(el('summary', {class: 'set-section-summary'}, [
+    el('span', {text: title}),
+    el('span', {class: 'set-section-chevron', text: '›', 'aria-hidden': 'true'}),
+  ]));
+  section.appendChild(el('div', {class: 'set-section-body'}, children));
+  return section;
+}
+
+function buildServiceAction(label, action, danger = false) {
+  const button = el('button', {type: 'button', class: `set-service-action${danger ? ' danger' : ''}`, text: label});
+  button.addEventListener('click', () => {
+    document.getElementById('settings-popover').hidden = true;
+    action();
+  });
+  return button;
+}
+
 function getRoomView() {
   return localStorage.getItem('agentbus-room-view') === 'projects' ? 'projects' : 'latest';
 }
@@ -590,42 +614,53 @@ function buildSettingsPopover(pop) {
   pop.innerHTML = '';
   const origin = location.origin;
   pop.appendChild(el('div', {class: 'set-title'}, [el('span', {text: t('set.appearance')}), helpIcon('tip.view')]));
-  pop.appendChild(buildSettingsRow('set.lang', I18N_LANGS, 'agentbus-lang', () => LANG, setLang, 'tip.lang'));
   pop.appendChild(buildSettingsRow('set.theme', themeOpts(), 'agentbus-theme',
     () => localStorage.getItem('agentbus-theme') || 'auto', applyTheme, 'tip.theme'));
-  pop.appendChild(buildSettingsRow('set.skin', SKIN_OPTS, 'agentbus-skin',
-    () => localStorage.getItem('agentbus-skin') || 'glass', applySkin, 'tip.skin'));
-  pop.appendChild(buildSettingsRow('set.palette', PALETTE_OPTS, 'agentbus-palette',
-    () => localStorage.getItem('agentbus-palette') || 'default', applyPalette, 'tip.palette'));
   pop.appendChild(buildSettingsRow('set.roomView', [
     {v: 'latest', label: t('roomView.latest')},
     {v: 'projects', label: t('roomView.projects')},
   ], 'agentbus-room-view', getRoomView, applyRoomView));
+  pop.appendChild(buildSettingsSection(`${t('set.skin')} · ${t('set.palette')} · ${t('set.lang')}`, [
+    buildSettingsRow('set.lang', I18N_LANGS, 'agentbus-lang', () => LANG, setLang, 'tip.lang'),
+    buildSettingsRow('set.skin', SKIN_OPTS, 'agentbus-skin',
+      () => localStorage.getItem('agentbus-skin') || 'opus', applySkin, 'tip.skin'),
+    buildSettingsRow('set.palette', PALETTE_OPTS, 'agentbus-palette',
+      () => localStorage.getItem('agentbus-palette') || 'default', applyPalette, 'tip.palette'),
+  ]));
   pop.appendChild(el('div', {class: 'set-sep'}));
-  pop.appendChild(el('div', {class: 'set-title'}, [el('span', {text: t('set.mcp')})]));
-  pop.appendChild(buildCopyRow(t('mcp.endpoint'), origin + '/mcp'));
-  pop.appendChild(buildCopyRow(t('mcp.claude'), `claude mcp add --transport http huddle ${origin}/mcp`));
-  pop.appendChild(buildCopyRow(t('mcp.codex'), `[mcp_servers.huddle]\nurl = "${origin}/mcp"`));
-  pop.appendChild(buildCopyRow(t('mcp.stdio'), 'mcp-huddle'));
-  pop.appendChild(el('div', {class: 'set-hint', text: t('mcp.hint')}));
+  pop.appendChild(buildSettingsSection(t('set.mcp'), [
+    buildCopyRow(t('mcp.endpoint'), origin + '/mcp'),
+    buildCopyRow(t('mcp.claude'), `claude mcp add --transport http huddle ${origin}/mcp`),
+    buildCopyRow(t('mcp.codex'), `[mcp_servers.huddle]\nurl = "${origin}/mcp"`),
+    buildCopyRow(t('mcp.stdio'), 'mcp-huddle'),
+    el('div', {class: 'set-hint', text: t('mcp.hint')}),
+  ]));
 
   // ── Environment variables / spawn rules (reference; click a name to copy) ──
   pop.appendChild(el('div', {class: 'set-sep'}));
-  pop.appendChild(el('div', {class: 'set-title'}, [el('span', {text: t('set.spawn')}), helpIcon('tip.spawn')]));
-  pop.appendChild(buildVarRow('MCP_HUDDLE_READONLY=0', t('var.readonly')));
-  pop.appendChild(buildVarRow('~/.mcp-huddle/registry.json', t('var.registryFile')));
-  pop.appendChild(buildVarRow('MCP_HUDDLE_SPAWN_REGISTRY', t('var.registryEnv')));
-  pop.appendChild(buildVarRow('MCP_HUDDLE_CLAUDE_ENABLED=1', t('var.claude')));
-  pop.appendChild(buildVarRow('MCP_HUDDLE_ANTIGRAVITY_ENABLED=1', t('var.antigravity')));
-  pop.appendChild(buildVarRow('MCP_HUDDLE_MIMO_ENABLED=0', t('var.mimo')));
-  pop.appendChild(buildVarRow('MCP_HUDDLE_TOKEN', t('var.token')));
-  pop.appendChild(buildVarRow('MCP_HUDDLE_HOME', t('var.home')));
-  pop.appendChild(buildVarRow('PORT', t('var.port')));
+  pop.appendChild(buildSettingsSection(t('set.spawn'), [
+    buildVarRow('MCP_HUDDLE_READONLY=0', t('var.readonly')),
+    buildVarRow('~/.mcp-huddle/registry.json', t('var.registryFile')),
+    buildVarRow('MCP_HUDDLE_SPAWN_REGISTRY', t('var.registryEnv')),
+    buildVarRow('MCP_HUDDLE_CLAUDE_ENABLED=1', t('var.claude')),
+    buildVarRow('MCP_HUDDLE_ANTIGRAVITY_ENABLED=1', t('var.antigravity')),
+    buildVarRow('MCP_HUDDLE_MIMO_ENABLED=0', t('var.mimo')),
+    buildVarRow('MCP_HUDDLE_TOKEN', t('var.token')),
+    buildVarRow('MCP_HUDDLE_HOME', t('var.home')),
+    buildVarRow('PORT', t('var.port')),
+  ]));
 
   // ── Copy-paste prompt to onboard an agent into huddle ──
   pop.appendChild(el('div', {class: 'set-sep'}));
-  pop.appendChild(el('div', {class: 'set-title'}, [el('span', {text: t('set.agentPrompt')}), helpIcon('tip.agentPrompt')]));
-  pop.appendChild(buildPromptRow(t('agentPrompt.text').split('{origin}').join(location.origin)));
+  pop.appendChild(buildSettingsSection(t('set.agentPrompt'), [
+    helpIcon('tip.agentPrompt'),
+    buildPromptRow(t('agentPrompt.text').split('{origin}').join(location.origin)),
+  ]));
+  pop.appendChild(buildSettingsSection(LANG === 'ru' ? 'Обслуживание' : 'Maintenance', [
+    buildServiceAction(t('btn.closeAll'), bulkCloseAll),
+    buildServiceAction(t('btn.deleteClosed'), bulkDeleteClosed, true),
+    buildServiceAction(t('btn.nukeAll'), bulkNuke, true),
+  ]));
 }
 
 function setLang(lang) {
@@ -640,7 +675,7 @@ function setLang(lang) {
 function initSettings() {
   // Apply saved values (head script already set them pre-paint; re-assert).
   applyTheme(localStorage.getItem('agentbus-theme') || 'auto');
-  applySkin(localStorage.getItem('agentbus-skin') || 'glass');
+  applySkin(localStorage.getItem('agentbus-skin') || 'opus');
   applyPalette(localStorage.getItem('agentbus-palette') || 'default');
   applyI18n();
 

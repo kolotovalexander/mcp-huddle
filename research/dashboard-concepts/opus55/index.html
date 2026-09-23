@@ -16,6 +16,7 @@ html,body{height:100%;margin:0}
   --a-deepseek:#17707f; --a-qwen:#94660d; --a-human:#d9431b; --a-system:#77705f;
   --serif:"Iowan Old Style","Palatino Linotype",Palatino,"Book Antiqua",Georgia,serif;
   --mono:ui-monospace,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Arial,sans-serif;
   --fs:16.5px; --row:11px; --msg:18px;
 }
 html[data-theme="ink"]{
@@ -28,7 +29,7 @@ html[data-fs="0"]{--fs:15px}
 html[data-fs="2"]{--fs:18.5px}
 html[data-density="dense"]{--row:6px;--msg:10px}
 
-body{background:var(--bg);color:var(--ink);font-family:var(--serif);font-size:var(--fs);
+body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:var(--fs);
   display:grid;grid-template-rows:auto minmax(0,1fr) auto;height:100vh;overflow:hidden}
 button{font:inherit;color:inherit;background:none;border:0;cursor:pointer;padding:0}
 kbd{font-family:var(--mono);font-size:11px;border:1px solid currentColor;padding:0 5px;border-radius:2px}
@@ -264,6 +265,14 @@ mark{background:var(--mark);color:#1b1915;padding:0 1px}
   .env{grid-template-columns:minmax(0,1fr);gap:2px}
 }
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+/* Keep the editorial accent in large headings; small labels and messages read as UI text. */
+.brand-name,.head h1,.grp b,.s-col h3,.doc h2,.sec h3{font-family:var(--serif)}
+.room .mt,.detail,.lede,.s-empty{font-style:normal}
+.brand-sub,.stamp,.tab,.facts,.lanes-top,.round span,.kind,.btn-ink,
+.s-top,.s-top button,.code button,.btn-line,.btn-danger{
+  text-transform:none;letter-spacing:normal;
+}
+.body,.hit .hs,.room .mt{font-family:var(--sans)}
 </style>
 </head>
 <body>

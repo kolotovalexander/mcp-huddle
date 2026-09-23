@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>🤖 Agent Bus</title>
+  <title>Huddle — agent workspace</title>
   <meta name="color-scheme" content="dark light">
   <link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🤖</text></svg>">
   <link rel="stylesheet" href="/static/dashboard.css">
@@ -17,7 +17,7 @@
           mode = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
         }
         var skin = localStorage.getItem('agentbus-skin');
-        skin = (skin === 'web' || skin === 'code' || skin === 'glass') ? skin : 'glass';
+        skin = (skin === 'opus' || skin === 'web' || skin === 'code' || skin === 'glass') ? skin : 'opus';
         document.documentElement.setAttribute('data-skin', skin);
         var PALETTES = ['default','dracula','nord','tokyonight','catppuccin','gruvbox'];
         var pal = localStorage.getItem('agentbus-palette');
@@ -27,7 +27,7 @@
         document.documentElement.setAttribute('data-theme', pal !== 'default' ? 'dark' : mode);
       } catch (e) {
         document.documentElement.setAttribute('data-theme', 'dark');
-        document.documentElement.setAttribute('data-skin', 'glass');
+        document.documentElement.setAttribute('data-skin', 'opus');
         document.documentElement.setAttribute('data-palette', 'default');
       }
     })();
@@ -39,9 +39,9 @@
 <div class="app">
   <header class="topbar lq-panel">
     <div class="brand">
-      <div class="logo"><span>AB</span></div>
+      <div class="logo"><span>H</span></div>
       <div class="brand-text">
-        <div class="title">Agent Bus</div>
+        <div class="title">Huddle</div>
         <div class="subtitle"><span id="room-count">0</span> <span data-i18n="app.subtitle">rooms &middot; multi-agent discussion</span></div>
       </div>
     </div>
