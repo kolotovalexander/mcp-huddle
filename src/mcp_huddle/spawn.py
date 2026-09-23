@@ -97,6 +97,9 @@ class SpawnSpec(TypedDict):
     # are copied at spawn time. Provider runners also opt in their
     # ``--api-key-env`` variable automatically.
     pass_env: NotRequired[list[str]]
+    model: NotRequired[str]
+    effort: NotRequired[str]
+    variant: NotRequired[str]
 
 
 class AgentSpawnError(RuntimeError):
@@ -581,6 +584,87 @@ def _validate_protected_profile_names(registry: list[SpawnSpec]) -> None:
             raise AgentSpawnError("protected Opus profile must use its canonical registry name")
 
 
+_VALID_CODEX_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+_VALID_CLAUDE_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+_VALID_AGY_EFFORTS = {"low", "medium", "high"}
+
+def _apply_model_effort_variant(spec: SpawnSpec, argv: list[str]) -> list[str]:
+    binary = _effective_binary(spec.get("cmd") or [])
+    model = spec.get("model")
+    effort = spec.get("effort")
+    variant = spec.get("variant")
+
+    if not model and not effort and not variant:
+        return argv
+
+    if binary == "codex":
+        if variant:
+            raise AgentSpawnError("Codex does not support 'variant'; use 'effort'")
+        if effort and effort not in _VALID_CODEX_EFFORTS:
+            raise AgentSpawnError(f"Codex unsupported effort '{effort}'")
+    elif binary == "claude":
+        if variant:
+            raise AgentSpawnError("Claude does not support 'variant'; use 'effort'")
+        if effort and effort not in _VALID_CLAUDE_EFFORTS:
+            raise AgentSpawnError(f"Claude unsupported effort '{effort}'")
+    elif binary == "agy":
+        if variant:
+            raise AgentSpawnError("Antigravity does not support 'variant'; use 'effort'")
+        if effort and effort not in _VALID_AGY_EFFORTS:
+            raise AgentSpawnError(f"Antigravity unsupported effort '{effort}'")
+    elif binary == "opencode":
+        if effort:
+            raise AgentSpawnError("OpenCode does not support 'effort'; use 'variant'")
+    else:
+        raise AgentSpawnError(f"Agent {spec['name']} ({binary}) does not support model/effort/variant overrides")
+
+    # Remove existing conflicting flags to avoid duplicates
+    out = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if binary in ("claude", "agy") and arg in ("--model", "-m"):
+            i += 2
+            continue
+        if binary in ("claude", "agy") and arg == "--effort":
+            i += 2
+            continue
+        if binary == "opencode" and arg in ("--model", "-m"):
+            i += 2
+            continue
+        if binary == "opencode" and arg == "--variant":
+            i += 2
+            continue
+        if binary == "codex" and arg in ("--model", "-m"):
+            i += 2
+            continue
+        if binary == "codex" and arg == "-c" and i + 1 < len(argv) and argv[i+1].startswith("model_reasoning_effort="):
+            i += 2
+            continue
+        out.append(arg)
+        i += 1
+
+    # Inject before -p or {brief} or at the end
+    inject_idx = len(out)
+    for idx, arg in enumerate(out):
+        if arg == "-p" or "{brief}" in arg:
+            inject_idx = idx
+            break
+
+    injects = []
+    if binary in ("claude", "agy"):
+        if model: injects.extend(["--model", model])
+        if effort: injects.extend(["--effort", effort])
+    elif binary == "opencode":
+        if model: injects.extend(["-m", model])
+        if variant: injects.extend(["--variant", variant])
+    elif binary == "codex":
+        if model: injects.extend(["-m", model])
+        if effort: injects.extend(["-c", f'model_reasoning_effort="{effort}"'])
+
+    return out[:inject_idx] + injects + out[inject_idx:]
+
+
 def _resolve_spawn_args(
     spec: SpawnSpec,
     brief: str,
@@ -588,8 +672,11 @@ def _resolve_spawn_args(
 ) -> tuple[list[str], str | None]:
     name = bus._safe_path_component(spec["name"], "agent_name")
     last_msg_path: str | None = None
+
+    template = _apply_model_effort_variant(spec, list(spec.get("cmd") or []))
+
     argv = []
-    for arg in spec["cmd"]:
+    for arg in template:
         if "{brief}" in arg:
             arg = arg.replace("{brief}", brief)
         if "{last_message}" in arg:
@@ -2149,14 +2236,29 @@ def codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str,
     # `-a never` would otherwise cancel. MCP_HUDDLE_READONLY=0 → full access.
     readonly = _readonly_enabled()
     sandbox = "read-only" if readonly else _CODEX_SANDBOX
+    spec = get_enabled_spec("Codex")
+    model = spec.get("model") if spec else None
+    effort = spec.get("effort") if spec else None
+
+    if effort and effort not in _VALID_CODEX_EFFORTS:
+        raise AgentSpawnError(f"Codex unsupported effort '{effort}'")
+
     argv = [
         _CODEX_BIN or "codex", "-a", "never",            # top-level: never auto-approve tool calls
         "exec", "resume", thread_id,                     # subcommand
         "--json",                                        # JSONL events to stdout
-        "-c", 'model_reasoning_effort="medium"',
+    ]
+    if model:
+        argv.extend(["-m", model])
+    if effort:
+        argv.extend(["-c", f'model_reasoning_effort="{effort}"'])
+    else:
+        argv.extend(["-c", 'model_reasoning_effort="medium"'])
+
+    argv.extend([
         "-c", f'sandbox_mode="{sandbox}"',               # resume has no -s flag; pin via -c
         "-c", "features.guardian_approval=false",
-    ]
+    ])
     if readonly:
         argv += ["-c", 'mcp_servers.huddle.default_tools_approval_mode="approve"']
     if last_msg_path:
