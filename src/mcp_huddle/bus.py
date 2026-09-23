@@ -49,6 +49,7 @@ MAX_STORED_MESSAGE_BYTES = 320 * 1024  # complete serialized JSONL entry cap
 ROOM_MESSAGE_RATE_LIMIT = 120
 ROOM_MESSAGE_RATE_WINDOW_SECS = 60
 ROOM_CLOSE_FINALIZE_ATTEMPTS = 3
+MAX_ROOM_NAME_CHARS = 160
 
 VALID_KINDS = {"request", "comment", "ack", "busy", "result", "final", "system", "close"}
 VALID_ROOM_STATUSES = {
@@ -369,6 +370,35 @@ def append_agent_event(room_id: str, agent_name: str, event: dict) -> None:
 
 def get_room_info(room_id: str) -> dict:
     return _read_meta(room_id)
+
+
+def rename_room(room_id: str, name: str, owner: str) -> dict:
+    """Rename an existing room without changing its identity or history.
+
+    The room owner is checked while holding the same metadata lock used for
+    the update, so a rename cannot race a concurrent metadata change.
+    """
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("room name must be non-empty")
+    name = name.strip()
+    if len(name) > MAX_ROOM_NAME_CHARS:
+        raise ValueError(f"room name must be at most {MAX_ROOM_NAME_CHARS} characters")
+    if not isinstance(owner, str) or not owner.strip():
+        raise ValueError("room owner is required")
+    owner = owner.strip()
+
+    def _update(meta: dict) -> dict:
+        if meta.get("owner") != owner:
+            raise PermissionError("only the room owner may rename it")
+        meta["name"] = name
+        return meta
+
+    try:
+        return _update_meta_locked(room_id, _update)
+    except FileNotFoundError as e:
+        # Opening the per-room lock fails before _update_meta_locked can
+        # inspect meta.json when the directory does not exist.
+        raise ValueError(f"Room '{room_id}' not found") from e
 
 
 def mark_idle(room_id: str) -> None:

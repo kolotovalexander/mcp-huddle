@@ -350,6 +350,16 @@ def room_info(room_id: str) -> dict:
 
 
 @mcp.tool()
+def room_rename(room_id: str, name: str, owner: str) -> dict:
+    """Rename a room while preserving its ID, messages, status, and access.
+
+    Only the recorded room owner may rename it. Names are trimmed and limited
+    to 160 characters.
+    """
+    return bus.rename_room(room_id, name, owner)
+
+
+@mcp.tool()
 def room_reclaim(room_id: str, owner: str, owner_pid: int,
                  session_id: str = "") -> str:
     """Re-stamp the room's owner_pid after your session resumed with a new PID.
