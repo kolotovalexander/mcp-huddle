@@ -103,7 +103,10 @@ def test_public_pilot_workflow_in_all_modes(isolated_home, monkeypatch, mode):
         completed = server.swarm_pilot_round_done(room, member, f"{member} done")
 
     if mode == "council":
-        assert completed["final_request"] is None
+        final_request = completed["final_request"]
+        assert isinstance(final_request, int)
+        assert bus._load_messages(room)[-1]["id"] == final_request
+        assert bus._load_messages(room)[-1]["to"] == "Organizer"
     else:
         final_request = completed["final_request"]
         assert isinstance(final_request, int)
@@ -130,3 +133,42 @@ def test_new_codex_pilot_member_gets_initial_fresh_spawn(isolated_home, monkeypa
     assert created["dispatched"][0]["member"] == "Codex"
     assert len(launches) == 1
     assert launches[0][0] == "Codex"
+
+
+def test_pilot_missing_reporter_prompts_all_then_dispatches(isolated_home, monkeypatch):
+    monkeypatch.setattr(server.spawn, "get_enabled_spec", lambda name: {"name": name})
+    monkeypatch.setattr(server, "_wake_agents_for_request", lambda *args: [])
+    created = server.swarm_pilot_create(
+        "missing reporter", "Organizer", "Produce one sentence", "team",
+        ["A", "B"], start=True,
+    )
+    room = created["room_id"]
+    for member in ("A", "B"):
+        request_id = swarm_pilot.status(room)["dispatched"][member]
+        server.message_post(room, member, f"{member} result", "result",
+                            to="Organizer", reply_to=request_id)
+        completed = server.swarm_pilot_round_done(room, member, f"{member} done")
+
+    # Since no reporter is claimed, the final request should ask "all"
+    final_req_msg_id = completed["final_request"]
+    assert isinstance(final_req_msg_id, int)
+    msg = bus._load_messages(room)[-1]
+    assert msg["id"] == final_req_msg_id
+    assert msg["to"] == "all"
+    assert "no reporter is claimed" in msg["body"]
+
+    with pytest.raises(ValueError, match="final request has not been delivered"):
+        server.swarm_pilot_finish(room, "A", "Too early")
+
+    # Now claim reporter
+    updated_state = server.swarm_pilot_record(room, "A", "responsibility", "reporter", "Final")
+
+    # Should dispatch final request to A
+    msg2 = bus._load_messages(room)[-1]
+    assert msg2["to"] == "A"
+    assert "publish the combined result" in msg2["body"]
+    assert updated_state["final_request"] == msg2["id"]
+
+    # Duplicates are ignored due to idempotency keys
+    updated_state2 = server.swarm_pilot_record(room, "A", "responsibility", "reporter", "Final")
+    assert bus._load_messages(room)[-1]["id"] == msg2["id"]

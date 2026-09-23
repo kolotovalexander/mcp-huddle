@@ -25,8 +25,12 @@ dispatch every named member. An agent posts its answer with `message_post`
 after that explicit completion. The organizer calls `swarm_pilot_finish` for
 council; in the other modes one member must first claim the `reporter`
 responsibility with `swarm_pilot_record` and then publish the final.
-When every member has finished, Huddle sends a final request to that reporter;
-in council the organizer keeps the final word.
+When every member has finished, Huddle sends a final request to that reporter
+(or requests members to claim one if missing); in council Huddle sends a final
+request to the organizer to keep the final word.
+`swarm_pilot_finish` accepts the final only after that addressed request is
+present in the room; a concurrent early finish cannot leave a stale request
+after the room is completed. A late reporter claim returns `final_request`.
 
 Use `swarm_pilot_status` for responsibilities, tasks, facts, decisions, and the
 final result. The pilot records one deliberate round. Other participants can

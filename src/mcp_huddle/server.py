@@ -479,7 +479,23 @@ def swarm_pilot_record(
     room_id: str, member: str, kind: str, key: str, value: str,
 ) -> dict:
     """Record a responsibility, task, decision or fact in the pilot room."""
-    return swarm_pilot.record(room_id, member, kind, key, value)
+    updated = swarm_pilot.record(room_id, member, kind, key, value)
+
+    final_request = None
+    if (kind == "responsibility" and key == "reporter"
+            and updated["mode"] != "council"
+            and len(updated["done"]) == len(updated["members"])):
+        final_request = message_post(
+            room_id, "System",
+            "All members have completed the round. Read their results and "
+            "publish the combined result with swarm_pilot_finish(room_id, "
+            "member, result).",
+            "request", to=member,
+            idempotency_key=(
+                f"swarm-pilot:{room_id}:{updated.get('round', 1)}:final-request"
+            ),
+        )
+    return {**updated, "final_request": final_request}
 
 
 @mcp.tool()
@@ -499,18 +515,42 @@ def swarm_pilot_round_done(room_id: str, member: str, summary: str) -> dict:
     updated = swarm_pilot.round_done(room_id, member, summary)
     next_dispatch = swarm_pilot_pump(room_id)
     final_request = None
-    if (updated["mode"] != "council"
-            and len(updated["done"]) == len(updated["members"])):
-        reporter = updated["responsibilities"].get("reporter", {}).get("member")
-        if reporter:
+    if len(updated["done"]) == len(updated["members"]):
+        if updated["mode"] == "council":
             final_request = message_post(
                 room_id, "System",
-                "All members have completed the round. Read their results and "
+                "All council members have spoken. Read their results and "
                 "publish the combined result with swarm_pilot_finish(room_id, "
                 "member, result).",
-                "request", to=reporter,
-                idempotency_key=f"swarm-pilot:{room_id}:final-request",
+                "request", to=updated["organizer"],
+                idempotency_key=(
+                    f"swarm-pilot:{room_id}:{updated.get('round', 1)}:final-request"
+                ),
             )
+        else:
+            reporter = updated["responsibilities"].get("reporter", {}).get("member")
+            if reporter:
+                final_request = message_post(
+                    room_id, "System",
+                    "All members have completed the round. Read their results and "
+                    "publish the combined result with swarm_pilot_finish(room_id, "
+                    "member, result).",
+                    "request", to=reporter,
+                    idempotency_key=(
+                        f"swarm-pilot:{room_id}:{updated.get('round', 1)}:final-request"
+                    ),
+                )
+            else:
+                final_request = message_post(
+                    room_id, "System",
+                    "All members have completed the round, but no reporter is claimed. "
+                    "One member must claim the reporter responsibility with "
+                    "swarm_pilot_record(room_id, member, 'responsibility', 'reporter', '<description>').",
+                    "request", to="all",
+                    idempotency_key=(
+                        f"swarm-pilot:{room_id}:{updated.get('round', 1)}:final-request-missing-reporter"
+                    ),
+                )
     return {"state": updated, "next_dispatch": next_dispatch,
             "final_request": final_request}
 
@@ -518,6 +558,16 @@ def swarm_pilot_round_done(room_id: str, member: str, summary: str) -> dict:
 @mcp.tool()
 def swarm_pilot_finish(room_id: str, member: str, result: str) -> dict:
     """Record the council organizer's last word or the swarm reporter's final."""
+    state = swarm_pilot.status(room_id)
+    final_request_key = (
+        f"swarm-pilot:{room_id}:{state.get('round', 1)}:final-request"
+    )
+    if not any(
+        msg.get("idempotency_key") == final_request_key
+        and msg.get("to") == member
+        for msg in bus._load_messages(room_id)
+    ):
+        raise ValueError("final request has not been delivered to this member")
     updated = swarm_pilot.finish(room_id, member, result)
     message_post(
         room_id, member, result, "final", to=updated["organizer"],
