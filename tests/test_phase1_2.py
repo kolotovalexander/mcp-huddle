@@ -1466,6 +1466,7 @@ def test_request_message_wakes_existing_codex_thread(tmp_path: Path, monkeypatch
             "log_path": str(log_path),
             "last_message_path": str(isolated_bus._room_dir(room_id) / "agents" / "codex.last_message.txt"),
             "last_seen_id": 1,
+            "model_settings": {"model": "pinned-gpt", "effort": "high"},
         }
     }
     isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
@@ -1491,6 +1492,9 @@ def test_request_message_wakes_existing_codex_thread(tmp_path: Path, monkeypatch
     updated = isolated_bus.get_room_info(room_id)["agent_meta"]["Codex"]
     assert calls[0]["spawn_kwargs"]["owner_room_id"] == room_id
     assert calls[0]["spawn_kwargs"]["process_handle"] == updated["wake_id"]
+    assert calls[0]["spawn_kwargs"]["model_settings"] == {
+        "model": "pinned-gpt", "effort": "high",
+    }
     assert updated["thread_id"] == "thread-123"
     assert updated["last_wake_msg_id"] == 2
     assert updated["last_seen_id"] == 2

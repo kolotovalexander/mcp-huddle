@@ -737,11 +737,17 @@ def respond_via_agent(
             raise ValueError(f"Agent {agent_name} already has an active process claim")
         _set_agent_phase(room_id, agent_name, "starting")
         try:
+            resume_settings = info.get("model_settings")
+            resume_kwargs = (
+                {"model_settings": resume_settings}
+                if isinstance(resume_settings, dict) else {}
+            )
             pid = spawn.codex_resume(
                 thread_id, prompt, cwd, log_path, last_msg_path,
                 on_exit=_make_wake_done_callback(
                     room_id, agent_name, wake_id),
                 owner_room_id=room_id, process_handle=wake_id,
+                **resume_kwargs,
             )
         except Exception:
             _set_agent_phase(room_id, agent_name, "unavailable")
@@ -3126,12 +3132,18 @@ def _wake_agents_for_request(
                     continue
                 _set_agent_phase(room_id, agent_name, "starting", task_id=msg_id)
                 try:
+                    resume_settings = info.get("model_settings")
+                    resume_kwargs = (
+                        {"model_settings": resume_settings}
+                        if isinstance(resume_settings, dict) else {}
+                    )
                     pid = spawn.codex_resume(
                         thread_id, prompt, cwd, log_path,
                         str(canonical_last),
                         on_exit=_make_wake_done_callback(room_id, agent_name, wake_id),
                         owner_room_id=room_id,
                         process_handle=wake_id,
+                        **resume_kwargs,
                     )
                 except Exception as exc:
                     _set_agent_phase(room_id, agent_name, "unavailable", msg_id, str(exc))
@@ -3496,6 +3508,9 @@ def _spawn_fresh_room_agent(
         "last_wake_at": int(time.time()),
         "wake_id": wake_id,
     }
+    model_settings = spawn.model_settings_for_spec(spec)
+    if model_settings:
+        fields["model_settings"] = model_settings
     if msg_id is not None:
         fields["last_wake_msg_id"] = msg_id
         fields["last_seen_id"] = msg_id
