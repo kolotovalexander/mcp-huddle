@@ -199,6 +199,10 @@ const I18N = {
     'app.subtitle': 'rooms · multi-agent discussion',
     'btn.closeAll': 'Close all', 'btn.deleteClosed': 'Delete closed', 'btn.nukeAll': 'Nuke all',
     'btn.view': 'View', 'btn.live': 'live', 'btn.copy': 'Copy', 'btn.send': 'Send',
+    'btn.search': 'Search',
+    'search.placeholder': 'Search room titles and messages',
+    'search.hint': 'Type a room name or words from a conversation',
+    'search.pending': 'Searching…', 'search.empty': 'No matching rooms or messages',
     'chat.selectRoom': 'Select a room',
     'chat.selectHint': 'Use room_create() from an agent to start a discussion',
     'chat.closed': 'Room closed — read-only',
@@ -244,6 +248,9 @@ const I18N = {
     'app.subtitle': 'комнат · мультиагентное обсуждение',
     'btn.closeAll': 'Закрыть все', 'btn.deleteClosed': 'Удалить закрытые', 'btn.nukeAll': 'Снести всё',
     'btn.view': 'Вид', 'btn.live': 'онлайн', 'btn.copy': 'Копировать', 'btn.send': 'Отправить',
+    'btn.search': 'Поиск', 'search.placeholder': 'Название комнаты или слова из переписки',
+    'search.hint': 'Введите название комнаты или слова из переписки',
+    'search.pending': 'Ищу…', 'search.empty': 'Совпадений нет',
     'chat.selectRoom': 'Выберите комнату',
     'chat.selectHint': 'Вызовите room_create() из агента, чтобы начать обсуждение',
     'chat.closed': 'Комната закрыта — только чтение',
@@ -409,6 +416,7 @@ function fmtTime(ts) {
 // ── State ─────────────────────────────────────────────────
 let currentRoom = null, currentOwner = null, lastId = 0;
 let rooms = [], msgMap = {};
+let searchResults = null, searchPending = false, searchTimer = null, searchSequence = 0;
 let agentMetaTotals = {}; // {agentName: {tokens_total, tokens_in, tokens_out, msgs, models:Set, last_reasoning}}
 let lastStatuses = {};    // {agentName: 'online'|'busy'|...} — latest room status snapshot
 
@@ -665,6 +673,11 @@ async function loadRooms() {
     rooms = loaded;
     document.getElementById('room-count').textContent = rooms.length;
     renderRooms();
+    const roomFromLink = new URLSearchParams(location.hash.slice(1)).get('room');
+    if (!currentRoom && roomFromLink) {
+      const target = rooms.find(room => room.id === roomFromLink);
+      if (target) openRoom(target.id, target.owner);
+    }
     hideAuthRequired();
   } catch(e) {
     // Preserve the last successfully rendered room list during auth/network errors.
@@ -702,6 +715,23 @@ function roomItem(r, label, indent = 46) {
 function renderRooms() {
   const sidebar = document.getElementById('room-list');
   sidebar.innerHTML = '';
+  if (!document.getElementById('room-search').hidden) {
+    if (searchPending) {
+      sidebar.appendChild(el('div', {class: 'empty-sidebar', text: t('search.pending')}));
+    } else if (searchResults) {
+      if (!searchResults.length) sidebar.appendChild(el('div', {class: 'empty-sidebar', text: t('search.empty')}));
+      for (const hit of searchResults) {
+        const item = roomItem(hit, hit.name, 18);
+        item.classList.add('search-hit');
+        if (hit.snippet) item.appendChild(el('div', {class: 'search-snippet', text: hit.snippet}));
+        if (hit.message_id != null) item.dataset.messageId = String(hit.message_id);
+        sidebar.appendChild(item);
+      }
+    } else {
+      sidebar.appendChild(el('div', {class: 'empty-sidebar', text: t('search.hint')}));
+    }
+    return;
+  }
   if (!rooms.length) {
     sidebar.appendChild(el('div', {class: 'empty-sidebar', text: t('sidebar.empty')}));
     return;
@@ -871,6 +901,7 @@ function buildChatShell(room) {
 async function openRoom(id, owner) {
   currentRoom = id;
   currentOwner = owner;
+  history.replaceState(null, '', `${location.pathname}${location.search}#room=${encodeURIComponent(id)}`);
   lastId = 0;
   msgMap = {};
   agentMetaTotals = {};
@@ -882,6 +913,101 @@ async function openRoom(id, owner) {
   // Re-paint totals badges after panels rebuilt
   Object.keys(agentMetaTotals).forEach(renderAgentTotalsBadge);
   relayout();  // reveal the activity panel now that a room is open
+}
+
+function initRoomSearch() {
+  const panel = document.getElementById('room-search');
+  const input = document.getElementById('room-search-input');
+  const button = document.getElementById('search-toggle');
+  input.placeholder = t('search.placeholder');
+  input.setAttribute('aria-label', t('search.placeholder'));
+  const close = () => {
+    panel.hidden = true;
+    input.value = '';
+    searchResults = null;
+    searchPending = false;
+    clearTimeout(searchTimer);
+    searchSequence++;
+    button.setAttribute('aria-expanded', 'false');
+    renderRooms();
+  };
+  button.onclick = () => {
+    if (!panel.hidden) return close();
+    panel.hidden = false;
+    button.setAttribute('aria-expanded', 'true');
+    if (isOverlay()) { layout.drawer = 'sidebar'; relayout(); }
+    else if (layout.sidebarCollapsed) { layout.sidebarCollapsed = false; persistLayout(); relayout(); }
+    input.focus();
+    renderRooms();
+  };
+  document.getElementById('room-search-close').onclick = close;
+  input.oninput = () => {
+    clearTimeout(searchTimer);
+    const query = input.value.trim();
+    const sequence = ++searchSequence;
+    if (!query) { searchResults = null; searchPending = false; renderRooms(); return; }
+    searchPending = true;
+    renderRooms();
+    searchTimer = setTimeout(async () => {
+      try {
+        let results;
+        try {
+          const response = await apiFetch(`/api/rooms_search?q=${encodeURIComponent(query)}`);
+          results = (await response.json()).results;
+        } catch (error) {
+          // An older running server may still serve the fresh dashboard files.
+          // Keep search usable until its Python process is restarted.
+          if (error.status !== 404) throw error;
+          results = await searchOnOlderServer(query, sequence);
+        }
+        if (sequence !== searchSequence) return;
+        searchResults = results;
+        searchPending = false;
+        renderRooms();
+      } catch (error) {
+        if (sequence !== searchSequence) return;
+        searchPending = false;
+        searchResults = [];
+        renderRooms();
+        showDashboardNotice(`Search failed: ${error.message}`, 'Retry', () => input.dispatchEvent(new Event('input')));
+      }
+    }, 250);
+  };
+  input.onkeydown = event => { if (event.key === 'Escape') close(); };
+}
+
+async function searchOnOlderServer(query, sequence) {
+  const needle = query.toLocaleLowerCase();
+  const snapshot = rooms.slice();
+  const found = [];
+  let next = 0;
+  async function worker() {
+    while (next < snapshot.length && sequence === searchSequence) {
+      const room = snapshot[next++];
+      const name = String(room.name || room.id);
+      const titleMatch = name.toLocaleLowerCase().includes(needle);
+      let match = null;
+      try {
+        const response = await apiFetch(`/api/messages_json?room_id=${encodeURIComponent(room.id)}`);
+        const data = await response.json();
+        match = (data.messages || []).find(msg =>
+          typeof msg.body === 'string' && msg.body.toLocaleLowerCase().includes(needle));
+      } catch (_) { /* A title hit still remains searchable if its log is unavailable. */ }
+      if (!titleMatch && !match) continue;
+      const body = match ? match.body.replace(/\s+/g, ' ') : '';
+      const at = body.toLocaleLowerCase().indexOf(needle);
+      const start = Math.max(0, at - 72);
+      found.push({id: room.id, name, owner: room.owner, status: room.status,
+        title_match: titleMatch, last_activity: room.last_activity || room.created_at,
+        message_id: match ? match.id : null,
+        snippet: body ? (start ? '…' : '') + body.slice(start, start + 190) +
+          (start + 190 < body.length ? '…' : '') : ''});
+    }
+  }
+  await Promise.all(Array.from({length: Math.min(4, snapshot.length)}, worker));
+  found.sort((a, b) => Number(b.title_match) - Number(a.title_match) ||
+    (b.last_activity || 0) - (a.last_activity || 0));
+  return found.slice(0, 100);
 }
 
 // ── Phase 1: agent live event panels ─────────────────────────────────────────
@@ -1461,7 +1587,14 @@ async function bulkNuke() {
 // ── Event delegation ──────────────────────────────────────
 document.addEventListener('click', e => {
   const item = e.target.closest('.room-item');
-  if (item) { openRoom(item.dataset.id, item.dataset.owner); return; }
+  if (item) {
+    openRoom(item.dataset.id, item.dataset.owner).then(() => {
+      if (item.dataset.messageId) {
+        document.querySelector(`#messages .msg[data-id="${item.dataset.messageId}"]`)?.scrollIntoView({block: 'center'});
+      }
+    });
+    return;
+  }
   if (e.target.closest('#bulk-close-all'))      { bulkCloseAll(); return; }
   if (e.target.closest('#bulk-delete-closed'))  { bulkDeleteClosed(); return; }
   if (e.target.closest('#bulk-nuke'))           { bulkNuke(); return; }
@@ -1712,6 +1845,7 @@ function initLayout() {
 
 initSettings();
 initLayout();
+initRoomSearch();
 authenticateDashboard(true)
   .then(loadRooms)
   .catch(e => showAuthRequired(e && e.message ? e.message : 'Authentication failed.'));

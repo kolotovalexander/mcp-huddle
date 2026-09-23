@@ -11,34 +11,34 @@
         <mxCell id="intro1" value="Пример: пользователь просит разобраться в задаче. Организатор — главный агент — открывает комнату Huddle, приглашает коллег и получает их ответы. Человек видит разговор в дашборде." style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#F3F5F7;strokeColor=#596776;strokeWidth=2;fontColor=#18212B;fontSize=19;fontFamily=Arial;align=center;verticalAlign=middle;spacing=12;" vertex="1" parent="1">
           <mxGeometry x="35" y="110" width="2030" height="95" as="geometry" />
         </mxCell>
-        <mxCell id="legend1" value="Зелёный — человек или организатор | Синий — работает сейчас | Серый — пояснение и граница" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#F3F5F7;strokeColor=#596776;strokeWidth=2;fontColor=#18212B;fontSize=17;fontFamily=Arial;align=center;verticalAlign=middle;spacing=12;" vertex="1" parent="1">
+        <mxCell id="legend1" value="Зелёный — человек или организатор | Синий — работает сейчас | Серый — пояснение и граница | Оранжевый — ограничения" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#F3F5F7;strokeColor=#596776;strokeWidth=2;fontColor=#18212B;fontSize=17;fontFamily=Arial;align=center;verticalAlign=middle;spacing=12;" vertex="1" parent="1">
           <mxGeometry x="35" y="225" width="2030" height="48" as="geometry" />
         </mxCell>
         <mxCell id="human" value="1 · ПОЛЬЗОВАТЕЛЬ&lt;br&gt;Ставит цель и ограничения&lt;br&gt;например: «сравните варианты»" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#E2F5EC;strokeColor=#268257;strokeWidth=2;fontColor=#18212B;fontSize=18;fontFamily=Arial;align=center;verticalAlign=middle;spacing=12;" vertex="1" parent="1">
           <mxGeometry x="35" y="335" width="305" height="135" as="geometry" />
         </mxCell>
         <mxCell id="organizer" value="2 · ОРГАНИЗАТОР&lt;br&gt;Решает, кого спросить&lt;br&gt;и формулирует общий вопрос" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#E2F5EC;strokeColor=#268257;strokeWidth=2;fontColor=#18212B;fontSize=18;fontFamily=Arial;align=center;verticalAlign=middle;spacing=12;" vertex="1" parent="1" tooltip="В обычной комнате организатор вызывает инструменты Huddle через MCP.">
-          <mxGeometry x="395" y="335" width="325" height="135" as="geometry" />
+          <mxGeometry x="438" y="335" width="325" height="135" as="geometry" />
         </mxCell>
         <mxCell id="create" value="3 · ДВЕ КОМАНДЫ HUDDLE&lt;br&gt;Сначала «Создать комнату»&lt;br&gt;потом «Пригласить участника»" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#EAF3FF;strokeColor=#2465A8;strokeWidth=2;fontColor=#18212B;fontSize=18;fontFamily=Arial;align=center;verticalAlign=middle;spacing=12;" vertex="1" parent="1" tooltip="Два отдельных MCP-вызова: room_create(name, owner, owner_pid, cwd) создаёт комнату; room_invite(room_id, agent_name, by=owner) добавляет участника. Приглашение само по себе не запускает ход.">
-          <mxGeometry x="775" y="335" width="330" height="135" as="geometry" />
+          <mxGeometry x="860" y="335" width="330" height="135" as="geometry" />
         </mxCell>
         <mxCell id="room" value="4 · КОМНАТА&lt;br&gt;Общая лента сообщений&lt;br&gt;Сохраняется на диске" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#EAF3FF;strokeColor=#2465A8;strokeWidth=2;fontColor=#18212B;fontSize=18;fontFamily=Arial;align=center;verticalAlign=middle;spacing=12;" vertex="1" parent="1" tooltip="Хранилище: meta.json, messages.jsonl и логи агентов. MCP-инструменты: message_post, messages_read.">
-          <mxGeometry x="1160" y="335" width="340" height="135" as="geometry" />
+          <mxGeometry x="1288" y="335" width="340" height="135" as="geometry" />
         </mxCell>
         <mxCell id="dashboard" value="5 · ДАШБОРД&lt;br&gt;Человек читает разговор&lt;br&gt;и при необходимости пишет сам" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#E2F5EC;strokeColor=#268257;strokeWidth=2;fontColor=#18212B;fontSize=18;fontFamily=Arial;align=center;verticalAlign=middle;spacing=12;" vertex="1" parent="1" link="http://127.0.0.1:8014/dashboard" tooltip="Локальный дашборд Huddle: http://127.0.0.1:8014/dashboard">
-          <mxGeometry x="1555" y="335" width="505" height="135" as="geometry" />
+          <mxGeometry x="1725" y="335" width="340" height="135" as="geometry" />
         </mxCell>
         <mxCell id="a1" value="задача" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2465A8;strokeWidth=2;endArrow=block;endFill=1;fontColor=#18212B;fontSize=15;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="human" target="organizer">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="a2" value="вызов MCP" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2465A8;strokeWidth=2;endArrow=block;endFill=1;fontColor=#18212B;fontSize=15;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="organizer" target="create">
+        <mxCell id="a2" value="MCP" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2465A8;strokeWidth=2;endArrow=block;endFill=1;fontColor=#18212B;fontSize=15;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="organizer" target="create">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
         <mxCell id="a3" value="создаёт" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2465A8;strokeWidth=2;endArrow=block;endFill=1;fontColor=#18212B;fontSize=15;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="create" target="room">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="a4" value="показывает" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2465A8;strokeWidth=2;endArrow=block;endFill=1;fontColor=#18212B;fontSize=15;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="room" target="dashboard">
+        <mxCell id="a4" value="виден в" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2465A8;strokeWidth=2;endArrow=block;endFill=1;fontColor=#18212B;fontSize=15;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="room" target="dashboard">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
         <mxCell id="ask" value="6 · HUDDLE ПЕРЕДАЁТ ВОПРОС&lt;br&gt;Адресует запрос выбранным участникам.&lt;br&gt;Профиль задаёт CLI и доступные права." style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#EAF3FF;strokeColor=#2465A8;strokeWidth=2;fontColor=#18212B;fontSize=18;fontFamily=Arial;align=center;verticalAlign=middle;spacing=12;" vertex="1" parent="1" tooltip="Технически: message_post(kind=request) и механизм spawn/wake; профиль берётся из реестра Huddle.">
@@ -48,7 +48,7 @@
           <mxGeometry x="945" y="585" width="470" height="145" as="geometry" />
         </mxCell>
         <mxCell id="answer" value="8 · ОТВЕТ В КОМНАТЕ&lt;br&gt;Результат сохраняется в ленте.&lt;br&gt;Другие агенты увидят его при чтении." style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#EAF3FF;strokeColor=#2465A8;strokeWidth=2;fontColor=#18212B;fontSize=18;fontFamily=Arial;align=center;verticalAlign=middle;spacing=12;" vertex="1" parent="1" tooltip="Технически: message_post(kind=result) и messages_read. Адресный новый вопрос может пробудить агента ещё раз.">
-          <mxGeometry x="1500" y="585" width="560" height="145" as="geometry" />
+          <mxGeometry x="1540" y="585" width="480" height="145" as="geometry" />
         </mxCell>
         <mxCell id="a5" value="вопрос" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2465A8;strokeWidth=2;endArrow=block;endFill=1;fontColor=#18212B;fontSize=15;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="room" target="ask">
           <mxGeometry relative="1" as="geometry">
@@ -64,11 +64,11 @@
         <mxCell id="a7" value="результат" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2465A8;strokeWidth=2;endArrow=block;endFill=1;fontColor=#18212B;fontSize=15;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="cli" target="answer">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="a8" value="сохраняет" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2465A8;strokeWidth=2;endArrow=block;endFill=1;fontColor=#18212B;fontSize=15;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="answer" target="room">
+        <mxCell id="a8" value="сохраняет" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#2465A8;strokeWidth=2;endArrow=block;endFill=1;fontColor=#18212B;fontSize=15;labelBackgroundColor=#FFFFFF;exitX=0.5;exitY=0;entryX=0.75;entryY=1;" edge="1" parent="1" source="answer" target="room">
           <mxGeometry relative="1" as="geometry">
             <Array as="points">
-              <mxPoint x="1780" y="800" />
-              <mxPoint x="1330" y="800" />
+              <mxPoint x="1780" y="525" />
+              <mxPoint x="1542" y="525" />
             </Array>
           </mxGeometry>
         </mxCell>
@@ -152,10 +152,10 @@
         <mxCell id="swarm" value="РОЙ&lt;br&gt;Когда нужна общая работа и спор.&lt;br&gt;Агенты общаются и работают параллельно.&lt;br&gt;Сами делят ответственность.&lt;br&gt;Итог — назначенный участник." style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#FFF2D9;strokeColor=#B87508;strokeWidth=2;fontColor=#18212B;fontSize=17;fontFamily=Arial;align=center;verticalAlign=middle;spacing=12;" vertex="1" parent="1" tooltip="Пилотный режим. Ответ: message_post(kind=result); завершение своей части: swarm_pilot_round_done.">
           <mxGeometry x="1580" y="660" width="485" height="235" as="geometry" />
         </mxCell>
-        <mxCell id="mode3" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#B87508;strokeWidth=2;endArrow=block;endFill=1;fontColor=#18212B;fontSize=15;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="dispatcher" target="swarm">
+        <mxCell id="mode3" value="" style="exitX=0.56;exitY=1;edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#B87508;strokeWidth=2;endArrow=block;endFill=1;fontColor=#18212B;fontSize=15;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="dispatcher" target="swarm">
           <mxGeometry relative="1" as="geometry">
             <Array as="points">
-              <mxPoint x="1790" y="570" />
+              <mxPoint x="1822" y="570" />
               <mxPoint x="1822" y="570" />
             </Array>
           </mxGeometry>
@@ -179,7 +179,7 @@
           <mxGeometry x="225" y="1120" width="1650" height="90" as="geometry" />
         </mxCell>
         <mxCell id="future_head" value="ПОСЛЕ ПИЛОТА · следующие улучшения, пока не единый работающий поток" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#F2EAFE;strokeColor=#7753AA;strokeWidth=2;fontColor=#18212B;fontSize=20;fontFamily=Arial;align=center;verticalAlign=middle;spacing=12;" vertex="1" parent="1">
-          <mxGeometry x="35" y="1255" width="2030" height="60" as="geometry" />
+          <mxGeometry x="35" y="1280" width="2030" height="60" as="geometry" />
         </mxCell>
         <mxCell id="jev" value="Jev — помощник выбора&lt;br&gt;предлагает режим, роли, модели&lt;br&gt;организатор решает" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#F2EAFE;strokeColor=#7753AA;strokeWidth=2;fontColor=#18212B;fontSize=17;fontFamily=Arial;align=center;verticalAlign=middle;spacing=12;" vertex="1" parent="1" link="https://github.com/kolotovalexander/AgentSync/issues/361">
           <mxGeometry x="35" y="1390" width="380" height="160" as="geometry" />
@@ -187,26 +187,14 @@
         <mxCell id="preflight" value="Huddle проверяет&lt;br&gt;точную модель, вход&lt;br&gt;и ответ в той же среде" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#F2EAFE;strokeColor=#7753AA;strokeWidth=2;fontColor=#18212B;fontSize=17;fontFamily=Arial;align=center;verticalAlign=middle;spacing=12;" vertex="1" parent="1" link="https://github.com/kolotovalexander/AgentSync/issues/361">
           <mxGeometry x="445" y="1390" width="380" height="160" as="geometry" />
         </mxCell>
-        <mxCell id="future1" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#7753AA;strokeWidth=2;endArrow=block;endFill=1;fontColor=#18212B;fontSize=15;labelBackgroundColor=#FFFFFF;dashed=1;dashPattern=8 5;" edge="1" parent="1" source="jev" target="preflight">
-          <mxGeometry relative="1" as="geometry" />
-        </mxCell>
         <mxCell id="pty" value="Терминал внутри Huddle&lt;br&gt;живой ввод и вопросы&lt;br&gt;разрешений агентам" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#F2EAFE;strokeColor=#7753AA;strokeWidth=2;fontColor=#18212B;fontSize=17;fontFamily=Arial;align=center;verticalAlign=middle;spacing=12;" vertex="1" parent="1" link="https://github.com/kolotovalexander/AgentSync/issues/361">
           <mxGeometry x="855" y="1390" width="380" height="160" as="geometry" />
-        </mxCell>
-        <mxCell id="future2" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#7753AA;strokeWidth=2;endArrow=block;endFill=1;fontColor=#18212B;fontSize=15;labelBackgroundColor=#FFFFFF;dashed=1;dashPattern=8 5;" edge="1" parent="1" source="preflight" target="pty">
-          <mxGeometry relative="1" as="geometry" />
         </mxCell>
         <mxCell id="workspace" value="Общее рабочее дерево&lt;br&gt;решения и факты видны&lt;br&gt;дополнительные рабочие копии" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#F2EAFE;strokeColor=#7753AA;strokeWidth=2;fontColor=#18212B;fontSize=17;fontFamily=Arial;align=center;verticalAlign=middle;spacing=12;" vertex="1" parent="1" link="https://github.com/kolotovalexander/AgentSync/issues/361">
           <mxGeometry x="1265" y="1390" width="380" height="160" as="geometry" />
         </mxCell>
-        <mxCell id="future3" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#7753AA;strokeWidth=2;endArrow=block;endFill=1;fontColor=#18212B;fontSize=15;labelBackgroundColor=#FFFFFF;dashed=1;dashPattern=8 5;" edge="1" parent="1" source="pty" target="workspace">
-          <mxGeometry relative="1" as="geometry" />
-        </mxCell>
         <mxCell id="recovery" value="Huddle восстанавливает&lt;br&gt;зависшего или ограниченного&lt;br&gt;участника" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#F2EAFE;strokeColor=#7753AA;strokeWidth=2;fontColor=#18212B;fontSize=17;fontFamily=Arial;align=center;verticalAlign=middle;spacing=12;" vertex="1" parent="1" link="https://github.com/kolotovalexander/AgentSync/issues/361">
           <mxGeometry x="1675" y="1390" width="380" height="160" as="geometry" />
-        </mxCell>
-        <mxCell id="future4" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#7753AA;strokeWidth=2;endArrow=block;endFill=1;fontColor=#18212B;fontSize=15;labelBackgroundColor=#FFFFFF;dashed=1;dashPattern=8 5;" edge="1" parent="1" source="workspace" target="recovery">
-          <mxGeometry relative="1" as="geometry" />
         </mxCell>
       </root>
     </mxGraphModel>

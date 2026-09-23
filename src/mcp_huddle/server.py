@@ -1432,6 +1432,50 @@ async def api_rooms(request: Request) -> JSONResponse:
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@mcp.custom_route("/api/rooms_search", methods=["GET"])
+async def api_rooms_search(request: Request) -> JSONResponse:
+    query = request.query_params.get("q", "").strip()
+    if not query or len(query) > 120:
+        return JSONResponse({"error": "q must contain 1–120 characters"}, status_code=400)
+
+    def search() -> list[dict]:
+        needle = query.casefold()
+        found = []
+        for room in bus.list_rooms():
+            name = str(room.get("name") or room.get("id") or "")
+            title_match = needle in name.casefold()
+            matching_message = None
+            for msg in bus._load_messages(room["id"]):
+                body = msg.get("body")
+                if isinstance(body, str) and needle in body.casefold():
+                    matching_message = msg
+                    break
+            if not title_match and matching_message is None:
+                continue
+            snippet = ""
+            message_id = None
+            if matching_message is not None:
+                body = " ".join(matching_message["body"].split())
+                at = body.casefold().find(needle)
+                start = max(0, at - 72)
+                snippet = ("…" if start else "") + body[start:start + 190]
+                if start + 190 < len(body):
+                    snippet += "…"
+                message_id = matching_message.get("id")
+            found.append({"id": room["id"], "name": name,
+                          "owner": room.get("owner"), "status": room.get("status"),
+                          "snippet": snippet, "message_id": message_id,
+                          "title_match": title_match,
+                          "last_activity": room.get("last_activity") or room.get("created_at")})
+        found.sort(key=lambda item: (not item["title_match"], -(item["last_activity"] or 0)))
+        return found[:100]
+
+    try:
+        return JSONResponse({"results": await asyncio.to_thread(search)})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @mcp.custom_route("/api/messages_json", methods=["GET"])
 async def api_messages_json(request: Request) -> JSONResponse:
     room_id = request.query_params.get("room_id", "")

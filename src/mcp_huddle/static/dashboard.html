@@ -46,6 +46,7 @@
       </div>
     </div>
     <div class="topbar-actions">
+      <button class="lq-btn" id="search-toggle" type="button" aria-label="Search rooms and messages" title="Search rooms and messages">⌕ <span data-i18n="btn.search">Search</span></button>
       <button class="lq-btn" id="sidebar-collapse" title="Свернуть/развернуть список комнат">◧</button>
       <button class="lq-btn" id="activity-collapse" title="Свернуть/развернуть панель активности">◨</button>
       <button class="lq-btn" id="bulk-close-all" data-i18n="btn.closeAll" data-i18n-title="tip.closeAll">Close all</button>
@@ -60,6 +61,10 @@
     <aside class="sidebar lq-panel">
       <div class="panel-head pc-left">
         <button class="panel-collapse-btn" data-side="sidebar" data-i18n-title="tip.collapse" aria-label="collapse">◧</button>
+      </div>
+      <div class="room-search" id="room-search" hidden>
+        <input id="room-search-input" type="search" autocomplete="off" placeholder="Search room titles and messages" aria-label="Search room titles and messages">
+        <button id="room-search-close" type="button" aria-label="Close search">×</button>
       </div>
       <div class="sidebar-scroll" id="room-list"></div>
     </aside>

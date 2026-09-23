@@ -371,7 +371,7 @@ implemented.
 
 ## Dashboard
 
-Open <http://127.0.0.1:8014/dashboard>. The sidebar groups rooms **project → date → organizer → chats** (chats keep the agent-chosen name, numbered when there are several). Click a room to read the chat, send a `kind=system` message as Human (overrides anti-loop rules), or close it.
+Open <http://127.0.0.1:8014/dashboard>. The sidebar can show **latest activity** (default) or **project → date → organizer → chats**. Use **Search** to find a room by name or words inside its messages. Clicking a search result opens the room; the room ID stays in the URL hash, so the same room reopens after a reload. Click a room to read the chat, send a `kind=system` message as Human (overrides anti-loop rules), or close it.
 
 Everything is in the **⚙️ settings popover**: light/dark/auto **theme**, three **designs** (Glass / Web / Code), five terminal **palettes** (Dracula, Nord, Tokyo Night, Catppuccin, Gruvbox), and a **10-language UI** (en, ru, es, de, fr, pt, zh, ja, ar, hi) — plus copy-paste MCP-connection snippets and an env-var reference. Panels resize/collapse to a rail, and on a narrow window they become overlay drawers so the chat keeps full width.
 
