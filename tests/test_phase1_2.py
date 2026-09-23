@@ -181,6 +181,53 @@ def test_opencode_slot_is_opt_in_timeout_wrapped_and_uses_local_model_config() -
     assert not any("9router" in arg for arg in spec["cmd"])
 
 
+def test_opencode_child_gets_parent_http_mcp_config_without_token(monkeypatch) -> None:
+    monkeypatch.setattr(spawn.sys, "argv", ["mcp-huddle", "--http", "--port", "8014"])
+    monkeypatch.setenv("MCP_HUDDLE_TOKEN", "must-not-reach-opencode")
+    spec = {
+        "name": "OpenCode-cohere",
+        "cmd": ["/opt/homebrew/bin/timeout", "1200", "/opt/homebrew/bin/opencode",
+                "run", "-m", "openrouter/cohere/north-mini-code:free", "{brief}"],
+        "enabled": True,
+    }
+
+    env = spawn._spawn_environment(spec, spec["cmd"])
+
+    config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
+    assert config["mcp"]["huddle"] == {"enabled": False}
+    assert config["mcp"]["huddle_parent"] == {
+        "type": "remote",
+        "url": "http://127.0.0.1:8014/mcp",
+        "enabled": True,
+        "oauth": False,
+    }
+    assert "must-not-reach-opencode" not in env["OPENCODE_CONFIG_CONTENT"]
+    assert "MCP_HUDDLE_TOKEN" not in env
+
+
+def test_opencode_parent_mcp_override_uses_cli_port_then_port_env(monkeypatch) -> None:
+    monkeypatch.setattr(spawn.sys, "argv", ["mcp-huddle", "--http", "--port=45111"])
+    monkeypatch.setenv("PORT", "8014")
+    assert spawn._opencode_parent_mcp_url() == "http://127.0.0.1:45111/mcp"
+
+    monkeypatch.setattr(spawn.sys, "argv", ["mcp-huddle", "--http"])
+    monkeypatch.setenv("PORT", "45112")
+    assert spawn._opencode_parent_mcp_url() == "http://127.0.0.1:45112/mcp"
+
+
+def test_opencode_parent_mcp_override_is_absent_outside_http_mode(monkeypatch) -> None:
+    monkeypatch.setattr(spawn.sys, "argv", ["mcp-huddle"])
+    monkeypatch.delenv("MCP_HUDDLE_HTTP", raising=False)
+    assert spawn._opencode_parent_mcp_url() is None
+
+    opencode = {"name": "OpenCode", "cmd": ["opencode", "run", "{brief}"], "enabled": True}
+    codex = {"name": "Codex", "cmd": ["codex", "exec", "{brief}"], "enabled": True}
+    assert "OPENCODE_CONFIG_CONTENT" not in spawn._spawn_environment(opencode, opencode["cmd"])
+
+    monkeypatch.setattr(spawn.sys, "argv", ["mcp-huddle", "--http"])
+    assert "OPENCODE_CONFIG_CONTENT" not in spawn._spawn_environment(codex, codex["cmd"])
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [("not-a-number", "1200"), ("0", "1200"), ("-1", "1200"), ("45", "45")],

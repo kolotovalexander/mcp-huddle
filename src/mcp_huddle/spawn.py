@@ -1501,7 +1501,29 @@ def _spawn_environment(spec: SpawnSpec, argv: list[str] | None = None) -> dict[s
             )
         return build_sanitized_environment()
     if spec.get("profile") != _DIRECT_OPUS_REVIEW_PROFILE:
-        return build_sanitized_environment(explicit_names)
+        env = build_sanitized_environment(explicit_names)
+        if argv and _effective_binary(argv) == "opencode":
+            endpoint = _opencode_parent_mcp_url()
+            if endpoint:
+                env["OPENCODE_CONFIG_CONTENT"] = json.dumps(
+                    {
+                        "mcp": {
+                            # Inline config merges with user config. Disable the
+                            # stale global connection, then add a clean endpoint
+                            # under a fresh name so old auth headers cannot be
+                            # inherited or sent to this server.
+                            "huddle": {"enabled": False},
+                            "huddle_parent": {
+                                "type": "remote",
+                                "url": endpoint,
+                                "enabled": True,
+                                "oauth": False,
+                            },
+                        },
+                    },
+                    separators=(",", ":"),
+                )
+        return env
     required = (
         "ANTHROPIC_API_KEY",
         _DIRECT_OPUS_WORKSPACE_ENV,
@@ -1516,6 +1538,47 @@ def _spawn_environment(spec: SpawnSpec, argv: list[str] | None = None) -> dict[s
     env["ANTHROPIC_BASE_URL"] = "https://api.anthropic.com"
     env["ANTHROPIC_CUSTOM_HEADERS"] = env.pop(_DIRECT_OPUS_WORKSPACE_ENV)
     return env
+
+
+def _opencode_parent_mcp_url() -> str | None:
+    """Resolve this Huddle HTTP process endpoint for OpenCode child MCP config.
+
+    The CLI is the source of truth: `--port` overrides `PORT`, then Huddle's
+    default port applies. Stdio Huddle has no HTTP endpoint and leaves the
+    user's OpenCode MCP config untouched.
+    """
+    args = sys.argv[1:]
+    if "--http" not in args and not os.environ.get("MCP_HUDDLE_HTTP"):
+        return None
+
+    # Keep aligned with mcp_huddle.__main__.DEFAULT_PORT.
+    port = 8014
+    raw_port = os.environ.get("PORT")
+    if raw_port:
+        try:
+            candidate = int(raw_port)
+            if 1 <= candidate <= 65535:
+                port = candidate
+        except (TypeError, ValueError):
+            pass  # __main__ warns and falls back to DEFAULT_PORT.
+
+    for index, arg in enumerate(args):
+        raw = None
+        if arg == "--port" and index + 1 < len(args):
+            raw = args[index + 1]
+        elif arg.startswith("--port="):
+            raw = arg.partition("=")[2]
+        if raw is not None:
+            try:
+                candidate = int(raw)
+            except (TypeError, ValueError):
+                return None
+            if not 1 <= candidate <= 65535:
+                return None
+            port = candidate
+            break
+
+    return f"http://127.0.0.1:{port}/mcp"
 
 
 # ── Same-binary spawn stagger ────────────────────────────────────────────────
