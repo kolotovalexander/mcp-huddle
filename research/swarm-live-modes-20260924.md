@@ -147,3 +147,62 @@ confirms completion but also shows that a waiting reporter can delay the next
 serialized OpenCode member. The earlier database-lock errors and the
 Antigravity completion gap remain as recorded above. The OpenAI
 `err_8c7b5165` cause remains unknown without the matching server log.
+
+## Post-restart serialized OpenCode lifecycle check — room_2d23acbe
+
+One new disposable live swarm was created after the Huddle `:8014` restart,
+using `OpenCode-cohere` (`openrouter/cohere/north-mini-code:free`) and
+`OpenCode-nvidia` (`openrouter/nvidia/nemotron-3-super-120b-a12b:free`). The
+toy goal was `18 + 24`; both participants were told to use Huddle MCP only and
+not to use shell or file tools. No corrective request was needed.
+
+Room and message evidence (timestamps below are Unix seconds; parenthetical
+wall times are Indochina Time, UTC+7):
+
+- Room `room_2d23acbe` created at `1790206531` (2026-09-24 06:35:31 ICT); both
+  initial requests (#1 and #2) were dispatched at that timestamp.
+- Cohere result #3 replied to request #1 at `1790206564` (06:36:04 ICT), then
+  its durable `round_done` entry was recorded at `1790206570` (06:36:10 ICT).
+- Nvidia result #4 replied to request #2 at `1790206601` (06:36:41 ICT), then
+  its durable `round_done` entry was recorded at `1790206604` (06:36:44 ICT).
+- System final request #5 went to Cohere at `1790206604`; Cohere published
+  combined result #6 at `1790206635` (06:37:15 ICT) and final #7 at
+  `1790206639` (06:37:19 ICT), 108 seconds after room creation.
+- Final durable state: `phase="completed"`; both members are in `done`;
+  `responsibilities.reporter.member="OpenCode-cohere"` and
+  `final.member="OpenCode-cohere"`. Both current `wake_claim_id` values are
+  null. Result #3 was `18 + 24 = 42`; #4 independently verified `18 + 24 =
+  42`. Final #7: `All members completed the round. Both OpenCode-cohere
+  (calculated) and OpenCode-nvidia (verified) independently confirmed that
+  18 + 24 = 42. Combined result published.`
+
+Lifecycle evidence and limits:
+
+- Nvidia's recorded child PID was `54141`, launched/claimed at
+  `1790206531`, with `last_wake_exit_at=1790206607` and `last_wake_rc=0`:
+  three seconds after its `round_done` timestamp. Its `wake_fail_count=0`.
+- Cohere's first child PID was `54138`. After its `round_done`, a live
+  metadata snapshot observed the wake claim released and `last_wake_rc=-15`.
+  That first exit timestamp was overwritten by Cohere's later reporter wake,
+  so the exact delay from the first `round_done` to that exit cannot be
+  recovered from current metadata. The later reporter PID `54793` had
+  `last_wake_exit_at=1790206641`, two seconds after final #7, and
+  `last_wake_rc=-15`.
+- At the final snapshot Cohere had `wake_claim_id=null` and
+  `wake_fail_count=2`, despite its successful result, `round_done`, and
+  `finish`; Nvidia had no failures. This is a telemetry defect: successful
+  pilot turns stopped by the lifecycle path are recorded as nonzero exits and
+  counted as wake failures. No source change was made in this pilot.
+- There was no observed 352-second stall: Nvidia's result arrived 70 seconds
+  after room creation and its round completed 73 seconds after creation.
+  However, the persisted start time is the wake claim time, not a timestamp
+  for when the serialized child actually acquired its slot. The first Cohere
+  exit timestamp was overwritten. Therefore this room does not prove the
+  exact `~1.5s` child-exit target or the precise inter-child start delay.
+
+This is a real completed Swarm run, not a simulated test. It confirms that
+both inexpensive OpenCode profiles returned results, completed their round,
+and produced the reporter final. It did not fully confirm the requested
+process-lifecycle timing; use a per-wake exit history and a terminal outcome
+that distinguishes an intentional stop from an execution failure to verify
+that target reliably.
