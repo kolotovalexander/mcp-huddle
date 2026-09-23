@@ -212,6 +212,11 @@ const I18N = {
     'btn.search': 'Search',
     'room.owner': 'Owner', 'room.round': 'Round', 'room.noRound': 'No recorded round', 'room.messages': 'messages',
     'room.updated': 'Updated', 'room.copyName': 'Copy name',
+    'swarm.title': 'Team brief', 'swarm.goal': 'Goal', 'swarm.mode': 'Mode',
+    'swarm.phase': 'Phase', 'swarm.round': 'Round', 'swarm.responsibilities': 'Responsibilities',
+    'swarm.tasks': 'Tasks', 'swarm.decisions': 'Decisions', 'swarm.facts': 'Facts',
+    'swarm.final': 'Final result', 'swarm.working': 'In progress', 'swarm.completed': 'Completed',
+    'swarm.empty': 'Nothing recorded yet', 'swarm.owner': 'Owner', 'swarm.reporter': 'Reporter',
     'lanes.title': 'Agents', 'lanes.collapse': 'Collapse', 'lanes.expand': 'Expand',
     'lanes.waiting': 'Waiting', 'lanes.working': 'Working', 'lanes.done': 'Finished',
     'lanes.offline': 'Offline', 'lanes.online': 'Online', 'lanes.unknown': 'No status',
@@ -315,6 +320,11 @@ const I18N = {
     'btn.search': 'Поиск', 'search.placeholder': 'Название комнаты или слова из переписки',
     'room.owner': 'Владелец', 'room.round': 'Раунд', 'room.noRound': 'Раунд не задан', 'room.messages': 'сообщений',
     'room.updated': 'Обновлена', 'room.copyName': 'Копировать имя',
+    'swarm.title': 'План команды', 'swarm.goal': 'Цель', 'swarm.mode': 'Режим',
+    'swarm.phase': 'Этап', 'swarm.round': 'Раунд', 'swarm.responsibilities': 'Обязанности',
+    'swarm.tasks': 'Задачи', 'swarm.decisions': 'Решения', 'swarm.facts': 'Факты',
+    'swarm.final': 'Итог', 'swarm.working': 'В работе', 'swarm.completed': 'Завершён',
+    'swarm.empty': 'Пока ничего не записано', 'swarm.owner': 'Ответственный', 'swarm.reporter': 'Сводит результат',
     'lanes.title': 'Агенты', 'lanes.collapse': 'Свернуть', 'lanes.expand': 'Развернуть',
     'lanes.waiting': 'Ждёт', 'lanes.working': 'Работает', 'lanes.done': 'Закончил',
     'lanes.offline': 'Не в сети', 'lanes.online': 'На связи', 'lanes.unknown': 'Нет статуса',
@@ -808,6 +818,7 @@ function setLang(lang) {
   LANG = lang;
   try { localStorage.setItem('agentbus-lang', lang); } catch (_) {}
   applyI18n();
+  if (roomData) renderSwarmPilot(roomData);
   const pop = document.getElementById('settings-popover');
   if (pop) buildSettingsPopover(pop);  // rebuild so the popover's own labels update
 }
@@ -1051,6 +1062,7 @@ function buildChatShell(room) {
   ]);
 
   const lanes = el('section', {class: 'room-lanes', id: 'room-lanes', 'aria-label': t('lanes.title')});
+  const swarmPanel = el('section', {class: 'swarm-pilot', id: 'swarm-pilot', hidden: '', 'aria-label': t('swarm.title')});
   const messages = el('div', {class: 'messages', id: 'messages'});
 
   const inputAttrs = {
@@ -1104,6 +1116,7 @@ function buildChatShell(room) {
 
   chat.appendChild(header);
   chat.appendChild(lanes);
+  chat.appendChild(swarmPanel);
   chat.appendChild(messages);
   chat.appendChild(inputWrap);
 
@@ -1117,6 +1130,84 @@ function buildChatShell(room) {
     input.onkeydown = e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendMsg(); } };
   }
   document.getElementById('copy-room-name').onclick = () => navigator.clipboard.writeText(room.name || room.id || '');
+  renderSwarmPilot(room);
+}
+
+const SWARM_BUCKETS = [
+  ['responsibilities', 'swarm.responsibilities'], ['tasks', 'swarm.tasks'],
+  ['decisions', 'swarm.decisions'], ['facts', 'swarm.facts'],
+];
+function swarmEntryText(entry) {
+  if (typeof entry === 'string') return entry;
+  return entry && typeof entry.value === 'string' ? entry.value : '';
+}
+function renderSwarmPilot(room) {
+  const panel = document.getElementById('swarm-pilot');
+  const state = room && room.swarm_pilot;
+  if (!panel) return;
+  if (!state || typeof state !== 'object') { panel.hidden = true; panel.replaceChildren(); return; }
+  panel.hidden = false;
+  const wasOpen = panel.querySelector('details')?.open;
+  const storageKey = `agentbus-swarm-panel:${room.id || currentRoom}`;
+  let savedOpen = null;
+  try { savedOpen = localStorage.getItem(storageKey); } catch (_) {}
+  const open = savedOpen === null ? (wasOpen ?? true) : savedOpen === '1';
+  panel.replaceChildren();
+
+  const mode = ROOM_MODES.has(state.mode) ? t(`roomMode.${state.mode}`) : String(state.mode || '—');
+  const phase = state.phase === 'completed' ? t('swarm.completed')
+    : state.phase === 'working' ? t('swarm.working') : String(state.phase || '—');
+  const head = el('summary', {class: 'swarm-summary'}, [
+    el('span', {class: 'swarm-marker', 'aria-hidden': 'true'}),
+    el('span', {class: 'swarm-title', text: t('swarm.title')}),
+    el('span', {class: 'swarm-meta', text: `${t('swarm.mode')}: ${mode} · ${t('swarm.phase')}: ${phase} · ${t('swarm.round')} ${state.round || 1}`}),
+  ]);
+  const details = el('details', {class: 'swarm-details'});
+  details.open = open;
+  details.addEventListener('toggle', () => {
+    try { localStorage.setItem(storageKey, details.open ? '1' : '0'); } catch (_) {}
+  });
+  details.appendChild(head);
+  const body = el('div', {class: 'swarm-body'});
+  if (state.goal) body.appendChild(el('div', {class: 'swarm-goal'}, [
+    el('span', {class: 'swarm-label', text: `${t('swarm.goal')} · `}),
+    el('span', {text: String(state.goal)}),
+  ]));
+
+  const grid = el('div', {class: 'swarm-grid'});
+  for (const [bucketName, labelKey] of SWARM_BUCKETS) {
+    const bucket = state[bucketName] && typeof state[bucketName] === 'object' ? state[bucketName] : {};
+    const entries = Object.entries(bucket);
+    const group = el('section', {class: `swarm-group swarm-${bucketName}`});
+    group.appendChild(el('h3', {text: `${t(labelKey)} · ${entries.length}`}));
+    if (!entries.length) {
+      group.appendChild(el('p', {class: 'swarm-empty', text: t('swarm.empty')}));
+    } else {
+      const list = el('ul', {class: 'swarm-list'});
+      for (const [key, entry] of entries) {
+        const value = swarmEntryText(entry);
+        const member = entry && typeof entry === 'object' ? entry.member : '';
+        const item = el('li', {}, [
+          el('span', {class: 'swarm-key', text: key}),
+          el('span', {class: 'swarm-value', text: value || '—'}),
+        ]);
+        if (member) item.appendChild(el('span', {class: 'swarm-owner', text: `${t(bucketName === 'responsibilities' && key === 'reporter' ? 'swarm.reporter' : 'swarm.owner')}: ${member}`}));
+        list.appendChild(item);
+      }
+      group.appendChild(list);
+    }
+    grid.appendChild(group);
+  }
+  body.appendChild(grid);
+  if (state.final && typeof state.final === 'object' && state.final.result) {
+    body.appendChild(el('section', {class: 'swarm-final'}, [
+      el('h3', {text: t('swarm.final')}),
+      el('p', {text: String(state.final.result)}),
+      state.final.member ? el('span', {class: 'swarm-owner', text: `${t('swarm.owner')}: ${state.final.member}`}) : null,
+    ]));
+  }
+  details.appendChild(body);
+  panel.appendChild(details);
 }
 
 async function openRoom(id, owner) {
@@ -1962,6 +2053,7 @@ function renderChatMeta(room, statuses) {
   meta.textContent = details.join('  /  ');
   const crumb = document.getElementById('room-crumb');
   if (crumb) crumb.textContent = room.cwd || room.project || '';
+  renderSwarmPilot(room);
 }
 
 async function fetchMessages(initial) {
