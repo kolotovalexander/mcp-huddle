@@ -1591,6 +1591,9 @@
    the reading order and removes decorative chrome that reduces legibility.
    ===================================================================== */
 :root[data-skin="opus"] {
+  --opus-serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+  --opus-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Arial, sans-serif;
+  --opus-mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
   --opus-paper: #f4f0e7;
   --opus-paper-2: #ebe5d8;
   --opus-ink: #26231e;
@@ -1670,8 +1673,8 @@
 [data-skin="opus"] body {
   background: var(--bg);
   color: var(--text);
-  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, "Segoe UI", sans-serif;
-  font-size: 14px;
+  font-family: var(--opus-sans);
+  font-size: 16.5px;
   letter-spacing: 0;
 }
 [data-skin="opus"] .bg-decor,
@@ -1705,7 +1708,7 @@
   backdrop-filter: none; -webkit-backdrop-filter: none;
 }
 [data-skin="opus"] .brand-text .title {
-  font-family: Georgia, "Times New Roman", serif;
+  font-family: var(--opus-serif);
   font-size: 27px; font-weight: 700; letter-spacing: -.035em;
 }
 [data-skin="opus"] .brand-text .subtitle {
@@ -1759,7 +1762,7 @@
   text-transform: none; letter-spacing: 0; color: var(--text-muted);
 }
 [data-skin="opus"] .proj-header {
-  padding: 14px 16px 5px; font-family: Georgia, "Times New Roman", serif;
+  padding: 14px 16px 5px; font-family: var(--opus-serif);
   font-size: 17px; font-weight: 600;
 }
 [data-skin="opus"] .sess-header {
@@ -1788,7 +1791,7 @@
   align-items: flex-end;
 }
 [data-skin="opus"] .chat-title {
-  font-family: Georgia, "Times New Roman", serif;
+  font-family: var(--opus-serif);
   font-size: clamp(24px, 3vw, 38px); font-weight: 600; letter-spacing: -.025em;
   line-height: 1.12; overflow-wrap: anywhere;
 }
@@ -1858,11 +1861,11 @@
   box-shadow: 10px 10px 0 var(--opus-accent); backdrop-filter: none;
   -webkit-backdrop-filter: none; color: var(--text);
 }
-[data-skin="opus"] .set-title { text-transform: none; letter-spacing: 0; font-family: Georgia, "Times New Roman", serif; font-size: 17px; color: var(--text); }
+[data-skin="opus"] .set-title { text-transform: none; letter-spacing: 0; font-family: var(--opus-serif); font-size: 17px; color: var(--text); }
 [data-skin="opus"] .set-section { border-top: 1px solid var(--opus-rule); padding-top: 8px; }
 [data-skin="opus"] .set-section-summary {
   display: flex; align-items: center; justify-content: space-between; gap: 10px;
-  cursor: pointer; list-style: none; font-family: Georgia, "Times New Roman", serif;
+  cursor: pointer; list-style: none; font-family: var(--opus-serif);
   font-size: 16px; color: var(--text); padding: 2px 0;
 }
 [data-skin="opus"] .set-section-summary::-webkit-details-marker { display: none; }
@@ -1960,7 +1963,7 @@
 [data-skin="opus"] .lane-row { display: grid; grid-template-columns: minmax(95px, 130px) minmax(88px, 118px) minmax(60px, 1fr) minmax(130px, 250px); gap: 14px; align-items: center; min-height: 34px; border-top: 1px solid var(--opus-rule); }
 [data-skin="opus"] .lane-row.is-active { box-shadow: inset 3px 0 0 var(--agent-c, var(--opus-accent)); padding-left: 8px; margin-left: -8px; }
 [data-skin="opus"] .lane-log { min-width: 0; }
-[data-skin="opus"] .lane-log summary { font-weight: 700; color: var(--agent-c, var(--text)); cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+[data-skin="opus"] .lane-log summary { font-family: var(--opus-sans); font-size: 16px; font-variant: small-caps; letter-spacing: .03em; font-weight: 700; color: var(--agent-c, var(--text)); cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 [data-skin="opus"] .lane-log summary::before { content: ''; display: inline-block; width: 9px; height: 9px; margin-right: 6px; vertical-align: 0; background: var(--agent-c, var(--text-muted)); }
 [data-skin="opus"] .lane-log-body { position: relative; display: flex; flex-direction: column; gap: 0; max-height: 200px; overflow: auto; padding: 6px 0; }
 [data-skin="opus"] .lane-log-body button { display: flex; flex-direction: column; gap: 3px; text-align: left; color: var(--text); background: transparent; border: 0; border-top: 1px solid var(--opus-rule); padding: 6px 0; font: 11px ui-monospace, "SF Mono", Menlo, monospace; cursor: pointer; }
@@ -1968,7 +1971,7 @@
 [data-skin="opus"] .lane-log-message { white-space: pre-wrap; overflow-wrap: anywhere; }
 [data-skin="opus"] .lane-phase,
 [data-skin="opus"] .lane-detail { color: var(--text-muted); font: 11px ui-monospace, "SF Mono", Menlo, monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-[data-skin="opus"] .lane-detail { font: calc(12.5px * var(--reading-scale, 1)) -apple-system, BlinkMacSystemFont, system-ui, sans-serif; }
+[data-skin="opus"] .lane-detail { font: calc(13.5px * var(--reading-scale, 1)) var(--opus-sans); }
 [data-skin="opus"] .lane-row.is-active .lane-detail { color: var(--text); }
 [data-skin="opus"] .lane-phase::before { content: ''; display: inline-block; width: 7px; height: 7px; margin-right: 6px; border: 1.5px solid currentColor; vertical-align: 0; }
 [data-skin="opus"] .phase-working,
@@ -2027,7 +2030,7 @@
 [data-skin="opus"] .msg-line { display: flex; flex-direction: column; align-items: start; gap: 1px; margin: 0; }
 [data-skin="opus"] .msg-agent-ident { display: inline-flex; align-items: center; gap: 6px; }
 [data-skin="opus"] .msg-agent-ident .avatar-inline { width: 16px; height: 16px; font-size: 9px; }
-[data-skin="opus"] .msg-name { font-size: 16px; font-variant: small-caps; }
+[data-skin="opus"] .msg-name { font-family: var(--opus-sans); font-size: 17px; font-variant: small-caps; }
 [data-skin="opus"] .msg-main { min-width: 0; }
 [data-skin="opus"] .msg-kind-line { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 4px; }
 [data-skin="opus"] .msg-kind-line .kind { padding: 0; background: transparent; border: 0; color: var(--text-muted); }
@@ -2039,7 +2042,7 @@
 [data-skin="opus"] .agent-panel .agent-panel-name { color: var(--agent-c, var(--text)); }
 [data-skin="opus"] .avatar-other { background: var(--agent-c, var(--c-system)); }
 [data-skin="opus"] .msg-bubble { border: 0; padding: 0; }
-[data-skin="opus"] .msg-body { font-size: calc(14px * var(--reading-scale, 1)); }
+[data-skin="opus"] .msg-body { font-family: var(--opus-sans); font-size: calc(16.5px * var(--reading-scale, 1)); }
 [data-skin="opus"] .msg:not(.is-system) .msg-body { max-width: 74ch; line-height: 1.55; }
 [data-skin="opus"] .msg.kind-final .msg-bubble { border: 2px solid var(--text); padding: 12px 16px; max-width: calc(74ch + 32px); }
 [data-skin="opus"] .msg-kind-line .kind { font: 11px ui-monospace, "SF Mono", Menlo, monospace; }
@@ -2061,10 +2064,13 @@
 [data-skin="opus"] .composer-kind[aria-pressed="true"] { background: var(--text); color: var(--bg); }
 [data-skin="opus"] .composer-controls select { margin-left: 4px; background: var(--bg); color: var(--text); border: 1px solid var(--text); padding: 2px 5px; font: inherit; max-width: 140px; }
 [data-skin="opus"] .composer-hint { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-[data-skin="opus"] .input-row textarea { flex: 1; min-width: 0; min-height: 46px; max-height: 100px; resize: vertical; background: transparent; border: 0; outline: none; color: var(--text); font: calc(14px * var(--reading-scale, 1)) -apple-system, BlinkMacSystemFont, system-ui, sans-serif; }
+[data-skin="opus"] .input-row textarea { flex: 1; min-width: 0; min-height: 46px; max-height: 100px; resize: vertical; background: transparent; border: 0; outline: none; color: var(--text); font: calc(16.5px * var(--reading-scale, 1)) var(--opus-sans); }
 [data-skin="opus"] .input-row textarea::placeholder { color: var(--text-sub); }
 [data-skin="opus"] .dashboard-status { height: 38px; }
 .dashboard-status { display: flex; align-items: center; gap: 18px; flex: none; min-width: 0; border-top: 2px solid var(--text); padding: 0 18px; background: var(--bg); color: var(--text-muted); font: 11px ui-monospace, "SF Mono", Menlo, monospace; }
+[data-skin="opus"] :is(.brand-text .subtitle, .room-meta, .chat-meta, .lanes-head,
+  .lane-phase, .msg-time, .msg-kind-line .kind, .msg-kind-line .msg-to,
+  .composer-controls, .dashboard-status) { font-family: var(--opus-mono); }
 .dashboard-status .status-live { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dashboard-status .status-live::before { content: '■'; color: var(--c-human); margin-right: 7px; }
 .dashboard-status .status-live.is-active { color: var(--text); }
