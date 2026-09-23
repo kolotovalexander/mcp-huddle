@@ -68,3 +68,39 @@ same bounded probe first.
 This run proves one live worker wake, a valid result post, and a missing
 completion transition. It does not prove council finalization or
 relay/team/swarm behavior. The repo's mechanical pilot tests were not run here.
+
+## Per-spawn OpenCode MCP override
+
+The spawned OpenCode profile previously inherited its global Huddle MCP route
+(`http://127.0.0.1:45111/mcp`), which did not point at the parent Huddle
+process. `src/mcp_huddle/spawn.py` now sets the documented
+`OPENCODE_CONFIG_CONTENT` inline configuration only for an OpenCode child of
+Huddle HTTP mode. It disables the inherited `mcp.huddle` entry and adds
+`mcp.huddle_parent` pointed at the parent endpoint (`127.0.0.1`, resolved
+`--port` / `PORT` / default `8014`). It does not forward `MCP_HUDDLE_TOKEN` or
+include a token in the inline configuration. Stdio Huddle and non-OpenCode
+profiles receive no override.
+
+References: OpenCode's [CLI config environment variable](https://opencode.ai/docs/cli/),
+[config precedence](https://dev.opencode.ai/docs/config/), and the
+[v1.18.23 config schema](https://github.com/anomalyco/opencode/blob/v1.18.23/packages/core/src/v1/config/config.ts)
+and [MCP schema](https://github.com/anomalyco/opencode/blob/v1.18.23/packages/core/src/v1/config/mcp.ts).
+
+Verification:
+
+- Targeted `tests/test_phase1_2.py`: **160 passed**. The added cases cover
+  endpoint injection and token absence, CLI port precedence, and no override
+  for stdio or other clients.
+- OpenCode `1.18.23` `debug config`, run with the inline value, exited 0 and
+  showed the old `huddle` MCP entry disabled and `huddle_parent` enabled at
+  `http://127.0.0.1:8014/mcp`, `oauth=false`. The global config was not edited.
+- The live server's `/api/auth` returned `required=false`; therefore its MCP
+  endpoint currently permits this no-token child route. (The project's HTTP
+  guard would reject unauthenticated MCP calls if token auth were enabled; this
+  implementation intentionally does not pass that secret.)
+- `opencode mcp list` with the override emitted no output and timed out after
+  25 seconds. It was not retried. The effective config was inspected, but live
+  child tool discovery and the council completion path remain unverified.
+- The running server was not restarted. No post-change live council probe was
+  made; the owner will restart it after this commit, then can repeat the small
+  council probe before scaling to other modes.
