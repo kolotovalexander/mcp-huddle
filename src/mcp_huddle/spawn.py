@@ -1380,6 +1380,10 @@ def spawn_agent(
     else:
         argv, last_msg_path = _resolve_spawn_args(spec, brief, log_dir)
         env = _spawn_environment(spec, argv)
+    # A batch stagger cannot cover separate rooms, separate Huddle processes,
+    # or wake-path launches. Serialize the complete lifetime of every
+    # OpenCode CLI child on the shared Huddle home instead.
+    argv = _serialize_opencode_argv(argv)
     try:
         if owner_room_id:
             log_fd = bus._safe_open_fd(
@@ -1616,6 +1620,22 @@ def _effective_binary(cmd: list[str]) -> str:
     if idx >= len(cmd):
         return ""
     return Path(cmd[idx]).name
+
+
+def _serialize_opencode_argv(argv: list[str]) -> list[str]:
+    """Wrap OpenCode so its shared local database stays locked for its lifetime.
+
+    The wrapper replaces itself with the original argv after taking a
+    process-shared advisory lock. Because the descriptor is explicitly
+    inherited across exec, the lock remains held by OpenCode (or its outer
+    timeout command) until the spawned process exits, including when Huddle
+    terminates the exact registered Popen.
+    """
+    if _effective_binary(argv) != "opencode":
+        return argv
+    lock_path = bus.HUDDLE_HOME / "internal" / "opencode-run.lock"
+    helper = Path(__file__).with_name("opencode_serial.py")
+    return [sys.executable, str(helper), str(lock_path), "--", *argv]
 
 
 def _same_bin_stagger_sec() -> float:
