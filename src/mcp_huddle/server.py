@@ -432,6 +432,11 @@ def _swarm_pilot_request(room_id: str, member: str) -> str:
         "messages_read(room_id, since_id=0, limit=10000, max_chars=0)"
         if mode == "council" else "messages_read(room_id, since_id=0, limit=50)"
     )
+    final_instruction = (
+        " If you claim reporter, publish the combined result with "
+        "swarm_pilot_finish only after every member is done."
+        if mode != "council" else ""
+    )
     return (
         f"Huddle swarm pilot, mode={mode}, round={state['round']}. "
         f"You are {member}; peers are agents, not the human user.\n"
@@ -441,7 +446,7 @@ def _swarm_pilot_request(room_id: str, member: str) -> str:
         "Discuss disagreements substantively. Post your completed answer as "
         "message_post(kind='result', reply_to=<this request id>), then call "
         "swarm_pilot_round_done(room_id, member, summary). "
-        "A message alone does not complete the round."
+        "A message alone does not complete the round." + final_instruction
     )
 
 
@@ -493,7 +498,21 @@ def swarm_pilot_round_done(room_id: str, member: str, summary: str) -> dict:
         raise ValueError("member must post a result for their request first")
     updated = swarm_pilot.round_done(room_id, member, summary)
     next_dispatch = swarm_pilot_pump(room_id)
-    return {"state": updated, "next_dispatch": next_dispatch}
+    final_request = None
+    if (updated["mode"] != "council"
+            and len(updated["done"]) == len(updated["members"])):
+        reporter = updated["responsibilities"].get("reporter", {}).get("member")
+        if reporter:
+            final_request = message_post(
+                room_id, "System",
+                "All members have completed the round. Read their results and "
+                "publish the combined result with swarm_pilot_finish(room_id, "
+                "member, result).",
+                "request", to=reporter,
+                idempotency_key=f"swarm-pilot:{room_id}:final-request",
+            )
+    return {"state": updated, "next_dispatch": next_dispatch,
+            "final_request": final_request}
 
 
 @mcp.tool()
@@ -2926,7 +2945,22 @@ def _wake_agents_for_request(
             last_seen = int(info.get("last_seen_id", 0) or 0)
             wake_id = uuid.uuid4().hex[:12]
 
-            if _is_thread_resumable(agent_name):
+            resumable = _is_thread_resumable(agent_name)
+            # A newly invited Codex has no native thread yet. The first pilot
+            # turn must start a registry-backed process; later turns resume
+            # the captured thread just like an ordinary room.
+            if (resumable and fresh.get("swarm_pilot")
+                    and not info.get("thread_id")):
+                initial_thread = _parse_owned_codex_thread_id(
+                    room_id, agent_name, timeout=1.0,
+                )
+                if initial_thread:
+                    _merge_agent_meta(room_id, agent_name,
+                                      {"thread_id": initial_thread})
+                    info["thread_id"] = initial_thread
+                else:
+                    resumable = False
+            if resumable:
                 try:
                     canonical_log, canonical_last = bus._agent_paths(
                         room_id, agent_name, create=False,

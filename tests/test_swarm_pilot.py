@@ -100,10 +100,33 @@ def test_public_pilot_workflow_in_all_modes(isolated_home, monkeypatch, mode):
         request_id = swarm_pilot.status(room)["dispatched"][member]
         server.message_post(room, member, f"{member} result", "result",
                             to="Organizer", reply_to=request_id)
-        server.swarm_pilot_round_done(room, member, f"{member} done")
+        completed = server.swarm_pilot_round_done(room, member, f"{member} done")
+
+    if mode == "council":
+        assert completed["final_request"] is None
+    else:
+        final_request = completed["final_request"]
+        assert isinstance(final_request, int)
+        assert bus._load_messages(room)[-1]["id"] == final_request
+        assert bus._load_messages(room)[-1]["to"] == "A"
 
     author = "Organizer" if mode == "council" else "A"
     result = server.swarm_pilot_finish(room, author, "Combined result")
     assert result["phase"] == "completed"
     finals = [m for m in bus._load_messages(room) if m["kind"] == "final"]
     assert len(finals) == 1 and finals[0]["agent"] == author
+
+
+def test_new_codex_pilot_member_gets_initial_fresh_spawn(isolated_home, monkeypatch):
+    monkeypatch.setattr(server.spawn, "get_enabled_spec", lambda name: {"name": name})
+    launches = []
+    monkeypatch.setattr(server, "_parse_owned_codex_thread_id", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_spawn_fresh_room_agent",
+                        lambda room, name, prompt, meta, **kwargs:
+                        (launches.append((name, prompt)) or (12345, "log", None)))
+    created = server.swarm_pilot_create(
+        "pilot", "Organizer", "One sentence", "council", ["Codex"], start=True,
+    )
+    assert created["dispatched"][0]["member"] == "Codex"
+    assert len(launches) == 1
+    assert launches[0][0] == "Codex"
