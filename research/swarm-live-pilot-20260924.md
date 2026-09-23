@@ -104,3 +104,26 @@ Verification:
 - The running server was not restarted. No post-change live council probe was
   made; the owner will restart it after this commit, then can repeat the small
   council probe before scaling to other modes.
+
+## Post-restart council acceptance
+
+The updated Huddle HTTP server restarted on `127.0.0.1:8014` (PID 11188).
+`initialize` and `tools/list` returned HTTP 200. The catalog contained all six
+`swarm_pilot_*` tools and `room_rename` (21 tools total); `/api/auth` reported
+`required=false`.
+
+Room `room_26e717c4` used mode `council`, organizer `Codex`, member
+`OpenCode-cohere`, and a no-file arithmetic goal. The goal allowed Huddle MCP
+tools while excluding shell/file tools. The live sequence was:
+
+1. Request #1 went to OpenCode-cohere.
+2. OpenCode-cohere posted result #2, addressed to Codex and replying to #1:
+   `42. The sum of seventeen and twenty-five is exactly forty-two.`
+3. OpenCode-cohere called `swarm_pilot_round_done`; durable `done` recorded its
+   summary. Its agent event log contains two `swarm_pilot_round_done` mentions.
+4. Huddle posted final request #3 to Codex.
+5. Codex called `swarm_pilot_finish` with its own final answer. Durable pilot
+   phase became `completed`, and `final.member` is `Codex`.
+
+This proves the one-member Council path end to end on a real spawned model.
+Relay, Team, and Swarm are being checked separately.
