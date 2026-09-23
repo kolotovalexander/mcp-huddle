@@ -27,6 +27,7 @@ from starlette.responses import FileResponse, JSONResponse, StreamingResponse
 from . import bus
 from . import child_processes
 from . import spawn
+from . import swarm_pilot
 
 # Shown to LLM clients in the `initialize` response. Keep tight — every agent
 # session sees this verbatim. Goal: stop one-shot misuse, enforce anti-loop.
@@ -373,6 +374,137 @@ def room_round_advance(room_id: str, owner: str, label: str = "") -> str:
     """
     n = bus.advance_round(room_id, owner, label)
     return f"round {n} opened"
+
+
+# ── Bounded four-mode swarm pilot ─────────────────────────────────────────────
+
+@mcp.tool()
+def swarm_pilot_create(
+    name: str,
+    organizer: str,
+    goal: str,
+    mode: str,
+    members: list[str],
+    cwd: str = "",
+    workspace_strategy: str = "shared_only",
+    start: bool = True,
+) -> dict:
+    """Create a pilot room; start exact enabled registry members when requested.
+
+    ``start=False`` prepares durable state without launching CLI workers. This
+    is useful for a dry run and never implies that model work was performed.
+    The pilot records workspace_strategy but does not create Git worktrees.
+    """
+    if start:
+        unavailable = [name for name in members if spawn.get_enabled_spec(name) is None]
+        if unavailable:
+            raise ValueError(f"unavailable registry members: {unavailable}")
+    room_id = swarm_pilot.create(
+        name, organizer, goal, mode, members, cwd, workspace_strategy,
+    )
+    for name in members:
+        room_invite(room_id, name, by=organizer)
+    dispatch = swarm_pilot_pump(room_id) if start else []
+    return {"room_id": room_id, "mode": mode, "dispatched": dispatch,
+            "started": start}
+
+
+@mcp.tool()
+def swarm_pilot_status(room_id: str) -> dict:
+    """Read the pilot's compact, durable room state."""
+    return swarm_pilot.status(room_id)
+
+
+def _swarm_pilot_request(room_id: str, member: str) -> str:
+    state = swarm_pilot.status(room_id)
+    mode = state["mode"]
+    mode_instruction = {
+        "council": "Read the WHOLE cumulative room history before answering. "
+                   "Add a substantive view to earlier answers. The organizer speaks last.",
+        "team": "Work on a distinct part. Declare your responsibility and discuss "
+                "interfaces with peers. A member must claim reporter.",
+        "relay": "Continue the previous member's result, explicitly accept the "
+                 "handoff and your next responsibility. A member must claim reporter.",
+        "swarm": "Self-assign a useful part of the shared goal. Announce uncovered "
+                 "responsibilities to peers. A member must claim reporter.",
+    }[mode]
+    read_call = (
+        "messages_read(room_id, since_id=0, limit=10000, max_chars=0)"
+        if mode == "council" else "messages_read(room_id, since_id=0, limit=50)"
+    )
+    return (
+        f"Huddle swarm pilot, mode={mode}, round={state['round']}. "
+        f"You are {member}; peers are agents, not the human user.\n"
+        f"Goal: {state['goal']}\n{mode_instruction}\n"
+        f"Use {read_call} to read room context; "
+        "use swarm_pilot_record for responsibility/task/decision/fact. "
+        "Discuss disagreements substantively. Post your completed answer as "
+        "message_post(kind='result', reply_to=<this request id>), then call "
+        "swarm_pilot_round_done(room_id, member, summary). "
+        "A message alone does not complete the round."
+    )
+
+
+@mcp.tool()
+def swarm_pilot_pump(room_id: str) -> list[dict]:
+    """Dispatch the next pilot turn(s) according to the room mode.
+
+    Retries reuse the same idempotency key so a failed state write cannot
+    duplicate a request. No room metadata lock is held while posting messages.
+    """
+    state = swarm_pilot.status(room_id)
+    dispatched: list[dict] = []
+    for member in swarm_pilot.due_members(room_id):
+        if spawn.get_enabled_spec(member) is None:
+            dispatched.append({"member": member, "status": "unavailable"})
+            continue
+        msg_id = message_post(
+            room_id, state["organizer"], _swarm_pilot_request(room_id, member),
+            "request", to=member,
+            idempotency_key=f"swarm-pilot:{room_id}:{state['round']}:{member}",
+        )
+        swarm_pilot.mark_dispatched(room_id, member, msg_id)
+        dispatched.append({"member": member, "request_id": msg_id,
+                           "status": "dispatched"})
+    return dispatched
+
+
+@mcp.tool()
+def swarm_pilot_record(
+    room_id: str, member: str, kind: str, key: str, value: str,
+) -> dict:
+    """Record a responsibility, task, decision or fact in the pilot room."""
+    return swarm_pilot.record(room_id, member, kind, key, value)
+
+
+@mcp.tool()
+def swarm_pilot_round_done(room_id: str, member: str, summary: str) -> dict:
+    """Consciously finish this member's turn, then wake the next if sequential."""
+    state = swarm_pilot.status(room_id)
+    request_id = state["dispatched"].get(member)
+    if request_id is None:
+        raise ValueError("member has no dispatched request")
+    delivered = any(
+        msg.get("agent") == member and msg.get("kind") == "result"
+        and msg.get("reply_to") == request_id
+        for msg in bus._load_messages(room_id)
+    )
+    if not delivered:
+        raise ValueError("member must post a result for their request first")
+    updated = swarm_pilot.round_done(room_id, member, summary)
+    next_dispatch = swarm_pilot_pump(room_id)
+    return {"state": updated, "next_dispatch": next_dispatch}
+
+
+@mcp.tool()
+def swarm_pilot_finish(room_id: str, member: str, result: str) -> dict:
+    """Record the council organizer's last word or the swarm reporter's final."""
+    updated = swarm_pilot.finish(room_id, member, result)
+    message_post(
+        room_id, member, result, "final", to=updated["organizer"],
+        idempotency_key=f"swarm-pilot:{room_id}:final",
+    )
+    return updated
 
 
 @mcp.tool()

@@ -88,7 +88,7 @@ Dashboard: <http://127.0.0.1:8014/dashboard>. The dashboard reads the same files
 
 ## Features
 
-- **14 MCP tools** for room creation, messaging, rounds, lifecycle status, and consensus
+- **20 MCP tools** for room creation, messaging, rounds, lifecycle status, consensus, and a bounded four-mode swarm pilot
 - **JSONL storage** at `~/.mcp-huddle/rooms/` — grep-able, no DB
 - **Bounded writes and anti-loop guards**: `kind` enum, per-message dedup,
   a server-side circuit breaker, a persisted 120-messages/minute room limit,
@@ -128,6 +128,14 @@ These are the tools exposed over MCP (decorated with `@mcp.tool()` in
 | `propose_resolution` | Propose a resolution to end discussion; returns `resolution_id`. |
 | `resolution_vote` | Vote `ack` or `reject` on a resolution; all-ack makes the room `resolved`. |
 | `notify_register` | Register a notification filename (or compatible absolute direct child) under `$MCP_HUDDLE_HOME/notifications/` for addressed `kind=request` messages. |
+| `swarm_pilot_create` | Create a durable pilot room in council, team, relay, or swarm mode; optionally dispatch explicitly named enabled agents. Does not create a Git worktree. |
+| `swarm_pilot_pump` | Dispatch the next member(s): sequentially for council/relay, in parallel for team/swarm. |
+| `swarm_pilot_record` | Store a member-owned responsibility, task, decision, or fact in room metadata. |
+| `swarm_pilot_round_done` | Mark a member's turn done only after its addressed `result` was saved; dispatch the next sequential member. |
+| `swarm_pilot_status` | Read the compact pilot state, including responsibilities and final result. |
+| `swarm_pilot_finish` | Save the organizer's council conclusion or a reporter's team/relay/swarm conclusion. |
+
+The pilot tools are documented in [docs/SWARM_PILOT.md](docs/SWARM_PILOT.md).
 
 Room lifecycle operations (request-close, close, delete, close-session) remain
 human/server-owned. Agent work status is exposed through `room_status`; agents
