@@ -212,6 +212,36 @@ const I18N = {
     'chat.pickAnother': 'Pick another room from the sidebar',
     'activity.title': 'Agent activity',
     'activity.hint': 'Opens when you select a room with spawned agents',
+    'activity.liveTitle': 'Agent activity · live',
+    'activity.noStream': 'no live stream',
+    'activity.pending': 'waiting for events',
+    'activity.detail': 'Raw diagnostic log',
+    'activity.started': 'Started', 'activity.completed': 'Completed',
+    'activity.failed': 'Failed', 'activity.error': 'Error',
+    'activity.cancelled': 'Stopped', 'activity.retrying': 'Retrying',
+    'activity.liveStatus': 'Live', 'activity.resetStatus': 'Stream reset',
+    'activity.errorStatus': 'Stream error', 'activity.authStatus': 'Authentication required',
+    'activity.answer': 'Answer', 'activity.fragment': 'Answer fragment',
+    'activity.step': 'Step completed', 'activity.tool': 'Tool call',
+    'activity.output': 'Process output', 'activity.generic': 'Agent event',
+    'activity.emptyLog': 'Empty log entry',
+    'activity.agentStarted': 'Agent started', 'activity.roomWork': 'Working with room',
+    'activity.limitReached': 'Provider limit reached',
+    'activity.setupIssue': 'Agent setup needs attention',
+    'activity.unownedLease': 'Agent state is unclear',
+    'activity.staleLease': 'Agent stopped responding',
+    'activity.wakeFailed': 'Agent could not resume',
+    'activity.wakeFailures': 'Resume failures',
+    'status.open': 'Open', 'status.idle': 'Idle',
+    'status.busy': 'Working', 'status.online': 'Online',
+    'status.offline': 'Offline', 'status.closed': 'Closed',
+    'status.resolved': 'Resolved', 'status.closing': 'Closing',
+    'status.closing_requested': 'Closing requested',
+    'activity.internal': 'Internal step',
+    'roomMode.council': 'Council', 'roomMode.relay': 'Relay',
+    'roomMode.team': 'Team', 'roomMode.swarm': 'Swarm',
+    'roomMode.ordinary': 'Ordinary room',
+    'roomMode.title': 'Room mode',
     'sidebar.empty': 'No rooms yet. Call room_create() from an agent.',
     'set.appearance': 'Appearance', 'set.theme': 'Theme', 'set.skin': 'Design',
     'set.palette': 'Palette', 'set.lang': 'Language', 'set.mcp': 'MCP connection',
@@ -260,6 +290,36 @@ const I18N = {
     'chat.pickAnother': 'Выберите другую комнату слева',
     'activity.title': 'Активность агентов',
     'activity.hint': 'Откроется при выборе комнаты со spawned-агентами',
+    'activity.liveTitle': 'Активность агентов · онлайн',
+    'activity.noStream': 'нет live-потока',
+    'activity.pending': 'ждём события',
+    'activity.detail': 'Сырой диагностический лог',
+    'activity.started': 'Запущено', 'activity.completed': 'Завершено',
+    'activity.failed': 'Не выполнено', 'activity.error': 'Ошибка',
+    'activity.cancelled': 'Остановлено', 'activity.retrying': 'Повторная попытка',
+    'activity.liveStatus': 'Онлайн', 'activity.resetStatus': 'Поток сброшен',
+    'activity.errorStatus': 'Ошибка потока', 'activity.authStatus': 'Нужна авторизация',
+    'activity.answer': 'Ответ', 'activity.fragment': 'Фрагмент ответа',
+    'activity.step': 'Шаг завершён', 'activity.tool': 'Вызов инструмента',
+    'activity.output': 'Вывод процесса', 'activity.generic': 'Событие агента',
+    'activity.emptyLog': 'Пустая запись лога',
+    'activity.agentStarted': 'Агент запущен', 'activity.roomWork': 'Работа с комнатой',
+    'activity.limitReached': 'Достигнут лимит провайдера',
+    'activity.setupIssue': 'Проблема с настройкой агента',
+    'activity.unownedLease': 'Состояние агента неясно',
+    'activity.staleLease': 'Агент перестал отвечать',
+    'activity.wakeFailed': 'Не удалось возобновить агента',
+    'activity.wakeFailures': 'Ошибок возобновления',
+    'status.open': 'Открыта', 'status.idle': 'Без активности',
+    'status.busy': 'Работает', 'status.online': 'Онлайн',
+    'status.offline': 'Не в сети', 'status.closed': 'Закрыта',
+    'status.resolved': 'Решена', 'status.closing': 'Закрывается',
+    'status.closing_requested': 'Запрошено закрытие',
+    'activity.internal': 'Внутренний шаг',
+    'roomMode.council': 'Совет', 'roomMode.relay': 'Эстафета',
+    'roomMode.team': 'Команда', 'roomMode.swarm': 'Рой',
+    'roomMode.ordinary': 'Обычная комната',
+    'roomMode.title': 'Режим комнаты',
     'sidebar.empty': 'Пока нет комнат. Вызовите room_create() из агента.',
     'set.appearance': 'Оформление', 'set.theme': 'Тема', 'set.skin': 'Дизайн',
     'set.palette': 'Палитра', 'set.lang': 'Язык', 'set.mcp': 'MCP-подключение',
@@ -732,8 +792,29 @@ function toggleTree(key) {
   renderRooms();
 }
 
+const ROOM_MODES = new Set(['council', 'relay', 'team', 'swarm']);
+function roomModeBadge(room, showOrdinary = false) {
+  const mode = room && room.swarm_pilot && room.swarm_pilot.mode;
+  if (!ROOM_MODES.has(mode)) {
+    return showOrdinary ? el('span', {
+      class: 'room-mode room-mode-ordinary',
+      text: t('roomMode.ordinary'),
+      title: t('roomMode.title'),
+    }) : null;
+  }
+  return el('span', {
+    class: `room-mode room-mode-${mode}`,
+    text: t(`roomMode.${mode}`),
+    title: t('roomMode.title'),
+  });
+}
+
 function roomItem(r, label, indent = 46) {
   const active = r.id === currentRoom;
+  // Search results are intentionally compact and may omit swarm_pilot. Reuse
+  // the full /api/rooms record when it is already loaded in memory.
+  const fullRoom = rooms.find(room => room.id === r.id) || r;
+  const modeBadge = roomModeBadge(fullRoom);
   return el('div', {
     class: 'room-item' + (active ? ' active' : ''),
     dataset: {id: r.id, owner: r.owner},
@@ -742,6 +823,7 @@ function roomItem(r, label, indent = 46) {
     el('div', {class: 'room-name'}, [
       el('span', {class: `dot dot-${r.status}` + (r.status === 'open' ? ' pulse' : '')}),
       el('span', {text: label}),
+      modeBadge,
     ]),
     el('div', {class: 'room-meta', text: `${(r.participants || []).length}·${fmtTime(r.last_activity || r.created_at)}`}),
   ]);
@@ -860,6 +942,8 @@ function buildChatShell(room) {
     el('span', {class: 'hash', text: '#'}),
     el('span', {text: room.name || room.id || ''}),
   ];
+  const modeBadge = roomModeBadge(room, true);
+  if (modeBadge) titleChildren.push(modeBadge);
   if (isClosed) {
     titleChildren.push(el('span', {class: 'kind kind-close', text: 'closed'}));
   } else if (room.status === 'resolved') {
@@ -1179,10 +1263,15 @@ async function streamAgentEvents(baseUrl, name, stream) {
               }
               if (Number.isSafeInteger(parsedOffset)) stream.offset = parsedOffset;
               const node = status();
-              if (node) node.textContent = event.event === 'open' ? '● live' : '↻ stream reset';
+              if (node) node.textContent = event.event === 'open'
+                ? `● ${t('activity.liveStatus')}`
+                : `↻ ${t('activity.resetStatus')}`;
             } else if (event.event === 'error') {
               const node = status();
-              if (node) node.textContent = `× ${event.data || 'stream error'}`;
+              if (node) node.textContent = `× ${t('activity.errorStatus')}`;
+              if (event.data) {
+                appendAgentEvent(name, JSON.stringify({type: 'error', error: event.data}));
+              }
             } else {
               if (Number.isSafeInteger(parsedOffset)) {
                 if (parsedOffset <= stream.offset) continue;
@@ -1202,7 +1291,7 @@ async function streamAgentEvents(baseUrl, name, stream) {
             || (e && e.name === 'AbortError')) return;
         if (e && e.status === 401) {
           const node = status();
-          if (node) node.textContent = '× authentication required';
+          if (node) node.textContent = `× ${t('activity.authStatus')}`;
           showAuthRequired('Authentication expired. Enter the token to reconnect.');
           return;
         }
@@ -1211,7 +1300,7 @@ async function streamAgentEvents(baseUrl, name, stream) {
       stream.attempt = Math.min((stream.attempt || 0) + 1, 5);
       const delayMs = Math.min(1000 * (2 ** (stream.attempt - 1)), 10000);
       const node = status();
-      if (node) node.textContent = `↻ reconnecting in ${delayMs / 1000}s`;
+      if (node) node.textContent = `↻ ${t('activity.retrying')} · ${delayMs / 1000}s`;
       await reconnectDelay(stream, delayMs);
     }
   } finally {
@@ -1225,7 +1314,7 @@ function resetActivityPanel(emptyHint) {
   panel.innerHTML = '';
   if (emptyHint) {
     panel.appendChild(el('div', {class: 'activity-empty'}, [
-      el('div', {class: 'activity-empty-title', text: 'Agent activity'}),
+      el('div', {class: 'activity-empty-title', text: t('activity.title')}),
       el('div', {class: 'activity-empty-hint', text: emptyHint}),
     ]));
   }
@@ -1261,7 +1350,7 @@ async function attachAgentPanels(roomId) {
   }
 
   const wrap = el('div', {class: 'agent-panels', id: 'agent-panels'});
-  wrap.appendChild(el('div', {class: 'agent-panels-header', text: 'Agent activity (live)'}));
+  wrap.appendChild(el('div', {class: 'agent-panels-header', text: t('activity.liveTitle')}));
   const scroll = el('div', {class: 'agent-panels-scroll'});
   wrap.appendChild(scroll);
 
@@ -1276,7 +1365,7 @@ async function attachAgentPanels(roomId) {
                   title: `${name}: offline`}),
       el('span', {class: 'agent-panel-totals', id: `agent-totals-${name}`, text: ''}),
       el('span', {class: 'agent-panel-status', id: `agent-status-${name}`,
-                  text: isSpawned ? '·' : 'no live stream'}),
+                  text: isSpawned ? t('activity.pending') : t('activity.noStream')}),
       healthSpan,
     ]);
 
@@ -1314,10 +1403,10 @@ async function attachAgentPanels(roomId) {
 // Wake-health label for an agent panel (from /api/room_agents `health`).
 function activityHealthLabel(h) {
   if (!h) return '';
-  if (h.unowned_lease) return '⚠ unowned/unknown lease';
-  if (h.stale_lease) return '⚠ stale lease';
-  if (h.last_wake_failed) return `✗ wake failed (rc ${h.last_wake_rc})`;
-  if (h.wake_fail_count > 0) return `⚠ ${h.wake_fail_count} wake fail(s)`;
+  if (h.unowned_lease) return `⚠ ${t('activity.unownedLease')}`;
+  if (h.stale_lease) return `⚠ ${t('activity.staleLease')}`;
+  if (h.last_wake_failed) return `✗ ${t('activity.wakeFailed')}`;
+  if (h.wake_fail_count > 0) return `⚠ ${t('activity.wakeFailures')}: ${h.wake_fail_count}`;
   return '';
 }
 
@@ -1329,44 +1418,149 @@ function updateActivityStatuses(statuses) {
     const st = statuses[name] || 'offline';
     const cls = st === 'busy' ? 'busy' : st === 'online' ? 'online' : 'offline';
     dot.className = 'agent-status-dot ' + cls;
-    dot.title = `${name}: ${st}`;
+    dot.title = `${name}: ${t(`status.${st}`)}`;
   });
+}
+
+// Terminal runners emit a mixture of JSONL, plain stderr and ANSI control
+// sequences. Keep the raw record behind an explicit disclosure, while the
+// everyday panel shows a short human-readable status or result.
+function stripAnsi(value) {
+  return String(value == null ? '' : value)
+    .replace(/\x1B\][^\x07]*(?:\x07|\x1B\\)/g, '')
+    .replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '')
+    .replace(/\x9B[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, ' ');
+}
+
+function printableDiagnostic(value) {
+  return String(value == null ? '' : value)
+    .replace(/\x1B/g, '\\x1b')
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, c => `\\x${c.charCodeAt(0).toString(16).padStart(2, '0')}`);
+}
+
+function activityTypeLabel(type, object) {
+  const key = String(type || '').toLowerCase().replace(/\s+/g, '_');
+  if (object && object.item && object.item.type === 'agent_message') return t('activity.answer');
+  if (object && object.item && object.item.type === 'mcp_tool_call') return t('activity.tool');
+  if (object && object.item && object.item.type === 'command_execution') return t('activity.internal');
+  if (/agent[_ .-]?message|message/.test(key)) return t('activity.answer');
+  if (/delta|chunk|stream/.test(key)) return t('activity.fragment');
+  if (/tool[_ .-]?call|tool|function[_ .-]?call/.test(key)) return t('activity.tool');
+  if (/huddle[_ .-]|room[_ .-]|messages?[_ .-]?read|message[_ .-]?post/.test(key)) return t('activity.roomWork');
+  if (/thread[._-]?started|turn[._-]?started|spawn|^start|^started/.test(key)) return t('activity.started');
+  if (/thread[._-]?completed|turn[._-]?completed|^complete|^completed|finished|success/.test(key)) return t('activity.completed');
+  if (/failed|failure/.test(key)) return t('activity.failed');
+  if (/error|exception/.test(key)) return t('activity.error');
+  if (/rate.?limit|quota/.test(key)) return t('activity.limitReached');
+  if (/cancel|abort|stopped/.test(key)) return t('activity.cancelled');
+  if (/churn|retry|reconnect/.test(key)) return t('activity.retrying');
+  if (/output|stdout|stderr/.test(key)) return t('activity.output');
+  if (/item[._-]?completed|step[._-]?completed/.test(key)) return t('activity.step');
+  return t('activity.generic');
+}
+
+function activityPayload(object) {
+  if (!object || typeof object !== 'object') return '';
+  const item = object.item && typeof object.item === 'object' ? object.item : null;
+  const value = object.agent_message ?? object.message ?? object.delta ?? object.content
+    ?? object.text ?? object.error ?? object.reason ?? (item && (item.text || item.message));
+  if (value == null || typeof value === 'object') return '';
+  return stripAnsi(value).replace(/\s+/g, ' ').trim();
+}
+
+function visibleActivityPayload(payload, type) {
+  if (!payload) return '';
+  if (/usage limit|rate.?limit|quota exceeded/i.test(payload)) return t('activity.limitReached');
+  if (/failed to parse hooks config|unknown field.*expected/i.test(payload)) return t('activity.setupIssue');
+  if (/^(?:item[._-]?completed|step[._-]?completed|thread[._-]?started|turn[._-]?started)$/i.test(type)) return '';
+  if (/^\s*(?:\{|\[|\/Users\/|\/private\/)/.test(payload)) return '';
+  return payload.slice(0, 220);
+}
+
+function plainActivityLabel(clean) {
+  // OpenCode and shell bridges often print a startup banner or a tool call as
+  // plain text. Do not leak their command/JSON arguments into the default UI.
+  if (/reading additional input from stdin|waiting for (?:additional )?input from stdin/i.test(clean)) {
+    return t('activity.agentStarted');
+  }
+  if (/^>\s*(build|run|start|model)\b/i.test(clean)
+      || /\b(model|reasoning)\s*[·:]/i.test(clean)) {
+    return t('activity.agentStarted');
+  }
+  if (/\b(?:huddle|room)_(?:messages?_read|message_post|room_(?:list|create|status))\b/i.test(clean)
+      || /\b(?:messages?_read|message_post|room_list|room_create)\b/i.test(clean)) {
+    return t('activity.roomWork');
+  }
+  if (/^\s*(?:tool|function|calling)\b/i.test(clean)) return t('activity.tool');
+  if (/^\s*(?:error|failed|failure|exception)\b/i.test(clean)) return t('activity.error');
+  // Antigravity/CLI bridges may emit a path or bare room identifier as a
+  // transport line. A prose line that mentions a path remains visible.
+  if (/^(?:file:\/\/\/|\/(?:Users|private|tmp|var)\/)[^\n]+$/i.test(clean)
+      || /^room_[a-z0-9_-]+$/i.test(clean)
+      || /^(?:room_id|session_id|request_id)\s*[:=]\s*\S+$/i.test(clean)) {
+    return t('activity.internal');
+  }
+  return '';
+}
+
+function activityPresentation(raw) {
+  const clean = stripAnsi(raw).trim();
+  if (!clean) return null;
+  let object = null;
+  try { object = JSON.parse(clean); } catch (_) {}
+  if (object && typeof object === 'object') {
+    const type = object.type || object.event || object.status || '';
+    const label = activityTypeLabel(type, object);
+    const payload = visibleActivityPayload(activityPayload(object), type);
+    const suffix = payload ? `: ${payload}` : '';
+    return {
+      summary: label === t('activity.generic') && !payload ? '' : `${label}${suffix}`,
+      raw: JSON.stringify(object, null, 2),
+    };
+  }
+  // Plain process output is useful when readable, but never expose a raw
+  // JSON-looking line as if it were a user-facing result.
+  if (/^[\[{]/.test(clean)) {
+    return {summary: t('activity.generic'), raw};
+  }
+  const label = plainActivityLabel(clean);
+  if (label) return {summary: label, raw};
+  return {summary: `${t('activity.output')}: ${clean.slice(0, 420)}`, raw};
+}
+
+function appendAgentDiagnostic(list, raw) {
+  let details = list.querySelector('.agent-diagnostics');
+  if (!details) {
+    details = el('details', {class: 'agent-diagnostics'}, [
+      el('summary', {text: t('activity.detail')}),
+      el('pre'),
+    ]);
+    details._records = [];
+    list.appendChild(details);
+  }
+  details._records.push(printableDiagnostic(raw));
+  while (details._records.length > 200) details._records.shift();
+  details.querySelector('summary').textContent = `${t('activity.detail')} · ${details._records.length}`;
+  details.querySelector('pre').textContent = details._records.join('\n\n');
 }
 
 function appendAgentEvent(agentName, raw) {
   const list = document.getElementById(`agent-events-${agentName}`);
   if (!list) return;
-  let summary = raw;
-  let detail = null;
-  try {
-    const obj = JSON.parse(raw);
-    // Codex --json events: {type, agent_message?, delta?, ...}
-    // Runner events (MiMo / DeepSeek / Qwen via *_runner): {type, error?,
-    //   reason?, model?, message_id?, ...}. Antigravity (agy -p) is plain text.
-    if (obj.type) {
-      summary = obj.type;
-      // Lines word-wrap in the panel now, so we can afford a fuller preview.
-      if (obj.agent_message) summary += ': ' + String(obj.agent_message).slice(0, 400);
-      else if (obj.delta) summary += ': ' + String(obj.delta).slice(0, 400);
-      else if (obj.content) summary += ': ' + String(obj.content).slice(0, 400);
-      else if (obj.error) summary += ': ' + String(obj.error).slice(0, 400);
-      else if (obj.reason) summary += ': ' + String(obj.reason).slice(0, 400);
-      else if (obj.model) summary += ': ' + String(obj.model).slice(0, 120);
-      detail = JSON.stringify(obj, null, 2);
-    }
-  } catch(e) {
-    // Not JSON — show as plain text (e.g. stderr lines).
+  const view = activityPresentation(raw);
+  if (!view) return;
+  const keepAtEnd = list.scrollHeight - list.scrollTop - list.clientHeight < 32;
+  if (view.summary) {
+    const line = el('div', {class: 'agent-event'}, [
+      el('span', {class: 'agent-event-summary', text: view.summary}),
+    ]);
+    const diagnostics = list.querySelector('.agent-diagnostics');
+    if (diagnostics) list.insertBefore(line, diagnostics);
+    else list.appendChild(line);
   }
-  const line = el('div', {class: 'agent-event'}, [
-    el('span', {class: 'agent-event-summary', text: summary}),
-  ]);
-  if (detail) {
-    line.title = detail;
-  }
-  list.appendChild(line);
-  // Auto-scroll: keep last 200 events to avoid runaway DOM.
-  while (list.children.length > 200) list.removeChild(list.firstChild);
-  list.scrollTop = list.scrollHeight;
+  appendAgentDiagnostic(list, raw);
+  if (keepAtEnd) list.scrollTop = list.scrollHeight;
 }
 
 function renderOne(m) {
@@ -1391,6 +1585,7 @@ function renderOne(m) {
     renderAgentTotalsBadge(m.agent);
   }
   const line = el('div', {class: 'msg-line'}, [
+    avatar(m.agent, 'avatar-inline'),
     el('span', {class: 'msg-name', text: m.agent}),
     m.to ? el('span', {class: 'msg-to', text: '→ ' + m.to}) : null,
     el('span', {class: `kind kind-${m.kind}`, text: m.kind}),
@@ -1426,7 +1621,6 @@ function renderOne(m) {
     class: `msg ${agentCls(m.agent)} kind-${m.kind}`,
     dataset: {id: String(m.id)},
   }, [
-    avatar(m.agent),
     el('div', {class: 'msg-content'}, [line, bubble]),
   ]);
 
@@ -1449,7 +1643,7 @@ function renderChatMeta(room, statuses) {
   meta.innerHTML = '';
   const parts = (room.participants || []);
   meta.appendChild(document.createTextNode(parts.join(' · ') + ' · '));
-  meta.appendChild(el('span', {class: 'msg-time', text: room.status}));
+  meta.appendChild(el('span', {class: 'msg-time', text: t(`status.${room.status}`)}));
   if (room.session_id) {
     meta.appendChild(document.createTextNode(' · '));
     meta.appendChild(el('span', {class: 'msg-meta', text: 'sid: ' + room.session_id, title: 'session_id'}));
@@ -1457,7 +1651,7 @@ function renderChatMeta(room, statuses) {
   for (const [agent, st] of Object.entries(statuses || {})) {
     if (!st || st === 'online') continue;
     meta.appendChild(document.createTextNode(' '));
-    meta.appendChild(el('span', {class: `kind kind-${st === 'busy' ? 'busy' : 'comment'}`, text: `${agent}: ${st}`}));
+    meta.appendChild(el('span', {class: `kind kind-${st === 'busy' ? 'busy' : 'comment'}`, text: `${agent}: ${t(`status.${st}`)}`}));
   }
 }
 
