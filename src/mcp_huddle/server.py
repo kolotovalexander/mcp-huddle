@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import json
 import os
+import signal
 import stat
 import sys
 import threading
@@ -496,10 +497,21 @@ def _stop_completed_pilot_turn(
         return
     if child_processes.state(room_id, wake_id) != "alive":
         return
+    _merge_agent_meta(room_id, member, {"intentional_stop_wake_id": wake_id})
     result = child_processes.terminate(room_id, wake_id)
     if result == "denied":
         print(f"[huddle] could not stop completed pilot turn "
               f"({member}@{room_id}, wake={wake_id})", flush=True)
+    if result != "sent":
+        # A vanished/unowned child was not intentionally signalled. Remove
+        # only this generation's marker so a later wake cannot inherit it.
+        def clear_marker(meta: dict) -> dict:
+            current = (meta.get("agent_meta") or {}).get(member) or {}
+            if (current.get("wake_id") == wake_id
+                    and current.get("intentional_stop_wake_id") == wake_id):
+                current.pop("intentional_stop_wake_id", None)
+            return meta
+        bus._update_meta_locked(room_id, clear_marker)
 
 
 def _schedule_completed_pilot_turn_exit(
@@ -3023,19 +3035,26 @@ def _on_wake_exit(room_id: str, agent_name: str, wake_id: str,
         # notice when the exact child eventually exits.
         already_announced = True
     rc = -999 if returncode is None else int(returncode)
+    intentional_pilot_stop = (
+        info.get("intentional_stop_wake_id") == wake_id
+        and rc == -int(signal.SIGTERM)
+    )
     fail_count = int(info.get("wake_fail_count", 0) or 0)
     updates = {
         "last_wake_rc": rc,
         "last_wake_exit_at": int(time.time()),
-        "wake_fail_count": (fail_count + 1) if rc != 0 else 0,
+        "wake_fail_count": (
+            fail_count if intentional_pilot_stop
+            else (fail_count + 1) if rc != 0 else 0
+        ),
     }
-    if rc == 0:
+    if rc == 0 and not intentional_pilot_stop:
         # A clean turn clears any prior rate-limit cooldown so the agent can be
         # woken again immediately.
         updates["rate_limited_until"] = 0
     _merge_agent_meta(room_id, agent_name, updates)
     rate_limit_announced = False
-    if not already_announced and rc != 0:
+    if not already_announced and rc != 0 and not intentional_pilot_stop:
         try:
             rate_limit_announced = _handle_rate_limit_on_exit(room_id, agent_name)
         except Exception as exc:
@@ -3053,7 +3072,8 @@ def _on_wake_exit(room_id: str, agent_name: str, wake_id: str,
     else:
         final_phase = "unavailable"
     _set_agent_phase(room_id, agent_name, final_phase)
-    if not already_announced and not rate_limit_announced:
+    if (not already_announced and not rate_limit_announced
+            and not intentional_pilot_stop):
         try:
             _announce_noreply_on_exit(
                 room_id, agent_name,

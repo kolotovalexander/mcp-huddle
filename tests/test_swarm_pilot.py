@@ -186,6 +186,123 @@ def test_round_done_timer_still_releases_reporter_after_peers_finish(
     assert terminated == [(room, "wake-A-1")]
 
 
+def test_intentional_pilot_stop_keeps_exit_code_without_counting_failure(
+    isolated_home, monkeypatch,
+):
+    monkeypatch.setattr(server, "_wake_agents_for_request", lambda *args: [])
+    monkeypatch.setattr(server.child_processes, "state",
+                        lambda room, handle: "alive" if handle == "wake-A-1"
+                        else "unknown")
+    terminated = []
+    monkeypatch.setattr(server.child_processes, "terminate",
+                        lambda room, handle: terminated.append((room, handle)) or "sent")
+    rate_checks = []
+    noreply_checks = []
+    drains = []
+    monkeypatch.setattr(server, "_handle_rate_limit_on_exit",
+                        lambda *args: rate_checks.append(args) or False)
+    monkeypatch.setattr(server, "_announce_noreply_on_exit",
+                        lambda *args: noreply_checks.append(args))
+    monkeypatch.setattr(server, "_drain_pending_wakes",
+                        lambda *args: drains.append(args))
+
+    room = swarm_pilot.create(
+        "pilot", "Organizer", "Decide", "team", ["A", "B"],
+    )
+    request_id = server.message_post(
+        room, "Organizer", "Do part A", "request", to="A",
+    )
+    swarm_pilot.mark_dispatched(room, "A", request_id)
+    server.message_post(room, "A", "Part A done", "result", to="Organizer",
+                        reply_to=request_id)
+    swarm_pilot.round_done(room, "A", "done")
+    server._merge_agent_meta(room, "A", {
+        "wake_id": "wake-A-1", "wake_claim_id": "wake-A-1",
+        "wake_claim_msg_id": request_id, "last_wake_msg_id": request_id,
+        "last_wake_pid": 91234, "wake_fail_count": 2,
+    })
+
+    server._stop_completed_pilot_turn(room, "A", "wake-A-1", "round_done")
+    stopped_info = (bus.get_room_info(room)["agent_meta"]["A"])
+    assert terminated == [(room, "wake-A-1")]
+    assert stopped_info["intentional_stop_wake_id"] == "wake-A-1"
+
+    server._on_wake_exit(room, "A", "wake-A-1", -15)
+
+    info = bus.get_room_info(room)["agent_meta"]["A"]
+    assert info["last_wake_rc"] == -15  # Keep the real signal exit code.
+    assert info["wake_fail_count"] == 2
+    assert "wake_claim_id" not in info
+    assert bus.get_status_details(room)["A"]["phase"] == "completed"
+    assert not rate_checks and not noreply_checks
+    assert drains == [(room, "A")]
+
+
+def test_pilot_stop_never_uses_pid_or_marks_a_new_wake(
+    isolated_home, monkeypatch,
+):
+    room = swarm_pilot.create(
+        "pilot", "Organizer", "Decide", "team", ["A", "B"],
+    )
+    request_id = server.message_post(
+        room, "Organizer", "Do part A", "request", to="A",
+    )
+    swarm_pilot.mark_dispatched(room, "A", request_id)
+    server.message_post(room, "A", "Part A done", "result", to="Organizer",
+                        reply_to=request_id)
+    swarm_pilot.round_done(room, "A", "done")
+    server._merge_agent_meta(room, "A", {
+        "wake_id": "new-wake", "wake_claim_id": "new-wake",
+        "wake_claim_msg_id": request_id, "last_wake_msg_id": request_id,
+        "last_wake_pid": 91234,
+    })
+    terminate_calls = []
+    # A persisted PID is diagnostic only; this exact generation is not locally owned.
+    monkeypatch.setattr(server.child_processes, "state", lambda *args: "unknown")
+    monkeypatch.setattr(server.child_processes, "terminate",
+                        lambda *args: terminate_calls.append(args) or "sent")
+
+    server._stop_completed_pilot_turn(room, "A", "new-wake", "round_done")
+    server._stop_completed_pilot_turn(room, "A", "old-wake", "round_done")
+    server._on_wake_exit(room, "A", "old-wake", -15)
+
+    info = bus.get_room_info(room)["agent_meta"]["A"]
+    assert not terminate_calls
+    assert "intentional_stop_wake_id" not in info
+    assert info["wake_id"] == "new-wake"
+    assert info.get("last_wake_rc") is None
+
+
+def test_pilot_stop_marker_does_not_hide_a_non_sigterm_exit(
+    isolated_home, monkeypatch,
+):
+    rate_checks = []
+    noreply_checks = []
+    monkeypatch.setattr(server, "_handle_rate_limit_on_exit",
+                        lambda *args: rate_checks.append(args) or False)
+    monkeypatch.setattr(server, "_announce_noreply_on_exit",
+                        lambda *args: noreply_checks.append(args))
+    monkeypatch.setattr(server, "_drain_pending_wakes", lambda *args: None)
+    room = swarm_pilot.create(
+        "pilot", "Organizer", "Decide", "team", ["A", "B"],
+    )
+    request_id = server.message_post(
+        room, "Organizer", "Do part A", "request", to="A",
+    )
+    server._merge_agent_meta(room, "A", {
+        "wake_id": "wake-A-1", "last_wake_msg_id": request_id,
+        "wake_fail_count": 2, "intentional_stop_wake_id": "wake-A-1",
+    })
+
+    server._on_wake_exit(room, "A", "wake-A-1", 1)
+
+    info = bus.get_room_info(room)["agent_meta"]["A"]
+    assert info["last_wake_rc"] == 1
+    assert info["wake_fail_count"] == 3
+    assert rate_checks == [(room, "A")]
+    assert noreply_checks
+
+
 def test_round_done_does_not_stop_last_member_or_unowned_process(
     isolated_home, monkeypatch,
 ):
