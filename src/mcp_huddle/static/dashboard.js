@@ -254,7 +254,7 @@ const I18N = {
     'activity.liveTitle': 'Agent activity · live',
     'activity.noStream': 'no live stream',
     'activity.pending': 'waiting for events',
-    'activity.detail': 'Raw diagnostic log',
+    'activity.detail': 'Technical details',
     'activity.started': 'Started', 'activity.completed': 'Completed',
     'activity.failed': 'Failed', 'activity.error': 'Error',
     'activity.cancelled': 'Stopped', 'activity.retrying': 'Retrying',
@@ -263,6 +263,10 @@ const I18N = {
     'activity.answer': 'Answer', 'activity.fragment': 'Answer fragment',
     'activity.step': 'Step completed', 'activity.tool': 'Tool call',
     'activity.output': 'Process output', 'activity.generic': 'Agent event',
+    'activity.transcript': 'Room conversation', 'activity.noParticipants': 'No participants in this room',
+    'activity.loadAgentsFailed': 'Could not load participants',
+    'activity.ownerHint': 'Room organizer. Their messages appear in the room conversation.',
+    'activity.staticHint': 'Participant has no live event stream.',
     'activity.emptyLog': 'Empty log entry',
     'activity.agentStarted': 'Agent started', 'activity.roomWork': 'Working with room',
     'activity.limitReached': 'Provider limit reached',
@@ -361,7 +365,7 @@ const I18N = {
     'activity.liveTitle': 'Активность агентов · онлайн',
     'activity.noStream': 'нет live-потока',
     'activity.pending': 'ждём события',
-    'activity.detail': 'Сырой диагностический лог',
+    'activity.detail': 'Технические подробности',
     'activity.started': 'Запущено', 'activity.completed': 'Завершено',
     'activity.failed': 'Не выполнено', 'activity.error': 'Ошибка',
     'activity.cancelled': 'Остановлено', 'activity.retrying': 'Повторная попытка',
@@ -370,6 +374,10 @@ const I18N = {
     'activity.answer': 'Ответ', 'activity.fragment': 'Фрагмент ответа',
     'activity.step': 'Шаг завершён', 'activity.tool': 'Вызов инструмента',
     'activity.output': 'Вывод процесса', 'activity.generic': 'Событие агента',
+    'activity.transcript': 'Переписка комнаты', 'activity.noParticipants': 'В комнате нет участников',
+    'activity.loadAgentsFailed': 'Не удалось загрузить участников',
+    'activity.ownerHint': 'Организатор комнаты. Его сообщения видны в переписке комнаты.',
+    'activity.staticHint': 'У участника нет live-потока событий.',
     'activity.emptyLog': 'Пустая запись лога',
     'activity.agentStarted': 'Агент запущен', 'activity.roomWork': 'Работа с комнатой',
     'activity.limitReached': 'Достигнут лимит провайдера',
@@ -819,6 +827,11 @@ function setLang(lang) {
   try { localStorage.setItem('agentbus-lang', lang); } catch (_) {}
   applyI18n();
   if (roomData) renderSwarmPilot(roomData);
+  document.querySelectorAll('.agent-transcript').forEach(transcript => {
+    const content = transcript.querySelector('.agent-transcript-scroll');
+    const summary = transcript.querySelector('summary');
+    if (content && summary) summary.textContent = `${t('activity.transcript')} · ${content.querySelectorAll('.agent-transcript-message').length}`;
+  });
   const pop = document.getElementById('settings-popover');
   if (pop) buildSettingsPopover(pop);  // rebuild so the popover's own labels update
 }
@@ -905,7 +918,7 @@ function roomItem(r, label, indent = 46) {
   // Search results are intentionally compact and may omit swarm_pilot. Reuse
   // the full /api/rooms record when it is already loaded in memory.
   const fullRoom = rooms.find(room => room.id === r.id) || r;
-  const modeBadge = roomModeBadge(fullRoom);
+  const modeBadge = roomModeBadge(fullRoom, true);
   return el('div', {
     class: 'room-item' + (active ? ' active' : ''),
     dataset: {id: r.id, owner: r.owner},
@@ -1343,7 +1356,7 @@ function closeAgentStreams() {
     if (stream.retryResolve) stream.retryResolve();
   }
   agentStreams = {};
-  resetActivityPanel('Откроется при выборе комнаты со spawned-агентами');
+  resetActivityPanel(t('activity.hint'));
 }
 
 function parseSSEText(state, text, finish = false) {
@@ -1521,14 +1534,19 @@ function resetActivityPanel(emptyHint) {
 }
 
 async function attachAgentPanels(roomId) {
+  const attachGeneration = activityStreamGeneration;
   let resp;
   try {
     resp = await apiFetch('/api/room_agents?room_id=' + encodeURIComponent(roomId));
   } catch(e) {
-    resetActivityPanel('Не удалось загрузить агентов');
+    if (roomId === currentRoom && attachGeneration === activityStreamGeneration) {
+      resetActivityPanel(t('activity.loadAgentsFailed'));
+    }
     return;
   }
+  if (roomId !== currentRoom || attachGeneration !== activityStreamGeneration) return;
   const {agents, health} = await resp.json();
+  if (roomId !== currentRoom || attachGeneration !== activityStreamGeneration) return;
   const spawned = agents || {};
   const healthMap = health || {};
   if (roomId === currentRoom) lastHealth = healthMap;
@@ -1545,7 +1563,7 @@ async function attachAgentPanels(roomId) {
   for (const p of Object.keys(spawned)) { if (!seen.has(p)) { seen.add(p); participants.push(p); } }
 
   if (!participants.length) {
-    resetActivityPanel('В этой комнате нет участников');
+    resetActivityPanel(t('activity.noParticipants'));
     return;
   }
 
@@ -1569,16 +1587,16 @@ async function attachAgentPanels(roomId) {
       healthSpan,
     ]);
 
+    const transcript = buildAgentTranscript(name, roomMessages);
     const body = isSpawned
       ? el('div', {class: 'agent-events', id: `agent-events-${name}`})
       : el('div', {class: 'agent-panel-hint', text: name === room.owner
-          ? 'Оркестратор комнаты. Его реплики видны в чате слева — huddle не spawn-ит owner-а, поэтому отдельного live-лога событий у него нет.'
-          : 'Участник без spawned-процесса: live-потока событий нет, только статус.'});
+          ? t('activity.ownerHint') : t('activity.staticHint')});
 
     const detailsEl = el('details', {
       class: 'agent-panel' + (isSpawned ? '' : ' static'),
       dataset: {agent: name}, open: '', style: `--agent-c:${agentColor(name)}`,
-    }, [summary, body]);
+    }, [summary, transcript, body]);
     scroll.appendChild(detailsEl);
 
     if (isSpawned) {
@@ -1641,6 +1659,7 @@ function printableDiagnostic(value) {
 
 function activityTypeLabel(type, object) {
   const key = String(type || '').toLowerCase().replace(/\s+/g, '_');
+  if (object && object.agent_message != null) return t('activity.answer');
   if (object && object.item && object.item.type === 'agent_message') return t('activity.answer');
   if (object && object.item && object.item.type === 'mcp_tool_call') return t('activity.tool');
   if (object && object.item && object.item.type === 'command_execution') return t('activity.internal');
@@ -1669,11 +1688,15 @@ function activityPayload(object) {
   return stripAnsi(value).replace(/\s+/g, ' ').trim();
 }
 
-function visibleActivityPayload(payload, type) {
+function visibleActivityPayload(payload, type, object) {
   if (!payload) return '';
   if (/usage limit|rate.?limit|quota exceeded/i.test(payload)) return t('activity.limitReached');
   if (/failed to parse hooks config|unknown field.*expected/i.test(payload)) return t('activity.setupIssue');
   if (/^(?:item[._-]?completed|step[._-]?completed|thread[._-]?started|turn[._-]?started)$/i.test(type)) return '';
+  const answer = (object && (object.agent_message != null
+    || (object.item && object.item.type === 'agent_message')))
+    || /agent[_ .-]?message|^answer$/i.test(String(type || ''));
+  if (!answer) return '';
   if (/^\s*(?:\{|\[|\/Users\/|\/private\/)/.test(payload)) return '';
   return payload.slice(0, 220);
 }
@@ -1712,21 +1735,24 @@ function activityPresentation(raw) {
   if (object && typeof object === 'object') {
     const type = object.type || object.event || object.status || '';
     const label = activityTypeLabel(type, object);
-    const payload = visibleActivityPayload(activityPayload(object), type);
+    const payload = visibleActivityPayload(activityPayload(object), type, object);
+    if (payload === t('activity.limitReached') || payload === t('activity.setupIssue')) {
+      return {summary: payload, raw: JSON.stringify(object, null, 2)};
+    }
     const suffix = payload ? `: ${payload}` : '';
     return {
       summary: label === t('activity.generic') && !payload ? '' : `${label}${suffix}`,
       raw: JSON.stringify(object, null, 2),
     };
   }
-  // Plain process output is useful when readable, but never expose a raw
-  // JSON-looking line as if it were a user-facing result.
+  // Keep unclassified process output out of the readable stream. It remains
+  // available in the disclosure below for diagnosis.
   if (/^[\[{]/.test(clean)) {
-    return {summary: t('activity.generic'), raw};
+    return {summary: '', raw};
   }
   const label = plainActivityLabel(clean);
   if (label) return {summary: label, raw};
-  return {summary: `${t('activity.output')}: ${clean.slice(0, 420)}`, raw};
+  return {summary: '', raw};
 }
 
 function appendAgentDiagnostic(list, raw) {
@@ -1761,6 +1787,55 @@ function appendAgentEvent(agentName, raw) {
   }
   appendAgentDiagnostic(list, raw);
   if (keepAtEnd) list.scrollTop = list.scrollHeight;
+}
+
+function transcriptMessagesFor(name, messages) {
+  return messages.filter(m => m.agent === name || m.to === name || m.to === 'all');
+}
+
+function buildAgentTranscript(name, messages) {
+  const relevant = transcriptMessagesFor(name, messages || []);
+  const content = el('div', {class: 'agent-transcript-scroll'});
+  for (const message of relevant) content.appendChild(agentTranscriptMessage(message));
+  content.dataset.lastId = String((messages || []).reduce((max, m) => Math.max(max, Number(m.id) || 0), 0));
+  return el('details', {class: 'agent-transcript', dataset: {agent: name}}, [
+    el('summary', {text: `${t('activity.transcript')} · ${relevant.length}`}),
+    content,
+  ]);
+}
+
+function agentTranscriptMessage(message) {
+  return el('article', {class: 'agent-transcript-message'}, [
+    el('div', {class: 'agent-transcript-meta', text: `${message.agent || '—'} · ${messageKindLabel(message.kind)} · ${fmtTime(message.timestamp)}`}),
+    el('div', {class: 'agent-transcript-body', text: message.body || ''}),
+  ]);
+}
+
+function updateAgentTranscripts(messages) {
+  const additions = (messages || []).slice();
+  if (!additions.length) return;
+  document.querySelectorAll('.agent-transcript').forEach(transcript => {
+    const name = transcript.dataset.agent;
+    const content = transcript.querySelector('.agent-transcript-scroll');
+    if (!content) return;
+    let lastId = Number(content.dataset.lastId) || 0;
+    const keepAtEnd = content.scrollHeight - content.scrollTop - content.clientHeight < 32;
+    for (const message of additions) {
+      const id = Number(message.id) || 0;
+      if (id <= lastId) continue;
+      if (message.agent === name || message.to === name || message.to === 'all') {
+        content.appendChild(agentTranscriptMessage(message));
+        const summary = transcript.querySelector('summary');
+        if (summary) {
+          const count = content.querySelectorAll('.agent-transcript-message').length;
+          summary.textContent = `${t('activity.transcript')} · ${count}`;
+        }
+      }
+      lastId = Math.max(lastId, id);
+    }
+    content.dataset.lastId = String(lastId);
+    if (keepAtEnd) content.scrollTop = content.scrollHeight;
+  });
 }
 
 function renderOne(m) {
@@ -2058,10 +2133,14 @@ function renderChatMeta(room, statuses) {
 
 async function fetchMessages(initial) {
   if (!currentRoom) return;
+  const requestedRoom = currentRoom;
   try {
-    const url = `/api/messages_json?room_id=${encodeURIComponent(currentRoom)}&since_id=${lastId}`;
+    const url = `/api/messages_json?room_id=${encodeURIComponent(requestedRoom)}&since_id=${lastId}`;
     const resp = await apiFetch(url);
     const data = await resp.json();
+    // A fetch from the previous room can finish after close/delete or a room
+    // switch. It must not resurrect stale room state or move the footer back.
+    if (requestedRoom !== currentRoom) return;
 
     if (data.room) roomData = data.room;
     lastStatuses = data.statuses || {};
@@ -2079,6 +2158,7 @@ async function fetchMessages(initial) {
     const msgs = data.messages || [];
     for (const m of msgs) renderOne(m);
     roomMessages.push(...msgs);
+    updateAgentTranscripts(msgs);
     if (msgs.length) lastId = msgs[msgs.length-1].id;
     if (roomData) {
       renderChatMeta(roomData, lastStatuses);
@@ -2123,6 +2203,7 @@ function clearSelectedRoom() {
   lastPhases = {};
   lastHealth = {};
   lastId = 0;
+  agentMetaTotals = {};
   history.replaceState(null, '', `${location.pathname}${location.search}`);
   updateFooterStatus();
 }
