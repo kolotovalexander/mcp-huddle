@@ -443,7 +443,9 @@ def _swarm_pilot_request(room_id: str, member: str) -> str:
         if mode == "council" else "messages_read(room_id, since_id=0, limit=50)"
     )
     final_instruction = (
-        " After round_done, end this CLI turn; do not poll or wait for peers. "
+        " To claim reporter, call swarm_pilot_record(room_id, member, "
+        "kind='responsibility', key='reporter', value='final reporter'). "
+        "After round_done, end this CLI turn; do not poll or wait for peers. "
         "Huddle will wake the chosen reporter with a separate addressed final "
         "request after everyone is done. Only then call swarm_pilot_finish."
         if mode != "council" else

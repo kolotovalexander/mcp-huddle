@@ -76,6 +76,7 @@ def test_council_server_pump_waits_for_real_result(isolated_home, monkeypatch):
 def test_member_brief_exits_after_round_done_instead_of_polling(isolated_home):
     room = swarm_pilot.create("pilot", "Organizer", "Decide", "swarm", ["A", "B"])
     brief = server._swarm_pilot_request(room, "A")
+    assert "kind='responsibility', key='reporter'" in brief
     assert "end this CLI turn; do not poll or wait for peers" in brief
     assert "separate addressed final request" in brief
 
