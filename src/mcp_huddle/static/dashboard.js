@@ -220,6 +220,12 @@ const I18N = {
     'lanes.limited': 'Rate limited', 'lanes.stuck': 'Stalled',
     'lanes.messages': 'messages', 'round.discussion': 'Discussion', 'round.label': 'Round',
     'lanes.legend': '□ request  ■ answer  • comment',
+    'lanes.now': 'now', 'lanes.nowFar': 'now — no messages since', 'lanes.noPosts': 'has not posted yet',
+    'lanes.pending': 'request', 'lanes.unanswered': 'no reply to', 'lanes.from': 'from',
+    'lanes.last': 'last', 'lanes.until': 'until', 'lanes.active': 'active',
+    'kind.request': 'request', 'kind.comment': 'comment', 'kind.ack': 'acknowledged',
+    'kind.busy': 'busy', 'kind.result': 'answer', 'kind.final': 'final',
+    'kind.system': 'system', 'kind.close': 'closed', 'kind.other': 'message',
     'compose.as': 'From Human', 'compose.request': 'Request', 'compose.comment': 'Comment',
     'compose.system': 'Important', 'compose.to': 'To', 'compose.all': 'Everyone',
     'compose.hint': 'A request wakes its recipients. A comment does not.',
@@ -317,6 +323,12 @@ const I18N = {
     'lanes.limited': 'Уперся в лимит', 'lanes.stuck': 'Завис',
     'lanes.messages': 'сообщений', 'round.discussion': 'Обсуждение', 'round.label': 'Раунд',
     'lanes.legend': '□ запрос  ■ ответ  • реплика',
+    'lanes.now': 'сейчас', 'lanes.nowFar': 'сейчас — сообщений не было с', 'lanes.noPosts': 'ещё не писал',
+    'lanes.pending': 'запрос', 'lanes.unanswered': 'без ответа на', 'lanes.from': 'от',
+    'lanes.last': 'последнее', 'lanes.until': 'до', 'lanes.active': 'в работе',
+    'kind.request': 'запрос', 'kind.comment': 'комментарий', 'kind.ack': 'принял',
+    'kind.busy': 'занят', 'kind.result': 'ответ', 'kind.final': 'итог',
+    'kind.system': 'системное', 'kind.close': 'закрытие', 'kind.other': 'сообщение',
     'compose.as': 'От имени Human', 'compose.request': 'Запрос', 'compose.comment': 'Комментарий',
     'compose.system': 'Важное', 'compose.to': 'Кому', 'compose.all': 'Всем',
     'compose.hint': 'Запрос разбудит адресатов. Комментарий — нет.',
@@ -529,6 +541,14 @@ function messageCount(n) {
   return `${n} ${n === 1 ? 'message' : t('room.messages')}`;
 }
 
+function messageKindLabel(kind) {
+  return t(`kind.${kind}`) === `kind.${kind}` ? t('kind.other') : t(`kind.${kind}`);
+}
+
+function messageRecipientLabel(to) {
+  return to === 'all' ? t('compose.all').toLowerCase() : to;
+}
+
 // ── State ─────────────────────────────────────────────────
 let currentRoom = null, currentOwner = null, lastId = 0;
 let rooms = [], msgMap = {};
@@ -536,6 +556,7 @@ let searchResults = null, searchPending = false, searchTimer = null, searchSeque
 let agentMetaTotals = {}; // {agentName: {tokens_total, tokens_in, tokens_out, msgs, models:Set, last_reasoning}}
 let lastStatuses = {};    // {agentName: 'online'|'busy'|...} — latest room status snapshot
 let lastPhases = {};      // lifecycle phase explicitly reported by agent/server
+let lastHealth = {};      // wake-health from /api/room_agents (rate-limit window, last wake)
 let roomMessages = [], laneCollapsed = false, composerKind = 'request', lastRenderedRound = null;
 let roomData = null;
 
@@ -1107,6 +1128,7 @@ async function openRoom(id, owner) {
   roomMessages = [];
   roomData = null;
   lastPhases = {};
+  lastHealth = {};
   lastRenderedRound = null;
   agentMetaTotals = {};
   closeAgentStreams();  // abort authenticated fetch streams from previous room
@@ -1114,6 +1136,7 @@ async function openRoom(id, owner) {
   buildChatShell(rooms.find(x => x.id === id) || {id});
   await fetchMessages(true);
   await attachAgentPanels(id);  // Phase 1: live agent event stream (Codex / runner agents)
+  if (roomData && currentRoom === id) { renderRoomLanes(roomData, lastStatuses); updateFooterStatus(); }
   // Re-paint totals badges after panels rebuilt
   Object.keys(agentMetaTotals).forEach(renderAgentTotalsBadge);
   relayout();  // reveal the activity panel now that a room is open
@@ -1417,6 +1440,7 @@ async function attachAgentPanels(roomId) {
   const {agents, health} = await resp.json();
   const spawned = agents || {};
   const healthMap = health || {};
+  if (roomId === currentRoom) lastHealth = healthMap;
   const panel = resetActivityPanel(null);
   if (!panel) return;
 
@@ -1681,8 +1705,8 @@ function renderOne(m) {
     el('span', {class: 'msg-time', text: `${fmtTime(m.timestamp)} · #${m.id}`}),
   ]);
   const kindLine = el('div', {class: 'msg-kind-line'}, [
-    el('span', {class: `kind kind-${m.kind}`, text: m.kind}),
-    m.to ? el('span', {class: 'msg-to', text: '→ ' + m.to}) : null,
+    el('span', {class: `kind kind-${m.kind}`, text: messageKindLabel(m.kind)}),
+    m.to ? el('span', {class: 'msg-to', text: '→ ' + messageRecipientLabel(m.to)}) : null,
     badge,
   ]);
 
@@ -1721,40 +1745,97 @@ function renderOne(m) {
   list.scrollTop = list.scrollHeight;
 }
 
+// Lane state comes only from the live snapshot: explicit phase first, then the
+// legacy lease status (servers without `phases`). Idle agents never blink.
+const LANE_PHASES = {
+  thinking: ['thinking', 'lanes.thinking'], responding: ['responding', 'lanes.responding'],
+  working: ['working', 'lanes.working'], starting: ['starting', 'lanes.starting'],
+  queued: ['queued', 'lanes.queued'], completed: ['done', 'lanes.done'],
+  rate_limited: ['limited', 'lanes.limited'], stuck: ['stuck', 'lanes.stuck'],
+  unavailable: ['offline', 'lanes.offline'], online: ['online', 'lanes.online'],
+};
+const LANE_ACTIVE = new Set(['thinking', 'responding', 'working', 'starting', 'queued']);
+
+function laneState(room, name) {
+  if (room.status === 'closed' || room.status === 'resolved') return ['done', t('lanes.done')];
+  const st = lastStatuses && lastStatuses[name];
+  const known = LANE_PHASES[lastPhases[name]];
+  const h = lastHealth[name];
+  // Health is fetched once per room open, so honour its end time locally.
+  const limited = h && h.rate_limited && (!h.rate_limited_until || h.rate_limited_until > Date.now() / 1000);
+  if (limited && (!known || !LANE_ACTIVE.has(known[0]))) return ['limited', t('lanes.limited')];
+  if (known) return [known[0], t(known[1])];
+  if (st === 'busy') return ['working', t('lanes.working')];
+  if (st === 'online') return ['online', t('lanes.online')];
+  if (st === 'offline') return ['offline', t('lanes.offline')];
+  return ['unknown', t('lanes.unknown')];
+}
+
+// One short, verifiable line about what the agent is on: derived from the
+// transcript (addressed requests, own posts) and wake-health, never invented.
+function laneDetail(room, name, phase, authored) {
+  const last = authored[authored.length - 1];
+  const open = room.status !== 'closed' && room.status !== 'resolved';
+  let pending = null;
+  for (let i = roomMessages.length - 1; i >= 0; i--) {
+    const m = roomMessages[i];
+    if (last && m.id <= last.id) break;
+    if (m.kind === 'request' && m.agent !== name && (m.to === name || m.to === 'all')) { pending = m; break; }
+  }
+  const h = lastHealth[name] || {};
+  if (phase === 'limited' && h.rate_limited_until > Date.now() / 1000) {
+    return `${t('lanes.until')} ${fmtTime(h.rate_limited_until)}${h.rate_limit_reason ? ' · ' + h.rate_limit_reason : ''}`;
+  }
+  if (LANE_ACTIVE.has(phase) && pending) return `${t('lanes.pending')} #${pending.id} ${t('lanes.from')} ${pending.agent} · ${fmtTime(pending.timestamp)}`;
+  if (open && pending) return `${t('lanes.unanswered')} #${pending.id} ${t('lanes.from')} ${pending.agent}`;
+  if (last) return `${t('lanes.last')}: ${messageKindLabel(last.kind)} #${last.id} · ${fmtTime(last.timestamp)}`;
+  return t('lanes.noPosts');
+}
+
+function roomLanePeople(room) {
+  return [...new Set((room.participants || []).filter(p => p !== 'Human' && p !== 'System'))];
+}
+
 function renderRoomLanes(room, statuses) {
   const root = document.getElementById('room-lanes');
   if (!root || !room) return;
+  const isOpen = room.status !== 'closed' && room.status !== 'resolved';
+  const nowSec = Date.now() / 1000;
+  // Open rooms re-render once a minute so the "now" edge keeps moving.
   const signature = JSON.stringify([room.id, room.status, roomMessages.length,
-    roomMessages.length && roomMessages[roomMessages.length - 1].id, statuses, lastPhases, laneCollapsed]);
+    roomMessages.length && roomMessages[roomMessages.length - 1].id, statuses, lastPhases,
+    lastHealth, laneCollapsed, LANG, isOpen && Math.floor(nowSec / 60)]);
   if (root.dataset.signature === signature) return;
   root.dataset.signature = signature;
   const expanded = new Set([...root.querySelectorAll('.lane-log[open]')].map(x => x.dataset.agent));
-  const people = [...new Set((room.participants || []).filter(p => p !== 'Human' && p !== 'System'))];
-  const state = name => {
-    const st = statuses && statuses[name];
-    const phase = lastPhases[name];
-    const known = {
-      thinking: ['thinking', 'lanes.thinking'], responding: ['responding', 'lanes.responding'],
-      working: ['working', 'lanes.working'], starting: ['starting', 'lanes.starting'],
-      queued: ['queued', 'lanes.queued'], completed: ['done', 'lanes.done'],
-      rate_limited: ['limited', 'lanes.limited'], stuck: ['stuck', 'lanes.stuck'],
-      unavailable: ['offline', 'lanes.offline'],
-    };
-    if (known[phase]) return [known[phase][0], t(known[phase][1])];
-    if (st === 'busy') return ['working', t('lanes.working')];
-    if (st === 'online') return ['online', t('lanes.online')];
-    if (room.status === 'closed' || room.status === 'resolved') return ['done', t('lanes.done')];
-    if (st === 'offline') return ['offline', t('lanes.offline')];
-    return ['unknown', t('lanes.unknown')];
-  };
+  const people = roomLanePeople(room);
+  const states = Object.fromEntries(people.map(name => [name, laneState(room, name)]));
   const tally = {};
-  for (const name of people) { const key = state(name)[1]; tally[key] = (tally[key] || 0) + 1; }
+  for (const name of people) { const key = states[name][1]; tally[key] = (tally[key] || 0) + 1; }
+
+  // Time axis: first message → now (open) or → last message (closed). A long
+  // idle gap is compressed and the now edge is drawn dashed with its real time.
+  let first = nowSec, lastTs = nowSec, stampCount = 0;
+  for (const m of roomMessages) {
+    const stamp = Number(m.timestamp);
+    if (!Number.isFinite(stamp) || stamp <= 0) continue;
+    if (!stampCount) first = lastTs = stamp;
+    else { first = Math.min(first, stamp); lastTs = Math.max(lastTs, stamp); }
+    stampCount++;
+  }
+  const span = Math.max(60, lastTs - first);
+  const far = isOpen && nowSec - lastTs > span;
+  const axisEnd = isOpen ? (far ? lastTs + span * 0.12 : Math.max(nowSec, lastTs)) : lastTs;
+  const pos = ts => `${Math.max(1.5, Math.min(98.5, ((Number(ts) || first) - first) / Math.max(1, axisEnd - first) * 97 + 1.5))}%`;
+
   root.innerHTML = '';
   const summary = Object.entries(tally).map(([key, n]) => `${key} — ${n}`).join(' · ');
   const toggle = el('button', {class: 'lane-toggle', type: 'button', text: t(laneCollapsed ? 'lanes.expand' : 'lanes.collapse')});
   toggle.onclick = () => { laneCollapsed = !laneCollapsed; renderRoomLanes(roomData, lastStatuses); };
+  const range = stampCount ? `${fmtTime(first)} → ${isOpen ? t('lanes.now') : fmtTime(lastTs)}` : '';
   root.appendChild(el('div', {class: 'lanes-head'}, [
     el('span', {text: `${t('lanes.title')}: ${summary || '—'}`}),
+    range ? el('span', {class: 'lanes-range', text: range}) : null,
     el('span', {class: 'lanes-legend', text: t('lanes.legend')}),
     toggle,
   ]));
@@ -1762,21 +1843,23 @@ function renderRoomLanes(room, statuses) {
   for (const name of people) {
     const authored = roomMessages.filter(m => m.agent === name);
     const relevant = roomMessages.filter(m => m.agent === name || m.to === name || (m.kind === 'request' && m.to === 'all'));
-    const [phase, phaseLabel] = state(name);
+    const [phase, phaseLabel] = states[name];
     const track = el('div', {class: 'lane-track'});
-    const maxId = roomMessages.length ? roomMessages[roomMessages.length - 1].id : 1;
-    const minId = roomMessages.length ? roomMessages[0].id : 0;
     for (const m of authored) {
       const tick = el('button', {class: `lane-tick kind-${m.kind}`, type: 'button',
         title: `#${m.id} · ${m.kind} · ${fmtTime(m.timestamp)}`,
         'aria-label': `${name} #${m.id}`});
-      tick.style.left = `${Math.max(2, Math.min(98, (m.id - minId) / Math.max(1, maxId - minId) * 96 + 2))}%`;
+      tick.style.left = pos(m.timestamp);
       tick.onclick = () => {
         const target = document.querySelector(`#messages .msg[data-id="${m.id}"]`);
         if (target) { target.scrollIntoView({block: 'center'}); target.classList.add('lane-flash');
           setTimeout(() => target.classList.remove('lane-flash'), 1500); }
       };
       track.appendChild(tick);
+    }
+    if (isOpen) {
+      track.appendChild(el('span', {class: 'lane-now' + (far ? ' is-far' : ''), 'aria-hidden': 'true',
+        title: far ? `${t('lanes.nowFar')} ${fmtTime(lastTs)}` : `${t('lanes.now')} ${fmtTime(nowSec)}`}));
     }
     const log = el('details', {class: 'lane-log', dataset: {agent: name}}, [
       el('summary', {text: name}),
@@ -1792,11 +1875,13 @@ function renderRoomLanes(room, statuses) {
       b.onclick = () => { const m = relevant[i]; const target = document.querySelector(`#messages .msg[data-id="${m.id}"]`);
         if (target) target.scrollIntoView({block: 'center'}); };
     });
-    root.appendChild(el('div', {class: 'lane-row', style: `--agent-c:${agentColor(name)}`}, [
+    const detail = laneDetail(room, name, phase, authored);
+    root.appendChild(el('div', {class: 'lane-row' + (LANE_ACTIVE.has(phase) ? ' is-active' : ''),
+      style: `--agent-c:${agentColor(name)}`, dataset: {phase}}, [
       log,
       el('span', {class: `lane-phase phase-${phase}`, text: phaseLabel}),
       track,
-      el('span', {class: 'lane-detail', text: messageCount(authored.length)}),
+      el('span', {class: 'lane-detail', text: detail, title: `${detail} · ${messageCount(authored.length)}`}),
     ]));
   }
 }
@@ -1804,9 +1889,12 @@ function renderRoomLanes(room, statuses) {
 function updateFooterStatus() {
   const target = document.getElementById('footer-room-status');
   if (!target) return;
-  target.textContent = roomData
-    ? `${roomData.name || roomData.id} · ${t(`status.${roomData.status}`)} · ${messageCount(roomMessages.length)}`
-    : t('footer.noRoom');
+  if (!roomData) { target.textContent = t('footer.noRoom'); target.classList.remove('is-active'); return; }
+  const active = roomLanePeople(roomData).filter(p => LANE_ACTIVE.has(laneState(roomData, p)[0])).length;
+  const parts = [roomData.name || roomData.id, t(`status.${roomData.status}`), messageCount(roomMessages.length)];
+  if (active) parts.push(`${t('lanes.active')}: ${active}`);
+  target.textContent = parts.join(' · ');
+  target.classList.toggle('is-active', active > 0);
 }
 
 function initStatusBar() {
@@ -1927,6 +2015,7 @@ function clearSelectedRoom() {
   roomMessages = [];
   lastStatuses = {};
   lastPhases = {};
+  lastHealth = {};
   lastId = 0;
   history.replaceState(null, '', `${location.pathname}${location.search}`);
   updateFooterStatus();
