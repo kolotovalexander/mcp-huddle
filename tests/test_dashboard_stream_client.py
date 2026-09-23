@@ -25,6 +25,16 @@ let agentStreams = {};
 const rendered = [];
 const statusNode = {textContent: ''};
 global.document = {getElementById: () => statusNode};
+// streamAgentEvents uses the dashboard's global translator in production;
+// provide that same dependency in this isolated browser-stream harness.
+const labels = {
+  'activity.liveStatus': 'Live',
+  'activity.resetStatus': 'Stream reset',
+  'activity.errorStatus': 'Stream error',
+  'activity.authStatus': 'Authentication required',
+  'activity.retrying': 'Retrying',
+};
+global.t = key => labels[key] || key;
 global.appendAgentEvent = (_name, data) => rendered.push(data);
 global.showAuthRequired = () => {};
 global.HuddleHTTPError = class extends Error { constructor(status, message) { super(message); this.status = status; } };
@@ -90,6 +100,7 @@ streamAgentEvents('/agents/room_test/Codex/events', 'Codex', stream).then(() => 
   if (stream.offset !== 20) throw new Error(`wrong resume offset ${stream.offset}`);
   if (stream.fileGeneration !== 'b'.repeat(64)) throw new Error('new generation not committed');
   if (stream.fileCursor !== 'f'.repeat(64)) throw new Error('new cursor not committed');
+  if (statusNode.textContent !== '● Live') throw new Error(`wrong translated stream status: ${statusNode.textContent}`);
 }).catch(error => {
   console.error(error);
   process.exitCode = 1;
