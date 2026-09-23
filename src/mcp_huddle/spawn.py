@@ -2366,8 +2366,6 @@ def codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str,
         argv.extend(["-m", model])
     if effort:
         argv.extend(["-c", f'model_reasoning_effort="{effort}"'])
-    else:
-        argv.extend(["-c", 'model_reasoning_effort="medium"'])
 
     argv.extend([
         "-c", f'sandbox_mode="{sandbox}"',               # resume has no -s flag; pin via -c

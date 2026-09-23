@@ -177,6 +177,22 @@ def test_codex_resume_uses_room_pinned_settings_not_mutable_registry(monkeypatch
     assert "changed" not in argv
 
 
+def test_codex_resume_keeps_implicit_effort_implicit(monkeypatch, tmp_path):
+    captured = {}
+
+    class Proc:
+        pid = 9876
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", lambda argv, **kwargs: captured.update(argv=argv, **kwargs) or Proc())
+    monkeypatch.setattr(spawn, "_reap_in_background", lambda *args, **kwargs: None)
+    codex_resume(
+        "thread", "prompt", str(tmp_path), str(tmp_path / "events.jsonl"),
+        model_settings={"model": "pinned"},
+    )
+    assert captured["argv"][captured["argv"].index("-m") + 1] == "pinned"
+    assert not any("model_reasoning_effort=" in arg for arg in captured["argv"])
+
+
 def test_codex_resume_rejects_invalid_pinned_settings_before_popen(monkeypatch, tmp_path):
     monkeypatch.setattr(spawn.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("invalid settings must not spawn"))
     monkeypatch.setattr(spawn, "_reap_in_background", lambda *args, **kwargs: None)
