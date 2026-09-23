@@ -588,61 +588,144 @@ _VALID_CODEX_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "ma
 _VALID_CLAUDE_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 _VALID_AGY_EFFORTS = {"low", "medium", "high"}
 
-def _apply_model_effort_variant(spec: SpawnSpec, argv: list[str]) -> list[str]:
-    binary = _effective_binary(spec.get("cmd") or [])
-    model = spec.get("model")
-    effort = spec.get("effort")
-    variant = spec.get("variant")
 
-    if not model and not effort and not variant:
-        return argv
+def _validated_model_overrides(spec: SpawnSpec, binary: str) -> dict[str, str]:
+    """Validate registry model controls and return only explicitly supplied ones."""
+    values: dict[str, str] = {}
+    for key in ("model", "effort", "variant"):
+        if key not in spec:
+            continue
+        value = spec[key]
+        if not isinstance(value, str) or not value.strip():
+            raise AgentSpawnError(
+                f"{spec.get('name', binary)} {key} must be a non-empty string"
+            )
+        values[key] = value.strip()
 
     if binary == "codex":
-        if variant:
+        if "variant" in values:
             raise AgentSpawnError("Codex does not support 'variant'; use 'effort'")
-        if effort and effort not in _VALID_CODEX_EFFORTS:
-            raise AgentSpawnError(f"Codex unsupported effort '{effort}'")
+        if values.get("effort") and values["effort"] not in _VALID_CODEX_EFFORTS:
+            raise AgentSpawnError(f"Codex unsupported effort '{values['effort']}'")
     elif binary == "claude":
-        if variant:
+        if "variant" in values:
             raise AgentSpawnError("Claude does not support 'variant'; use 'effort'")
-        if effort and effort not in _VALID_CLAUDE_EFFORTS:
-            raise AgentSpawnError(f"Claude unsupported effort '{effort}'")
+        if values.get("effort") and values["effort"] not in _VALID_CLAUDE_EFFORTS:
+            raise AgentSpawnError(f"Claude unsupported effort '{values['effort']}'")
     elif binary == "agy":
-        if variant:
+        if "variant" in values:
             raise AgentSpawnError("Antigravity does not support 'variant'; use 'effort'")
-        if effort and effort not in _VALID_AGY_EFFORTS:
-            raise AgentSpawnError(f"Antigravity unsupported effort '{effort}'")
+        if values.get("effort") and values["effort"] not in _VALID_AGY_EFFORTS:
+            raise AgentSpawnError(f"Antigravity unsupported effort '{values['effort']}'")
     elif binary == "opencode":
-        if effort:
+        if "effort" in values:
             raise AgentSpawnError("OpenCode does not support 'effort'; use 'variant'")
-    else:
-        raise AgentSpawnError(f"Agent {spec['name']} ({binary}) does not support model/effort/variant overrides")
+    elif values:
+        raise AgentSpawnError(
+            f"Agent {spec.get('name', binary)} ({binary}) does not support model/effort/variant overrides"
+        )
+    return values
 
-    # Remove existing conflicting flags to avoid duplicates
-    out = []
+
+def _remove_option_values(
+    argv: list[str], options: tuple[str, ...], should_remove,
+) -> list[str]:
+    """Remove selected option/value pairs, including --option=value forms."""
+    result: list[str] = []
     i = 0
     while i < len(argv):
         arg = argv[i]
-        if binary in ("claude", "agy") and arg in ("--model", "-m"):
-            i += 2
-            continue
-        if binary in ("claude", "agy") and arg == "--effort":
-            i += 2
-            continue
-        if binary == "opencode" and arg in ("--model", "-m"):
-            i += 2
-            continue
-        if binary == "opencode" and arg == "--variant":
-            i += 2
-            continue
-        if binary == "codex" and arg in ("--model", "-m"):
-            i += 2
-            continue
-        if binary == "codex" and arg == "-c" and i + 1 < len(argv) and argv[i+1].startswith("model_reasoning_effort="):
-            i += 2
-            continue
-        out.append(arg)
+        option = next((name for name in options if arg == name), None)
+        if option is not None and i + 1 < len(argv):
+            value = argv[i + 1]
+            if should_remove(value):
+                i += 2
+                continue
+        else:
+            option = next((name for name in options if arg.startswith(name + "=")), None)
+            if option is not None and should_remove(arg[len(option) + 1:]):
+                i += 1
+                continue
+        result.append(arg)
         i += 1
+    return result
+
+
+def _setting_from_argv(argv: list[str], options: tuple[str, ...]) -> str | None:
+    """Read the last effective spelling of an option from a CLI template."""
+    result = None
+    for i, arg in enumerate(argv):
+        option = next((name for name in options if arg == name), None)
+        if option is not None and i + 1 < len(argv):
+            result = argv[i + 1]
+            continue
+        option = next((name for name in options if arg.startswith(name + "=")), None)
+        if option is not None:
+            result = arg[len(option) + 1:]
+    return result
+
+
+def _codex_effort_from_argv(argv: list[str]) -> str | None:
+    value = None
+    for i, arg in enumerate(argv):
+        config = None
+        if arg in ("-c", "--config") and i + 1 < len(argv):
+            config = argv[i + 1]
+        elif arg.startswith("-c="):
+            config = arg[3:]
+        elif arg.startswith("--config="):
+            config = arg[len("--config="):]
+        if config:
+            key, separator, configured_value = config.partition("=")
+            if separator and key.strip() == "model_reasoning_effort":
+                value = configured_value.strip().strip("\"'")
+    return value
+
+
+def model_settings_for_spec(spec: SpawnSpec) -> dict[str, str]:
+    """Return effective explicit CLI model settings to pin to a room session."""
+    argv = _apply_model_effort_variant(spec, list(spec.get("cmd") or []))
+    binary = _effective_binary(spec.get("cmd") or [])
+    settings: dict[str, str] = {}
+    model = _setting_from_argv(argv, ("--model", "-m"))
+    if model:
+        settings["model"] = model
+    if binary == "codex":
+        effort = _codex_effort_from_argv(argv)
+        if effort:
+            settings["effort"] = effort
+    else:
+        effort = _setting_from_argv(argv, ("--effort",))
+        variant = _setting_from_argv(argv, ("--variant",))
+        if effort:
+            settings["effort"] = effort
+        if variant:
+            settings["variant"] = variant
+    return settings
+
+
+def _apply_model_effort_variant(spec: SpawnSpec, argv: list[str]) -> list[str]:
+    binary = _effective_binary(spec.get("cmd") or [])
+    overrides = _validated_model_overrides(spec, binary)
+    model = overrides.get("model")
+    effort = overrides.get("effort")
+    variant = overrides.get("variant")
+
+    if not overrides:
+        return argv
+
+    out = list(argv)
+    if model is not None:
+        out = _remove_option_values(out, ("--model", "-m"), lambda _value: True)
+    if effort is not None and binary in ("claude", "agy"):
+        out = _remove_option_values(out, ("--effort",), lambda _value: True)
+    if variant is not None and binary == "opencode":
+        out = _remove_option_values(out, ("--variant",), lambda _value: True)
+    if effort is not None and binary == "codex":
+        def is_effort_setting(value: str) -> bool:
+            key, separator, _configured_value = value.partition("=")
+            return bool(separator and key.strip() == "model_reasoning_effort")
+        out = _remove_option_values(out, ("-c", "--config"), is_effort_setting)
 
     # Inject before -p or {brief} or at the end
     inject_idx = len(out)
@@ -1742,14 +1825,18 @@ def compute_stagger_delays(
 
 def _placeholder_agent_meta(
     spec: SpawnSpec, brief: str, log_dir: Path
-) -> dict[str, str | None]:
+) -> dict[str, object]:
     """Deterministic {log_path, last_message_path} for a spec, computable
     without actually spawning a process — lets a delayed (staggered) spawn's
     identity be registered in agent_meta immediately, before its process
     exists, so the room already knows it's coming."""
-    _, last_msg_path = _resolve_spawn_args(spec, brief, log_dir)
+    argv, last_msg_path = _resolve_spawn_args(spec, brief, log_dir)
     log_path = log_dir / f"{spec['name'].lower()}.events.jsonl"
-    return {"log_path": str(log_path), "last_message_path": last_msg_path}
+    result = {"log_path": str(log_path), "last_message_path": last_msg_path}
+    settings = model_settings_for_spec({**spec, "cmd": argv})
+    if settings:
+        result["model_settings"] = settings
+    return result
 
 
 def _schedule_delayed_spawn(
@@ -2215,7 +2302,8 @@ def detect_rate_limit(log_path: str) -> str | None:
 def codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str,
                  last_msg_path: str | None = None, on_exit=None,
                  owner_room_id: str = "",
-                 process_handle: str | None = None) -> int:
+                 process_handle: str | None = None,
+                 model_settings: dict[str, str] | None = None) -> int:
     """Resume a Codex thread with a new prompt. Cheaper than fresh spawn —
     Codex remembers prior conversation via its rollout file.
 
@@ -2227,7 +2315,8 @@ def codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str,
     We pin danger-full-access so Codex's huddle MCP tool calls aren't auto-
     cancelled: under a restricted sandbox + `-a never`, MCP calls need approval
     that `never` denies ("user cancelled MCP tool call"). `-a` is a top-level
-    flag (before `exec`). The model is left to ~/.codex/config.toml (SoT).
+    flag (before `exec`). A room's initial model settings are retained for
+    resumed turns so a registry edit cannot switch models mid-session.
     """
     cwd, prompt = _codex_safe_cwd_and_brief(cwd, prompt)
     # Read-only by default (matches the initial-spawn transform): pin
@@ -2236,12 +2325,17 @@ def codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str,
     # `-a never` would otherwise cancel. MCP_HUDDLE_READONLY=0 → full access.
     readonly = _readonly_enabled()
     sandbox = "read-only" if readonly else _CODEX_SANDBOX
-    spec = get_enabled_spec("Codex")
-    model = spec.get("model") if spec else None
-    effort = spec.get("effort") if spec else None
-
-    if effort and effort not in _VALID_CODEX_EFFORTS:
-        raise AgentSpawnError(f"Codex unsupported effort '{effort}'")
+    if model_settings is None:
+        spec = get_enabled_spec("Codex")
+        settings = model_settings_for_spec(spec) if spec else {}
+    else:
+        # A room's initial selection is durable. Do not let a later registry
+        # edit silently switch the model halfway through its native session.
+        settings = _validated_model_overrides(
+            {"name": "Codex", "cmd": ["codex"], **model_settings}, "codex",
+        )
+    model = settings.get("model")
+    effort = settings.get("effort")
 
     argv = [
         _CODEX_BIN or "codex", "-a", "never",            # top-level: never auto-approve tool calls
