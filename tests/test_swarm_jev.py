@@ -33,11 +33,13 @@ def fake_service(monkeypatch, tmp_path):
 def test_mode_request_is_bounded_and_uses_exact_shared_api_shape(fake_service):
     result = swarm_jev.choose_mode(
         swarm_jev.ModeFacts(
-            task_kind="code_change",
-            parallel_work=True,
-            shared_files=True,
-            independent_opinions=False,
-            sequential_handoff=False,
+            task_type="code_change",
+            needs_files="write",
+            parts="two_three",
+            sequential_dependency=False,
+            diverse_opinions=False,
+            max_members=4,
+            budget="cheap",
         )
     )
 
@@ -51,13 +53,13 @@ def test_mode_request_is_bounded_and_uses_exact_shared_api_shape(fake_service):
     assert set(body) == {"model", "state", "questions"}
     assert body["model"] == "jev-latest"
     assert set(body["state"]) == {
-        "task_kind", "parallel_work", "shared_files",
-        "independent_opinions", "sequential_handoff",
+        "task_type", "needs_files", "parts", "sequential_dependency",
+        "diverse_opinions", "max_members", "budget",
     }
     assert set(body["questions"]) == {"mode"}
     assert body["questions"]["mode"]["type"] == "choice"
     assert set(body["questions"]["mode"]["criteria"]) == {
-        "sonnet", "relay", "team", "swarm", "none"
+        "council", "relay", "team", "swarm", "none"
     }
     assert "local-secret-key" not in request.data.decode()
     assert request.get_header("Authorization") == "Bearer local-secret-key"
@@ -67,11 +69,13 @@ def test_mode_request_is_bounded_and_uses_exact_shared_api_shape(fake_service):
 def test_rejects_free_text_and_paths_before_network(fake_service, bad_kind):
     result = swarm_jev.choose_mode(
         swarm_jev.ModeFacts(
-            task_kind=bad_kind,
-            parallel_work=False,
-            shared_files=False,
-            independent_opinions=False,
-            sequential_handoff=False,
+            task_type=bad_kind,
+            needs_files="none",
+            parts="one",
+            sequential_dependency=False,
+            diverse_opinions=False,
+            max_members=1,
+            budget="cheap",
         )
     )
     assert result.status == "fallback"
@@ -97,6 +101,7 @@ def test_low_confidence_returns_explicit_fallback(fake_service, monkeypatch):
         {},
         {"answers": {"mode": {"type": "score", "score": 0.8}}},
         {"answers": {"mode": {"type": "choice", "choice": "../tmp", "confidence": 0.9}}},
+        {"answers": {"mode": {"type": "choice", "choice": "sonnet", "confidence": 0.9}}},
         {"answers": {"mode": {"type": "choice", "choice": "swarm", "confidence": "high"}}},
         {"answers": {"mode": {"type": "choice", "choice": "swarm"}}},
     ],
@@ -123,26 +128,36 @@ def test_candidate_choice_uses_only_verified_closed_fields(fake_service):
     result = swarm_jev.choose_candidate(
         _facts(),
         [
-            swarm_jev.VerifiedCandidate("codex-1", "codex", "strong", True),
-            swarm_jev.VerifiedCandidate("gemini-2", "gemini", "fast", False),
+            swarm_jev.VerifiedCandidate("codex-1", "codex", "strong", "paid", True),
+            swarm_jev.VerifiedCandidate("gemini-2", "gemini", "fast", "free", False),
         ],
     )
     assert result.status == "ok"
     request = json.loads(fake_service[0][0].data)
     criteria = request["questions"]["candidate"]["criteria"]
-    assert set(criteria) == {"codex-1", "gemini-2", "none"}
-    assert criteria["codex-1"] == "Verified Codex agent; strong reasoning; can edit room files."
+    assert set(criteria) == {"c1", "c2", "none"}
+    assert "codex-1" not in json.dumps(criteria)
+    assert criteria["c1"] == (
+        "Verified Codex agent; strong reasoning; paid cost class; "
+        "the harness enforces read-only access."
+    )
+    assert result.choice == "codex-1"
+    assert "read-only access is not enforced by the harness" in criteria["c2"]
+    assert "read-only in the room" not in json.dumps(criteria)
 
 
 @pytest.mark.parametrize(
     "candidates",
     [
-        [swarm_jev.VerifiedCandidate("/tmp/secret", "codex", "strong", True)],
-        [swarm_jev.VerifiedCandidate("a", "codex", "strong", True)] * 2,
-        [swarm_jev.VerifiedCandidate(f"agent-{i}", "codex", "strong", True) for i in range(11)],
+        [swarm_jev.VerifiedCandidate("/tmp/secret", "codex", "strong", "cheap", True)],
         [
-            swarm_jev.VerifiedCandidate("agent-1", [], "strong", True),
-            swarm_jev.VerifiedCandidate("agent-2", "codex", "strong", True),
+            swarm_jev.VerifiedCandidate("a", "codex", "strong", "cheap", True),
+            swarm_jev.VerifiedCandidate("a", "gemini", "fast", "free", False),
+        ],
+        [swarm_jev.VerifiedCandidate(f"agent-{i}", "codex", "strong", "cheap", True) for i in range(10)],
+        [
+            swarm_jev.VerifiedCandidate("agent-1", [], "strong", "cheap", True),
+            swarm_jev.VerifiedCandidate("agent-2", "codex", "strong", "cheap", True),
         ],
     ],
 )
@@ -163,6 +178,33 @@ def test_missing_key_falls_back_without_network_or_secret_output(monkeypatch, tm
     assert capsys.readouterr().out == ""
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"needs_files": "/tmp/project"},
+        {"task_type": ["code_change"]},
+        {"budget": "unbounded prompt"},
+        {"max_members": 9},
+        {"max_members": True},
+    ],
+)
+def test_profile_schema_rejects_unclosed_facts_before_network(fake_service, overrides):
+    values = {
+        "task_type": "code_change",
+        "needs_files": "read",
+        "parts": "two_three",
+        "sequential_dependency": False,
+        "diverse_opinions": True,
+        "max_members": 4,
+        "budget": "cheap",
+    }
+    values.update(overrides)
+    result = swarm_jev.choose_mode(swarm_jev.ModeFacts(**values))
+    assert result.status == "fallback"
+    assert result.reason == "invalid_input"
+    assert fake_service == []
+
+
 def test_redirects_are_rejected_by_transport_handler():
     handler = swarm_jev._RejectRedirects()
     assert handler.redirect_request(None, None, 302, "Found", {}, "http://elsewhere") is None
@@ -170,9 +212,11 @@ def test_redirects_are_rejected_by_transport_handler():
 
 def _facts():
     return swarm_jev.ModeFacts(
-        task_kind="analysis",
-        parallel_work=True,
-        shared_files=False,
-        independent_opinions=True,
-        sequential_handoff=False,
+        task_type="code_change",
+        needs_files="write",
+        parts="two_three",
+        sequential_dependency=False,
+        diverse_opinions=True,
+        max_members=4,
+        budget="cheap",
     )

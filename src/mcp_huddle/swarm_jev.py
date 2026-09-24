@@ -27,15 +27,12 @@ ENDPOINT = "http://127.0.0.1:45987/v1/systemone"
 TIMEOUT_SECONDS = 3.0
 CONFIDENCE_THRESHOLD = 0.60
 _MAX_RESPONSE_BYTES = 64 * 1024
-_TASK_KINDS = {
-    "analysis": "Analyze information and produce findings.",
-    "code_change": "Change or create software in a project.",
-    "planning": "Produce an implementation plan without making the changes.",
-    "research": "Collect and compare evidence from available sources.",
-    "incident": "Diagnose and restore a failing system or workflow.",
-}
+_TASK_TYPES = {"question", "review", "design", "research", "code_change"}
+_FILE_NEEDS = {"none", "read", "write"}
+_WORK_PARTS = {"one", "two_three", "four_plus"}
+_BUDGETS = {"free", "cheap", "any"}
 _MODE_CRITERIA = {
-    "sonnet": "One organizer-led room turn; participants respond in sequence and the organizer makes the final decision.",
+    "council": "The organizer chairs a discussion; participants respond in sequence, and the organizer makes the final decision.",
     "relay": "Agents hand the work to one another in sequence, each continuing from the prior result.",
     "team": "Several agents work as a coordinated team with assigned responsibilities.",
     "swarm": "Several agents work in parallel, coordinate within a shared room, and produce a member-authored result.",
@@ -53,16 +50,24 @@ _TIER_LABELS = {
     "fast": "fast lightweight reasoning",
     "strong": "strong reasoning",
 }
+_COST_LABELS = {
+    "free": "free cost class",
+    "cheap": "low cost class",
+    "paid": "paid cost class",
+    "unknown": "unknown cost class",
+}
 _CANDIDATE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 
 
 @dataclass(frozen=True)
 class ModeFacts:
-    task_kind: str
-    parallel_work: bool
-    shared_files: bool
-    independent_opinions: bool
-    sequential_handoff: bool
+    task_type: str
+    needs_files: str
+    parts: str
+    sequential_dependency: bool
+    diverse_opinions: bool
+    max_members: int
+    budget: str
 
 
 @dataclass(frozen=True)
@@ -71,8 +76,9 @@ class VerifiedCandidate:
 
     candidate_id: str
     harness: str
-    reasoning_tier: str
-    can_edit_room_files: bool
+    model_class: str
+    cost_class: str
+    readonly_enforced: bool
 
 
 @dataclass(frozen=True)
@@ -108,13 +114,13 @@ def choose_mode(facts: ModeFacts) -> ChoiceResult:
 def choose_candidate(
     facts: ModeFacts, candidates: Sequence[VerifiedCandidate]
 ) -> ChoiceResult:
-    """Ask Jev to advise among up to ten locally verified team candidates."""
+    """Ask Jev among verified candidates, reserving a Jev option for ``none``."""
 
     state = _serialize_facts(facts)
     criteria = _candidate_criteria(candidates)
     if state is None or criteria is None:
         return _fallback("invalid_input")
-    return _choose(
+    result = _choose(
         question_id="candidate",
         state=state,
         instructions=(
@@ -124,26 +130,42 @@ def choose_candidate(
         ),
         criteria=criteria,
     )
+    if result.status != "ok" or result.choice == "none":
+        return result
+    try:
+        candidate_index = int(result.choice[1:]) - 1
+        selected = candidates[candidate_index]
+    except (ValueError, IndexError, TypeError):
+        return _fallback("invalid_response")
+    return ChoiceResult("ok", selected.candidate_id, result.confidence, "advisory")
 
 
 def _serialize_facts(facts: ModeFacts) -> dict[str, object] | None:
     if not isinstance(facts, ModeFacts):
         return None
-    task_description = _TASK_KINDS.get(facts.task_kind) if isinstance(facts.task_kind, str) else None
-    flags = (
-        facts.parallel_work,
-        facts.shared_files,
-        facts.independent_opinions,
-        facts.sequential_handoff,
-    )
-    if task_description is None or any(type(flag) is not bool for flag in flags):
+    if (
+        not isinstance(facts.task_type, str)
+        or facts.task_type not in _TASK_TYPES
+        or not isinstance(facts.needs_files, str)
+        or facts.needs_files not in _FILE_NEEDS
+        or not isinstance(facts.parts, str)
+        or facts.parts not in _WORK_PARTS
+        or not isinstance(facts.budget, str)
+        or facts.budget not in _BUDGETS
+        or type(facts.sequential_dependency) is not bool
+        or type(facts.diverse_opinions) is not bool
+        or type(facts.max_members) is not int
+        or not 1 <= facts.max_members <= 8
+    ):
         return None
     return {
-        "task_kind": task_description,
-        "parallel_work": facts.parallel_work,
-        "shared_files": facts.shared_files,
-        "independent_opinions": facts.independent_opinions,
-        "sequential_handoff": facts.sequential_handoff,
+        "task_type": facts.task_type,
+        "needs_files": facts.needs_files,
+        "parts": facts.parts,
+        "sequential_dependency": facts.sequential_dependency,
+        "diverse_opinions": facts.diverse_opinions,
+        "max_members": facts.max_members,
+        "budget": facts.budget,
     }
 
 
@@ -152,9 +174,11 @@ def _candidate_criteria(
 ) -> dict[str, str] | None:
     if isinstance(candidates, (str, bytes)) or not isinstance(candidates, Sequence):
         return None
-    if not 2 <= len(candidates) <= 10:
+    # Jev supports at most ten choice options; reserve one for the required none.
+    if not 2 <= len(candidates) <= 9:
         return None
     criteria: dict[str, str] = {}
+    seen_ids: set[str] = set()
     for candidate in candidates:
         if not isinstance(candidate, VerifiedCandidate):
             return None
@@ -164,16 +188,27 @@ def _candidate_criteria(
             or candidate.candidate_id == "none"
             or not isinstance(candidate.harness, str)
             or candidate.harness not in _HARNESS_LABELS
-            or not isinstance(candidate.reasoning_tier, str)
-            or candidate.reasoning_tier not in _TIER_LABELS
-            or type(candidate.can_edit_room_files) is not bool
-            or candidate.candidate_id in criteria
+            or not isinstance(candidate.model_class, str)
+            or candidate.model_class not in _TIER_LABELS
+            or not isinstance(candidate.cost_class, str)
+            or candidate.cost_class not in _COST_LABELS
+            or type(candidate.readonly_enforced) is not bool
+            or candidate.candidate_id in seen_ids
         ):
             return None
-        edit_capability = "can edit room files" if candidate.can_edit_room_files else "read-only in the room"
-        criteria[candidate.candidate_id] = (
+        if len(criteria) == 10:
+            return None
+        readonly = (
+            "the harness enforces read-only access"
+            if candidate.readonly_enforced
+            else "read-only access is not enforced by the harness"
+        )
+        option_id = f"c{len(criteria) + 1}"
+        seen_ids.add(candidate.candidate_id)
+        criteria[option_id] = (
             f"Verified {_HARNESS_LABELS[candidate.harness]} agent; "
-            f"{_TIER_LABELS[candidate.reasoning_tier]}; {edit_capability}."
+            f"{_TIER_LABELS[candidate.model_class]}; "
+            f"{_COST_LABELS[candidate.cost_class]}; {readonly}."
         )
     criteria["none"] = _MODE_CRITERIA["none"]
     return criteria
