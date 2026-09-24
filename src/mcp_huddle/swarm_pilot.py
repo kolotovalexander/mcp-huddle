@@ -6,6 +6,7 @@ requests and waking CLI workers, so no message lock is held with the meta lock.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import time
 from typing import Any
@@ -79,11 +80,12 @@ def create(
 
     def init(meta: dict) -> dict:
         meta["swarm_pilot"] = {
-            "schema": 1,
+            "schema": 2,
             "mode": mode,
             "goal": goal,
             "organizer": organizer,
             "members": members,
+            "member_ids": _member_ids(room_id, members),
             "workspace_strategy": workspace_strategy,
             "round": 1,
             "dispatched": {},
@@ -123,7 +125,7 @@ def status(room_id: str) -> dict:
     state = bus.get_room_info(room_id).get("swarm_pilot")
     if not isinstance(state, dict):
         raise ValueError("room is not a swarm pilot")
-    return state
+    return _expose_member_ids(room_id, state)
 
 
 def due_members(room_id: str) -> list[str]:
@@ -155,7 +157,8 @@ def mark_dispatched(room_id: str, member: str, message_id: int) -> dict:
         state["dispatched"][member] = message_id
         return meta
 
-    return bus._update_meta_locked(room_id, update)["swarm_pilot"]
+    state = bus._update_meta_locked(room_id, update)["swarm_pilot"]
+    return _expose_member_ids(room_id, state)
 
 
 def record(room_id: str, member: str, kind: str, key: str, value: str) -> dict:
@@ -186,7 +189,8 @@ def record(room_id: str, member: str, kind: str, key: str, value: str) -> dict:
         }
         return meta
 
-    return bus._update_meta_locked(room_id, update)["swarm_pilot"]
+    state = bus._update_meta_locked(room_id, update)["swarm_pilot"]
+    return _expose_member_ids(room_id, state)
 
 
 def round_done(room_id: str, member: str, summary: str) -> dict:
@@ -213,7 +217,8 @@ def round_done(room_id: str, member: str, summary: str) -> dict:
         }
         return meta
 
-    return bus._update_meta_locked(room_id, update)["swarm_pilot"]
+    state = bus._update_meta_locked(room_id, update)["swarm_pilot"]
+    return _expose_member_ids(room_id, state)
 
 
 def finish(room_id: str, member: str, result: str) -> dict:
@@ -243,7 +248,8 @@ def finish(room_id: str, member: str, result: str) -> dict:
         state["phase"] = "completed"
         return meta
 
-    return bus._update_meta_locked(room_id, update)["swarm_pilot"]
+    state = bus._update_meta_locked(room_id, update)["swarm_pilot"]
+    return _expose_member_ids(room_id, state)
 
 
 def _state(meta: dict[str, Any]) -> dict:
@@ -251,3 +257,25 @@ def _state(meta: dict[str, Any]) -> dict:
     if not isinstance(state, dict):
         raise ValueError("room is not a swarm pilot")
     return state
+
+
+def _member_ids(room_id: str, members: list[str]) -> dict[str, str]:
+    """Return stable opaque IDs derived from the room and slot order.
+
+    Profile names deliberately stay out of the ID so renaming a configured
+    harness does not change a member's identity inside an existing room.
+    Operational maps remain keyed by profile name for API compatibility.
+    """
+    return {
+        member: "mem_" + hashlib.sha256(f"{room_id}:{ordinal}".encode("utf-8")).hexdigest()[:12]
+        for ordinal, member in enumerate(members, start=1)
+    }
+
+
+def _expose_member_ids(room_id: str, state: dict) -> dict:
+    """Expose identities for old rooms without rewriting their stored schema."""
+    exposed = dict(state)
+    stored = exposed.get("member_ids")
+    if not isinstance(stored, dict) or set(stored) != set(exposed.get("members", [])):
+        exposed["member_ids"] = _member_ids(room_id, exposed["members"])
+    return exposed

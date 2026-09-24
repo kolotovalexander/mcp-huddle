@@ -1,5 +1,6 @@
-"""Stable identity metadata for safely retried swarm plan creation."""
+"""Stable identity metadata for swarm pilot members."""
 
+import hashlib
 import pytest
 
 from mcp_huddle import bus, swarm_pilot
@@ -30,6 +31,11 @@ def test_create_uses_fixed_room_id_and_persists_supplied_fingerprints(isolated_h
     state = swarm_pilot.status(room_id)
     assert state["client_request_fingerprint"] == request_fingerprint
     assert state["plan_hash"] == plan_hash
+    assert state["schema"] == 2
+    assert state["member_ids"] == {
+        "A": "mem_" + hashlib.sha256(b"room_1234abcd:1").hexdigest()[:12]
+    }
+    assert swarm_pilot.status(room_id)["member_ids"] == state["member_ids"]
 
 
 def test_create_keeps_legacy_generated_id_and_omits_empty_fingerprints(isolated_home):
@@ -43,6 +49,40 @@ def test_create_keeps_legacy_generated_id_and_omits_empty_fingerprints(isolated_
     assert "client_request_fingerprint" not in state
     assert "plan_hash" not in state
     assert state["mode"] == "swarm"
+    assert state["member_ids"]["A"].startswith("mem_")
+
+
+def test_schema_one_room_lazily_exposes_stable_member_ids_without_rewriting(
+    isolated_home,
+):
+    room_id = swarm_pilot.create(
+        "pilot", "Organizer", "Make a tiny result", "swarm", ["Agent A", "Agent B"],
+    )
+
+    def make_legacy(meta):
+        state = meta["swarm_pilot"]
+        state["schema"] = 1
+        state.pop("member_ids", None)
+        return meta
+
+    bus._update_meta_locked(room_id, make_legacy)
+    first = swarm_pilot.status(room_id)
+    second = swarm_pilot.status(room_id)
+
+    assert first["schema"] == 1
+    assert first["member_ids"] == second["member_ids"]
+    assert len(set(first["member_ids"].values())) == 2
+    stored = bus.get_room_info(room_id)["swarm_pilot"]
+    assert stored["schema"] == 1
+    assert "member_ids" not in stored
+
+    # The public operations and their dictionaries remain keyed by member name.
+    dispatched = swarm_pilot.mark_dispatched(room_id, "Agent A", 1)
+    done = swarm_pilot.round_done(room_id, "Agent A", "finished")
+    assert dispatched["dispatched"] == {"Agent A": 1}
+    assert done["done"]["Agent A"]["summary"] == "finished"
+    assert dispatched["member_ids"] == first["member_ids"]
+    assert done["member_ids"] == first["member_ids"]
 
 
 @pytest.mark.parametrize(
