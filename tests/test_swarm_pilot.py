@@ -419,6 +419,10 @@ def test_round_done_accepts_result_to_organizer_recovery_request(
     assert original_id != retry_id
     assert response["state"]["done"]["A"]["summary"] == "recovered"
     assert response["next_dispatch"] == []
+    assert original_id not in {
+        item["id"] for item in server.room_status(room)["pending_requests"]
+    }
+    assert server._agent_replied_to_request(room, "A", original_id)
 
 
 def test_pilot_room_survives_organizer_session_close(isolated_home):
@@ -466,6 +470,8 @@ def test_public_pilot_workflow_in_all_modes(isolated_home, monkeypatch, mode):
     assert result["phase"] == "completed"
     finals = [m for m in bus._load_messages(room) if m["kind"] == "final"]
     assert len(finals) == 1 and finals[0]["agent"] == author
+    assert finals[0]["reply_to"] == final_request
+    assert server.room_status(room)["pending_requests"] == []
     before_late_reply = len(bus._load_messages(room))
     with pytest.raises(ValueError, match="late final-request result discarded"):
         server.message_post(
@@ -523,10 +529,108 @@ def test_pilot_missing_reporter_prompts_all_then_dispatches(isolated_home, monke
     assert msg2["to"] == "A"
     assert "publish the combined result" in msg2["body"]
     assert updated_state["final_request"] == msg2["id"]
+    assert final_req_msg_id not in {
+        item["id"] for item in server.room_status(room)["pending_requests"]
+    }
+    assert server._agent_replied_to_request(room, "B", final_req_msg_id)
+    server._merge_agent_meta(room, "B", {"last_wake_msg_id": final_req_msg_id - 1})
+    assert server._next_pending_request(
+        room, "B", {"last_wake_msg_id": final_req_msg_id - 1},
+    ) is None
 
     # Duplicates are ignored due to idempotency keys
     updated_state2 = server.swarm_pilot_record(room, "A", "responsibility", "reporter", "Final")
     assert bus._load_messages(room)[-1]["id"] == msg2["id"]
+
+
+@pytest.mark.parametrize("block_status", ["unavailable", "spec_drift"])
+def test_watchdog_reports_blocked_member_once_and_recovers_when_available(
+    isolated_home, monkeypatch, block_status,
+):
+    available = {"A": True, "B": True}
+    monkeypatch.setattr(server.spawn, "get_enabled_spec",
+                        lambda name: {"name": name} if available[name] else None)
+    monkeypatch.setattr(server, "_wake_agents_for_request", lambda *args: [])
+    room = server.swarm_pilot_create(
+        "blocked member", "Organizer", "Tiny result", "relay", ["A", "B"],
+        start=True,
+    )["room_id"]
+    first = swarm_pilot.status(room)["dispatched"]["A"]
+    server.message_post(room, "A", "A result", "result", to="Organizer",
+                        reply_to=first)
+    swarm_pilot.round_done(room, "A", "done")
+    if block_status == "unavailable":
+        available["B"] = False
+    else:
+        original_drift = server._swarm_spec_drift
+        monkeypatch.setattr(server, "_swarm_spec_drift",
+                            lambda meta, member, spec:
+                            member == "B" or original_drift(meta, member, spec))
+
+    first_tick = server._recover_swarm_pilots()
+    second_tick = server._recover_swarm_pilots()
+    blocked = [m for m in bus._load_messages(room)
+               if m.get("idempotency_key", "").endswith(
+                   f":B:blocked:{block_status}")]
+    assert len(blocked) == 1 and blocked[0]["kind"] == "system"
+    assert first_tick[0]["blocked"][0]["status"] == block_status
+    assert second_tick == []
+
+    available["B"] = True
+    if block_status == "spec_drift":
+        monkeypatch.setattr(server, "_swarm_spec_drift", original_drift)
+    resumed = server._recover_swarm_pilots()
+    assert resumed[0]["next_dispatch"][0]["member"] == "B"
+    assert len(blocked) == 1
+
+
+def test_watchdog_restores_final_message_after_completed_state(
+    isolated_home, monkeypatch,
+):
+    monkeypatch.setattr(server.spawn, "get_enabled_spec", lambda name: {"name": name})
+    monkeypatch.setattr(server, "_wake_agents_for_request", lambda *args: [])
+    room = server.swarm_pilot_create(
+        "final restart", "Organizer", "Tiny result", "team", ["A"],
+        start=True,
+    )["room_id"]
+    server.swarm_pilot_record(room, "A", "responsibility", "reporter", "Final")
+    first = swarm_pilot.status(room)["dispatched"]["A"]
+    server.message_post(room, "A", "A result", "result", to="Organizer",
+                        reply_to=first)
+    final_request = server.swarm_pilot_round_done(room, "A", "done")["final_request"]
+    swarm_pilot.finish(room, "A", "Combined")  # Process dies before message_post.
+
+    server._recover_swarm_pilots()
+    server._recover_swarm_pilots()
+
+    finals = [msg for msg in bus._load_messages(room) if msg["kind"] == "final"]
+    assert len(finals) == 1
+    assert finals[0]["reply_to"] == final_request
+    assert not server.room_status(room)["pending_requests"]
+
+
+def test_existing_pilot_final_without_reply_to_is_settled_without_duplicate(
+    isolated_home, monkeypatch,
+):
+    monkeypatch.setattr(server.spawn, "get_enabled_spec", lambda name: {"name": name})
+    monkeypatch.setattr(server, "_wake_agents_for_request", lambda *args: [])
+    room = server.swarm_pilot_create(
+        "older final", "Organizer", "Tiny result", "team", ["A"],
+        start=True,
+    )["room_id"]
+    server.swarm_pilot_record(room, "A", "responsibility", "reporter", "Final")
+    first = swarm_pilot.status(room)["dispatched"]["A"]
+    server.message_post(room, "A", "A result", "result", to="Organizer",
+                        reply_to=first)
+    final_request = server.swarm_pilot_round_done(room, "A", "done")["final_request"]
+    swarm_pilot.finish(room, "A", "Combined")
+    server.message_post(room, "A", "Combined", "final", to="Organizer",
+                        idempotency_key=f"swarm-pilot:{room}:final")
+
+    assert server._recover_swarm_pilots() == []
+    assert server.room_status(room)["pending_requests"] == []
+    assert server._agent_replied_to_request(room, "A", final_request)
+    assert len([msg for msg in bus._load_messages(room) if msg["kind"] == "final"]) == 1
 
 
 @pytest.mark.parametrize("mode", ["council", "relay"])

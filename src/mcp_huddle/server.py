@@ -1259,29 +1259,100 @@ def _recover_swarm_pilots() -> list[dict]:
     for room in bus.list_rooms():
         state = room.get("swarm_pilot")
         if (room.get("status") not in ("open", "idle")
-                or not isinstance(state, dict) or state.get("phase") != "working"
-                or state.get("server_create_state") == "preparing"
-                or not (state.get("start_requested") is True
-                        or state.get("dispatched") or state.get("done"))):
+                or not isinstance(state, dict)
+                or state.get("server_create_state") == "preparing"):
             continue
         room_id = room.get("id")
         if not isinstance(room_id, str):
             continue
         try:
+            if state.get("phase") == "completed" and state.get("final"):
+                final_message = _post_swarm_final_if_missing(room_id, state)
+                if final_message is not None:
+                    recovered.append({"room_id": room_id,
+                                      "final_message": final_message})
+                continue
+            if (state.get("phase") != "working"
+                    or not (state.get("start_requested") is True
+                            or state.get("dispatched") or state.get("done"))):
+                continue
             advanced = _swarm_advance(room_id)
             dispatched = [item for item in advanced["next_dispatch"]
                           if item.get("status") == "dispatched"]
-            if dispatched or advanced["new_final_request"]:
-                recovered.append({"room_id": room_id,
-                                  "next_dispatch": dispatched,
-                                  "final_request": advanced["final_request"]
-                                  if advanced["new_final_request"] else None})
+            blocked = []
+            for item in advanced["next_dispatch"]:
+                if item.get("status") not in {"unavailable", "spec_drift"}:
+                    continue
+                member, reason = item["member"], item["status"]
+                key = (f"swarm-pilot:{room_id}:{state.get('round', 1)}:"
+                       f"{member}:blocked:{reason}")
+                existing = next(
+                    (msg for msg in bus._load_messages(room_id)
+                     if msg.get("idempotency_key") == key), None,
+                )
+                if existing is not None:
+                    if (existing.get("agent") != "System"
+                            or existing.get("kind") != "system"):
+                        raise ValueError("pilot blocked key belongs to another message")
+                    continue
+                detail = (
+                    "The pinned member profile changed; dispatch is paused. "
+                    "Restore the original profile to continue."
+                    if reason == "spec_drift" else
+                    "The member profile is unavailable; dispatch is paused. "
+                    "Enable the profile to continue."
+                )
+                event_id = message_post(
+                    room_id, "System", f"Swarm member {member}: {detail}",
+                    "system", idempotency_key=key,
+                )
+                blocked.append({"member": member, "status": reason,
+                                "event_id": event_id})
+            if dispatched or advanced["new_final_request"] or blocked:
+                event = {"room_id": room_id, "next_dispatch": dispatched,
+                         "final_request": advanced["final_request"]
+                         if advanced["new_final_request"] else None}
+                if blocked:
+                    event["blocked"] = blocked
+                recovered.append(event)
         except Exception as exc:
             # One malformed/removed room must not prevent other rooms from
             # recovering on this tick. The next tick can retry this room.
             print(f"[watchdog] swarm advance failed ({room_id}): {exc}",
                   flush=True)
     return recovered
+
+
+def _post_swarm_final_if_missing(room_id: str, state: dict) -> int | None:
+    """Complete the final-request reply after a crash between state and post."""
+    final = state.get("final") or {}
+    member, result = final.get("member"), final.get("result")
+    if not member or not result:
+        return None
+    messages = bus._load_messages(room_id)
+    key = f"swarm-pilot:{room_id}:{state.get('round', 1)}:final-request"
+    request = next((msg for msg in messages
+                    if msg.get("idempotency_key") == key
+                    and msg.get("kind") == "request"
+                    and msg.get("to") == member), None)
+    if request is None:
+        raise ValueError("final request has not been delivered to this member")
+    final_key = f"swarm-pilot:{room_id}:final"
+    existing = next((msg for msg in messages
+                     if msg.get("idempotency_key") == final_key), None)
+    if existing is not None:
+        if (existing.get("agent") != member or existing.get("kind") != "final"
+                or existing.get("body") != result
+                or existing.get("reply_to") not in (None, request["id"])):
+            raise ValueError("pilot final key belongs to another message")
+        # Pilots completed before final replies carried reply_to have an
+        # append-only final message. The pending queue recognizes that legacy
+        # settlement without rewriting history or publishing a second final.
+        return None
+    return message_post(
+        room_id, member, result, "final", to=state["organizer"],
+        reply_to=request["id"], idempotency_key=final_key,
+    )
 
 
 def _swarm_spec_drift(
@@ -1374,10 +1445,7 @@ def swarm_pilot_finish(room_id: str, member: str, result: str) -> dict:
     ):
         raise ValueError("final request has not been delivered to this member")
     updated = swarm_pilot.finish(room_id, member, result)
-    message_post(
-        room_id, member, result, "final", to=updated["organizer"],
-        idempotency_key=f"swarm-pilot:{room_id}:final",
-    )
+    _post_swarm_final_if_missing(room_id, updated)
     _schedule_completed_pilot_turn_exit(room_id, member, updated, "final")
     return updated
 
@@ -1660,16 +1728,42 @@ def _server_terminal_failure_task_ids(status_info: dict, wake_info: dict) -> set
     return task_ids
 
 
+def _swarm_pilot_request_superseded(
+    room_id: str, message: dict, pilot: dict | None,
+    messages: list[dict] | None = None,
+) -> bool:
+    """Whether durable pilot state has replaced this request's work."""
+    if not isinstance(pilot, dict) or message.get("kind") != "request":
+        return False
+    prefix = f"swarm-pilot:{room_id}:{pilot.get('round', 1)}:"
+    key = message.get("idempotency_key")
+    if not isinstance(key, str) or not key.startswith(prefix):
+        return False
+    suffix = key[len(prefix):]
+    if suffix == "final-request-missing-reporter":
+        return bool(pilot.get("responsibilities", {}).get("reporter", {}).get("member"))
+    if suffix == "final-request" and pilot.get("phase") == "completed":
+        final_member = (pilot.get("final") or {}).get("member")
+        return any(
+            msg.get("idempotency_key") == f"swarm-pilot:{room_id}:final"
+            and msg.get("agent") == final_member and msg.get("kind") == "final"
+            for msg in (messages or [])
+        )
+    return suffix in pilot.get("members", []) and suffix in pilot.get("done", {})
+
+
 def _pending_requests(
     room_id: str,
     participants: list[str],
     terminal_tasks: dict[str, set[str]] | None = None,
+    pilot: dict | None = None,
 ) -> list[dict]:
     """Return unanswered request work, including agents still expected.
 
     A terminal lifecycle phase only settles the request recorded in its
     ``task_id``. Progress messages (ack/busy/comment) are not a receipt;
-    only a stored result/final reply settles a request.
+    a stored result/final reply settles ordinary work. Durable pilot completion
+    also supersedes its initial dispatch and the reporter-claim broadcast.
     """
     terminal_tasks = terminal_tasks or {}
     messages = bus._load_messages(room_id)
@@ -1682,6 +1776,8 @@ def _pending_requests(
     pending: list[dict] = []
     for message in messages:
         if message.get("kind") != "request" or message.get("reply_to") is not None:
+            continue
+        if _swarm_pilot_request_superseded(room_id, message, pilot, messages):
             continue
         to = message.get("to")
         if to and to != "all":
@@ -1723,7 +1819,9 @@ def room_status(room_id: str) -> dict:
         )
         if task_ids:
             terminal_tasks[name] = task_ids
-    pending = _pending_requests(room_id, participants, terminal_tasks)
+    pending = _pending_requests(
+        room_id, participants, terminal_tasks, meta.get("swarm_pilot"),
+    )
     pending_by_agent = {
         name: [item["id"] for item in pending if name in item["waiting_for"]]
         for name in set(participants) | set(agent_meta) | set(status_details)
@@ -3795,10 +3893,14 @@ def _next_pending_request(room_id: str, agent_name: str,
     """Oldest request addressed to agent_name it has not been woken for yet.
     The message log itself is the per-agent wake queue."""
     last_wake = int(info.get("last_wake_msg_id", 0) or 0)
-    for msg in bus._load_messages(room_id):
+    pilot = bus.get_room_info(room_id).get("swarm_pilot")
+    messages = bus._load_messages(room_id)
+    for msg in messages:
         if msg.get("id", 0) <= last_wake:
             continue
         if msg.get("kind") != "request" or msg.get("reply_to") is not None:
+            continue
+        if _swarm_pilot_request_superseded(room_id, msg, pilot, messages):
             continue
         if msg.get("agent") == agent_name:
             continue
@@ -4024,7 +4126,8 @@ def _agent_replied_to_request(room_id: str, agent_name: str, msg_id: int) -> boo
     A failure settlement remains a failure lifecycle state; this predicate only
     prevents a duplicate wake when wake metadata is missing.
     """
-    for msg in bus._load_messages(room_id):
+    messages = bus._load_messages(room_id)
+    for msg in messages:
         if (
             msg.get("agent") == agent_name
             and msg.get("reply_to") == msg_id
@@ -4036,6 +4139,11 @@ def _agent_replied_to_request(room_id: str, agent_name: str, msg_id: int) -> boo
         meta = bus.get_room_info(room_id)
     except Exception:
         return False
+    request = next((msg for msg in messages if msg.get("id") == msg_id), None)
+    if request and _swarm_pilot_request_superseded(
+        room_id, request, meta.get("swarm_pilot"), messages,
+    ):
+        return True
     wake_info = (meta.get("agent_meta") or {}).get(agent_name) or {}
     return str(msg_id) in _server_terminal_failure_task_ids(status_info, wake_info)
 
