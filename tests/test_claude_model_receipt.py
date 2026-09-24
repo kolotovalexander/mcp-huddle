@@ -77,3 +77,29 @@ def test_rejects_unbounded_or_invalid_offsets_without_reading(tmp_path):
     for start, end in ((-1, 0), (1, 0), (0, 1_048_577), (True, 1)):
         with pytest.raises(ValueError):
             parse_claude_model_receipt(path, start_offset=start, end_offset=end)
+
+
+def test_skips_partial_previous_line_at_segment_start(tmp_path):
+    previous = b'{"type":"assistant","message":{"model":"claude-opus-5-5"}'
+    current = _event(type="system", subtype="init", model="claude-sonnet-5")
+    assert _receipt(tmp_path, previous + b" tail\n" + current, start=len(previous)) == {
+        "reported_model": "claude-sonnet-5", "source": "init",
+    }
+
+
+def test_mixed_cli_sessions_do_not_claim_a_model(tmp_path):
+    data = _event(type="system", subtype="init", session_id="one", model="claude-sonnet-5")
+    data += _event(type="assistant", session_id="two", parent_tool_use_id=None,
+                   message={"model": "claude-opus-5-5"})
+    assert _receipt(tmp_path, data) == {"reported_model": None, "source": "mixed"}
+
+
+def test_open_file_identity_must_match_expected_inode(tmp_path):
+    path = tmp_path / "claude.jsonl"
+    data = _event(type="system", subtype="init", model="claude-sonnet-5")
+    path.write_bytes(data)
+    with path.open("rb") as stream:
+        with pytest.raises(ValueError, match="identity"):
+            parse_claude_model_receipt(
+                stream, start_offset=0, end_offset=len(data), expected_inode=-1,
+            )

@@ -104,3 +104,24 @@ def test_status_exposes_legacy_member_ids_without_writing_schema_one(isolated_ho
                }
                for detail in first["members_detail"])
     assert "member_ids" not in bus.get_room_info(room)["swarm_pilot"]
+
+
+def test_status_exposes_only_safe_last_claude_receipt(isolated_home):
+    room = swarm_pilot.create(
+        "pilot", "Organizer", "Tiny result", "council", ["Reviewer"],
+    )
+    _set_agent_meta(room, "Reviewer", {
+        "wake_id": "new-generation",
+        "claude_model_receipt": {
+            "reported_model": "claude-opus-5-5", "source": "assistant",
+            "generation": "old-generation", "private_log": "must-not-leak",
+        },
+    })
+
+    detail = server.swarm_pilot_status(room)["members_detail"][0]
+
+    assert detail["last_model_receipt"] == {
+        "reported_model": "claude-opus-5-5", "source": "assistant",
+        "claim_scope": "cli_reported_identifier", "generation": "old-generation",
+    }
+    assert "must-not-leak" not in repr(detail)

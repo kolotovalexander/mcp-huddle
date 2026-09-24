@@ -1227,15 +1227,17 @@ def swarm_pilot_status(room_id: str) -> dict:
                     "claim_scope": "cli_reported_identifier",
                     "generation": receipt_generation,
                 }
-        details.append({
+        member_detail = {
             "member_id": state["member_ids"][member],
             "name": member,
             "profile": member,
             "native_session": native_session,
             "process_generation": generation,
-            "last_model_receipt": model_receipt,
             "delivery_cursor": cursor,
-        })
+        }
+        if model_receipt is not None:
+            member_detail["last_model_receipt"] = model_receipt
+        details.append(member_detail)
     return {**state, "members_detail": details}
 
 
