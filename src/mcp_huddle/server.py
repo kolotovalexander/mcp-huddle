@@ -6,6 +6,7 @@ HTTP mode (`--http`): uvicorn + Liquid Glass dashboard on :8014.
 
 import asyncio
 import contextlib
+import hashlib
 import hmac
 import json
 import os
@@ -393,10 +394,158 @@ def room_round_advance(room_id: str, owner: str, label: str = "") -> str:
 # ── Bounded four-mode swarm pilot ─────────────────────────────────────────────
 
 _SWARM_COST_CLASSES = {"free", "cheap", "paid", "unknown"}
+_SWARM_CLIENT_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_SWARM_HASH_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _SWARM_JEV_HARNESSES = {
     "agy": "antigravity", "antigravity": "antigravity",
     "claude": "claude", "codex": "codex", "opencode": "opencode",
 }
+
+
+def _swarm_client_request_fingerprint(
+    name: str, organizer: str, goal: str, mode: str, members: list[str],
+    cwd: str, workspace_strategy: str, start_requested: bool,
+) -> str:
+    payload = {
+        "name": name,
+        "organizer": organizer,
+        "goal": goal,
+        "mode": mode,
+        "members": list(members),
+        "cwd": cwd,
+        "workspace_strategy": workspace_strategy,
+        "start_requested": start_requested,
+    }
+    try:
+        encoded = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, UnicodeError):
+        raise ValueError("request fields cannot be encoded safely") from None
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _swarm_request_room_id(organizer: str, client_request_id: str) -> str:
+    digest = hashlib.sha256(
+        (organizer + "\0" + client_request_id).encode("utf-8")
+    ).hexdigest()
+    return "room_" + digest[:8]
+
+
+def _swarm_validate_expected_specs(
+    members: list[str], expected_specs: dict[str, str] | None,
+    *, check_registry: bool = True,
+) -> dict[str, str] | None:
+    if expected_specs is None:
+        return None
+    if not isinstance(members, list) or not all(isinstance(item, str) for item in members):
+        raise ValueError("members must be a list of participant names")
+    if not isinstance(expected_specs, dict):
+        raise ValueError("expected_specs must map every member to a sha256 fingerprint")
+    if len(members) != len(set(members)):
+        raise ValueError("members must be unique when expected_specs is supplied")
+    if set(expected_specs) != set(members):
+        raise ValueError("expected_specs keys must exactly match members")
+    for member, fingerprint in expected_specs.items():
+        if not isinstance(member, str) or not isinstance(fingerprint, str) or not _SWARM_HASH_RE.fullmatch(fingerprint):
+            raise ValueError("expected_specs values must be sha256 fingerprints")
+
+    if check_registry:
+        registry = {item["id"]: item for item in _swarm_plan_candidates()}
+        for member in members:
+            current = registry.get(member)
+            if current is None or not current["enabled"] or not current["static_ok"]:
+                raise ValueError(f"participant is not statically available: {member}")
+            if current["spec_fingerprint"] != expected_specs[member]:
+                raise ValueError(f"registry spec drift for participant: {member}")
+    return dict(expected_specs)
+
+
+def _swarm_mark_create_state(
+    room_id: str, state: str, expected_specs: dict[str, str] | None,
+    start_requested: bool, initial_dispatch: list[dict] | None = None,
+) -> None:
+    def update(meta: dict) -> dict:
+        pilot = meta.get("swarm_pilot")
+        if not isinstance(pilot, dict):
+            raise ValueError("partial_room: swarm pilot state is missing")
+        pilot["server_create_state"] = state
+        pilot["start_requested"] = start_requested
+        pilot["registry_availability_checked"] = True
+        if expected_specs is not None:
+            pilot["expected_specs"] = dict(expected_specs)
+        if state == "ready":
+            pilot["initial_dispatch"] = list(initial_dispatch or [])
+        return meta
+    bus._update_meta_locked(room_id, update)
+
+
+def _swarm_existing_request(
+    room_id: str, fingerprint: str, organizer: str, expected_specs: dict[str, str] | None,
+) -> dict | None:
+    try:
+        meta = bus.get_room_info(room_id)
+    except ValueError:
+        try:
+            room_path = bus._room_dir(room_id)
+        except ValueError:
+            raise ValueError("partial_room: deterministic room path is invalid") from None
+        if room_path.exists():
+            raise ValueError("partial_room: room exists without readable initialized metadata") from None
+        return None
+
+    pilot = meta.get("swarm_pilot")
+    if not isinstance(pilot, dict):
+        raise ValueError("partial_room: deterministic room ID is occupied by a non-pilot room")
+    stored_fingerprint = pilot.get("client_request_fingerprint")
+    if not isinstance(stored_fingerprint, str) or not _SWARM_HASH_RE.fullmatch(stored_fingerprint):
+        raise ValueError("partial_room: room has no valid client request fingerprint")
+    if stored_fingerprint != fingerprint:
+        raise ValueError("client_request_id conflict: the room belongs to a different request")
+    if meta.get("owner") != organizer or pilot.get("organizer") != organizer:
+        raise ValueError("client_request_id conflict: organizer does not match the stored room")
+    if not isinstance(pilot.get("start_requested"), bool):
+        raise ValueError("partial_room: original start request state is missing")
+
+    try:
+        recomputed = _swarm_client_request_fingerprint(
+            meta["name"], pilot["organizer"], pilot["goal"], pilot["mode"],
+            pilot["members"], meta.get("cwd", ""), pilot["workspace_strategy"],
+            pilot["start_requested"],
+        )
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("partial_room: stored request data is incomplete") from None
+    if recomputed != stored_fingerprint:
+        raise ValueError("partial_room: stored request fingerprint does not match room data")
+    if pilot.get("server_create_state") != "ready":
+        raise ValueError("partial_room: room initialization did not reach ready state")
+    if not isinstance(pilot.get("initial_dispatch"), list):
+        raise ValueError("partial_room: initial dispatch result is missing")
+    members = pilot.get("members")
+    participants = meta.get("participants")
+    if (not isinstance(members, list) or not isinstance(participants, list)
+            or any(member not in participants for member in members)):
+        raise ValueError("partial_room: room roster initialization is incomplete")
+    if expected_specs is not None:
+        stored_specs = pilot.get("expected_specs")
+        if stored_specs is not None and stored_specs != expected_specs:
+            raise ValueError("client_request_id conflict: expected agent specs differ from stored request")
+        if stored_specs is None:
+            _swarm_validate_expected_specs(members, expected_specs)
+    return {
+        "room_id": room_id,
+        "mode": pilot.get("mode"),
+        "dispatched": [],
+        "started": pilot["start_requested"],
+        "start_requested": pilot["start_requested"],
+        "previous_dispatch": list(pilot.get("initial_dispatch", [])),
+        "reused": True,
+        "availability": {
+            "static_only": not bool(pilot.get("registry_availability_checked")),
+            "registry_availability_checked": bool(pilot.get("registry_availability_checked")),
+            "provider_response_verified": False,
+        },
+    }
 
 
 def _swarm_cli_exists(command: str) -> bool:
@@ -718,25 +867,93 @@ def swarm_pilot_create(
     cwd: str = "",
     workspace_strategy: str = "shared_only",
     start: bool = True,
+    client_request_id: str = "",
+    expected_specs: dict[str, str] | None = None,
+    plan_hash: str = "",
 ) -> dict:
     """Create a pilot room; start exact enabled registry members when requested.
 
     ``start=False`` prepares durable state without launching CLI workers. This
     is useful for a dry run and never implies that model work was performed.
     The pilot records workspace_strategy but does not create Git worktrees.
+    Supplying ``client_request_id`` makes retries idempotent for the exact
+    request payload. ``expected_specs`` pins each selected profile to its
+    current static registry fingerprint before creating a room. ``plan_hash``
+    is stored for audit only; it does not grant permissions.
     """
+    if not isinstance(client_request_id, str):
+        raise ValueError("client_request_id must be a string")
+    if client_request_id and not _SWARM_CLIENT_REQUEST_ID_RE.fullmatch(client_request_id):
+        raise ValueError("client_request_id must be 1-128 ASCII letters, digits, dot, underscore, colon or hyphen")
+    if not isinstance(plan_hash, str) or (plan_hash and not _SWARM_HASH_RE.fullmatch(plan_hash)):
+        raise ValueError("plan_hash must be empty or a sha256 fingerprint")
+    if not isinstance(start, bool):
+        raise ValueError("start must be a boolean")
+
+    expected = _swarm_validate_expected_specs(
+        members, expected_specs, check_registry=not bool(client_request_id),
+    )
+    request_fingerprint = ""
+    deterministic_room_id = None
+    if client_request_id:
+        if not all(isinstance(value, str) for value in (name, organizer, goal, cwd, workspace_strategy, mode)):
+            raise ValueError("idempotent request fields must be strings")
+        if not isinstance(members, list) or not all(isinstance(member, str) for member in members):
+            raise ValueError("members must be a list of participant names")
+        request_fingerprint = _swarm_client_request_fingerprint(
+            name, organizer, goal, mode, members, cwd, workspace_strategy, start,
+        )
+        deterministic_room_id = _swarm_request_room_id(organizer, client_request_id)
+        existing = _swarm_existing_request(
+            deterministic_room_id, request_fingerprint, organizer, expected,
+        )
+        if existing is not None:
+            return existing
+
+    # Check expected static registry fingerprints before the old live
+    # availability probe or any persistent room creation.
+    if client_request_id:
+        expected = _swarm_validate_expected_specs(members, expected_specs)
     if start:
         unavailable = [name for name in members if spawn.get_enabled_spec(name) is None]
         if unavailable:
             raise ValueError(f"unavailable registry members: {unavailable}")
-    room_id = swarm_pilot.create(
-        name, organizer, goal, mode, members, cwd, workspace_strategy,
-    )
+    try:
+        room_id = swarm_pilot.create(
+            name, organizer, goal, mode, members, cwd, workspace_strategy,
+            room_id=deterministic_room_id,
+            client_request_fingerprint=request_fingerprint,
+            plan_hash=plan_hash,
+        )
+    except FileExistsError:
+        if deterministic_room_id:
+            existing = _swarm_existing_request(
+                deterministic_room_id, request_fingerprint, organizer, expected,
+            )
+            if existing is not None:
+                return existing
+            raise ValueError("partial_room: deterministic room directory already exists") from None
+        raise
+    if client_request_id:
+        _swarm_mark_create_state(room_id, "preparing", expected, start)
     for name in members:
         room_invite(room_id, name, by=organizer)
     dispatch = swarm_pilot_pump(room_id) if start else []
-    return {"room_id": room_id, "mode": mode, "dispatched": dispatch,
-            "started": start}
+    if client_request_id:
+        _swarm_mark_create_state(room_id, "ready", expected, start, dispatch)
+    return {
+        "room_id": room_id,
+        "mode": mode,
+        "dispatched": dispatch,
+        "started": start,
+        "start_requested": start,
+        "reused": False,
+        "availability": {
+            "static_only": False,
+            "registry_availability_checked": True,
+            "provider_response_verified": False,
+        },
+    }
 
 
 @mcp.tool()
