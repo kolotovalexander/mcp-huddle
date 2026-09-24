@@ -6,10 +6,11 @@ HTTP mode (`--http`): uvicorn + Liquid Glass dashboard on :8014.
 
 import asyncio
 import contextlib
-import hashlib
 import hmac
 import json
 import os
+import re
+import shutil
 import signal
 import stat
 import sys
@@ -29,6 +30,8 @@ from . import bus
 from . import child_processes
 from . import spawn
 from . import swarm_pilot
+from . import swarm_jev
+from . import swarm_planner
 
 # Shown to LLM clients in the `initialize` response. Keep tight — every agent
 # session sees this verbatim. Goal: stop one-shot misuse, enforce anti-loop.
@@ -388,6 +391,316 @@ def room_round_advance(room_id: str, owner: str, label: str = "") -> str:
 
 
 # ── Bounded four-mode swarm pilot ─────────────────────────────────────────────
+
+_SWARM_COST_CLASSES = {"free", "cheap", "paid", "unknown"}
+_SWARM_JEV_HARNESSES = {
+    "agy": "antigravity", "antigravity": "antigravity",
+    "claude": "claude", "codex": "codex", "opencode": "opencode",
+}
+
+
+def _swarm_cli_exists(command: str) -> bool:
+    """Check only the executable named by a registry command; never launch it."""
+    if not isinstance(command, str) or not command.strip():
+        return False
+    if os.path.isabs(command):
+        path = Path(command)
+        return path.is_file() and os.access(path, os.X_OK)
+    if os.sep in command:
+        path = Path(command)
+        return path.is_file() and os.access(path, os.X_OK)
+    return shutil.which(command) is not None
+
+
+def _swarm_display_model(value: object) -> str:
+    """Keep model IDs useful while hiding values that look like credentials."""
+    if not isinstance(value, str) or not value.strip():
+        return "harness default"
+    model = value.strip()
+    lowered = model.lower()
+    if (
+        len(model) > 160
+        or any(marker in lowered for marker in ("api_key", "token=", "secret=", "password=", "bearer "))
+        or lowered.startswith("sk-")
+        or re.fullmatch(r"[A-Za-z0-9_-]{40,}", model)
+    ):
+        return "configured model (redacted)"
+    return model
+
+
+def _swarm_readonly_enforced(spec: dict) -> bool:
+    """Confirm the active CLI argv has Huddle's known enforced RO flags."""
+    if not spawn._readonly_enabled():
+        return False
+    # Check the final command after the same enforced transform the registry
+    # uses. Applying it again is idempotent for Claude and Codex.
+    spec = spawn._apply_readonly(spec)
+    command = spec.get("cmd")
+    if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
+        return False
+    cli_index = spawn._effective_binary_index(command)
+    if cli_index is None:
+        return False
+    binary = spawn._effective_binary(command)
+    args = command[cli_index + 1:]
+    if binary == "claude":
+        if "--dangerously-skip-permissions" in args:
+            return False
+        allowed = spawn._setting_from_argv(args, ("--allowedTools",))
+        denied = spawn._setting_from_argv(args, ("--disallowedTools", "--disallowed-tools"))
+        mode = spawn._setting_from_argv(args, ("--permission-mode",))
+        return (
+            allowed == "Read,Glob,Grep,WebFetch,WebSearch,mcp__huddle__*"
+            and denied is not None
+            and {"Edit", "Write", "NotebookEdit", "MultiEdit", "Bash"}.issubset(
+                {name.strip() for name in denied.split(",")}
+            )
+            and mode == "manual"
+        )
+    if binary == "codex":
+        if "--dangerously-bypass-approvals-and-sandbox" in args:
+            return False
+        sandbox = spawn._setting_from_argv(args, ("-s", "--sandbox"))
+        approval = None
+        for i, arg in enumerate(args):
+            value = None
+            if arg in ("-c", "--config") and i + 1 < len(args):
+                value = args[i + 1]
+            elif arg.startswith("-c="):
+                value = arg[3:]
+            elif arg.startswith("--config="):
+                value = arg[len("--config="):]
+            if value and value.partition("=")[0].strip() == (
+                "mcp_servers.huddle.default_tools_approval_mode"
+            ):
+                approval = value.partition("=")[2].strip().strip("\"'")
+        return sandbox == "read-only" and approval == "approve"
+    return False
+
+
+def _swarm_plan_candidates() -> list[dict]:
+    """Build closed preview facts from the raw registry without live probes."""
+    candidates = []
+    for spec in spawn._raw_registry():
+        name = spec.get("name")
+        command = spec.get("cmd")
+        enabled = spec.get("enabled") is True
+        reasons: list[str] = []
+        cli_kind = "unsupported"
+        model = "harness default"
+        effort = variant = None
+        static_ok = True
+        settings: dict[str, str] = {}
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if not isinstance(command, list) or not command or not all(
+            isinstance(item, str) for item in command
+        ):
+            static_ok = False
+            reasons.append("invalid command template")
+            executable = ""
+        else:
+            cli_index = spawn._effective_binary_index(command)
+            executable = command[cli_index] if cli_index is not None else ""
+            binary = spawn._effective_binary(command)
+            cli_kind = binary or "unsupported"
+            if cli_index is None or not _swarm_cli_exists(executable):
+                static_ok = False
+                reasons.append("CLI executable not found")
+            try:
+                settings = spawn.model_settings_for_spec(spec)
+                if not isinstance(settings, dict) or any(
+                    key not in {"model", "effort", "variant"}
+                    or not isinstance(value, str) or not value.strip()
+                    for key, value in settings.items()
+                ):
+                    raise ValueError("invalid effective model settings")
+            except Exception:
+                settings = {}
+                static_ok = False
+                reasons.append("model settings are invalid")
+            model = settings.get("model") or spec.get("model") or model
+            effort = settings.get("effort") or spec.get("effort")
+            variant = settings.get("variant") or spec.get("variant")
+        # Special typed profiles have a different fixed runner/auth contract;
+        # the static pilot planner does not claim to preflight those yet.
+        if spec.get("profile"):
+            static_ok = False
+            reasons.append("typed runner profile is not covered by static preflight")
+        try:
+            fingerprint = spawn.spec_fingerprint(spec)
+        except Exception:
+            fingerprint = "sha256:invalid"
+            static_ok = False
+            reasons.append("registry contract could not be fingerprinted")
+        raw_cost = spec.get("cost_class")
+        cost_class = (
+            raw_cost if isinstance(raw_cost, str) and raw_cost in _SWARM_COST_CLASSES
+            else "unknown"
+        )
+        if cost_class == "unknown" and isinstance(model, str) and model.lower().endswith(":free"):
+            cost_class = "free"
+            reasons.append("configured model route is explicitly marked free")
+        if cost_class == "unknown":
+            reasons.append("cost class is not declared in registry")
+        candidates.append({
+            "id": name,
+            "name": name,
+            "cli_kind": cli_kind,
+            "model": _swarm_display_model(model),
+            "effort": effort if isinstance(effort, str) and effort.strip() else None,
+            "variant": variant if isinstance(variant, str) and variant.strip() else None,
+            "readonly_enforced": _swarm_readonly_enforced(spec),
+            "enabled": enabled,
+            "static_ok": static_ok,
+            "cost_class": cost_class,
+            "spec_fingerprint": fingerprint,
+            "reasons": reasons,
+        })
+    return candidates
+
+
+def _swarm_jev_facts(profile: dict) -> swarm_jev.ModeFacts:
+    return swarm_jev.ModeFacts(
+        task_type=profile["task_type"],
+        needs_files=profile["needs_files"],
+        parts=profile["parts"],
+        sequential_dependency=profile["sequential_dependency"],
+        diverse_opinions=profile["diverse_opinions"],
+        max_members=profile["max_members"],
+        budget=profile["budget"],
+    )
+
+
+@mcp.tool()
+def swarm_plan_preview(
+    profile: dict,
+    explicit_mode: str = "",
+    explicit_members: list[str] | None = None,
+    allow_unenforced_read: bool = False,
+) -> dict:
+    """Recommend a four-mode plan from closed task facts; creates no room/process.
+
+    This is a static advisory preview. It checks the configured CLI executable,
+    enabled flag, model settings, and enforced read-only argv. It does not test
+    provider authentication or ask a model to answer the task. Jev receives
+    only the closed profile and safe candidate capability labels.
+    """
+    if not isinstance(profile, dict):
+        raise ValueError("profile must be an object")
+    if explicit_mode == "":
+        explicit_mode = None
+    candidates = _swarm_plan_candidates()
+    explicit_kwargs = {
+        "explicit_mode": explicit_mode,
+        "explicit_members": explicit_members,
+        "explicit_allow_unenforced_read": allow_unenforced_read,
+    }
+    # Validate the closed input before contacting Jev. This call is pure and
+    # deliberately uses no room, process, or live registry-availability APIs.
+    base = swarm_planner.build_plan(profile, candidates, **explicit_kwargs)
+    eligible = [
+        item for item in candidates
+        if item["enabled"] and item["static_ok"]
+        and (item["readonly_enforced"] or (
+            allow_unenforced_read and profile.get("needs_files") == "read"
+        ))
+        and (
+            profile["budget"] == "any"
+            or (profile["budget"] == "cheap" and item["cost_class"] in {"free", "cheap"})
+            or (profile["budget"] == "free" and item["cost_class"] == "free")
+        )
+    ]
+    jev_facts = _swarm_jev_facts(profile)
+    jev_mode = None
+    jev_mode_confidence = None
+    mode_reason = "organizer supplied the mode" if explicit_mode else "Jev not consulted"
+    if explicit_mode is None and eligible and profile["needs_files"] != "write":
+        try:
+            result = swarm_jev.choose_mode(jev_facts)
+        except Exception:
+            result = None
+        if result is not None:
+            mode_reason = result.reason
+            if result.status == "ok" and result.choice in swarm_planner.MODES:
+                jev_mode = result.choice
+                jev_mode_confidence = result.confidence
+        else:
+            mode_reason = "Jev request failed; deterministic mode fallback"
+
+    effective_mode = explicit_mode or jev_mode or base["mode"]
+    ordered_candidates = list(candidates)
+    roster_lead = None
+    roster_reason = "organizer supplied the participant list" if explicit_members is not None else "Jev not consulted"
+    if explicit_members is None and len(eligible) >= 2 and profile["needs_files"] != "write":
+        jev_candidates = []
+        for item in eligible:
+            harness = _SWARM_JEV_HARNESSES.get(item["cli_kind"].lower())
+            if not harness:
+                continue
+            effort = (item["effort"] or "").lower()
+            model_class = "fast" if effort in {"minimal", "low", "none"} else (
+                "strong" if effort in {"high", "xhigh", "max", "ultra"} else "balanced"
+            )
+            jev_candidates.append(swarm_jev.VerifiedCandidate(
+                candidate_id=item["id"],
+                harness=harness,
+                model_class=model_class,
+                cost_class=item["cost_class"],
+                readonly_enforced=item["readonly_enforced"],
+            ))
+            if len(jev_candidates) == 9:
+                break
+        if len(jev_candidates) >= 2:
+            try:
+                result = swarm_jev.choose_candidate(jev_facts, jev_candidates)
+            except Exception:
+                result = None
+            if result is not None:
+                roster_reason = result.reason
+                if result.status == "ok" and result.choice in {item.candidate_id for item in jev_candidates}:
+                    roster_lead = result.choice
+                    ordered_candidates.sort(key=lambda item: item["id"] != roster_lead)
+            else:
+                roster_reason = "Jev request failed; eligible registry order used"
+
+    # A single Jev pick is the lead participant; Huddle fills the rest using
+    # the verified registry order, bounded to two for a one-part council.
+    effective_profile = dict(profile)
+    roster_cap = profile["max_members"]
+    if (explicit_members is None and effective_mode == "council"
+            and profile["parts"] == "one"):
+        roster_cap = min(roster_cap, 2)
+        effective_profile["max_members"] = roster_cap
+    jev_advice = {
+        "confidence": jev_mode_confidence,
+        "mode": jev_mode,
+        "member_ids": [],
+    } if jev_mode else None
+    plan = swarm_planner.build_plan(
+        effective_profile,
+        ordered_candidates,
+        jev_advice=jev_advice,
+        **explicit_kwargs,
+    )
+    roster_note = ""
+    if roster_lead:
+        roster_note = (
+            "Jev selected the first participant; Huddle filled the remaining places "
+            "in eligible registry order."
+        )
+    if roster_cap < profile["max_members"]:
+        cap_note = f"Roster capped at {roster_cap} for a one-participant council profile."
+        roster_note = f"{roster_note} {cap_note}".strip()
+    plan["jev"] = {
+        "mode": {"choice": jev_mode, "reason": mode_reason},
+        "first_participant": {"choice": roster_lead, "reason": roster_reason},
+        "roster_note": roster_note,
+    }
+    plan["readiness"] = "static advisory only; provider authentication and response not verified"
+    plan["side_effects"] = {"room_created": False, "child_processes_started": False}
+    return plan
+
 
 @mcp.tool()
 def swarm_pilot_create(
