@@ -31,6 +31,7 @@ from starlette.responses import FileResponse, JSONResponse, StreamingResponse
 
 from . import bus
 from . import child_processes
+from .claude_model_receipt import parse_claude_model_receipt
 from . import spawn
 from . import swarm_pilot
 from . import swarm_jev
@@ -3066,6 +3067,100 @@ def _room_open_for_spawn(room_id: str) -> bool:
 _SPAWNED_PID_HISTORY_MAX = 64
 
 
+def _claude_receipt_log_open(
+    room_id: str, agent_name: str, generation: str, source: str, spec: dict,
+):
+    """Bind one subscription Claude stream segment to its owned generation."""
+    if spec.get("profile") != spawn._SUBSCRIPTION_OPUS_REVIEW_PROFILE:
+        return None
+
+    def _opened(start_offset: int, log_path: str, device: int, inode: int) -> None:
+        try:
+            canonical, _ = bus._agent_paths(room_id, agent_name, create=True)
+        except (OSError, ValueError) as exc:
+            raise spawn.AgentSpawnError("Claude room log unavailable") from exc
+        if log_path != str(canonical):
+            raise spawn.AgentSpawnError("Claude log path does not match room agent path")
+        claimed = False
+
+        def _update(meta: dict) -> dict:
+            nonlocal claimed
+            info = (meta.get("agent_meta") or {}).get(agent_name)
+            if not isinstance(info, dict):
+                return meta
+            if source == "initial_spawn_id":
+                claimed = (info.get(source) == generation
+                           and info.get("initial_spawn_active") is True)
+            else:
+                claimed = (info.get(source) == generation
+                           and info.get("wake_claim_id") == generation)
+            if claimed:
+                info["claude_log_segment"] = {
+                    "generation": generation, "source": source,
+                    "start_offset": start_offset,
+                    "device": device, "inode": inode,
+                }
+            return meta
+
+        bus._update_meta_locked(room_id, _update)
+        if not claimed:
+            raise spawn.AgentSpawnError("Claude process generation no longer owns room slot")
+
+    return _opened
+
+
+def _record_claude_model_receipt(
+    room_id: str, agent_name: str, generation: str, source: str,
+) -> None:
+    """Observe only this exited CLI process and publish under the same claim."""
+    meta = bus.get_room_info(room_id)
+    info = (meta.get("agent_meta") or {}).get(agent_name) or {}
+    segment = info.get("claude_log_segment") or {}
+    if (segment.get("generation") != generation
+            or segment.get("source") != source
+            or info.get(source) != generation):
+        return
+    start = segment.get("start_offset")
+    if type(start) is not int:
+        return
+    canonical, _ = bus._agent_paths(room_id, agent_name, create=False)
+    try:
+        fd = bus._safe_open_fd(canonical, os.O_RDONLY)
+        with os.fdopen(fd, "rb") as stream:
+            current_stat = os.fstat(stream.fileno())
+            if (current_stat.st_dev != segment.get("device")
+                    or current_stat.st_ino != segment.get("inode")
+                    or current_stat.st_size < start):
+                return
+            receipt = parse_claude_model_receipt(
+                stream, start_offset=start, end_offset=current_stat.st_size,
+                expected_device=segment.get("device"),
+                expected_inode=segment.get("inode"),
+            )
+    except (OSError, ValueError):
+        receipt = {"reported_model": None, "source": "none"}
+
+    def _update(current: dict) -> dict:
+        slot = (current.get("agent_meta") or {}).get(agent_name)
+        if not isinstance(slot, dict):
+            return current
+        owned_segment = slot.get("claude_log_segment") or {}
+        if (slot.get(source) != generation
+                or owned_segment.get("generation") != generation
+                or owned_segment.get("source") != source
+                or owned_segment.get("start_offset") != start):
+            return current
+        slot["claude_model_receipt"] = {
+            "reported_model": receipt["reported_model"],
+            "source": receipt["source"],
+            "claim_scope": "cli_reported_identifier",
+            "generation": generation,
+        }
+        return current
+
+    bus._update_meta_locked(room_id, _update)
+
+
 def _bounded_spawned_pids(pids: list, *new_pids: int) -> list[int]:
     values = [int(pid) for pid in pids if isinstance(pid, int) and pid > 0]
     for pid in new_pids:
@@ -3315,6 +3410,10 @@ def _spawn_agents(
                         ))(spec["name"], initial_spawn_id),
                     owner_room_id=room_id,
                     process_handle=initial_spawn_id,
+                    on_log_open_identity=_claude_receipt_log_open(
+                        room_id, spec["name"], initial_spawn_id,
+                        "initial_spawn_id", spec,
+                    ),
                 )
                 continue
             try:
@@ -3325,6 +3424,10 @@ def _spawn_agents(
                         room_id, spec["name"], initial_spawn_id),
                     owner_room_id=room_id,
                     process_handle=initial_spawn_id,
+                    on_log_open_identity=_claude_receipt_log_open(
+                        room_id, spec["name"], initial_spawn_id,
+                        "initial_spawn_id", spec,
+                    ),
                 )
                 pids.append(pid)
                 names.append(spec["name"])
@@ -3382,6 +3485,10 @@ def _spawn_agents(
             owner_room_id=room_id,
             process_handle_factory=lambda n: initial_generations[n],
             prepare_spawn=_prepare_initial_spawn,
+            on_log_open_identity_factory=lambda n: _claude_receipt_log_open(
+                room_id, n, initial_generations[n], "initial_spawn_id",
+                spawn.get_enabled_spec(n) or {},
+            ),
         )
         for agent_name, info in agent_meta.items():
             info["initial_spawn_id"] = initial_generations[agent_name]
@@ -3947,6 +4054,13 @@ def _on_initial_spawn_exit(
     # A stale callback must not overwrite a newer wake's phase or metadata.
     if not _begin_initial_spawn_exit(room_id, agent_name, initial_spawn_id):
         return
+    try:
+        _record_claude_model_receipt(
+            room_id, agent_name, initial_spawn_id, "initial_spawn_id",
+        )
+    except Exception as exc:
+        print(f"[huddle] Claude model receipt failed (init) "
+              f"({agent_name}@{room_id}): {exc}", flush=True)
     rc = -999 if returncode is None else int(returncode)
     rate_limit_announced = False
     if rc != 0:
@@ -4007,6 +4121,11 @@ def _on_wake_exit(room_id: str, agent_name: str, wake_id: str,
     # superseded us (then it owns the busy state and the drain).
     if info.get("wake_id") != wake_id:
         return
+    try:
+        _record_claude_model_receipt(room_id, agent_name, wake_id, "wake_id")
+    except Exception as exc:
+        print(f"[huddle] Claude model receipt failed (wake) "
+              f"({agent_name}@{room_id}): {exc}", flush=True)
     if (not already_announced and (
         info.get("stuck_announced_wake_id") == wake_id
         or info.get("stuck_killed_wake_id") == wake_id
@@ -4617,6 +4736,9 @@ def _spawn_fresh_room_agent(
             on_exit=_make_wake_done_callback(room_id, agent_name, wake_id),
             owner_room_id=room_id,
             process_handle=wake_id,
+            on_log_open_identity=_claude_receipt_log_open(
+                room_id, agent_name, wake_id, "wake_id", spec,
+            ),
         )
     except Exception as exc:
         _set_agent_phase(room_id, agent_name, "unavailable", detail=str(exc))

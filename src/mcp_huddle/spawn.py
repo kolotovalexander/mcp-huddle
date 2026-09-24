@@ -1848,6 +1848,7 @@ def spawn_agent(
     owner_room_id: str = "",
     process_handle: str | None = None,
     on_log_open: Callable[[int, str], None] | None = None,
+    on_log_open_identity: Callable[[int, str, int, int], None] | None = None,
 ) -> tuple[int, str, str | None]:
     """Spawn one agent.
 
@@ -1916,8 +1917,15 @@ def spawn_agent(
             shutil.rmtree(cleanup_dir, ignore_errors=True)
         raise
     try:
-        if on_log_open is not None:
-            on_log_open(os.fstat(log_file.fileno()).st_size, str(log_path))
+        if on_log_open is not None or on_log_open_identity is not None:
+            log_stat = os.fstat(log_file.fileno())
+            if on_log_open is not None:
+                on_log_open(log_stat.st_size, str(log_path))
+            if on_log_open_identity is not None:
+                on_log_open_identity(
+                    log_stat.st_size, str(log_path),
+                    log_stat.st_dev, log_stat.st_ino,
+                )
         proc = subprocess.Popen(
             argv,
             cwd=cwd or None,
@@ -2233,6 +2241,8 @@ def _schedule_delayed_spawn(
     on_spawned=None,
     owner_room_id: str = "",
     process_handle: str | None = None,
+    on_log_open: Callable[[int, str], None] | None = None,
+    on_log_open_identity: Callable[[int, str, int, int], None] | None = None,
 ) -> threading.Timer:
     """Fire spawn_agent(spec, ...) after `delay` seconds on a daemon timer
     thread, without blocking the caller. Spawn failures are logged/notified
@@ -2267,6 +2277,8 @@ def _schedule_delayed_spawn(
             pid, _, _ = spawn_agent(
                 spec, brief, cwd, log_dir, on_exit=on_exit,
                 owner_room_id=owner_room_id, process_handle=process_handle,
+                on_log_open=on_log_open,
+                on_log_open_identity=on_log_open_identity,
             )
         except (FileNotFoundError, PermissionError, AgentSpawnError, OSError) as exc:
             log_spawn_failure(spec, brief, cwd, log_dir, exc)
@@ -2373,6 +2385,8 @@ def spawn_all(
     owner_room_id: str = "",
     process_handle_factory=None,
     prepare_spawn=None,
+    on_log_open_factory=None,
+    on_log_open_identity_factory=None,
 ) -> tuple[list[str], list[int], dict[str, dict[str, object]]]:
     """Spawn every enabled agent in the registry.
 
@@ -2462,6 +2476,10 @@ def spawn_all(
                 on_spawned=spawned_cb,
                 owner_room_id=owner_room_id,
                 process_handle=process_handle,
+                on_log_open=(on_log_open_factory(spec["name"])
+                             if on_log_open_factory else None),
+                on_log_open_identity=(on_log_open_identity_factory(spec["name"])
+                                      if on_log_open_identity_factory else None),
             )
             continue
         try:
@@ -2471,6 +2489,10 @@ def spawn_all(
                 on_exit=on_exit_factory(spec["name"]) if on_exit_factory else None,
                 owner_room_id=owner_room_id,
                 process_handle=process_handle,
+                on_log_open=(on_log_open_factory(spec["name"])
+                             if on_log_open_factory else None),
+                on_log_open_identity=(on_log_open_identity_factory(spec["name"])
+                                      if on_log_open_identity_factory else None),
             )
             pids.append(pid)
             names.append(spec["name"])

@@ -10,8 +10,9 @@ from __future__ import annotations
 import json
 import os
 import re
+from contextlib import nullcontext
 from pathlib import Path
-from typing import Literal, TypedDict
+from typing import BinaryIO, Literal, TypedDict
 
 
 MAX_SEGMENT_BYTES = 1_048_576
@@ -31,7 +32,8 @@ def _valid_model(value: object) -> str | None:
 
 
 def parse_claude_model_receipt(
-    log_path: str | os.PathLike[str], *, start_offset: int, end_offset: int
+    log_path: str | os.PathLike[str] | BinaryIO, *, start_offset: int, end_offset: int,
+    expected_device: int | None = None, expected_inode: int | None = None,
 ) -> ClaudeModelReceipt:
     """Read only ``[start_offset, end_offset)`` and return a model receipt.
 
@@ -51,9 +53,35 @@ def parse_claude_model_receipt(
 
     assistant_models: set[str] = set()
     init_models: set[str] = set()
+    init_sessions: set[str] = set()
+    assistant_sessions: set[str] = set()
     remaining = end_offset - start_offset
-    with Path(log_path).open("rb") as stream:
-        stream.seek(start_offset)
+    opened = (Path(log_path).open("rb")
+              if isinstance(log_path, (str, os.PathLike))
+              else nullcontext(log_path))
+    with opened as stream:
+        file_stat = os.fstat(stream.fileno())
+        if ((expected_device is not None and file_stat.st_dev != expected_device)
+                or (expected_inode is not None and file_stat.st_ino != expected_inode)
+                or file_stat.st_size < end_offset):
+            raise ValueError("Claude log file identity or size changed")
+        if start_offset:
+            stream.seek(start_offset - 1)
+            if stream.read(1) != b"\n":
+                # The earlier process left a partial line. Skip its tail.
+                stream.seek(start_offset)
+                skipped = stream.readline(min(remaining, MAX_LINE_BYTES + 1))
+                remaining -= len(skipped)
+                if not skipped.endswith(b"\n"):
+                    while remaining:
+                        skipped = stream.readline(min(remaining, MAX_LINE_BYTES + 1))
+                        if not skipped:
+                            raise ValueError("Claude log segment ended during line skip")
+                        remaining -= len(skipped)
+                        if skipped.endswith(b"\n"):
+                            break
+        if start_offset == 0:
+            stream.seek(0)
         while remaining:
             line = stream.readline(min(remaining, MAX_LINE_BYTES + 1))
             if not line:
@@ -80,6 +108,9 @@ def parse_claude_model_receipt(
                 continue
 
             if event.get("type") == "system" and event.get("subtype") == "init":
+                session = event.get("session_id")
+                if isinstance(session, str) and 0 < len(session) <= 128:
+                    init_sessions.add(session)
                 model = _valid_model(event.get("model"))
                 if model:
                     init_models.add(model)
@@ -89,10 +120,16 @@ def parse_claude_model_receipt(
                 and event["parent_tool_use_id"] is None
                 and isinstance(event.get("message"), dict)
             ):
+                session = event.get("session_id")
+                if isinstance(session, str) and 0 < len(session) <= 128:
+                    assistant_sessions.add(session)
                 model = _valid_model(event["message"].get("model"))
-                if model:
+                if model and (not init_sessions or session in init_sessions):
                     assistant_models.add(model)
 
+    if (len(init_sessions) > 1 or len(assistant_sessions) > 1
+            or (init_sessions and assistant_sessions - init_sessions)):
+        return {"reported_model": None, "source": "mixed"}
     if len(assistant_models) > 1:
         return {"reported_model": None, "source": "mixed"}
     if assistant_models:
