@@ -1032,7 +1032,7 @@ def _direct_opus_review_argv(brief: str, read_root: str, mcp_config: str) -> lis
         "--strict-mcp-config",
         "--mcp-config", mcp_config,
         "--add-dir", read_root,
-        "--model", "claude-opus-5",
+        "--model", "claude-opus-5-5",
         "-p", (
             f"{brief}\n\n"
             "For this direct-review turn, use Huddle only to return one `result` "

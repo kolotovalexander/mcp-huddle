@@ -2780,7 +2780,7 @@ def test_direct_anthropic_opus_spawn_uses_only_direct_api_environment(
     assert "--allowedTools" in captured["argv"]
     argv = captured["argv"]
     assert "--bare" in argv and "--restricted" in argv and "--strict-mcp-config" in argv
-    assert argv[argv.index("--model") + 1] == "claude-opus-5"
+    assert argv[argv.index("--model") + 1] == "claude-opus-5-5"
     assert argv[argv.index("--add-dir") + 1] == str(project.resolve())
     mcp_config = json.loads(argv[argv.index("--mcp-config") + 1])
     assert mcp_config["mcpServers"]["huddle"]["url"] == "http://127.0.0.1:45111/mcp"
