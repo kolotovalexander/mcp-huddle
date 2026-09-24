@@ -634,18 +634,16 @@ def post_message(room_id: str, agent: str, body: str, kind: str,
         if cur["status"] == "resolved" and kind not in ("system", "close"):
             raise ValueError("Room is resolved and read-only.")
 
-        # Idempotency: scan last 20 lines
-        if idempotency_key:
-            existing = _read_last_n_raw(msgs_file, 20)
-            for line in existing:
-                try:
-                    msg = json.loads(line)
-                    if msg.get("idempotency_key") == idempotency_key:
-                        return msg["id"]
-                except Exception:
-                    pass
-
+        # Load the locked history once. Idempotency keys must remain durable
+        # after arbitrarily many later messages and across process restarts.
         persisted_messages = _load_messages_unlocked(room_id)
+        if idempotency_key:
+            for msg in persisted_messages:
+                if (isinstance(msg, dict)
+                        and msg.get("idempotency_key") == idempotency_key
+                        and "id" in msg):
+                    return msg["id"]
+
         _check_room_rate_locked(persisted_messages, int(time.time()))
 
         # Check and append are one atomic decision. Previously two concurrent
@@ -1400,13 +1398,6 @@ def _next_id(msgs_file: Path) -> int:
         except Exception:
             pass
     return 1
-
-
-def _read_last_n_raw(msgs_file: Path, n: int) -> list[str]:
-    if not _safe_exists(msgs_file):
-        return []
-    lines = _safe_read_text(msgs_file).strip().splitlines()
-    return lines[-n:]
 
 
 class _lock:

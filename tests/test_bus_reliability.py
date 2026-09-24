@@ -852,6 +852,63 @@ def test_idempotency_key_reuses_message_id(isolated_bus) -> None:
     assert len(isolated_bus._load_messages(room_id)) == 1
 
 
+def test_idempotency_key_survives_many_messages_and_bus_reopen(isolated_bus) -> None:
+    room_id = _create_room(isolated_bus)
+    original_id = isolated_bus.post_message(
+        room_id, "Swarm", "start work", "request", idempotency_key="swarm-start-1",
+    )
+
+    for index in range(25):
+        isolated_bus.post_message(room_id, f"Worker-{index}", f"progress {index}", "comment")
+
+    # Simulate a process restart: the in-memory parsed-message cache is reset,
+    # while the durable JSONL history remains.
+    reopened_bus = importlib.reload(isolated_bus)
+    retried_id = reopened_bus.post_message(
+        room_id, "Swarm", "start work", "request", idempotency_key="swarm-start-1",
+    )
+
+    assert retried_id == original_id
+    messages = reopened_bus._load_messages(room_id)
+    assert len(messages) == 26
+    assert sum(message.get("idempotency_key") == "swarm-start-1" for message in messages) == 1
+
+
+def test_concurrent_posts_with_same_idempotency_key_append_once(isolated_bus) -> None:
+    room_id = _create_room(isolated_bus)
+    count = 8
+    barrier = threading.Barrier(count)
+    results: list[int] = []
+    errors: list[BaseException] = []
+    result_lock = threading.Lock()
+
+    def post() -> None:
+        try:
+            barrier.wait(timeout=5)
+            msg_id = isolated_bus.post_message(
+                room_id, "Swarm", "start work", "request", idempotency_key="swarm-start-concurrent",
+            )
+            with result_lock:
+                results.append(msg_id)
+        except BaseException as exc:
+            with result_lock:
+                errors.append(exc)
+
+    workers = [threading.Thread(target=post) for _ in range(count)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=10)
+
+    assert not errors
+    assert all(not worker.is_alive() for worker in workers)
+    assert len(results) == count
+    assert len(set(results)) == 1
+    messages = isolated_bus._load_messages(room_id)
+    assert len(messages) == 1
+    assert messages[0]["idempotency_key"] == "swarm-start-concurrent"
+
+
 def test_http_message_post_honors_idempotency_key(isolated_bus) -> None:
     from mcp_huddle.server import api_message_post
 
