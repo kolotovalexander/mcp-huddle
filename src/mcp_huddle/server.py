@@ -1210,12 +1210,30 @@ def swarm_pilot_status(room_id: str) -> dict:
             for field in ("last_wake_msg_id", "last_seen_id")
         }
         cursor["read_receipt"] = False
+        raw_receipt = info.get("claude_model_receipt")
+        model_receipt = None
+        if isinstance(raw_receipt, dict):
+            reported = raw_receipt.get("reported_model")
+            receipt_generation = raw_receipt.get("generation")
+            receipt_source = raw_receipt.get("source")
+            if ((reported is None or (isinstance(reported, str)
+                                      and re.fullmatch(r"claude-[A-Za-z0-9._-]{1,121}", reported)))
+                    and receipt_source in ("assistant", "init", "mixed", "none")
+                    and isinstance(receipt_generation, str)
+                    and 0 < len(receipt_generation) <= 64):
+                model_receipt = {
+                    "reported_model": reported,
+                    "source": receipt_source,
+                    "claim_scope": "cli_reported_identifier",
+                    "generation": receipt_generation,
+                }
         details.append({
             "member_id": state["member_ids"][member],
             "name": member,
             "profile": member,
             "native_session": native_session,
             "process_generation": generation,
+            "last_model_receipt": model_receipt,
             "delivery_cursor": cursor,
         })
     return {**state, "members_detail": details}
