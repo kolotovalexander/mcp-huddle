@@ -1380,27 +1380,43 @@ def _apply_readonly(spec: SpawnSpec) -> SpawnSpec:
       which `-a never` would cancel). Cross-model council, 2026-06-19.
     Other agents are returned unchanged (no confirmed read-only flag yet).
     """
-    profile = spec.get("profile")
-    name = spec.get("name")
     cmd = list(spec.get("cmd") or [])
-    if profile in {_DIRECT_OPUS_REVIEW_PROFILE, _SUBSCRIPTION_OPUS_REVIEW_PROFILE} or name == "Claude":
+    cli_index = _effective_binary_index(cmd)
+    binary = _effective_binary(cmd)
+    if binary == "claude":
         cmd = [c for c in cmd if c != "--dangerously-skip-permissions"]
         if cmd and "--allowedTools" not in cmd:
-            cmd = [cmd[0], *_CLAUDE_RO_FLAGS, *cmd[1:]]
-    elif name == "Codex":
-        out: list[str] = []
+            # Keep wrappers such as ``timeout 120`` intact and put flags after
+            # the actual Claude executable, where its CLI can parse them.
+            cli_index = _effective_binary_index(cmd)
+            insert_at = (cli_index + 1) if cli_index is not None else len(cmd)
+            cmd = [*cmd[:insert_at], *_CLAUDE_RO_FLAGS, *cmd[insert_at:]]
+    elif binary == "codex":
+        # Leave timeout's own options (for example ``timeout -s TERM``)
+        # untouched. Only rewrite Codex sandbox options after its executable.
+        prefix = cmd[: (cli_index + 1)] if cli_index is not None else []
+        codex_args = cmd[(cli_index + 1):] if cli_index is not None else cmd
+        out: list[str] = list(prefix)
         i = 0
-        while i < len(cmd):
-            out.append(cmd[i])
-            if cmd[i] == "-s" and i + 1 < len(cmd):
-                out.append("read-only")  # replace the sandbox value
+        while i < len(codex_args):
+            arg = codex_args[i]
+            if arg in ("-s", "--sandbox"):
+                # Remove any registry-provided sandbox so the enforced value
+                # cannot be overridden by a later duplicate flag.
                 i += 2
                 continue
+            if arg.startswith("--sandbox=") or arg.startswith("-s="):
+                i += 1
+                continue
+            out.append(arg)
             i += 1
         # Auto-approve huddle MCP tools so read-only doesn't cancel them;
         # insert before the trailing positional ({brief}).
-        approve = ["-c", 'mcp_servers.huddle.default_tools_approval_mode="approve"']
-        out = [*out[:-1], *approve, out[-1]] if out else out
+        readonly = ["-s", "read-only", "-c", 'mcp_servers.huddle.default_tools_approval_mode="approve"']
+        if out and out[-1] == "{brief}":
+            out = [*out[:-1], *readonly, out[-1]]
+        else:
+            out.extend(readonly)
         cmd = out
     return {**spec, "cmd": cmd}
 
@@ -1773,13 +1789,26 @@ def _effective_binary(cmd: list[str]) -> str:
     bare one of the same underlying binary are recognized as the same thing.
     Empty cmd → "" (never staggered against anything).
     """
+    idx = _effective_binary_index(cmd)
+    return Path(cmd[idx]).name if idx is not None else ""
+
+
+def _effective_binary_index(cmd: list[str]) -> int | None:
+    """Return the argv index of the executed program, skipping timeout args."""
     if not cmd:
-        return ""
+        return None
     idx = 0
     if Path(cmd[0]).name == "timeout":
         idx = 1
         while idx < len(cmd):
             tok = cmd[idx]
+            if tok in ("-s", "--signal", "-k", "--kill-after"):
+                # These timeout options consume a value before the duration.
+                idx += 2
+                continue
+            if tok.startswith("--signal=") or tok.startswith("--kill-after="):
+                idx += 1
+                continue
             if tok.startswith("-"):
                 idx += 1
                 continue
@@ -1787,9 +1816,7 @@ def _effective_binary(cmd: list[str]) -> str:
                 idx += 1
                 continue
             break
-    if idx >= len(cmd):
-        return ""
-    return Path(cmd[idx]).name
+    return idx if idx < len(cmd) else None
 
 
 def _serialize_opencode_argv(argv: list[str]) -> list[str]:

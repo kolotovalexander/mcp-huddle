@@ -2541,6 +2541,72 @@ def test_readonly_default_on_codex_and_claude(monkeypatch: pytest.MonkeyPatch) -
     assert claude[claude.index("--permission-mode") + 1] == "manual"
 
 
+@pytest.mark.parametrize(
+    ("name", "cmd", "expected_binary"),
+    [
+        ("Codex Worktree", ["codex", "exec", "{brief}"], "codex"),
+        ("Claude Reviewer", ["claude", "-p", "{brief}"], "claude"),
+    ],
+)
+def test_readonly_uses_cli_for_renamed_codex_and_claude_profiles(
+    name: str, cmd: list[str], expected_binary: str,
+) -> None:
+    """Read-only flags follow the executable, not a registry display label."""
+    rewritten = spawn._apply_readonly({"name": name, "cmd": cmd, "enabled": True})["cmd"]
+
+    if expected_binary == "codex":
+        assert "read-only" in rewritten
+        assert 'mcp_servers.huddle.default_tools_approval_mode="approve"' in rewritten
+        assert "--allowedTools" not in rewritten
+    else:
+        assert "--allowedTools" in rewritten
+        assert "--disallowedTools" in rewritten
+        assert "read-only" not in rewritten
+
+
+@pytest.mark.parametrize(
+    ("name", "cmd"),
+    [
+        ("Codex", ["opencode", "run", "{brief}"]),
+        ("Claude", ["agy", "-p", "{brief}"]),
+    ],
+)
+def test_readonly_does_not_apply_cli_flags_to_misnamed_nonmatching_runner(
+    name: str, cmd: list[str],
+) -> None:
+    """A display-name collision must not inject flags for another CLI."""
+    rewritten = spawn._apply_readonly({"name": name, "cmd": cmd, "enabled": True})["cmd"]
+    assert rewritten == cmd
+
+
+def test_readonly_claude_flags_follow_cli_when_timeout_wrapped() -> None:
+    cmd = ["timeout", "-s", "TERM", "120", "claude", "-p", "{brief}"]
+
+    rewritten = spawn._apply_readonly(
+        {"name": "Claude Reviewer", "cmd": cmd, "enabled": True}
+    )["cmd"]
+
+    assert rewritten[:5] == cmd[:5]
+    assert rewritten[4] == "claude"
+    assert rewritten[5:5 + len(spawn._CLAUDE_RO_FLAGS)] == spawn._CLAUDE_RO_FLAGS
+
+
+def test_readonly_codex_flags_preserve_timeout_signal_and_follow_cli() -> None:
+    cmd = ["timeout", "-s", "TERM", "120", "codex", "exec", "-s",
+           "danger-full-access", "{brief}"]
+
+    rewritten = spawn._apply_readonly(
+        {"name": "Codex Worker", "cmd": cmd, "enabled": True}
+    )["cmd"]
+
+    assert rewritten[:5] == cmd[:5]
+    codex_index = rewritten.index("codex")
+    assert rewritten[codex_index + 1] == "exec"
+    assert "read-only" in rewritten[codex_index + 1:]
+    assert "danger-full-access" not in rewritten
+    assert rewritten.count("-s") == 2  # timeout signal and Codex sandbox
+
+
 def test_readonly_opt_out_restores_full_access(monkeypatch: pytest.MonkeyPatch) -> None:
     """MCP_HUDDLE_READONLY=0 restores the full-access spawn (worker mode)."""
     monkeypatch.setenv("MCP_HUDDLE_READONLY", "0")
