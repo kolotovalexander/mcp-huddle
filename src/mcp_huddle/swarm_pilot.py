@@ -18,6 +18,7 @@ MODES = frozenset({"council", "team", "relay", "swarm"})
 WORKSPACES = frozenset({"shared_only", "allow_subworktrees"})
 _ROOM_ID_RE = re.compile(r"room_[0-9a-f]{8}\Z")
 _FINGERPRINT_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_MEMBER_ID_RE = re.compile(r"mem_[0-9a-f]{12}\Z")
 
 
 def create(
@@ -260,11 +261,11 @@ def _state(meta: dict[str, Any]) -> dict:
 
 
 def _member_ids(room_id: str, members: list[str]) -> dict[str, str]:
-    """Return stable opaque IDs derived from the room and slot order.
+    """Return opaque IDs derived from the room and slot order.
 
-    Profile names deliberately stay out of the ID so renaming a configured
-    harness does not change a member's identity inside an existing room.
-    Operational maps remain keyed by profile name for API compatibility.
+    These IDs label slots only. The mapping key and all current operations
+    still use the configured profile name; this does not support renaming a
+    profile while preserving its operational identity.
     """
     return {
         member: "mem_" + hashlib.sha256(f"{room_id}:{ordinal}".encode("utf-8")).hexdigest()[:12]
@@ -273,9 +274,25 @@ def _member_ids(room_id: str, members: list[str]) -> dict[str, str]:
 
 
 def _expose_member_ids(room_id: str, state: dict) -> dict:
-    """Expose identities for old rooms without rewriting their stored schema."""
+    """Validate schema-2 IDs, or derive schema-1 IDs without writing them."""
     exposed = dict(state)
+    schema = exposed.get("schema")
     stored = exposed.get("member_ids")
-    if not isinstance(stored, dict) or set(stored) != set(exposed.get("members", [])):
+    members = exposed.get("members")
+    if not isinstance(members, list) or any(not isinstance(member, str) for member in members):
+        raise ValueError("swarm pilot members are invalid")
+
+    if schema == 1 and stored is None:
         exposed["member_ids"] = _member_ids(room_id, exposed["members"])
+        return exposed
+    if schema not in (1, 2):
+        raise ValueError("unsupported swarm pilot schema")
+    if (
+        not isinstance(stored, dict)
+        or set(stored) != set(members)
+        or any(not isinstance(member_id, str) or not _MEMBER_ID_RE.fullmatch(member_id)
+               for member_id in stored.values())
+        or len(set(stored.values())) != len(stored)
+    ):
+        raise ValueError("swarm pilot member_ids are invalid")
     return exposed

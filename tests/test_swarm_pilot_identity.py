@@ -86,6 +86,34 @@ def test_schema_one_room_lazily_exposes_stable_member_ids_without_rewriting(
 
 
 @pytest.mark.parametrize(
+    "member_ids",
+    [
+        {"A": "mem_000000000001"},  # Missing the second member.
+        {"A": "mem_000000000001", "Other": "mem_000000000002"},
+        {"A": "not-an-id", "B": "mem_000000000002"},
+        {"A": "mem_000000000001", "B": "mem_000000000001"},
+    ],
+)
+def test_schema_two_rejects_malformed_or_mismatched_member_ids(
+    isolated_home, member_ids,
+):
+    room_id = swarm_pilot.create(
+        "pilot", "Organizer", "Make a tiny result", "swarm", ["A", "B"],
+    )
+
+    bus._update_meta_locked(
+        room_id,
+        lambda meta: {
+            **meta,
+            "swarm_pilot": {**meta["swarm_pilot"], "member_ids": member_ids},
+        },
+    )
+
+    with pytest.raises(ValueError, match="member_ids are invalid"):
+        swarm_pilot.status(room_id)
+
+
+@pytest.mark.parametrize(
     "kwargs",
     [
         {"room_id": "room_1234ABCd"},
