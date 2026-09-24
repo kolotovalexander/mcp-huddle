@@ -1133,14 +1133,17 @@ def probe_cli_login(spec: SpawnSpec, cwd: str) -> CliLoginProbe:
             return {"status": "authenticated", "reason": "cli_login_present"}
         return {"status": "unknown", "reason": "unrecognized_output"}
 
-    # Codex currently reports a short text status. Inspect recognized lines,
-    # never return or log the raw output. Any unknown wording fails closed.
-    lines = result.stdout.splitlines()
-    if any(re.fullmatch(r"Not logged in\s*", line, re.IGNORECASE) for line in lines):
+    # Codex versions may write login status to stdout or stderr. Inspect only
+    # recognized whole lines, never return or log either raw stream. Conflicting
+    # signals fail closed even when the process exits successfully.
+    lines = result.stdout.splitlines() + result.stderr.splitlines()
+    logged_out = any(re.fullmatch(r"Not logged in\s*", line, re.IGNORECASE) for line in lines)
+    logged_in = any(re.fullmatch(r"Logged in using .+", line, re.IGNORECASE) for line in lines)
+    if logged_out and logged_in:
+        return {"status": "unknown", "reason": "unrecognized_output"}
+    if logged_out:
         return {"status": "unauthenticated", "reason": "cli_logged_out"}
-    if result.returncode == 0 and any(
-        re.fullmatch(r"Logged in using .+", line, re.IGNORECASE) for line in lines
-    ):
+    if result.returncode == 0 and logged_in:
         return {"status": "authenticated", "reason": "cli_login_present"}
     return {"status": "unknown", "reason": "unrecognized_output"}
 

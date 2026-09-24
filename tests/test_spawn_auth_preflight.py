@@ -63,6 +63,31 @@ def test_codex_login_status_and_router_limit(monkeypatch, tmp_path):
         "status": "unauthenticated", "reason": "cli_logged_out"}
 
 
+def test_codex_recognizes_login_on_stderr_without_leaking_it(monkeypatch, tmp_path):
+    monkeypatch.setattr(spawn.subprocess, "run", lambda argv, **kwargs:
+                        subprocess.CompletedProcess(argv, 0, "", "Logged in using ChatGPT\n"))
+    assert spawn.probe_cli_login(_spec("codex"), str(tmp_path)) == {
+        "status": "authenticated", "reason": "cli_login_present"}
+
+    monkeypatch.setattr(spawn.subprocess, "run", lambda argv, **kwargs:
+                        subprocess.CompletedProcess(argv, 1, "", "Not logged in\nprivate@example.com"))
+    result = spawn.probe_cli_login(_spec("codex"), str(tmp_path))
+    assert result == {"status": "unauthenticated", "reason": "cli_logged_out"}
+    assert "private@example.com" not in repr(result)
+
+
+def test_codex_conflicting_or_unrecognized_status_is_unknown(monkeypatch, tmp_path):
+    monkeypatch.setattr(spawn.subprocess, "run", lambda argv, **kwargs:
+                        subprocess.CompletedProcess(argv, 0, "Logged in using ChatGPT", "Not logged in"))
+    assert spawn.probe_cli_login(_spec("codex"), str(tmp_path)) == {
+        "status": "unknown", "reason": "unrecognized_output"}
+
+    monkeypatch.setattr(spawn.subprocess, "run", lambda argv, **kwargs:
+                        subprocess.CompletedProcess(argv, 0, "", "account=private@example.com"))
+    assert spawn.probe_cli_login(_spec("codex"), str(tmp_path)) == {
+        "status": "unknown", "reason": "unrecognized_output"}
+
+
 def test_probe_unknown_harness_and_timeout_never_exposes_exception(monkeypatch, tmp_path):
     monkeypatch.setattr(spawn.subprocess, "run", lambda *args, **kwargs:
                         (_ for _ in ()).throw(AssertionError("must not call")))
