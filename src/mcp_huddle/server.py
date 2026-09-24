@@ -16,6 +16,7 @@ import shutil
 import signal
 import stat
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -909,6 +910,7 @@ def swarm_room_proposal(
     explicit_members: list[str] | None = None,
     allow_unenforced_read: bool = False,
     cwd: str = "",
+    check_cli_login: bool = True,
 ) -> dict:
     """Build a reviewable room proposal from a goal and closed requirements.
 
@@ -917,7 +919,9 @@ def swarm_room_proposal(
     ``swarm_plan_preview``; the goal, room name, organizer, and path do not.
     This tool never creates a room or starts a process. ``create_args`` is
     present only when the static plan is ready and contains ``start=False``.
-    Static readiness does not verify provider authentication or a model reply.
+    Login probing checks only native Claude/Codex login status; it does not
+    verify the selected model, provider route, quota, or model response. Login
+    probing is enabled by default and can be skipped with ``False``.
     """
     for label, value, limit in (
         ("name", name, 200),
@@ -930,6 +934,8 @@ def swarm_room_proposal(
             raise ValueError(f"{label} is too long (maximum {limit} characters)")
     if not isinstance(cwd, str) or len(cwd) > 4096:
         raise ValueError("cwd must be a string of at most 4096 characters")
+    if not isinstance(check_cli_login, bool):
+        raise ValueError("check_cli_login must be a boolean")
 
     plan = swarm_plan_preview(
         requirements,
@@ -937,6 +943,52 @@ def swarm_room_proposal(
         explicit_members=explicit_members,
         allow_unenforced_read=allow_unenforced_read,
     )
+    login_checks = {}
+    if plan.get("status") == "planned":
+        selected_ids = [member["id"] for member in plan.get("members", [])]
+        if check_cli_login:
+            specs_by_name = {
+                spec.get("name"): spec for spec in spawn._raw_registry()
+                if isinstance(spec.get("name"), str)
+            }
+            probe_cwd = cwd or tempfile.gettempdir()
+            probed_routes = {}
+            for member_id in selected_ids:
+                spec = specs_by_name.get(member_id)
+                command = spec.get("cmd", []) if spec else []
+                route = spawn._effective_binary(command) if isinstance(command, list) else None
+                route_key = ("binary", route) if route else ("profile", member_id)
+                if route_key not in probed_routes:
+                    if spec is None:
+                        result = {"status": "unknown", "reason": "unsupported_harness"}
+                    else:
+                        try:
+                            probe = spawn.probe_cli_login(spec, probe_cwd)
+                        except Exception:
+                            # Never expose exceptions that may contain local account or
+                            # process details; the login probe contract is closed data.
+                            probe = None
+                        statuses = {"authenticated", "unauthenticated", "unknown"}
+                        reasons = {
+                            "cli_login_present", "cli_logged_out", "unsupported_harness",
+                            "non_native_profile", "probe_unavailable", "probe_timeout",
+                            "unrecognized_output",
+                        }
+                        if (not isinstance(probe, dict)
+                                or probe.get("status") not in statuses
+                                or probe.get("reason") not in reasons):
+                            result = {"status": "unknown", "reason": "probe_unavailable"}
+                        else:
+                            result = {
+                                "status": probe["status"], "reason": probe["reason"],
+                            }
+                    probed_routes[route_key] = result
+                login_checks[member_id] = dict(probed_routes[route_key])
+        else:
+            login_checks = {
+                member_id: {"status": "skipped", "reason": "caller_disabled"}
+                for member_id in selected_ids
+            }
     create_args = None
     proposal_blockers = []
     if plan.get("status") == "planned":
@@ -974,8 +1026,14 @@ def swarm_room_proposal(
         "plan": plan,
         "create_args": create_args,
         "proposal_blockers": proposal_blockers,
+        "preflight": {
+            "static_plan": plan.get("status", "unknown"),
+            "cli_login": login_checks,
+            "exact_model_provider_response": "not_checked",
+        },
         "readiness": (
-            "static advisory only; provider authentication and response not verified"
+            "static advisory plus bounded local CLI login status; exact model, "
+            "provider route, quota, and response not verified"
         ),
         "side_effects": {"room_created": False, "child_processes_started": False},
     }
