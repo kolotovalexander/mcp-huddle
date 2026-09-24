@@ -900,6 +900,88 @@ def swarm_plan_preview(
 
 
 @mcp.tool()
+def swarm_room_proposal(
+    name: str,
+    organizer: str,
+    goal: str,
+    requirements: dict,
+    explicit_mode: str = "",
+    explicit_members: list[str] | None = None,
+    allow_unenforced_read: bool = False,
+    cwd: str = "",
+) -> dict:
+    """Build a reviewable room proposal from a goal and closed requirements.
+
+    The exact goal and requirements are retained in the local response. Only
+    ``requirements`` and sanitized candidate facts reach Jev through
+    ``swarm_plan_preview``; the goal, room name, organizer, and path do not.
+    This tool never creates a room or starts a process. ``create_args`` is
+    present only when the static plan is ready and contains ``start=False``.
+    Static readiness does not verify provider authentication or a model reply.
+    """
+    for label, value, limit in (
+        ("name", name, 200),
+        ("organizer", organizer, 120),
+        ("goal", goal, 5000),
+    ):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{label} must be a non-empty string")
+        if len(value) > limit:
+            raise ValueError(f"{label} is too long (maximum {limit} characters)")
+    if not isinstance(cwd, str) or len(cwd) > 4096:
+        raise ValueError("cwd must be a string of at most 4096 characters")
+
+    plan = swarm_plan_preview(
+        requirements,
+        explicit_mode=explicit_mode,
+        explicit_members=explicit_members,
+        allow_unenforced_read=allow_unenforced_read,
+    )
+    create_args = None
+    proposal_blockers = []
+    if plan.get("status") == "planned":
+        members = [member["id"] for member in plan.get("members", [])]
+        if organizer in members:
+            proposal_blockers.append("organizer must not also be a participant")
+        if {"Human", "System"}.intersection(members):
+            proposal_blockers.append("reserved names cannot be participants")
+        if not proposal_blockers:
+            create_args = {
+                "name": name,
+                "organizer": organizer,
+                "goal": goal,
+                "mode": plan["mode"],
+                "members": members,
+                "cwd": cwd,
+                "workspace_strategy": "shared_only",
+                "start": False,
+                "expected_specs": {
+                    member["id"]: member["spec_fingerprint"]
+                    for member in plan["members"]
+                },
+                # Audit metadata only; it is not approval or authorization.
+                "plan_hash": plan["plan_hash"],
+            }
+    else:
+        proposal_blockers.append("the static plan is not ready for room creation")
+
+    return {
+        "status": "ready_for_review" if create_args is not None else "not_ready",
+        "name": name,
+        "organizer": organizer,
+        "goal": goal,
+        "requirements": requirements,
+        "plan": plan,
+        "create_args": create_args,
+        "proposal_blockers": proposal_blockers,
+        "readiness": (
+            "static advisory only; provider authentication and response not verified"
+        ),
+        "side_effects": {"room_created": False, "child_processes_started": False},
+    }
+
+
+@mcp.tool()
 @_serialize_swarm_create_by_request_id
 def swarm_pilot_create(
     name: str,
