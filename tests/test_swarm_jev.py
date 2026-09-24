@@ -146,10 +146,29 @@ def test_candidate_choice_uses_only_verified_closed_fields(fake_service):
     assert "read-only in the room" not in json.dumps(criteria)
 
 
+def test_candidate_selection_accepts_human_readable_local_ids_without_sending_them(fake_service):
+    local_id = "OpenCode NVIDIA / Nemotron (free)"
+    result = swarm_jev.choose_candidate(
+        _facts(),
+        [
+            swarm_jev.VerifiedCandidate(local_id, "opencode", "balanced", "free", False),
+            swarm_jev.VerifiedCandidate("Gemini 3 Flash — подписка", "gemini", "fast", "cheap", True),
+        ],
+    )
+
+    assert result.status == "ok"
+    assert result.choice == local_id
+    request_text = fake_service[0][0].data.decode("utf-8")
+    assert local_id not in request_text
+    assert "Gemini 3 Flash" not in request_text
+
+
 @pytest.mark.parametrize(
     "candidates",
     [
-        [swarm_jev.VerifiedCandidate("/tmp/secret", "codex", "strong", "cheap", True)],
+        [swarm_jev.VerifiedCandidate("   ", "codex", "strong", "cheap", True)],
+        [swarm_jev.VerifiedCandidate("bad\x00name", "codex", "strong", "cheap", True)],
+        [swarm_jev.VerifiedCandidate("x" * 257, "codex", "strong", "cheap", True)],
         [
             swarm_jev.VerifiedCandidate("a", "codex", "strong", "cheap", True),
             swarm_jev.VerifiedCandidate("a", "gemini", "fast", "free", False),

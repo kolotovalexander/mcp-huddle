@@ -230,6 +230,20 @@ def build_plan(
     eligible_ids = {candidate["id"] for candidate in eligible}
     recommendation, advice_reason = _advice(jev_advice, set(by_id), eligible_ids)
     advised_mode = explicit_mode or (recommendation and recommendation["mode"]) or _deterministic_mode(task)
+    # A mode recommendation is only usable when the bounded roster can meet
+    # that mode's minimum. If the deterministic mode is also too large, one
+    # available agent can still run a council room.
+    roster_capacity = min(len(eligible), task["max_members"])
+    effective_advised_mode = (recommendation["mode"] if recommendation
+                              and recommendation["mode"] else _deterministic_mode(task))
+    if (explicit_mode is None and recommendation
+            and roster_capacity < _minimum_members(effective_advised_mode)):
+        recommendation = None
+        advice_reason = (
+            f"Jev mode {effective_advised_mode} requires "
+            f"{_minimum_members(effective_advised_mode)} eligible member(s); "
+            "fallback to a feasible deterministic mode"
+        )
     if (recommendation and explicit_members is None and recommendation["member_ids"]
             and (len(recommendation["member_ids"]) > task["max_members"]
                  or len(recommendation["member_ids"]) < _minimum_members(advised_mode))):
@@ -240,6 +254,10 @@ def build_plan(
         decisions.append("unenforced read-only status was explicitly allowed for this read-only plan")
 
     mode = explicit_mode or (recommendation and recommendation["mode"]) or _deterministic_mode(task)
+    if explicit_mode is None and roster_capacity < _minimum_members(mode) and roster_capacity >= 1:
+        mode = "council"
+        recommendation = None
+        decisions.append("only one eligible member fits; selected feasible council mode")
     mode_source = "explicit organizer choice" if explicit_mode else (
         "Jev recommendation" if recommendation and recommendation["mode"] else
         "deterministic profile rule"

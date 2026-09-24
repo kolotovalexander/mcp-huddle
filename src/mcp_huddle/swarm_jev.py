@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import math
-import re
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,7 +56,7 @@ _COST_LABELS = {
     "paid": "paid cost class",
     "unknown": "unknown cost class",
 }
-_CANDIDATE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
+_MAX_LOCAL_CANDIDATE_ID_LENGTH = 256
 
 
 @dataclass(frozen=True)
@@ -184,8 +184,9 @@ def _candidate_criteria(
             return None
         if (
             not isinstance(candidate.candidate_id, str)
-            or not _CANDIDATE_ID.fullmatch(candidate.candidate_id)
-            or candidate.candidate_id == "none"
+            or not candidate.candidate_id.strip()
+            or len(candidate.candidate_id) > _MAX_LOCAL_CANDIDATE_ID_LENGTH
+            or any(unicodedata.category(char) == "Cc" for char in candidate.candidate_id)
             or not isinstance(candidate.harness, str)
             or candidate.harness not in _HARNESS_LABELS
             or not isinstance(candidate.model_class, str)

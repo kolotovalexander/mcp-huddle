@@ -103,6 +103,31 @@ def test_invalid_jev_advice_falls_back_to_deterministic_plan(advice):
     assert any("fallback" in item for item in result["decisions"])
 
 
+@pytest.mark.parametrize("mode", ["relay", "team", "swarm"])
+def test_jev_multi_member_mode_falls_back_to_council_when_only_one_candidate_is_eligible(mode):
+    result = build_plan(
+        profile(parts="four_plus"),
+        [candidate("a")],
+        jev_advice={"confidence": 0.95, "mode": mode, "member_ids": ["a"]},
+    )
+
+    assert result["status"] == "planned"
+    assert result["mode"] == "council"
+    assert [member["id"] for member in result["members"]] == ["a"]
+    assert any("fallback to a feasible deterministic mode" in item for item in result["decisions"])
+
+
+def test_no_eligible_candidate_is_blocked_after_advice_fallback():
+    result = build_plan(
+        profile(parts="four_plus"),
+        [candidate("a", enabled=False)],
+        jev_advice={"confidence": 0.95, "mode": "swarm", "member_ids": []},
+    )
+
+    assert result["status"] == "blocked"
+    assert result["members"] == []
+
+
 def test_jev_roster_over_profile_limit_falls_back_without_changing_explicit_mode():
     result = build_plan(
         profile(max_members=2),
