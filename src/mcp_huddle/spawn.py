@@ -51,6 +51,7 @@ Phase 1 changes (2026-04-30):
 """
 from __future__ import annotations
 import _thread
+import hashlib
 import json
 import os
 import re
@@ -746,6 +747,117 @@ def _apply_model_effort_variant(spec: SpawnSpec, argv: list[str]) -> list[str]:
         if effort: injects.extend(["-c", f'model_reasoning_effort="{effort}"'])
 
     return out[:inject_idx] + injects + out[inject_idx:]
+
+
+_FINGERPRINT_PERMISSION_KEY = re.compile(
+    r"(?:permission|sandbox|approval|allowed.?tools|deny.?tools|read.?only|readonly|"
+    r"writ(?:e|able)|access|trust|guard)", re.IGNORECASE,
+)
+_FINGERPRINT_SECRET_KEY = re.compile(
+    r"(?:api.?key|token|secret|password|credential|authorization|auth.?header)",
+    re.IGNORECASE,
+)
+_FINGERPRINT_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)(\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|"
+    r"password|credential|authorization)\b\s*[=:]\s*)([^\s,;]+)"
+)
+_FINGERPRINT_AUTH_SCHEME = re.compile(
+    r"(?i)(\bauthorization\s*:\s*(?:bearer|basic)\s+)[^\s,;]+"
+)
+_FINGERPRINT_SECRET_QUERY = re.compile(
+    r"(?i)([?&](?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|"
+    r"password|credential)=)[^&#\s]+"
+)
+_FINGERPRINT_URL_CREDENTIALS = re.compile(r"(://)[^/@\s]+@")
+
+
+def _fingerprint_safe_value(value):
+    """Drop credential values recursively while keeping non-secret settings."""
+    if isinstance(value, dict):
+        return {
+            str(key): (
+                "<redacted>" if _FINGERPRINT_SECRET_KEY.search(str(key))
+                else _fingerprint_safe_value(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_fingerprint_safe_value(item) for item in value]
+    if isinstance(value, str):
+        safe = _FINGERPRINT_AUTH_SCHEME.sub(r"\1<redacted>", value)
+        safe = _FINGERPRINT_SECRET_ASSIGNMENT.sub(r"\1<redacted>", safe)
+        safe = _FINGERPRINT_SECRET_QUERY.sub(r"\1<redacted>", safe)
+        return _FINGERPRINT_URL_CREDENTIALS.sub(r"\1<redacted>@", safe)
+    return value
+
+
+def _fingerprint_safe_argv(argv: list[str]) -> list[str]:
+    """Keep effective argv shape while removing values passed as credentials."""
+    result: list[str] = []
+    redact_next = False
+    keep_env_name_next = False
+    for arg in argv:
+        if keep_env_name_next:
+            result.append(arg)
+            keep_env_name_next = False
+            continue
+        if redact_next:
+            result.append("<redacted>")
+            redact_next = False
+            continue
+        if re.match(r"^--[\w-]+-env=", arg):
+            result.append(arg)
+            continue
+        if re.match(r"^--[\w-]+-env$", arg):
+            result.append(arg)
+            keep_env_name_next = True
+            continue
+        if _FINGERPRINT_AUTH_SCHEME.search(arg):
+            result.append(_FINGERPRINT_AUTH_SCHEME.sub(r"\1<redacted>", arg))
+            continue
+        if _FINGERPRINT_SECRET_KEY.search(arg) and "=" not in arg and not arg.endswith("-env"):
+            result.append(arg)
+            redact_next = True
+            continue
+        safe = _FINGERPRINT_AUTH_SCHEME.sub(r"\1<redacted>", arg)
+        safe = _FINGERPRINT_SECRET_ASSIGNMENT.sub(r"\1<redacted>", safe)
+        safe = _FINGERPRINT_SECRET_QUERY.sub(r"\1<redacted>", safe)
+        safe = _FINGERPRINT_URL_CREDENTIALS.sub(r"\1<redacted>@", safe)
+        result.append(safe)
+    return result
+
+
+def spec_fingerprint(spec: SpawnSpec) -> str:
+    """Return a stable SHA-256 fingerprint of an effective registry profile.
+
+    Pass a spec from :func:`_raw_registry`; its ``cmd`` already contains the
+    read-only transform when enabled. This function applies model controls to
+    that command once and deliberately does not reapply read-only rewriting.
+    Environment values and endpoint/probe fields are never read or included;
+    only explicitly passed environment variable names are part of the digest.
+    """
+    cmd = list(spec.get("cmd") or [])
+    effective_argv = _apply_model_effort_variant(spec, cmd)
+    canonical: dict[str, object] = {
+        "name": spec.get("name", ""),
+        "enabled": spec.get("enabled", True),
+        "auto": spec.get("auto", True),
+        "argv": _fingerprint_safe_argv(effective_argv),
+        "pass_env": sorted(
+            name for name in spec.get("pass_env", []) if isinstance(name, str)
+        ),
+    }
+    for key in ("model", "effort", "variant", "profile"):
+        if key in spec:
+            canonical[key] = _fingerprint_safe_value(spec[key])
+    for key, value in spec.items():
+        if _FINGERPRINT_PERMISSION_KEY.search(str(key)):
+            canonical[str(key)] = _fingerprint_safe_value(value)
+
+    payload = json.dumps(
+        canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _resolve_spawn_args(
