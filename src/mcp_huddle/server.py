@@ -1014,6 +1014,9 @@ def swarm_room_proposal(
                 command = spec.get("cmd", []) if spec else []
                 route = spawn._effective_binary(command) if isinstance(command, list) else None
                 if route not in {"claude", "codex"}:
+                    exact_model_checks[member_id] = {
+                        "status": "unsupported", "reason": "unsupported_harness",
+                    }
                     continue
                 if spec is None:
                     probe = {"status": "unsupported", "reason": "unsupported_harness"}

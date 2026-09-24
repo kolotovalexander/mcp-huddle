@@ -667,7 +667,8 @@ def probe_cli_model_response(spec: SpawnSpec, cwd: str) -> dict[str, str]:
     try:
         result = subprocess.run(
             argv, cwd=cwd, env=build_sanitized_environment(),
-            capture_output=True, text=True, timeout=_MODEL_PREFLIGHT_TIMEOUT_SEC,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            timeout=_MODEL_PREFLIGHT_TIMEOUT_SEC,
         )
     except subprocess.TimeoutExpired:
         probe = {"status": "failed", "reason": "response_timeout"}

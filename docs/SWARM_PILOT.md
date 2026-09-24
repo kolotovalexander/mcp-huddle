@@ -84,7 +84,10 @@ run with tools disabled and permission prompts denied; Codex runs ephemeral in
 a read-only sandbox. A result is `passed` only when that exact sentinel comes
 back. Missing explicit model or effort, CLI errors, and timeouts block
 `create_args`; Huddle does not silently choose a different model or ask Jev
-again. Other harnesses are not probed by this option.
+again. Other harnesses are reported as unsupported and also block this strict
+proposal. Current local registry entries for Codex and the subscription Opus
+profile do not pin both model and effort, so this optional check will mark
+them unsupported until those exact settings are configured.
 
 ## Mechanical verification
 

@@ -181,6 +181,7 @@ def test_exact_model_preflight_uses_only_sentinel_and_blocks_failed_route(monkey
     assert "HUDDLE PREFLIGHT OK" in argv[-1]
     assert "private room goal" not in repr(argv)
     assert kwargs["cwd"] == "/neutral/tmp"
+    assert kwargs["stdin"] is spawn.subprocess.DEVNULL
     assert "ANTHROPIC_API_KEY" not in kwargs["env"]
     assert "PROVIDER_API_KEY" not in kwargs["env"]
     codex_argv, codex_kwargs = calls[1]
@@ -191,6 +192,7 @@ def test_exact_model_preflight_uses_only_sentinel_and_blocks_failed_route(monkey
     assert "mcp_servers={}" in codex_argv
     assert "private room goal" not in repr(codex_argv)
     assert codex_kwargs["cwd"] == "/neutral/tmp"
+    assert codex_kwargs["stdin"] is spawn.subprocess.DEVNULL
     assert "ANTHROPIC_API_KEY" not in codex_kwargs["env"]
     assert "PROVIDER_API_KEY" not in codex_kwargs["env"]
     assert result["preflight"]["exact_model_provider_response"] == {
@@ -212,6 +214,21 @@ def test_exact_model_preflight_uses_only_sentinel_and_blocks_failed_route(monkey
     assert repeated["preflight"]["exact_model_provider_response"] == result["preflight"][
         "exact_model_provider_response"
     ]
+
+
+def test_exact_model_preflight_does_not_claim_unchecked_harness_ready(monkeypatch):
+    _configure_registry(monkeypatch, [_spec("OpenCode", "opencode")])
+    result = server.swarm_room_proposal(
+        name="Unsupported exact route", organizer="Human", goal="Small task",
+        requirements=_profile(parts="one", max_members=1), explicit_mode="council",
+        explicit_members=["OpenCode"], allow_unenforced_read=True,
+        check_cli_login=False, check_exact_model=True,
+    )
+    assert result["preflight"]["exact_model_provider_response"] == {
+        "OpenCode": {"status": "unsupported", "reason": "unsupported_harness"},
+    }
+    assert result["status"] == "not_ready"
+    assert result["create_args"] is None
 
 
 def test_blocked_or_unsupported_plan_has_no_create_args(monkeypatch):
