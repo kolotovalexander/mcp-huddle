@@ -35,6 +35,47 @@ def test_storage_root_uses_mcp_huddle_home(isolated_bus, tmp_path: Path) -> None
     assert not (Path.home() / ".mcp-huddle" / "rooms" / room_id).exists()
 
 
+def test_create_room_accepts_explicit_safe_id(isolated_bus, tmp_path: Path) -> None:
+    room_id = isolated_bus.create_room(
+        "Explicit", "Codex", 0, "/tmp", "session", room_id="room_0123abcd",
+    )
+
+    assert room_id == "room_0123abcd"
+    assert isolated_bus.get_room_info(room_id)["id"] == room_id
+    assert (tmp_path / "rooms" / room_id / "status.json").exists()
+
+
+def test_create_room_explicit_id_collision_preserves_existing_room(isolated_bus, tmp_path: Path) -> None:
+    room_id = isolated_bus.create_room(
+        "Original", "Codex", 0, "/tmp", "session", room_id="room_0123abcd",
+    )
+    meta_path = tmp_path / "rooms" / room_id / "meta.json"
+    original_meta = meta_path.read_bytes()
+
+    with pytest.raises(FileExistsError):
+        isolated_bus.create_room(
+            "Replacement", "Claude", 0, "/different", "other", room_id=room_id,
+        )
+
+    assert meta_path.read_bytes() == original_meta
+    assert isolated_bus.get_room_info(room_id)["name"] == "Original"
+
+
+@pytest.mark.parametrize(
+    "room_id",
+    ["../outside", "room_0123ABCD", "room_0123abc", "room_0123abcd/child", "room_0123abcd\\child"],
+)
+def test_create_room_rejects_invalid_explicit_id_before_creating_storage(
+    isolated_bus, tmp_path: Path, room_id: str,
+) -> None:
+    with pytest.raises(ValueError, match="room_id"):
+        isolated_bus.create_room(
+            "Invalid", "Codex", 0, "/tmp", "session", room_id=room_id,
+        )
+
+    assert not (tmp_path / "rooms").exists()
+
+
 def test_concurrent_appends_have_unique_sequential_ids(isolated_bus) -> None:
     room_id = _create_room(isolated_bus)
     count = 10

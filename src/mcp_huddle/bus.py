@@ -269,8 +269,19 @@ def _agent_paths(room_id: str, agent_name: str, *, create: bool = False) -> tupl
 
 
 def create_room(name: str, owner: str, owner_pid: int, cwd: str = "",
-                session_id: str = "") -> str:
-    room_id = f"room_{uuid.uuid4().hex[:8]}"
+                session_id: str = "", *, room_id: str | None = None) -> str:
+    if room_id is None:
+        room_id = f"room_{uuid.uuid4().hex[:8]}"
+    elif (
+        not isinstance(room_id, str)
+        or len(room_id) != 13
+        or not room_id.startswith("room_")
+        or any(char not in "0123456789abcdef" for char in room_id[5:])
+    ):
+        # Validate caller-controlled IDs before creating or changing any
+        # storage directories. Explicit IDs use the same compact form as the
+        # generated IDs, which also keeps them safe as one path component.
+        raise ValueError("Invalid room_id: expected room_ followed by 8 lowercase hex digits")
     BUS_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     rdir = _room_dir(room_id)
     root_fd = os.open(
