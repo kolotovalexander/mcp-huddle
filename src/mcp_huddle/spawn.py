@@ -63,7 +63,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import BinaryIO, NamedTuple, NotRequired, TypedDict
+from typing import BinaryIO, Literal, NamedTuple, NotRequired, TypedDict
 from urllib import error as urlerror
 from urllib import request as urlrequest
 from urllib.parse import urlparse
@@ -105,6 +105,15 @@ class SpawnSpec(TypedDict):
 
 class AgentSpawnError(RuntimeError):
     """Raised when a process starts but fails the optional health check."""
+
+
+class CliLoginProbe(TypedDict):
+    status: Literal["authenticated", "unauthenticated", "unknown"]
+    reason: Literal[
+        "cli_login_present", "cli_logged_out", "unsupported_harness",
+        "non_native_profile", "probe_unavailable", "probe_timeout",
+        "unrecognized_output",
+    ]
 
 
 class _RetainedChild(NamedTuple):
@@ -1073,6 +1082,67 @@ def _verify_subscription_auth(env: dict[str, str], cwd: str) -> None:
         and auth.get("subscriptionType")
     ):
         raise AgentSpawnError("subscription review requires an existing claude.ai subscription login")
+
+
+def probe_cli_login(spec: SpawnSpec, cwd: str) -> CliLoginProbe:
+    """Check a known CLI's local login without issuing a model request.
+
+    The status proves only that the CLI recognizes a local login. It does not
+    prove that the requested model, provider route, or current quota works.
+    Output is deliberately limited to closed status/reason codes because CLI
+    stdout and stderr can contain account identities or credential material.
+    Native config paths and Keychain access remain available through the same
+    minimal HOME/CODEX_HOME/CLAUDE_CONFIG_DIR child environment as a spawn.
+    Provider credential variables and registry pass_env values are not copied.
+    """
+    if spec.get("profile") == _DIRECT_OPUS_REVIEW_PROFILE:
+        return {"status": "unknown", "reason": "non_native_profile"}
+    command = spec.get("cmd", [])
+    if not isinstance(command, list) or not all(isinstance(x, str) for x in command):
+        return {"status": "unknown", "reason": "unsupported_harness"}
+    binary_index = _effective_binary_index(command)
+    if binary_index is None:
+        return {"status": "unknown", "reason": "unsupported_harness"}
+    binary = command[binary_index]
+    harness = Path(binary).name
+    if harness == "claude":
+        argv = [binary, "auth", "status", "--json"]
+    elif harness == "codex":
+        argv = [binary, "login", "status"]
+    else:
+        return {"status": "unknown", "reason": "unsupported_harness"}
+
+    try:
+        result = subprocess.run(
+            argv, cwd=cwd, env=build_sanitized_environment(),
+            capture_output=True, text=True, timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        return {"status": "unknown", "reason": "probe_timeout"}
+    except (OSError, ValueError):
+        return {"status": "unknown", "reason": "probe_unavailable"}
+
+    if harness == "claude":
+        try:
+            payload = json.loads(result.stdout)
+        except (TypeError, ValueError):
+            return {"status": "unknown", "reason": "unrecognized_output"}
+        if isinstance(payload, dict) and payload.get("loggedIn") is False:
+            return {"status": "unauthenticated", "reason": "cli_logged_out"}
+        if result.returncode == 0 and isinstance(payload, dict) and payload.get("loggedIn") is True:
+            return {"status": "authenticated", "reason": "cli_login_present"}
+        return {"status": "unknown", "reason": "unrecognized_output"}
+
+    # Codex currently reports a short text status. Inspect recognized lines,
+    # never return or log the raw output. Any unknown wording fails closed.
+    lines = result.stdout.splitlines()
+    if any(re.fullmatch(r"Not logged in\s*", line, re.IGNORECASE) for line in lines):
+        return {"status": "unauthenticated", "reason": "cli_logged_out"}
+    if result.returncode == 0 and any(
+        re.fullmatch(r"Logged in using .+", line, re.IGNORECASE) for line in lines
+    ):
+        return {"status": "authenticated", "reason": "cli_login_present"}
+    return {"status": "unknown", "reason": "unrecognized_output"}
 
 
 def log_spawn_failure(
