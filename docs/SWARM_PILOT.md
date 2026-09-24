@@ -51,6 +51,26 @@ room's `messages.jsonl` and agent event logs. It sets `owner_pid=0` and an empty
 No background service is activated by importing these tools; Python server
 changes take effect after the server running this checkout is started.
 
+## Bounded replacement after a failed turn
+
+A registry profile is eligible as a backup only when its full entry is enabled,
+available, and sets `"swarm_replacement": true`. A profile override in
+`registry.json` replaces the whole entry, so retain its complete `cmd`. After
+an owned pilot member process exits without an answer, Huddle classifies the
+failure and may use one eligible backup, at most three route attempts per
+member. The backup keeps the original room member name, ID, responsibility,
+request, and log path. It starts a new CLI turn; a launch alone does not count
+as an answer. The old failure record remains visible. Unrecognized failures,
+an unproved process exit, and exhausted routes do not trigger blind retries.
+
+In a `shared_write` room, the backup must pass the same room workspace policy
+before launch; it inherits that room's write rights. A native permission or
+user-input wait is never automatically approved. The current pilot does not
+yet extract such waits from every CLI, so this state must be surfaced by the
+harness integration before that specific branch can be relied on. Backup
+routes are an opt-in capability, not a claim that provider quota or model
+availability has been checked by a real model request.
+
 ## Mechanical verification
 
 `PYTHONPATH=src python3 -m pytest tests/test_swarm_pilot.py -q`

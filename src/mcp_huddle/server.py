@@ -36,6 +36,7 @@ from . import room_workspace
 from . import spawn
 from . import swarm_pilot
 from . import swarm_jev
+from . import swarm_replacement
 from . import swarm_planner
 
 # Shown to LLM clients in the `initialize` response. Keep tight — every agent
@@ -1263,13 +1264,20 @@ def swarm_pilot_status(room_id: str) -> dict:
         member_detail = {
             "member_id": state["member_ids"][member],
             "name": member,
-            "profile": member,
+            "profile": _swarm_route_profile(info) or member,
             "native_session": native_session,
             "process_generation": generation,
             "delivery_cursor": cursor,
         }
         if model_receipt is not None:
             member_detail["last_model_receipt"] = model_receipt
+        route = info.get("swarm_route")
+        if isinstance(route, dict):
+            member_detail["replacement"] = {
+                "attempts": len(route.get("attempts") or []),
+                "terminal": route.get("terminal"),
+                "reason": route.get("reason"),
+            }
         details.append(member_detail)
     return {**state, "members_detail": details}
 
@@ -1409,8 +1417,7 @@ def swarm_pilot_pump(room_id: str) -> list[dict]:
     room_state = bus.get_room_info(room_id)
     dispatched: list[dict] = []
     for member in swarm_pilot.due_members(room_id):
-        spec = spawn.get_enabled_spec(member)
-        drift = _swarm_spec_drift(room_state, member, spec)
+        spec, drift = _member_launch_spec(room_state, member)
         if drift:
             dispatched.append({"member": member, "status": "spec_drift"})
             continue
@@ -1618,6 +1625,244 @@ def _swarm_spec_drift(
         return spawn.spec_fingerprint(spec) != expected
     except Exception:
         return True
+
+
+# ── Swarm member replacement ────────────────────────────────────────────────
+# agent_meta[member]["swarm_route"] records which registry profile currently
+# runs a pilot member. The member name stays the room identity (messages, log
+# path, receipts); only the launched profile changes.
+
+
+def _swarm_route_profile(info: dict) -> str | None:
+    route = info.get("swarm_route") if isinstance(info, dict) else None
+    profile = route.get("profile") if isinstance(route, dict) else None
+    return profile if isinstance(profile, str) and profile else None
+
+
+def _member_launch_spec(meta: dict, agent_name: str) -> tuple[dict | None, bool]:
+    """Return (enabled spec, drift) for the profile currently running a member."""
+    info = (meta.get("agent_meta") or {}).get(agent_name) or {}
+    profile = _swarm_route_profile(info)
+    if profile is None:
+        spec = spawn.get_enabled_spec(agent_name)
+        return spec, _swarm_spec_drift(meta, agent_name, spec)
+    spec = spawn.get_enabled_spec(profile)
+    if spec is None or spec.get("swarm_replacement") is not True:
+        return None, True
+    try:
+        drift = spawn.spec_fingerprint(spec) != info["swarm_route"].get("fingerprint")
+    except Exception:
+        drift = True
+    return spec, drift
+
+
+def _swarm_route_attempt(name: str, spec: dict | None) -> dict:
+    spec = spec or {}
+    cmd = spec.get("cmd") or [name]
+    return {"route": name, "harness": Path(str(cmd[0])).name,
+            "model": str(spec.get("model") or ""), "provider": spec.get("provider")}
+
+
+def _swarm_replacement_candidates(meta: dict, agent_name: str, writes: bool) -> list[dict]:
+    """Enabled registry profiles explicitly marked ``swarm_replacement: true``.
+
+    In a write room a candidate qualifies only when this room's workspace
+    policy validates it for the member; otherwise it is excluded.
+    """
+    candidates = []
+    for spec in spawn.load_registry():
+        name = spec.get("name")
+        if (not spec.get("enabled") or spec.get("swarm_replacement") is not True
+                or not isinstance(name, str) or name == agent_name):
+            continue
+        can_limit = True
+        if writes:
+            try:
+                room_workspace.launch(meta, agent_name, spec)
+            except Exception:
+                can_limit = False
+        candidates.append({
+            **_swarm_route_attempt(name, spec), "available": True,
+            "quality": spec.get("swarm_quality", 0.5),
+            "reliability": spec.get("swarm_reliability", 0.5),
+            "cost": spec.get("swarm_cost", 0.5),
+            "can_limit_writes": can_limit,
+        })
+    return candidates
+
+
+def _swarm_route_cas(room_id: str, agent_name: str, wake_id: str, apply) -> bool:
+    """Apply ``apply(info)`` only while ``wake_id`` still owns wake and claim."""
+    applied = False
+
+    def _update(meta: dict) -> dict:
+        nonlocal applied
+        info = (meta.get("agent_meta") or {}).get(agent_name)
+        if (not isinstance(info, dict) or info.get("wake_id") != wake_id
+                or info.get("wake_claim_id") != wake_id):
+            return meta
+        apply(info)
+        applied = True
+        return meta
+
+    bus._update_meta_locked(room_id, _update)
+    return applied
+
+
+def _swarm_replace_failed_member(
+    room_id: str, agent_name: str, wake_id: str, info: dict,
+    rc: int, final_phase: str, rate_limit_announced: bool,
+) -> bool:
+    """Continue a failed pilot member's request on one backup profile.
+
+    Runs inside the exact child's exit callback while ``wake_id`` still holds
+    the persisted claim. The route change and the claim hand-off to the new
+    generation are one meta-lock CAS, so no other server can claim in between.
+    Returns True when a replacement generation now owns the member.
+    """
+    meta = bus.get_room_info(room_id)
+    pilot = meta.get("swarm_pilot")
+    req = int(info.get("last_wake_msg_id", 0) or 0)
+    if (meta.get("status") not in ("open", "idle") or not isinstance(pilot, dict)
+            or pilot.get("phase") != "working"
+            or agent_name not in pilot.get("members", []) or not req):
+        return False
+    messages = bus._load_messages(room_id)
+    request = next((m for m in messages if m.get("id") == req), None)
+    if (not isinstance(request, dict) or request.get("kind") != "request"
+            or request.get("reply_to") is not None
+            or request.get("to") not in (agent_name, "all")
+            or _swarm_pilot_request_superseded(room_id, request, pilot, messages)):
+        return False
+
+    route = info.get("swarm_route") if isinstance(info.get("swarm_route"), dict) else {}
+    current_profile = _swarm_route_profile(info) or agent_name
+    attempts = list(route.get("attempts") or []) or [
+        _swarm_route_attempt(agent_name, spawn.get_enabled_spec(agent_name))]
+    try:
+        writes = room_workspace.write_policy(meta) == room_workspace.SHARED_WRITE
+    except ValueError:
+        writes = True  # invalid record: only a validated launch may proceed
+    member_id = swarm_pilot.status(room_id)["member_ids"].get(agent_name)
+    responsibility = ", ".join(
+        f"{key}: {item.get('value', '')}"
+        for key, item in (pilot.get("responsibilities") or {}).items()
+        if isinstance(item, dict) and item.get("member") == agent_name
+    )
+    failure = {"text": _log_tail(room_id, agent_name),
+               "waiting_for": info.get("waiting_for")}
+    if rate_limit_announced:
+        failure["kind"] = "quota"
+    if final_phase == "stuck":
+        failure["progress"] = False
+    candidates = _swarm_replacement_candidates(meta, agent_name, writes)
+    plan = swarm_replacement.plan_replacement(
+        failure, attempts,
+        {"member_id": member_id, "responsibility": responsibility,
+         "harness": attempts[-1].get("harness"), "write_rights": writes},
+        candidates,
+        child_stopped=child_processes.state(room_id, wake_id) == "exited",
+    )
+    now = int(time.time())
+    base = {"task_id": req, "failed_wake_id": wake_id, "updated_at": now,
+            "failure_class": plan["failure_class"], "reason": plan["reason"]}
+
+    if plan["action"] != "replace":
+        if not route and (plan["failure_class"] == "unknown" or (
+                not candidates and plan["action"] != "needs_user")):
+            # Replacement is not configured or not applicable: the ordinary
+            # noreply / rate-limit notice already explains this failure.
+            return False
+
+        def record_outcome(slot: dict) -> None:
+            slot["swarm_route"] = {**route, **base, "profile": route.get("profile"),
+                                   "attempts": attempts, "terminal": plan["action"]}
+        if _swarm_route_cas(room_id, agent_name, wake_id, record_outcome):
+            prefix = ("Ждёт решения человека" if plan["action"] == "needs_user"
+                      else "Замена не выполнена")
+            _swarm_replacement_notice(
+                room_id, agent_name, wake_id,
+                f"{agent_name} ({current_profile}): {prefix} — {plan['reason']} "
+                f"[{plan['failure_class']}].")
+        return False
+
+    profile = plan["candidate"]["route"]
+    spec = spawn.get_enabled_spec(profile)
+    if spec is None:
+        return False
+    try:
+        fingerprint = spawn.spec_fingerprint(spec)
+    except Exception:
+        return False
+    new_wake = uuid.uuid4().hex[:12]
+
+    def hand_off(slot: dict) -> None:
+        slot["swarm_route"] = {
+            **base, "profile": profile, "fingerprint": fingerprint,
+            "generation": new_wake, "terminal": None,
+            "attempts": attempts + [_swarm_route_attempt(profile, spec)],
+        }
+        # Transfer the claim directly: it is never released in between.
+        slot.update({
+            "wake_claim_id": new_wake, "wake_claim_msg_id": req,
+            "wake_claimed_at": now, "wake_id": new_wake,
+            "last_wake_msg_id": req, "last_wake_pid": None,
+            "rate_limited_until": 0,
+        })
+        # The previous profile's native session and settings do not transfer.
+        for field in ("thread_id", "model_settings"):
+            slot.pop(field, None)
+
+    note = (f"\n\n[Huddle] You continue as member {agent_name} (member_id "
+            f"{member_id}) on profile {profile} because the previous route "
+            f"{current_profile} failed ({plan['failure_class']}). Keep the same "
+            f"responsibility{': ' + responsibility if responsibility else ''}. "
+            "Read the room history before answering this same request.")
+    prompt = _build_registry_agent_wakeup_prompt(
+        room_id, agent_name, request.get("agent", ""),
+        request.get("body", "") + note, request.get("to"), req,
+        int(info.get("last_seen_id", 0) or 0),
+        bus.read_messages(room_id, since_id=0, limit=50),
+    )
+    # Finish every fallible prompt read before transferring the persisted
+    # claim; once transferred, only the exact new generation may release it.
+    if not _swarm_route_cas(room_id, agent_name, wake_id, hand_off):
+        return False  # a newer generation already owns this member
+    try:
+        _spawn_fresh_room_agent(room_id, agent_name, prompt,
+                                bus.get_room_info(room_id), msg_id=req,
+                                wake_id=new_wake)
+    except Exception as exc:
+        _clear_wake_claim(room_id, agent_name, new_wake, rollback=True)
+
+        def mark_failed(meta: dict) -> dict:
+            slot = (meta.get("agent_meta") or {}).get(agent_name)
+            current = slot.get("swarm_route") if isinstance(slot, dict) else None
+            if isinstance(current, dict) and current.get("generation") == new_wake:
+                current.update({"terminal": "terminal",
+                                "reason": f"replacement launch failed: {exc}"[:300]})
+            return meta
+        bus._update_meta_locked(room_id, mark_failed)
+        _announce_spawn_failure(room_id, agent_name, exc, f"swarm-replace:{new_wake}")
+        return False
+    _swarm_replacement_notice(
+        room_id, agent_name, new_wake,
+        f"{agent_name} продолжает через {profile}: маршрут {current_profile} "
+        f"завершился сбоем [{plan['failure_class']}]. Тот же участник "
+        f"{member_id}, тот же запрос #{req}.")
+    return True
+
+
+def _swarm_replacement_notice(room_id: str, agent_name: str, generation: str,
+                              body: str) -> None:
+    try:
+        _post_message_checked(
+            room_id, "System", body, kind="system",
+            idempotency_key=f"swarm-replace:{room_id}:{agent_name}:{generation}",
+        )
+    except Exception as exc:
+        print(f"[huddle] swarm replacement notice failed "
+              f"({agent_name}@{room_id}): {exc}", flush=True)
 
 
 @mcp.tool()
@@ -1972,6 +2217,12 @@ def _server_terminal_failure_task_ids(status_info: dict, wake_info: dict) -> set
         and status_info.get("task_id", "") != ""
     ):
         task_ids.add(str(status_info["task_id"]))
+    # A live Swarm replacement generation reopened exactly one failed request.
+    # The old receipt stays as diagnostics; it settles again only if the
+    # replacement route itself ends terminally.
+    route = wake_info.get("swarm_route") if isinstance(wake_info, dict) else None
+    if isinstance(route, dict) and not route.get("terminal") and route.get("task_id"):
+        task_ids.discard(str(route["task_id"]))
     return task_ids
 
 
@@ -4239,6 +4490,18 @@ def _on_wake_exit(room_id: str, agent_name: str, wake_id: str,
         except Exception as exc:
             print(f"[huddle] noreply check error "
                   f"({agent_name}@{room_id}): {exc}", flush=True)
+    if not posted_result and not intentional_pilot_stop:
+        try:
+            # Still holding this generation's claim: a replacement takes it
+            # over atomically, making the release below a no-op.
+            if _swarm_replace_failed_member(
+                room_id, agent_name, wake_id, info, rc, final_phase,
+                rate_limit_announced,
+            ):
+                return
+        except Exception as exc:
+            print(f"[huddle] swarm replacement error "
+                  f"({agent_name}@{room_id}): {exc}", flush=True)
     try:
         # Operational status is terminal now. Release only this exact
         # generation, then allow the queued-drain path to claim the next turn.
@@ -4354,18 +4617,17 @@ def _wake_agents_for_request(
                 pilot_state.get("expected_specs")
                 if isinstance(pilot_state, dict) else None
             )
-            current_spec = None
-            if isinstance(pinned_specs, dict):
-                current_spec = spawn.get_enabled_spec(agent_name)
-                if _swarm_spec_drift(fresh, agent_name, current_spec):
-                    wakes.append({"agent": agent_name, "status": "spec_drift"})
-                    continue
+            if isinstance(pinned_specs, dict) and _member_launch_spec(fresh, agent_name)[1]:
+                wakes.append({"agent": agent_name, "status": "spec_drift"})
+                continue
 
             log_path = info.get("log_path")
             last_seen = int(info.get("last_seen_id", 0) or 0)
             wake_id = uuid.uuid4().hex[:12]
 
-            resumable = _is_thread_resumable(agent_name)
+            # A replaced member always launches its route profile fresh.
+            resumable = (_is_thread_resumable(agent_name)
+                         and _swarm_route_profile(info) is None)
             # A newly invited Codex has no native thread yet. The first pilot
             # turn must start a registry-backed process; later turns resume
             # the captured thread just like an ordinary room.
@@ -4772,13 +5034,13 @@ def _spawn_fresh_room_agent(
 
     Records a wake lease (wake_id + last_wake_pid) and wires a reaper callback
     so the busy lease is released — and the next request drained — when the
-    process exits."""
-    spec = spawn.get_enabled_spec(agent_name)
+    process exits. A replaced Swarm member launches its route profile under
+    the member's own room/log identity."""
+    current_meta = bus.get_room_info(room_id)
+    spec, drift = _member_launch_spec(current_meta, agent_name)
     if not spec:
         raise ValueError(f"Agent {agent_name} has no enabled spawn registry entry")
-
-    current_meta = bus.get_room_info(room_id)
-    if _swarm_spec_drift(current_meta, agent_name, spec):
+    if drift:
         raise ValueError(
             f"spec_drift: refusing to launch {agent_name} with a changed swarm profile"
         )
@@ -4793,6 +5055,7 @@ def _spawn_fresh_room_agent(
         wake_id = uuid.uuid4().hex[:12]
     session_id = meta.get("session_id", "")
     _set_agent_phase(room_id, agent_name, "starting", task_id=msg_id or "")
+    identity = {"log_name": agent_name} if spec.get("name") != agent_name else {}
     try:
         pid, log_path, last_msg_path = spawn.spawn_agent(
             launch_spec,
@@ -4805,6 +5068,7 @@ def _spawn_fresh_room_agent(
             on_log_open_identity=_claude_receipt_log_open(
                 room_id, agent_name, wake_id, "wake_id", spec,
             ),
+            **identity,
         )
     except Exception as exc:
         _set_agent_phase(room_id, agent_name, "unavailable", detail=str(exc))

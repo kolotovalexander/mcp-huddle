@@ -889,8 +889,9 @@ def _resolve_spawn_args(
     spec: SpawnSpec,
     brief: str,
     log_dir: Path,
+    log_name: str | None = None,
 ) -> tuple[list[str], str | None]:
-    name = bus._safe_path_component(spec["name"], "agent_name")
+    name = bus._safe_path_component(log_name or spec["name"], "agent_name")
     last_msg_path: str | None = None
 
     template = _apply_model_effort_variant(spec, list(spec.get("cmd") or []))
@@ -2072,11 +2073,15 @@ def spawn_agent(
     process_handle: str | None = None,
     on_log_open: Callable[[int, str], None] | None = None,
     on_log_open_identity: Callable[[int, str, int, int], None] | None = None,
+    log_name: str | None = None,
 ) -> tuple[int, str, str | None]:
     """Spawn one agent.
 
     Returns (pid, log_path, last_message_path).
     last_message_path is None for agents whose argv doesn't reference {last_message}.
+    log_name: room participant whose log/last-message paths this turn owns.
+    Defaults to the profile name; a Swarm replacement profile passes the
+    original member so readers and receipts keep one room identity.
 
     on_exit: optional callable(returncode) fired when the process exits.
     on_log_open: optional callable(start_offset, log_path) fired after opening
@@ -2086,7 +2091,8 @@ def spawn_agent(
     Side effects: creates log_dir, opens log file, redirects stdout+stderr to it.
     """
     _validate_protected_profile_names([spec])
-    name = bus._safe_path_component(spec["name"], "agent_name")
+    profile_name = bus._safe_path_component(spec["name"], "agent_name")
+    name = bus._safe_path_component(log_name or profile_name, "agent_name")
     # Allocate the ownership generation before any resource or Popen: even
     # handle generation failure must leave no child or profile temp cwd.
     process_handle = process_handle or child_processes.new_handle()
@@ -2096,7 +2102,7 @@ def spawn_agent(
     else:
         log_path = log_dir / f"{name.lower()}.events.jsonl"
     cleanup_dir: str | None = None
-    if name == "Codex":
+    if profile_name == "Codex":
         cwd, brief = _codex_safe_cwd_and_brief(cwd, brief)
     if spec.get("profile") in {_DIRECT_OPUS_REVIEW_PROFILE, _SUBSCRIPTION_OPUS_REVIEW_PROFILE}:
         # This typed profile deliberately ignores registry argv: it always has
@@ -2121,7 +2127,7 @@ def spawn_agent(
                 shutil.rmtree(cleanup_dir, ignore_errors=True)
                 raise
     else:
-        argv, last_msg_path = _resolve_spawn_args(spec, brief, log_dir)
+        argv, last_msg_path = _resolve_spawn_args(spec, brief, log_dir, name)
         env = _spawn_environment(spec, argv)
     # A batch stagger cannot cover separate rooms, separate Huddle processes,
     # or wake-path launches. Serialize the complete lifetime of every
