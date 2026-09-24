@@ -6,6 +6,7 @@ requests and waking CLI workers, so no message lock is held with the meta lock.
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any
 
@@ -14,6 +15,8 @@ from . import bus
 
 MODES = frozenset({"council", "team", "relay", "swarm"})
 WORKSPACES = frozenset({"shared_only", "allow_subworktrees"})
+_ROOM_ID_RE = re.compile(r"room_[0-9a-f]{8}\Z")
+_FINGERPRINT_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
 def create(
@@ -24,6 +27,10 @@ def create(
     members: list[str],
     cwd: str = "",
     workspace_strategy: str = "shared_only",
+    *,
+    room_id: str | None = None,
+    client_request_fingerprint: str = "",
+    plan_hash: str = "",
 ) -> str:
     if mode not in MODES:
         raise ValueError(f"mode must be one of {sorted(MODES)}")
@@ -33,6 +40,16 @@ def create(
         raise ValueError("name, organizer and goal must be non-empty")
     if len(name) > 200 or len(organizer) > 120 or len(goal) > 5000:
         raise ValueError("pilot room name, organizer or goal is too long")
+    if room_id is not None and (
+        not isinstance(room_id, str) or not _ROOM_ID_RE.fullmatch(room_id)
+    ):
+        raise ValueError("room_id must be room_ followed by 8 lowercase hex digits")
+    for label, value in (
+        ("client_request_fingerprint", client_request_fingerprint),
+        ("plan_hash", plan_hash),
+    ):
+        if not isinstance(value, str) or (value and not _FINGERPRINT_RE.fullmatch(value)):
+            raise ValueError(f"{label} must be empty or sha256 followed by 64 lowercase hex digits")
     if (not members or len(members) > 8 or len(set(members)) != len(members)
             or organizer in members or {"Human", "System"}.intersection(members)):
         raise ValueError("members must be non-empty, unique and exclude organizer")
@@ -40,7 +57,7 @@ def create(
         bus._safe_path_component(member, "member")
     # A swarm survives organizer session exit. Ordinary rooms retain their
     # existing owner_pid/SessionEnd lifecycle.
-    room_id = bus.create_room(name, organizer, 0, cwd, "")
+    room_id = bus.create_room(name, organizer, 0, cwd, "", room_id=room_id)
     now = int(time.time())
 
     def init(meta: dict) -> dict:
@@ -62,6 +79,10 @@ def create(
             "phase": "working",
             "created_at": now,
         }
+        if client_request_fingerprint:
+            meta["swarm_pilot"]["client_request_fingerprint"] = client_request_fingerprint
+        if plan_hash:
+            meta["swarm_pilot"]["plan_hash"] = plan_hash
         return meta
 
     bus._update_meta_locked(room_id, init)
