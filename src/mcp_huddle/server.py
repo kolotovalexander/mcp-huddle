@@ -1027,8 +1027,57 @@ def swarm_pilot_create(
 
 @mcp.tool()
 def swarm_pilot_status(room_id: str) -> dict:
-    """Read the pilot's compact, durable room state."""
-    return swarm_pilot.status(room_id)
+    """Read pilot state and the current per-member runtime snapshot.
+
+    ``last_seen_id`` is the cursor Huddle places in a wake prompt, not proof
+    that a model read every message through that ID. Agent runtime fields stay
+    in room ``agent_meta``; no native session is copied into pilot state.
+    """
+    state = swarm_pilot.status(room_id)
+    agent_meta = bus.get_room_info(room_id).get("agent_meta") or {}
+    if not isinstance(agent_meta, dict):
+        agent_meta = {}
+    details = []
+    for member in state["members"]:
+        info = agent_meta.get(member) or {}
+        if not isinstance(info, dict):
+            info = {}
+        thread_id = info.get("thread_id")
+        native_session = (
+            {"kind": "codex_thread", "id": thread_id,
+             "source": "agent_meta.thread_id"}
+            if (_is_thread_resumable(member) and isinstance(thread_id, str)
+                and thread_id) else None
+        )
+        wake_id = info.get("wake_id")
+        initial_id = info.get("initial_spawn_id")
+        if isinstance(wake_id, str) and wake_id:
+            generation = {"id": wake_id, "source": "wake_id",
+                          "claim_active": info.get("wake_claim_id") == wake_id}
+        elif isinstance(initial_id, str) and initial_id:
+            generation = {"id": initial_id, "source": "initial_spawn_id",
+                          "claim_active": info.get("initial_spawn_active") is True}
+        else:
+            generation = None
+        # These are server delivery offsets. Neither one is a read receipt.
+        def cursor_value(field: str) -> int | None:
+            value = info.get(field)
+            return value if type(value) is int and value >= 0 else None
+
+        cursor = {
+            field: cursor_value(field)
+            for field in ("last_wake_msg_id", "last_seen_id")
+        }
+        cursor["read_receipt"] = False
+        details.append({
+            "member_id": state["member_ids"][member],
+            "name": member,
+            "profile": member,
+            "native_session": native_session,
+            "process_generation": generation,
+            "delivery_cursor": cursor,
+        })
+    return {**state, "members_detail": details}
 
 
 def _swarm_pilot_request(room_id: str, member: str) -> str:
