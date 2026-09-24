@@ -63,7 +63,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import BinaryIO, Literal, NamedTuple, NotRequired, TypedDict
+from typing import BinaryIO, Callable, Literal, NamedTuple, NotRequired, TypedDict
 from urllib import error as urlerror
 from urllib import request as urlrequest
 from urllib.parse import urlparse
@@ -1847,6 +1847,7 @@ def spawn_agent(
     on_exit=None,
     owner_room_id: str = "",
     process_handle: str | None = None,
+    on_log_open: Callable[[int, str], None] | None = None,
 ) -> tuple[int, str, str | None]:
     """Spawn one agent.
 
@@ -1854,6 +1855,9 @@ def spawn_agent(
     last_message_path is None for agents whose argv doesn't reference {last_message}.
 
     on_exit: optional callable(returncode) fired when the process exits.
+    on_log_open: optional callable(start_offset, log_path) fired after opening
+    the append log and before Popen. Its offset is the open fd's byte size at
+    that instant. An exception prevents launch and closes the descriptor.
 
     Side effects: creates log_dir, opens log file, redirects stdout+stderr to it.
     """
@@ -1912,6 +1916,8 @@ def spawn_agent(
             shutil.rmtree(cleanup_dir, ignore_errors=True)
         raise
     try:
+        if on_log_open is not None:
+            on_log_open(os.fstat(log_file.fileno()).st_size, str(log_path))
         proc = subprocess.Popen(
             argv,
             cwd=cwd or None,
@@ -1921,8 +1927,8 @@ def spawn_agent(
             env=env,
         )
     except BaseException:
-        # Preserve the original Popen failure even if closing its unused log
-        # descriptor also fails.
+        # Preserve the callback or Popen failure even if closing its unused
+        # log descriptor also fails.
         _close_parent_log_safely(log_file)
         if cleanup_dir is not None:
             shutil.rmtree(cleanup_dir, ignore_errors=True)
