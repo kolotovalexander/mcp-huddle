@@ -598,6 +598,96 @@ _VALID_CODEX_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "ma
 _VALID_CLAUDE_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 _VALID_AGY_EFFORTS = {"low", "medium", "high"}
 
+# Exact-model preflights are intentionally short and process-local. The key
+# contains only non-secret routing inputs; native CLI auth remains in its own
+# config/keychain and candidate registry `pass_env` values are never copied.
+_MODEL_PREFLIGHT_CACHE: dict[tuple[str, str, str, str, str], tuple[float, dict[str, str]]] = {}
+_MODEL_PREFLIGHT_LOCK = threading.Lock()
+_MODEL_PREFLIGHT_TTL_SEC = 60.0
+_MODEL_PREFLIGHT_TIMEOUT_SEC = 45
+_MODEL_PREFLIGHT_SENTINEL = "Reply with exactly this text and nothing else: HUDDLE PREFLIGHT OK"
+_MODEL_PREFLIGHT_EXPECTED = "HUDDLE PREFLIGHT OK"
+
+
+def probe_cli_model_response(spec: SpawnSpec, cwd: str) -> dict[str, str]:
+    """Make one bounded sentinel request using an explicitly pinned model/effort.
+
+    Only native Claude and Codex CLIs are supported. The prompt is a fixed
+    public sentinel, and the process runs outside the project in an isolated
+    no-tools/read-only invocation. Raw CLI output is never returned or logged.
+    Missing explicit model or effort is reported as unsupported because a
+    harness default cannot prove which exact route answered.
+    """
+    command = spec.get("cmd", [])
+    if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
+        return {"status": "unsupported", "reason": "unsupported_harness"}
+    binary_index = _effective_binary_index(command)
+    if binary_index is None:
+        return {"status": "unsupported", "reason": "unsupported_harness"}
+    binary = command[binary_index]
+    harness = Path(binary).name
+    if harness not in {"claude", "codex"}:
+        return {"status": "unsupported", "reason": "unsupported_harness"}
+    try:
+        settings = model_settings_for_spec(spec)
+    except Exception:
+        return {"status": "unsupported", "reason": "invalid_model_settings"}
+    model, effort = settings.get("model"), settings.get("effort")
+    if not model or not effort:
+        return {"status": "unsupported", "reason": "model_effort_not_explicit"}
+
+    cache_key = (
+        str(Path(binary).expanduser()), model, effort,
+        os.environ.get("CODEX_HOME", ""), os.environ.get("CLAUDE_CONFIG_DIR", ""),
+    )
+    now = time.monotonic()
+    with _MODEL_PREFLIGHT_LOCK:
+        cached = _MODEL_PREFLIGHT_CACHE.get(cache_key)
+        if cached and now - cached[0] < _MODEL_PREFLIGHT_TTL_SEC:
+            return dict(cached[1])
+        if cached:
+            _MODEL_PREFLIGHT_CACHE.pop(cache_key, None)
+
+    if harness == "claude":
+        argv = [
+            binary, "--restricted", "--strict-mcp-config", "--setting-sources", "",
+            "--tools", "", "--permission-prompts", "none",
+            "--no-session-persistence", "--model", model, "--effort", effort,
+            "-p", _MODEL_PREFLIGHT_SENTINEL,
+        ]
+    else:
+        argv = [
+            binary, "exec", "--ephemeral",
+            "--skip-git-repo-check", "--sandbox", "read-only",
+            "-c", "mcp_servers={}",
+            "--model", model, "-c", f'model_reasoning_effort="{effort}"',
+            _MODEL_PREFLIGHT_SENTINEL,
+        ]
+
+    try:
+        result = subprocess.run(
+            argv, cwd=cwd, env=build_sanitized_environment(),
+            capture_output=True, text=True, timeout=_MODEL_PREFLIGHT_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        probe = {"status": "failed", "reason": "response_timeout"}
+    except (OSError, ValueError):
+        probe = {"status": "unknown", "reason": "probe_unavailable"}
+    else:
+        stdout = result.stdout if isinstance(result.stdout, str) else ""
+        if result.returncode != 0:
+            probe = {"status": "failed", "reason": "provider_request_failed"}
+        elif stdout.strip() == _MODEL_PREFLIGHT_EXPECTED:
+            probe = {"status": "passed", "reason": "sentinel_response_received"}
+        else:
+            probe = {"status": "failed", "reason": "sentinel_response_not_received"}
+
+    with _MODEL_PREFLIGHT_LOCK:
+        if len(_MODEL_PREFLIGHT_CACHE) >= 128:
+            _MODEL_PREFLIGHT_CACHE.clear()
+        _MODEL_PREFLIGHT_CACHE[cache_key] = (time.monotonic(), dict(probe))
+    return probe
+
 
 def _validated_model_overrides(spec: SpawnSpec, binary: str) -> dict[str, str]:
     """Validate registry model controls and return only explicitly supplied ones."""

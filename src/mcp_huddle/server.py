@@ -918,6 +918,7 @@ def swarm_room_proposal(
     allow_unenforced_read: bool = False,
     cwd: str = "",
     check_cli_login: bool = True,
+    check_exact_model: bool = False,
 ) -> dict:
     """Build a reviewable room proposal from a goal and closed requirements.
 
@@ -928,7 +929,10 @@ def swarm_room_proposal(
     present only when the static plan is ready and contains ``start=False``.
     Login probing checks only native Claude/Codex login status; it does not
     verify the selected model, provider route, quota, or model response. Login
-    probing is enabled by default and can be skipped with ``False``.
+    probing is enabled by default and can be skipped with ``False``. The
+    opt-in ``check_exact_model`` makes one short fixed sentinel request for
+    each selected Claude/Codex model+effort route. It sends no room goal or
+    repository data and fails closed when the route is not explicitly pinned.
     """
     for label, value, limit in (
         ("name", name, 200),
@@ -943,6 +947,8 @@ def swarm_room_proposal(
         raise ValueError("cwd must be a string of at most 4096 characters")
     if not isinstance(check_cli_login, bool):
         raise ValueError("check_cli_login must be a boolean")
+    if not isinstance(check_exact_model, bool):
+        raise ValueError("check_exact_model must be a boolean")
 
     plan = swarm_plan_preview(
         requirements,
@@ -951,6 +957,7 @@ def swarm_room_proposal(
         allow_unenforced_read=allow_unenforced_read,
     )
     login_checks = {}
+    exact_model_checks = {}
     if plan.get("status") == "planned":
         selected_ids = [member["id"] for member in plan.get("members", [])]
         if check_cli_login:
@@ -996,10 +1003,55 @@ def swarm_room_proposal(
                 member_id: {"status": "skipped", "reason": "caller_disabled"}
                 for member_id in selected_ids
             }
+        if check_exact_model:
+            specs_by_name = {
+                spec.get("name"): spec for spec in spawn._raw_registry()
+                if isinstance(spec.get("name"), str)
+            }
+            probe_cwd = tempfile.gettempdir()
+            for member_id in selected_ids:
+                spec = specs_by_name.get(member_id)
+                command = spec.get("cmd", []) if spec else []
+                route = spawn._effective_binary(command) if isinstance(command, list) else None
+                if route not in {"claude", "codex"}:
+                    continue
+                if spec is None:
+                    probe = {"status": "unsupported", "reason": "unsupported_harness"}
+                else:
+                    try:
+                        probe = spawn.probe_cli_model_response(spec, probe_cwd)
+                    except Exception:
+                        probe = None
+                statuses = {"passed", "failed", "unsupported", "unknown"}
+                reasons = {
+                    "sentinel_response_received", "provider_request_failed",
+                    "sentinel_response_not_received", "response_timeout",
+                    "probe_unavailable", "unsupported_harness",
+                    "invalid_model_settings", "model_effort_not_explicit",
+                }
+                if (not isinstance(probe, dict) or probe.get("status") not in statuses
+                        or probe.get("reason") not in reasons):
+                    exact_model_checks[member_id] = {
+                        "status": "unknown", "reason": "probe_unavailable",
+                    }
+                else:
+                    exact_model_checks[member_id] = {
+                        "status": probe["status"], "reason": probe["reason"],
+                    }
     create_args = None
     proposal_blockers = []
     if plan.get("status") == "planned":
         members = [member["id"] for member in plan.get("members", [])]
+        failed_exact_routes = [
+            member_id for member_id, check in exact_model_checks.items()
+            if check["status"] != "passed"
+        ]
+        if failed_exact_routes:
+            proposal_blockers.append(
+                "exact Claude/Codex model preflight did not pass for: "
+                + ", ".join(failed_exact_routes)
+                + "; choose an explicitly pinned available route or disable exact-model preflight"
+            )
         if organizer in members:
             proposal_blockers.append("organizer must not also be a participant")
         if {"Human", "System"}.intersection(members):
@@ -1036,11 +1088,14 @@ def swarm_room_proposal(
         "preflight": {
             "static_plan": plan.get("status", "unknown"),
             "cli_login": login_checks,
-            "exact_model_provider_response": "not_checked",
+            "exact_model_provider_response": exact_model_checks or "not_checked",
         },
         "readiness": (
-            "static advisory plus bounded local CLI login status; exact model, "
-            "provider route, quota, and response not verified"
+            "static advisory; native CLI login status checked"
+            if check_cli_login else "static advisory; native CLI login status skipped"
+        ) + (
+            "; exact selected Claude/Codex model response checked with a sentinel"
+            if check_exact_model else "; exact selected model response not checked"
         ),
         "side_effects": {"room_created": False, "child_processes_started": False},
     }

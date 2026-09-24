@@ -71,6 +71,21 @@ harness integration before that specific branch can be relied on. Backup
 routes are an opt-in capability, not a claim that provider quota or model
 availability has been checked by a real model request.
 
+## Room proposal checks
+
+`swarm_room_proposal` does not create rooms or launch task work. Its normal
+login check verifies only that native Claude/Codex CLI recognizes a local
+login; it does not prove model availability. Set `check_exact_model=true` only
+when that extra evidence is useful. It makes at most one cached, 45-second
+request for each selected Claude/Codex model+effort route, using a fixed
+`HUDDLE PREFLIGHT OK` sentinel from a temporary directory. It sends no room
+goal, repository files, registry credentials, or `pass_env` values. Claude is
+run with tools disabled and permission prompts denied; Codex runs ephemeral in
+a read-only sandbox. A result is `passed` only when that exact sentinel comes
+back. Missing explicit model or effort, CLI errors, and timeouts block
+`create_args`; Huddle does not silently choose a different model or ask Jev
+again. Other harnesses are not probed by this option.
+
 ## Mechanical verification
 
 `PYTHONPATH=src python3 -m pytest tests/test_swarm_pilot.py -q`

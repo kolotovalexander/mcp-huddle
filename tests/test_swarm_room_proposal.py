@@ -144,6 +144,76 @@ def test_login_preflight_is_bounded_deduplicated_and_secret_free(monkeypatch):
     assert len(calls) == 2
 
 
+def test_exact_model_preflight_uses_only_sentinel_and_blocks_failed_route(monkeypatch):
+    claude = _spec("Claude", "claude", flags=("--model", "sonnet", "--effort", "low"))
+    claude["pass_env"] = ["PROVIDER_API_KEY"]
+    codex = _spec(
+        "Codex", "codex", flags=("exec", "-m", "gpt-6-sol", "-c", 'model_reasoning_effort="high"'),
+    )
+    _configure_registry(monkeypatch, [claude, codex])
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "private-api-key")
+    monkeypatch.setenv("PROVIDER_API_KEY", "private-provider-key")
+    monkeypatch.setattr(server.tempfile, "gettempdir", lambda: "/neutral/tmp")
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        if argv[0] == "claude":
+            return spawn.subprocess.CompletedProcess(argv, 1, "", "private provider detail")
+        return spawn.subprocess.CompletedProcess(argv, 0, "HUDDLE PREFLIGHT OK\n", "")
+
+    monkeypatch.setattr(spawn.subprocess, "run", fake_run)
+    result = server.swarm_room_proposal(
+        name="Pinned model check", organizer="Human", goal="private room goal",
+        requirements=_profile(parts="two_three", max_members=2),
+        explicit_mode="team", explicit_members=["Claude", "Codex"],
+        check_cli_login=False, check_exact_model=True,
+    )
+
+    assert len(calls) == 2
+    argv, kwargs = calls[0]
+    assert argv[0:2] == ["claude", "--restricted"]
+    assert ["--model", "sonnet"] == argv[argv.index("--model"):argv.index("--model") + 2]
+    assert ["--effort", "low"] == argv[argv.index("--effort"):argv.index("--effort") + 2]
+    assert "--tools" in argv and argv[argv.index("--tools") + 1] == ""
+    assert "--dangerously-skip-permissions" not in argv
+    assert "--permission-prompts" in argv and argv[argv.index("--permission-prompts") + 1] == "none"
+    assert "HUDDLE PREFLIGHT OK" in argv[-1]
+    assert "private room goal" not in repr(argv)
+    assert kwargs["cwd"] == "/neutral/tmp"
+    assert "ANTHROPIC_API_KEY" not in kwargs["env"]
+    assert "PROVIDER_API_KEY" not in kwargs["env"]
+    codex_argv, codex_kwargs = calls[1]
+    assert codex_argv[:3] == ["codex", "exec", "--ephemeral"]
+    assert codex_argv[codex_argv.index("--sandbox") + 1] == "read-only"
+    assert codex_argv[codex_argv.index("--model") + 1] == "gpt-6-sol"
+    assert 'model_reasoning_effort="high"' in codex_argv
+    assert "mcp_servers={}" in codex_argv
+    assert "private room goal" not in repr(codex_argv)
+    assert codex_kwargs["cwd"] == "/neutral/tmp"
+    assert "ANTHROPIC_API_KEY" not in codex_kwargs["env"]
+    assert "PROVIDER_API_KEY" not in codex_kwargs["env"]
+    assert result["preflight"]["exact_model_provider_response"] == {
+        "Claude": {"status": "failed", "reason": "provider_request_failed"},
+        "Codex": {"status": "passed", "reason": "sentinel_response_received"},
+    }
+    assert result["create_args"] is None
+    assert result["status"] == "not_ready"
+    assert "Claude" in result["proposal_blockers"][0]
+    assert "private provider detail" not in repr(result)
+
+    repeated = server.swarm_room_proposal(
+        name="Pinned model check again", organizer="Human", goal="different private goal",
+        requirements=_profile(parts="two_three", max_members=2),
+        explicit_mode="team", explicit_members=["Claude", "Codex"],
+        check_cli_login=False, check_exact_model=True,
+    )
+    assert len(calls) == 2
+    assert repeated["preflight"]["exact_model_provider_response"] == result["preflight"][
+        "exact_model_provider_response"
+    ]
+
+
 def test_blocked_or_unsupported_plan_has_no_create_args(monkeypatch):
     _configure_registry(monkeypatch, [_spec("Claude", "claude")])
     monkeypatch.setattr(server.shutil, "which", lambda _name: None)
