@@ -1184,6 +1184,106 @@ def swarm_pilot_pump(room_id: str) -> list[dict]:
     return dispatched
 
 
+def _swarm_advance(room_id: str) -> dict:
+    """Publish missing pilot requests after a tool turn or server restart.
+
+    A completed round is already durable in room metadata. Publishing happens
+    separately, so the watchdog must be able to repeat this step safely after
+    a process stops between those writes. Message keys are the durable journal;
+    an existing request is left to the ordinary pending-wake path.
+    """
+    room = bus.get_room_info(room_id)
+    state = room.get("swarm_pilot")
+    if (room.get("status") not in ("open", "idle")
+            or not isinstance(state, dict) or state.get("phase") != "working"
+            or state.get("server_create_state") == "preparing"):
+        return {"next_dispatch": [], "final_request": None,
+                "new_final_request": False}
+
+    next_dispatch = swarm_pilot_pump(room_id)
+    state = swarm_pilot.status(room_id)
+    if len(state["done"]) != len(state["members"]):
+        return {"next_dispatch": next_dispatch, "final_request": None,
+                "new_final_request": False}
+
+    round_no = state.get("round", 1)
+    if state["mode"] == "council":
+        recipient = state["organizer"]
+        suffix = "final-request"
+        body = (
+            "All council members have spoken. Read their results and "
+            "publish the combined result with swarm_pilot_finish(room_id, "
+            "member, result)."
+        )
+    else:
+        reporter = state["responsibilities"].get("reporter", {}).get("member")
+        if reporter:
+            recipient = reporter
+            suffix = "final-request"
+            body = (
+                "All members have completed the round. Read their results and "
+                "publish the combined result with swarm_pilot_finish(room_id, "
+                "member, result)."
+            )
+        else:
+            recipient = "all"
+            suffix = "final-request-missing-reporter"
+            body = (
+                "All members have completed the round, but no reporter is claimed. "
+                "One member must claim the reporter responsibility with "
+                "swarm_pilot_record(room_id, member, 'responsibility', 'reporter', '<description>')."
+            )
+    key = f"swarm-pilot:{room_id}:{round_no}:{suffix}"
+    existing = next(
+        (msg for msg in bus._load_messages(room_id)
+         if msg.get("idempotency_key") == key), None,
+    )
+    if existing is not None:
+        if (existing.get("agent") != "System"
+                or existing.get("kind") != "request"
+                or existing.get("to") != recipient):
+            raise ValueError("pilot final-request key belongs to another message")
+        return {"next_dispatch": next_dispatch, "final_request": existing["id"],
+                "new_final_request": False}
+    final_request = message_post(
+        room_id, "System", body, "request", to=recipient,
+        idempotency_key=key,
+    )
+    return {"next_dispatch": next_dispatch, "final_request": final_request,
+            "new_final_request": True}
+
+
+def _recover_swarm_pilots() -> list[dict]:
+    """Advance started, open pilots whose process stopped before publication."""
+    recovered: list[dict] = []
+    for room in bus.list_rooms():
+        state = room.get("swarm_pilot")
+        if (room.get("status") not in ("open", "idle")
+                or not isinstance(state, dict) or state.get("phase") != "working"
+                or state.get("server_create_state") == "preparing"
+                or not (state.get("start_requested") is True
+                        or state.get("dispatched") or state.get("done"))):
+            continue
+        room_id = room.get("id")
+        if not isinstance(room_id, str):
+            continue
+        try:
+            advanced = _swarm_advance(room_id)
+            dispatched = [item for item in advanced["next_dispatch"]
+                          if item.get("status") == "dispatched"]
+            if dispatched or advanced["new_final_request"]:
+                recovered.append({"room_id": room_id,
+                                  "next_dispatch": dispatched,
+                                  "final_request": advanced["final_request"]
+                                  if advanced["new_final_request"] else None})
+        except Exception as exc:
+            # One malformed/removed room must not prevent other rooms from
+            # recovering on this tick. The next tick can retry this room.
+            print(f"[watchdog] swarm advance failed ({room_id}): {exc}",
+                  flush=True)
+    return recovered
+
+
 def _swarm_spec_drift(
     room_state: dict, member: str, spec: dict | None,
 ) -> bool:
@@ -1212,21 +1312,12 @@ def swarm_pilot_record(
     """Record a responsibility, task, decision or fact in the pilot room."""
     updated = swarm_pilot.record(room_id, member, kind, key, value)
 
-    final_request = None
-    if (kind == "responsibility" and key == "reporter"
-            and updated["mode"] != "council"
-            and len(updated["done"]) == len(updated["members"])):
-        final_request = message_post(
-            room_id, "System",
-            "All members have completed the round. Read their results and "
-            "publish the combined result with swarm_pilot_finish(room_id, "
-            "member, result).",
-            "request", to=member,
-            idempotency_key=(
-                f"swarm-pilot:{room_id}:{updated.get('round', 1)}:final-request"
-            ),
-        )
-    return {**updated, "final_request": final_request}
+    advanced = _swarm_advance(room_id) if (
+        kind == "responsibility" and key == "reporter"
+        and updated["mode"] != "council"
+        and len(updated["done"]) == len(updated["members"])
+    ) else None
+    return {**updated, "final_request": advanced["final_request"] if advanced else None}
 
 
 @mcp.tool()
@@ -1263,47 +1354,10 @@ def swarm_pilot_round_done(room_id: str, member: str, summary: str) -> dict:
             "direct recovery request first"
         )
     updated = swarm_pilot.round_done(room_id, member, summary)
-    next_dispatch = swarm_pilot_pump(room_id)
-    final_request = None
-    if len(updated["done"]) == len(updated["members"]):
-        if updated["mode"] == "council":
-            final_request = message_post(
-                room_id, "System",
-                "All council members have spoken. Read their results and "
-                "publish the combined result with swarm_pilot_finish(room_id, "
-                "member, result).",
-                "request", to=updated["organizer"],
-                idempotency_key=(
-                    f"swarm-pilot:{room_id}:{updated.get('round', 1)}:final-request"
-                ),
-            )
-        else:
-            reporter = updated["responsibilities"].get("reporter", {}).get("member")
-            if reporter:
-                final_request = message_post(
-                    room_id, "System",
-                    "All members have completed the round. Read their results and "
-                    "publish the combined result with swarm_pilot_finish(room_id, "
-                    "member, result).",
-                    "request", to=reporter,
-                    idempotency_key=(
-                        f"swarm-pilot:{room_id}:{updated.get('round', 1)}:final-request"
-                    ),
-                )
-            else:
-                final_request = message_post(
-                    room_id, "System",
-                    "All members have completed the round, but no reporter is claimed. "
-                    "One member must claim the reporter responsibility with "
-                    "swarm_pilot_record(room_id, member, 'responsibility', 'reporter', '<description>').",
-                    "request", to="all",
-                    idempotency_key=(
-                        f"swarm-pilot:{room_id}:{updated.get('round', 1)}:final-request-missing-reporter"
-                    ),
-                )
+    advanced = _swarm_advance(room_id)
     _schedule_completed_pilot_turn_exit(room_id, member, updated, "round_done")
-    return {"state": updated, "next_dispatch": next_dispatch,
-            "final_request": final_request}
+    return {"state": updated, "next_dispatch": advanced["next_dispatch"],
+            "final_request": advanced["final_request"]}
 
 
 @mcp.tool()
@@ -1831,6 +1885,14 @@ async def _background_watchdog():
                 print(f"[watchdog] Deadlock-notified rooms: {notified}", flush=True)
         except Exception as e:
             print(f"[watchdog] deadlock check error: {e}", flush=True)
+
+        try:
+            advanced = _recover_swarm_pilots()
+            if advanced:
+                print(f"[watchdog] Recovered swarm requests: {advanced}",
+                      flush=True)
+        except Exception as e:
+            print(f"[watchdog] swarm recovery error: {e}", flush=True)
 
         try:
             wakes = _wake_pending_agents()

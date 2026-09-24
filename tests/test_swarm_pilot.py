@@ -527,3 +527,99 @@ def test_pilot_missing_reporter_prompts_all_then_dispatches(isolated_home, monke
     # Duplicates are ignored due to idempotency keys
     updated_state2 = server.swarm_pilot_record(room, "A", "responsibility", "reporter", "Final")
     assert bus._load_messages(room)[-1]["id"] == msg2["id"]
+
+
+@pytest.mark.parametrize("mode", ["council", "relay"])
+def test_watchdog_recovers_next_dispatch_after_persisted_round_done(
+    isolated_home, monkeypatch, mode,
+):
+    monkeypatch.setattr(server.spawn, "get_enabled_spec", lambda name: {"name": name})
+    wake_calls = []
+    monkeypatch.setattr(server, "_wake_agents_for_request",
+                        lambda *args: wake_calls.append(args) or [])
+    room = server.swarm_pilot_create(
+        "restart recovery", "Organizer", "Tiny result", mode, ["A", "B"],
+        start=True,
+    )["room_id"]
+    first = swarm_pilot.status(room)["dispatched"]["A"]
+    server.message_post(room, "A", "A result", "result", to="Organizer",
+                        reply_to=first)
+    swarm_pilot.round_done(room, "A", "done")  # Process dies before pump.
+    assert "B" not in swarm_pilot.status(room)["dispatched"]
+
+    first_tick = server._recover_swarm_pilots()
+    second_tick = server._recover_swarm_pilots()
+
+    requests = [m for m in bus._load_messages(room)
+                if m["kind"] == "request" and m["to"] == "B"]
+    assert len(requests) == 1
+    assert swarm_pilot.status(room)["dispatched"]["B"] == requests[0]["id"]
+    assert first_tick == [{"room_id": room, "next_dispatch": [{"member": "B",
+                           "request_id": requests[0]["id"], "status": "dispatched"}],
+                           "final_request": None}]
+    assert second_tick == []
+    assert len(wake_calls) == 2  # A at creation, B on recovery.
+
+
+@pytest.mark.parametrize("mode, final_to", [
+    ("council", "Organizer"), ("team", "A"), ("relay", "A"), ("swarm", "A"),
+])
+def test_watchdog_recovers_final_request_after_last_round_done(
+    isolated_home, monkeypatch, mode, final_to,
+):
+    monkeypatch.setattr(server.spawn, "get_enabled_spec", lambda name: {"name": name})
+    wake_calls = []
+    terminate_calls = []
+    monkeypatch.setattr(server, "_wake_agents_for_request",
+                        lambda *args: wake_calls.append(args) or [])
+    monkeypatch.setattr(server.child_processes, "terminate",
+                        lambda *args: terminate_calls.append(args))
+    room = server.swarm_pilot_create(
+        "restart recovery", "Organizer", "Tiny result", mode, ["A"],
+        start=True,
+    )["room_id"]
+    if mode != "council":
+        swarm_pilot.record(room, "A", "responsibility", "reporter", "Final")
+    first = swarm_pilot.status(room)["dispatched"]["A"]
+    server.message_post(room, "A", "A result", "result", to="Organizer",
+                        reply_to=first)
+    swarm_pilot.round_done(room, "A", "done")  # Process dies before final post.
+    server._merge_agent_meta(room, "A", {"last_wake_pid": 91234,
+                                          "wake_id": "foreign-generation"})
+
+    first_tick = server._recover_swarm_pilots()
+    second_tick = server._recover_swarm_pilots()
+
+    final_requests = [m for m in bus._load_messages(room)
+                      if m["kind"] == "request" and m["to"] == final_to
+                      and m.get("idempotency_key", "").endswith(":final-request")]
+    assert len(final_requests) == 1
+    assert first_tick[0]["final_request"] == final_requests[0]["id"]
+    assert second_tick == []
+    assert len(wake_calls) == 2  # First member request and final request.
+    assert not terminate_calls
+
+
+def test_watchdog_skips_preparing_unstarted_and_closed_pilots(
+    isolated_home, monkeypatch,
+):
+    monkeypatch.setattr(server.spawn, "get_enabled_spec", lambda name: {"name": name})
+    monkeypatch.setattr(server, "_wake_agents_for_request", lambda *args: [])
+    preparing = server.swarm_pilot_create(
+        "preparing", "Organizer", "Tiny result", "team", ["A"],
+        start=False, client_request_id="preparing",
+    )["room_id"]
+    unstarted = server.swarm_pilot_create(
+        "unstarted", "Organizer", "Tiny result", "team", ["A"],
+        start=False,
+    )["room_id"]
+    closed = server.swarm_pilot_create(
+        "closed", "Organizer", "Tiny result", "team", ["A"],
+        start=True,
+    )["room_id"]
+    server._swarm_mark_create_state(preparing, "preparing", None, False, True)
+    bus.close_room(closed, "Organizer")
+
+    assert server._recover_swarm_pilots() == []
+    assert swarm_pilot.status(preparing)["dispatched"] == {}
+    assert swarm_pilot.status(unstarted)["dispatched"] == {}
