@@ -6,6 +6,7 @@ HTTP mode (`--http`): uvicorn + Liquid Glass dashboard on :8014.
 
 import asyncio
 import contextlib
+from functools import wraps
 import hashlib
 import hmac
 import json
@@ -463,7 +464,8 @@ def _swarm_validate_expected_specs(
 
 def _swarm_mark_create_state(
     room_id: str, state: str, expected_specs: dict[str, str] | None,
-    start_requested: bool, initial_dispatch: list[dict] | None = None,
+    start_requested: bool, registry_checked: bool,
+    initial_dispatch: list[dict] | None = None,
 ) -> None:
     def update(meta: dict) -> dict:
         pilot = meta.get("swarm_pilot")
@@ -471,7 +473,7 @@ def _swarm_mark_create_state(
             raise ValueError("partial_room: swarm pilot state is missing")
         pilot["server_create_state"] = state
         pilot["start_requested"] = start_requested
-        pilot["registry_availability_checked"] = True
+        pilot["registry_availability_checked"] = registry_checked
         if expected_specs is not None:
             pilot["expected_specs"] = dict(expected_specs)
         if state == "ready":
@@ -517,9 +519,10 @@ def _swarm_existing_request(
         raise ValueError("partial_room: stored request data is incomplete") from None
     if recomputed != stored_fingerprint:
         raise ValueError("partial_room: stored request fingerprint does not match room data")
-    if pilot.get("server_create_state") != "ready":
-        raise ValueError("partial_room: room initialization did not reach ready state")
-    if not isinstance(pilot.get("initial_dispatch"), list):
+    create_state = pilot.get("server_create_state")
+    if create_state not in {"ready", "preparing"}:
+        raise ValueError("partial_room: room initialization state is missing or invalid")
+    if create_state == "ready" and not isinstance(pilot.get("initial_dispatch"), list):
         raise ValueError("partial_room: initial dispatch result is missing")
     members = pilot.get("members")
     participants = meta.get("participants")
@@ -530,19 +533,91 @@ def _swarm_existing_request(
         stored_specs = pilot.get("expected_specs")
         if stored_specs is not None and stored_specs != expected_specs:
             raise ValueError("client_request_id conflict: expected agent specs differ from stored request")
-        if stored_specs is None:
-            _swarm_validate_expected_specs(members, expected_specs)
-    return {
+        _swarm_validate_expected_specs(members, expected_specs)
+    result = {
         "room_id": room_id,
         "mode": pilot.get("mode"),
         "dispatched": [],
         "started": pilot["start_requested"],
         "start_requested": pilot["start_requested"],
-        "previous_dispatch": list(pilot.get("initial_dispatch", [])),
+        "previous_dispatch": (
+            list(pilot["initial_dispatch"])
+            if create_state == "ready" else _swarm_initial_dispatch(room_id)
+        ),
         "reused": True,
         "availability": {
             "static_only": not bool(pilot.get("registry_availability_checked")),
             "registry_availability_checked": bool(pilot.get("registry_availability_checked")),
+            "provider_response_verified": False,
+        },
+    }
+    if create_state == "preparing":
+        result["_resume_preparing"] = True
+    return result
+
+
+def _swarm_initial_dispatch(room_id: str) -> list[dict]:
+    state = swarm_pilot.status(room_id)
+    dispatched = state.get("dispatched")
+    if not isinstance(dispatched, dict):
+        return []
+    return [
+        {"member": member, "request_id": dispatched[member], "status": "dispatched"}
+        for member in state.get("members", []) if member in dispatched
+    ]
+
+
+def _serialize_swarm_create_by_request_id(function):
+    """Serialize same-process retries for one deterministic room identity."""
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        request_id = kwargs.get("client_request_id", args[8] if len(args) > 8 else "")
+        organizer = kwargs.get("organizer", args[1] if len(args) > 1 else "")
+        if (not isinstance(request_id, str) or not _SWARM_CLIENT_REQUEST_ID_RE.fullmatch(request_id)
+                or not isinstance(organizer, str)):
+            return function(*args, **kwargs)
+        room_id = _swarm_request_room_id(organizer, request_id)
+        # Reuse Huddle's weak in-process per-room lock. It is held only in
+        # memory; bus metadata locks remain sequential and are never nested.
+        with _wake_lock(room_id, "__swarm_create__"):
+            return function(*args, **kwargs)
+    return wrapped
+
+
+def _swarm_resume_preparing(
+    room_id: str, organizer: str, members: list[str], expected_specs: dict[str, str] | None,
+    start_requested: bool, registry_checked: bool,
+) -> dict:
+    """Idempotently finish invites and dispatch for a deterministic partial room."""
+    if start_requested:
+        unavailable = [member for member in members if spawn.get_enabled_spec(member) is None]
+        if unavailable:
+            raise ValueError(f"unavailable registry members while resuming partial room: {unavailable}")
+    for member in members:
+        room_invite(room_id, member, by=organizer)
+    new_dispatch = swarm_pilot_pump(room_id) if start_requested else []
+    if start_requested and swarm_pilot.due_members(room_id):
+        blocked = [
+            item for item in new_dispatch
+            if item.get("status") in {"spec_drift", "unavailable"}
+        ]
+        reason = ", ".join(item.get("status", "blocked") for item in blocked) or "pending members"
+        raise ValueError(f"partial_room: swarm dispatch remains incomplete ({reason})")
+    all_dispatch = _swarm_initial_dispatch(room_id) if start_requested else []
+    _swarm_mark_create_state(
+        room_id, "ready", expected_specs, start_requested, registry_checked, all_dispatch,
+    )
+    return {
+        "room_id": room_id,
+        "mode": swarm_pilot.status(room_id).get("mode"),
+        "dispatched": new_dispatch,
+        "started": start_requested,
+        "start_requested": start_requested,
+        "previous_dispatch": all_dispatch,
+        "reused": True,
+        "availability": {
+            "static_only": not registry_checked,
+            "registry_availability_checked": registry_checked,
             "provider_response_verified": False,
         },
     }
@@ -578,53 +653,11 @@ def _swarm_display_model(value: object) -> str:
 
 
 def _swarm_readonly_enforced(spec: dict) -> bool:
-    """Confirm the active CLI argv has Huddle's known enforced RO flags."""
-    if not spawn._readonly_enabled():
+    """Delegate CLI permission truth to spawn's canonical effective check."""
+    try:
+        return spawn.readonly_enforced(spec)
+    except Exception:
         return False
-    # Check the final command after the same enforced transform the registry
-    # uses. Applying it again is idempotent for Claude and Codex.
-    spec = spawn._apply_readonly(spec)
-    command = spec.get("cmd")
-    if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
-        return False
-    cli_index = spawn._effective_binary_index(command)
-    if cli_index is None:
-        return False
-    binary = spawn._effective_binary(command)
-    args = command[cli_index + 1:]
-    if binary == "claude":
-        if "--dangerously-skip-permissions" in args:
-            return False
-        allowed = spawn._setting_from_argv(args, ("--allowedTools",))
-        denied = spawn._setting_from_argv(args, ("--disallowedTools", "--disallowed-tools"))
-        mode = spawn._setting_from_argv(args, ("--permission-mode",))
-        return (
-            allowed == "Read,Glob,Grep,WebFetch,WebSearch,mcp__huddle__*"
-            and denied is not None
-            and {"Edit", "Write", "NotebookEdit", "MultiEdit", "Bash"}.issubset(
-                {name.strip() for name in denied.split(",")}
-            )
-            and mode == "manual"
-        )
-    if binary == "codex":
-        if "--dangerously-bypass-approvals-and-sandbox" in args:
-            return False
-        sandbox = spawn._setting_from_argv(args, ("-s", "--sandbox"))
-        approval = None
-        for i, arg in enumerate(args):
-            value = None
-            if arg in ("-c", "--config") and i + 1 < len(args):
-                value = args[i + 1]
-            elif arg.startswith("-c="):
-                value = arg[3:]
-            elif arg.startswith("--config="):
-                value = arg[len("--config="):]
-            if value and value.partition("=")[0].strip() == (
-                "mcp_servers.huddle.default_tools_approval_mode"
-            ):
-                approval = value.partition("=")[2].strip().strip("\"'")
-        return sandbox == "read-only" and approval == "approve"
-    return False
 
 
 def _swarm_plan_candidates() -> list[dict]:
@@ -653,6 +686,9 @@ def _swarm_plan_candidates() -> list[dict]:
             executable = command[cli_index] if cli_index is not None else ""
             binary = spawn._effective_binary(command)
             cli_kind = binary or "unsupported"
+            if cli_index and Path(command[0]).name == "timeout" and not _swarm_cli_exists(command[0]):
+                static_ok = False
+                reasons.append("timeout wrapper executable not found")
             if cli_index is None or not _swarm_cli_exists(executable):
                 static_ok = False
                 reasons.append("CLI executable not found")
@@ -773,6 +809,8 @@ def swarm_plan_preview(
             result = None
         if result is not None:
             mode_reason = result.reason
+            if result.status == "ok" and result.choice == "none":
+                mode_reason = f"Jev chose none; deterministic profile rule used. {result.reason}"
             if result.status == "ok" and result.choice in swarm_planner.MODES:
                 jev_mode = result.choice
                 jev_mode_confidence = result.confidence
@@ -809,6 +847,10 @@ def swarm_plan_preview(
                 result = None
             if result is not None:
                 roster_reason = result.reason
+                if result.status == "ok" and result.choice == "none":
+                    roster_reason = (
+                        f"Jev chose none; eligible registry order used. {result.reason}"
+                    )
                 if result.status == "ok" and result.choice in {item.candidate_id for item in jev_candidates}:
                     roster_lead = result.choice
                     ordered_candidates.sort(key=lambda item: item["id"] != roster_lead)
@@ -858,6 +900,7 @@ def swarm_plan_preview(
 
 
 @mcp.tool()
+@_serialize_swarm_create_by_request_id
 def swarm_pilot_create(
     name: str,
     organizer: str,
@@ -879,7 +922,9 @@ def swarm_pilot_create(
     Supplying ``client_request_id`` makes retries idempotent for the exact
     request payload. ``expected_specs`` pins each selected profile to its
     current static registry fingerprint before creating a room. ``plan_hash``
-    is stored for audit only; it does not grant permissions.
+    is stored for audit only; it does not grant permissions. For compatibility,
+    response field ``started`` mirrors the ``start`` request; it does not prove
+    that a child process launched or that a provider returned a response.
     """
     if not isinstance(client_request_id, str):
         raise ValueError("client_request_id must be a string")
@@ -908,6 +953,11 @@ def swarm_pilot_create(
             deterministic_room_id, request_fingerprint, organizer, expected,
         )
         if existing is not None:
+            if existing.pop("_resume_preparing", False):
+                return _swarm_resume_preparing(
+                    deterministic_room_id, organizer, members, expected, start,
+                    bool(existing["availability"]["registry_availability_checked"]),
+                )
             return existing
 
     # Check expected static registry fingerprints before the old live
@@ -931,16 +981,32 @@ def swarm_pilot_create(
                 deterministic_room_id, request_fingerprint, organizer, expected,
             )
             if existing is not None:
+                if existing.pop("_resume_preparing", False):
+                    return _swarm_resume_preparing(
+                        deterministic_room_id, organizer, members, expected, start,
+                        bool(existing["availability"]["registry_availability_checked"]),
+                    )
                 return existing
             raise ValueError("partial_room: deterministic room directory already exists") from None
         raise
+    registry_checked = bool(start or expected is not None)
     if client_request_id:
-        _swarm_mark_create_state(room_id, "preparing", expected, start)
+        _swarm_mark_create_state(room_id, "preparing", expected, start, registry_checked)
     for name in members:
         room_invite(room_id, name, by=organizer)
     dispatch = swarm_pilot_pump(room_id) if start else []
+    if client_request_id and start and swarm_pilot.due_members(room_id):
+        blocked = [
+            item for item in dispatch
+            if item.get("status") in {"spec_drift", "unavailable"}
+        ]
+        reason = ", ".join(item.get("status", "blocked") for item in blocked) or "pending members"
+        raise ValueError(f"partial_room: swarm dispatch remains incomplete ({reason})")
     if client_request_id:
-        _swarm_mark_create_state(room_id, "ready", expected, start, dispatch)
+        dispatch = _swarm_initial_dispatch(room_id) if start else []
+        _swarm_mark_create_state(
+            room_id, "ready", expected, start, registry_checked, dispatch,
+        )
     return {
         "room_id": room_id,
         "mode": mode,
@@ -949,8 +1015,8 @@ def swarm_pilot_create(
         "start_requested": start,
         "reused": False,
         "availability": {
-            "static_only": False,
-            "registry_availability_checked": True,
+            "static_only": not registry_checked,
+            "registry_availability_checked": registry_checked,
             "provider_response_verified": False,
         },
     }
@@ -1093,9 +1159,15 @@ def swarm_pilot_pump(room_id: str) -> list[dict]:
     duplicate a request. No room metadata lock is held while posting messages.
     """
     state = swarm_pilot.status(room_id)
+    room_state = bus.get_room_info(room_id)
     dispatched: list[dict] = []
     for member in swarm_pilot.due_members(room_id):
-        if spawn.get_enabled_spec(member) is None:
+        spec = spawn.get_enabled_spec(member)
+        drift = _swarm_spec_drift(room_state, member, spec)
+        if drift:
+            dispatched.append({"member": member, "status": "spec_drift"})
+            continue
+        if spec is None:
             dispatched.append({"member": member, "status": "unavailable"})
             continue
         msg_id = message_post(
@@ -1107,6 +1179,27 @@ def swarm_pilot_pump(room_id: str) -> list[dict]:
         dispatched.append({"member": member, "request_id": msg_id,
                            "status": "dispatched"})
     return dispatched
+
+
+def _swarm_spec_drift(
+    room_state: dict, member: str, spec: dict | None,
+) -> bool:
+    """Fail closed when a pinned participant no longer matches its profile."""
+    pilot = room_state.get("swarm_pilot")
+    if not isinstance(pilot, dict) and isinstance(room_state.get("expected_specs"), dict):
+        # swarm_pilot.status returns the pilot payload, while bus.get_room_info
+        # returns the enclosing room metadata object.
+        pilot = room_state
+    expected_specs = pilot.get("expected_specs") if isinstance(pilot, dict) else None
+    if expected_specs is None:
+        return False
+    expected = expected_specs.get(member) if isinstance(expected_specs, dict) else None
+    if not isinstance(expected, str) or spec is None:
+        return True
+    try:
+        return spawn.spec_fingerprint(spec) != expected
+    except Exception:
+        return True
 
 
 @mcp.tool()
@@ -3724,6 +3817,18 @@ def _wake_agents_for_request(
                 })
                 continue
 
+            pilot_state = fresh.get("swarm_pilot")
+            pinned_specs = (
+                pilot_state.get("expected_specs")
+                if isinstance(pilot_state, dict) else None
+            )
+            current_spec = None
+            if isinstance(pinned_specs, dict):
+                current_spec = spawn.get_enabled_spec(agent_name)
+                if _swarm_spec_drift(fresh, agent_name, current_spec):
+                    wakes.append({"agent": agent_name, "status": "spec_drift"})
+                    continue
+
             log_path = info.get("log_path")
             last_seen = int(info.get("last_seen_id", 0) or 0)
             wake_id = uuid.uuid4().hex[:12]
@@ -3767,6 +3872,16 @@ def _wake_agents_for_request(
                     continue
                 _set_agent_phase(room_id, agent_name, "starting", task_id=msg_id)
                 try:
+                    if isinstance(pinned_specs, dict):
+                        latest_spec = spawn.get_enabled_spec(agent_name)
+                        if _swarm_spec_drift(
+                            bus.get_room_info(room_id), agent_name, latest_spec,
+                        ):
+                            _clear_wake_claim(
+                                room_id, agent_name, wake_id, rollback=True,
+                            )
+                            wakes.append({"agent": agent_name, "status": "spec_drift"})
+                            continue
                     resume_settings = info.get("model_settings")
                     resume_kwargs = (
                         {"model_settings": resume_settings}
@@ -4114,6 +4229,11 @@ def _spawn_fresh_room_agent(
     spec = spawn.get_enabled_spec(agent_name)
     if not spec:
         raise ValueError(f"Agent {agent_name} has no enabled spawn registry entry")
+
+    if _swarm_spec_drift(bus.get_room_info(room_id), agent_name, spec):
+        raise ValueError(
+            f"spec_drift: refusing to launch {agent_name} with a changed swarm profile"
+        )
 
     if agent_name not in meta.get("participants", []):
         bus.invite_agent(room_id, agent_name)

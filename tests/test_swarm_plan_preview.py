@@ -188,3 +188,75 @@ def test_one_part_council_caps_automatic_roster_but_preserves_explicit_roster(mo
     assert len(automatic["members"]) == 2
     assert "Roster capped at 2" in automatic["jev"]["roster_note"]
     assert len(explicit["members"]) == 3
+
+
+def test_static_preflight_checks_timeout_wrapper_executable(monkeypatch):
+    _configure_registry(monkeypatch, [
+        {
+            **_spec("Claude", "timeout", cost="cheap"),
+            "cmd": ["timeout", "120", "claude", "-p", "{brief}"],
+        },
+    ])
+    monkeypatch.setattr(server.shutil, "which", lambda name: (
+        None if name == "timeout" else "/installed/claude"
+    ))
+
+    result = server.swarm_plan_preview(
+        _profile(parts="one", max_members=1), explicit_mode="council"
+    )
+
+    assert result["status"] == "blocked"
+    assert result["members"] == []
+    assert "timeout wrapper executable not found" in result["excluded"]["Claude"]
+
+
+def test_jev_none_reason_is_visible_while_deterministic_mode_is_used(monkeypatch):
+    _configure_registry(monkeypatch, [
+        _spec("Claude", "claude", cost="cheap", flags=("--model", "sonnet")),
+        _spec("Codex", "codex", cost="cheap", flags=("exec",)),
+    ])
+    monkeypatch.setattr(server.swarm_jev, "choose_mode", lambda *_: (
+        swarm_jev.ChoiceResult("ok", "none", 0.9, "organizer should choose")
+    ))
+
+    result = server.swarm_plan_preview(_profile())
+
+    assert result["mode"] == "team"
+    assert result["jev"]["mode"]["choice"] is None
+    assert "none" in result["jev"]["mode"]["reason"].lower()
+    assert "organizer should choose" in result["jev"]["mode"]["reason"]
+
+
+def test_jev_none_candidate_reason_is_visible_and_falls_back(monkeypatch):
+    _configure_registry(monkeypatch, [
+        _spec("Claude", "claude", cost="cheap", flags=("--model", "sonnet")),
+        _spec("Codex", "codex", cost="cheap", flags=("exec",)),
+    ])
+    monkeypatch.setattr(server.swarm_jev, "choose_mode", lambda *_: (
+        swarm_jev.ChoiceResult("ok", "team", 0.9, "advisory")
+    ))
+    monkeypatch.setattr(server.swarm_jev, "choose_candidate", lambda *_: (
+        swarm_jev.ChoiceResult("ok", "none", 0.9, "no candidate fits")
+    ))
+
+    result = server.swarm_plan_preview(_profile())
+
+    assert [member["id"] for member in result["members"]] == ["Claude", "Codex"]
+    assert "none" in result["jev"]["first_participant"]["reason"].lower()
+    assert "no candidate fits" in result["jev"]["first_participant"]["reason"]
+
+
+def test_readonly_gate_rejects_untrusted_cli_extension(monkeypatch):
+    _configure_registry(monkeypatch, [
+        _spec(
+            "Claude", "claude", cost="cheap",
+            flags=("--settings", "unsafe.json"),
+        ),
+    ])
+
+    result = server.swarm_plan_preview(
+        _profile(parts="one", max_members=1), explicit_mode="council"
+    )
+
+    assert result["status"] == "blocked"
+    assert "readonly_not_enforced" in result["excluded"]["Claude"]
