@@ -217,6 +217,8 @@ const I18N = {
     'swarm.tasks': 'Tasks', 'swarm.decisions': 'Decisions', 'swarm.facts': 'Facts',
     'swarm.final': 'Final result', 'swarm.working': 'In progress', 'swarm.completed': 'Completed',
     'swarm.empty': 'Nothing recorded yet', 'swarm.owner': 'Owner', 'swarm.reporter': 'Reporter',
+    'swarm.members': 'Members', 'swarm.memberDone': 'done', 'swarm.memberActive': 'working',
+    'swarm.memberWaiting': 'waiting', 'swarm.noRole': 'no role yet',
     'lanes.title': 'Agents', 'lanes.collapse': 'Collapse', 'lanes.expand': 'Expand',
     'lanes.waiting': 'Waiting', 'lanes.working': 'Working', 'lanes.done': 'Finished',
     'lanes.offline': 'Offline', 'lanes.online': 'Online', 'lanes.unknown': 'No status',
@@ -329,6 +331,8 @@ const I18N = {
     'swarm.tasks': 'Задачи', 'swarm.decisions': 'Решения', 'swarm.facts': 'Факты',
     'swarm.final': 'Итог', 'swarm.working': 'В работе', 'swarm.completed': 'Завершён',
     'swarm.empty': 'Пока ничего не записано', 'swarm.owner': 'Ответственный', 'swarm.reporter': 'Сводит результат',
+    'swarm.members': 'Участники', 'swarm.memberDone': 'готово', 'swarm.memberActive': 'в работе',
+    'swarm.memberWaiting': 'ждёт', 'swarm.noRole': 'роли нет',
     'lanes.title': 'Агенты', 'lanes.collapse': 'Свернуть', 'lanes.expand': 'Развернуть',
     'lanes.waiting': 'Ждёт', 'lanes.working': 'Работает', 'lanes.done': 'Закончил',
     'lanes.offline': 'Не в сети', 'lanes.online': 'На связи', 'lanes.unknown': 'Нет статуса',
@@ -1154,6 +1158,17 @@ function swarmEntryText(entry) {
   if (typeof entry === 'string') return entry;
   return entry && typeof entry.value === 'string' ? entry.value : '';
 }
+// Pure: one row per member with their claimed roles and this round's state.
+function swarmMemberRows(state) {
+  const members = Array.isArray(state && state.members) ? state.members.filter(m => typeof m === 'string') : [];
+  const asObj = v => (v && typeof v === 'object' ? v : {});
+  const done = asObj(state.done), dispatched = asObj(state.dispatched), resp = asObj(state.responsibilities);
+  return members.map(name => ({
+    name,
+    roles: Object.keys(resp).filter(k => asObj(resp[k]).member === name),
+    status: name in done ? 'done' : name in dispatched ? 'active' : 'waiting',
+  }));
+}
 function renderSwarmPilot(room) {
   const panel = document.getElementById('swarm-pilot');
   const state = room && room.swarm_pilot;
@@ -1170,10 +1185,13 @@ function renderSwarmPilot(room) {
   const mode = ROOM_MODES.has(state.mode) ? t(`roomMode.${state.mode}`) : String(state.mode || '—');
   const phase = state.phase === 'completed' ? t('swarm.completed')
     : state.phase === 'working' ? t('swarm.working') : String(state.phase || '—');
+  const memberRows = swarmMemberRows(state);
+  const doneCount = memberRows.filter(m => m.status === 'done').length;
+  const progress = memberRows.length ? ` · ${doneCount}/${memberRows.length}` : '';
   const head = el('summary', {class: 'swarm-summary'}, [
     el('span', {class: 'swarm-marker', 'aria-hidden': 'true'}),
     el('span', {class: 'swarm-title', text: t('swarm.title')}),
-    el('span', {class: 'swarm-meta', text: `${t('swarm.mode')}: ${mode} · ${t('swarm.phase')}: ${phase} · ${t('swarm.round')} ${state.round || 1}`}),
+    el('span', {class: 'swarm-meta', text: `${t('swarm.mode')}: ${mode} · ${t('swarm.phase')}: ${phase} · ${t('swarm.round')} ${state.round || 1}${progress}`}),
   ]);
   const details = el('details', {class: 'swarm-details'});
   details.open = open;
@@ -1186,6 +1204,19 @@ function renderSwarmPilot(room) {
     el('span', {class: 'swarm-label', text: `${t('swarm.goal')} · `}),
     el('span', {text: String(state.goal)}),
   ]));
+
+  if (memberRows.length) {
+    const strip = el('ul', {class: 'swarm-members', 'aria-label': t('swarm.members')});
+    for (const m of memberRows) {
+      const statusKey = {done: 'swarm.memberDone', active: 'swarm.memberActive', waiting: 'swarm.memberWaiting'}[m.status];
+      strip.appendChild(el('li', {class: `swarm-member swarm-member-${m.status}`}, [
+        el('span', {class: 'swarm-member-name', text: m.name}),
+        el('span', {class: 'swarm-member-role', text: m.roles.length ? m.roles.join(', ') : t('swarm.noRole')}),
+        el('span', {class: 'swarm-member-status', text: t(statusKey)}),
+      ]));
+    }
+    body.appendChild(strip);
+  }
 
   const grid = el('div', {class: 'swarm-grid'});
   for (const [bucketName, labelKey] of SWARM_BUCKETS) {

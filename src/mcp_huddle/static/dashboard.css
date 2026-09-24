@@ -2174,6 +2174,17 @@
   [data-skin="opus"] .swarm-grid { grid-template-columns: minmax(0, 1fr); }
   [data-skin="opus"] .swarm-list li { grid-template-columns: minmax(70px, 110px) minmax(0, 1fr); }
 }
+/* Member strip: role + round state per member, compact chips, both skins. */
+.swarm-members { list-style: none; display: flex; flex-wrap: wrap; gap: 4px 6px; margin: 0 0 8px; padding: 0; }
+.swarm-member { display: inline-flex; align-items: baseline; gap: 6px; max-width: 100%; padding: 2px 8px; border: 1px solid var(--panel-border, var(--opus-rule)); border-left-width: 3px; font-size: 11px; color: var(--text); }
+.swarm-member-name { font-weight: 600; }
+.swarm-member-role, .swarm-member-status { color: var(--text-muted); font-size: 10px; overflow-wrap: anywhere; }
+.swarm-member-active { border-left-color: var(--c-codex); }
+.swarm-member-done { border-left-color: var(--c-mimo); }
+.swarm-member-waiting { border-left-color: var(--text-muted); }
+@media (max-width: 720px) {
+  .swarm-pilot { max-height: 24vh !important; }
+}
 :root:not([data-skin="opus"]) .lane-now.is-far { border-left-style: dashed; opacity: .6; }
 :root:not([data-skin="opus"]) .lane-row { grid-template-columns: 110px 85px minmax(40px, 1fr) minmax(110px, 200px); }
 :root:not([data-skin="opus"]) .lane-phase,
