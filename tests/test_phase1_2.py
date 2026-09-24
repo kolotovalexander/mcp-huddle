@@ -2607,6 +2607,48 @@ def test_readonly_codex_flags_preserve_timeout_signal_and_follow_cli() -> None:
     assert rewritten.count("-s") == 2  # timeout signal and Codex sandbox
 
 
+@pytest.mark.parametrize("unsafe_setting", ["--settings unsafe.json", "--mcp-config=config.json"])
+def test_readonly_strips_claude_permission_overrides_and_rejects_external_tool_config(
+    unsafe_setting: str,
+) -> None:
+    cmd = [
+        "claude", "--permission-mode", "bypassPermissions", "--allowedTools", "Bash,Edit",
+        "--dangerously-skip-permissions", *unsafe_setting.split(), "-p", "{brief}",
+    ]
+
+    rewritten = spawn._apply_readonly({"name": "Claude", "cmd": cmd})["cmd"]
+
+    assert "bypassPermissions" not in rewritten
+    assert "Bash,Edit" not in rewritten
+    assert "--dangerously-skip-permissions" not in rewritten
+    assert rewritten[rewritten.index("--allowedTools") + 1] == (
+        "Read,Glob,Grep,WebFetch,WebSearch,mcp__huddle__*"
+    )
+    assert rewritten[rewritten.index("--permission-mode") + 1] == "manual"
+    assert not spawn.readonly_enforced({"name": "Claude", "cmd": cmd})
+
+
+@pytest.mark.parametrize("unsafe", [
+    "--dangerously-bypass-approvals-and-sandbox", "--approve-for-me", "--full-auto", "--yolo",
+])
+def test_readonly_strips_codex_bypass_flags_and_honors_readonly_gate(unsafe: str) -> None:
+    cmd = ["codex", unsafe, "exec", "--profile", "permissive", "-s", "danger-full-access", "{brief}"]
+
+    rewritten = spawn._apply_readonly({"name": "Codex", "cmd": cmd})["cmd"]
+
+    assert unsafe not in rewritten
+    assert "permissive" not in rewritten
+    assert "danger-full-access" not in rewritten
+    assert spawn.readonly_enforced({"name": "Codex", "cmd": cmd})
+
+
+def test_readonly_rejects_codex_custom_mcp_config_override() -> None:
+    cmd = ["codex", "exec", "-c", 'mcp_servers.other.command="mutator"', "{brief}"]
+    rewritten = spawn._apply_readonly({"name": "Codex", "cmd": cmd})["cmd"]
+    assert 'mcp_servers.other.command="mutator"' not in rewritten
+    assert spawn.readonly_enforced({"name": "Codex", "cmd": cmd})
+
+
 def test_readonly_opt_out_restores_full_access(monkeypatch: pytest.MonkeyPatch) -> None:
     """MCP_HUDDLE_READONLY=0 restores the full-access spawn (worker mode)."""
     monkeypatch.setenv("MCP_HUDDLE_READONLY", "0")

@@ -753,9 +753,9 @@ _FINGERPRINT_PERMISSION_KEY = re.compile(
     r"(?:permission|sandbox|approval|allowed.?tools|deny.?tools|read.?only|readonly|"
     r"writ(?:e|able)|access|trust|guard)", re.IGNORECASE,
 )
-_FINGERPRINT_SECRET_KEY = re.compile(
-    r"(?:api.?key|token|secret|password|credential|authorization|auth.?header)",
-    re.IGNORECASE,
+_FINGERPRINT_SECRET_ARG = re.compile(
+    r"(?i)^--?(?:api[_-]?(?:key|token)|access[_-]?token|refresh[_-]?token|token|secret|"
+    r"password|credential|authorization|auth(?:orization)?-header)$"
 )
 _FINGERPRINT_SECRET_ASSIGNMENT = re.compile(
     r"(?i)(\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|"
@@ -776,7 +776,7 @@ def _fingerprint_safe_value(value):
     if isinstance(value, dict):
         return {
             str(key): (
-                "<redacted>" if _FINGERPRINT_SECRET_KEY.search(str(key))
+                "<redacted>" if _fingerprint_secret_name(str(key))
                 else _fingerprint_safe_value(item)
             )
             for key, item in value.items()
@@ -789,6 +789,19 @@ def _fingerprint_safe_value(value):
         safe = _FINGERPRINT_SECRET_QUERY.sub(r"\1<redacted>", safe)
         return _FINGERPRINT_URL_CREDENTIALS.sub(r"\1<redacted>@", safe)
     return value
+
+
+def _fingerprint_secret_name(value: str) -> bool:
+    """Match credential fields without treating limits as credentials."""
+    normalized = re.sub(r"[^a-z0-9]", "", value.lower())
+    return (
+        normalized in {"token", "authorization", "auth"}
+        or normalized.endswith((
+            "apikey", "apitoken", "accesstoken", "refreshtoken", "secret", "password",
+            "credential", "authorization", "authheader",
+        ))
+        or _FINGERPRINT_SECRET_ARG.fullmatch(value) is not None
+    )
 
 
 def _fingerprint_safe_argv(argv: list[str]) -> list[str]:
@@ -815,7 +828,7 @@ def _fingerprint_safe_argv(argv: list[str]) -> list[str]:
         if _FINGERPRINT_AUTH_SCHEME.search(arg):
             result.append(_FINGERPRINT_AUTH_SCHEME.sub(r"\1<redacted>", arg))
             continue
-        if _FINGERPRINT_SECRET_KEY.search(arg) and "=" not in arg and not arg.endswith("-env"):
+        if _fingerprint_secret_name(arg) and "=" not in arg and not arg.endswith("-env"):
             result.append(arg)
             redact_next = True
             continue
@@ -847,7 +860,10 @@ def spec_fingerprint(spec: SpawnSpec) -> str:
             name for name in spec.get("pass_env", []) if isinstance(name, str)
         ),
     }
-    for key in ("model", "effort", "variant", "profile"):
+    for key in (
+        "model", "effort", "variant", "profile", "max_tokens", "max_output_tokens",
+        "token_limit", "max_completion_tokens",
+    ):
         if key in spec:
             canonical[key] = _fingerprint_safe_value(spec[key])
     for key, value in spec.items():
@@ -1470,7 +1486,7 @@ def _preserve_direct_opus_profile_contract(registry: list[SpawnSpec]) -> list[Sp
 _CLAUDE_RO_FLAGS = [
     "--allowedTools", "Read,Glob,Grep,WebFetch,WebSearch,mcp__huddle__*",
     "--disallowedTools", "Edit,Write,NotebookEdit,MultiEdit,Bash",
-    "--permission-mode", "manual",
+    "--permission-mode", "manual", "--permission-prompts", "none",
 ]
 
 
@@ -1496,13 +1512,26 @@ def _apply_readonly(spec: SpawnSpec) -> SpawnSpec:
     cli_index = _effective_binary_index(cmd)
     binary = _effective_binary(cmd)
     if binary == "claude":
-        cmd = [c for c in cmd if c != "--dangerously-skip-permissions"]
-        if cmd and "--allowedTools" not in cmd:
-            # Keep wrappers such as ``timeout 120`` intact and put flags after
-            # the actual Claude executable, where its CLI can parse them.
-            cli_index = _effective_binary_index(cmd)
-            insert_at = (cli_index + 1) if cli_index is not None else len(cmd)
-            cmd = [*cmd[:insert_at], *_CLAUDE_RO_FLAGS, *cmd[insert_at:]]
+        prefix = cmd[: (cli_index + 1)] if cli_index is not None else []
+        claude_args = cmd[(cli_index + 1):] if cli_index is not None else cmd
+        # A registry-supplied allowlist, denylist, or permission mode must not
+        # weaken the enforced set. These list-valued switches end at the next
+        # CLI option; `{brief}` is also a boundary for bare prompt templates.
+        claude_args = _remove_variadic_options(
+            claude_args,
+            ("--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools"),
+        )
+        claude_args = _remove_option_values(
+            claude_args, ("--permission-mode", "--permission-prompts"), lambda _value: True,
+        )
+        claude_args = [
+            arg for arg in claude_args
+            if arg not in ("--dangerously-skip-permissions", "--allow-dangerously-skip-permissions")
+            and not arg.startswith((
+                "--dangerously-skip-permissions=", "--allow-dangerously-skip-permissions=",
+            ))
+        ]
+        cmd = [*prefix, *_CLAUDE_RO_FLAGS, *claude_args]
     elif binary == "codex":
         # Leave timeout's own options (for example ``timeout -s TERM``)
         # untouched. Only rewrite Codex sandbox options after its executable.
@@ -1512,12 +1541,37 @@ def _apply_readonly(spec: SpawnSpec) -> SpawnSpec:
         i = 0
         while i < len(codex_args):
             arg = codex_args[i]
+            if arg in ("--dangerously-bypass-approvals-and-sandbox", "--approve-for-me",
+                       "--dangerously-bypass-hook-trust", "--full-auto", "--yolo",
+                       "--ignore-rules") or arg.startswith("--dangerously-bypass-"):
+                i += 1
+                continue
+            if arg in ("--profile", "-p", "--add-dir", "--remote", "--remote-auth-token-env"):
+                i += 2
+                continue
+            if arg.startswith(("--profile=", "--add-dir=", "--remote=", "--remote-auth-token-env=")):
+                i += 1
+                continue
             if arg in ("-s", "--sandbox"):
                 # Remove any registry-provided sandbox so the enforced value
                 # cannot be overridden by a later duplicate flag.
                 i += 2
                 continue
             if arg.startswith("--sandbox=") or arg.startswith("-s="):
+                i += 1
+                continue
+            if arg in ("-c", "--config"):
+                value = codex_args[i + 1] if i + 1 < len(codex_args) else ""
+                key, separator, _configured_value = value.partition("=")
+                if separator and key.strip() in ("model", "model_reasoning_effort"):
+                    out.extend((arg, value))
+                i += 2
+                continue
+            if arg.startswith("--config=") or arg.startswith("-c="):
+                value = arg.split("=", 1)[1]
+                key, separator, _configured_value = value.partition("=")
+                if separator and key.strip() in ("model", "model_reasoning_effort"):
+                    out.append(arg)
                 i += 1
                 continue
             out.append(arg)
@@ -1531,6 +1585,96 @@ def _apply_readonly(spec: SpawnSpec) -> SpawnSpec:
             out.extend(readonly)
         cmd = out
     return {**spec, "cmd": cmd}
+
+
+def _remove_variadic_options(argv: list[str], options: tuple[str, ...]) -> list[str]:
+    """Remove list-valued switches and their values until the next option."""
+    result: list[str] = []
+    i = 0
+    removing_values = False
+    while i < len(argv):
+        arg = argv[i]
+        option = next((name for name in options if arg == name or arg.startswith(name + "=")), None)
+        if option is not None:
+            removing_values = "=" not in arg
+            i += 1
+            continue
+        if removing_values and not arg.startswith("-") and "{brief}" not in arg:
+            i += 1
+            continue
+        removing_values = False
+        result.append(arg)
+        i += 1
+    return result
+
+
+def readonly_enforced(spec: SpawnSpec) -> bool:
+    """Return whether the effective CLI has Huddle's supported read-only gate.
+
+    This checks explicit CLI overrides as well as Huddle's injected flags. It
+    does not claim OS-level sandboxing for runners without a verified gate.
+    """
+    if not _readonly_enabled():
+        return False
+    command = _apply_readonly(spec).get("cmd")
+    if not isinstance(command, list) or not all(isinstance(arg, str) for arg in command):
+        return False
+    cli_index = _effective_binary_index(command)
+    if cli_index is None:
+        return False
+    binary = _effective_binary(command)
+    args = command[cli_index + 1:]
+    if binary == "claude":
+        unsafe_flags = {
+            "--settings", "--setting-sources", "--mcp-config", "--add-dir",
+            "--plugin-dir", "--agents", "--permission-mode", "--permission-prompts",
+            "--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools",
+            "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
+        }
+        # The flags injected above are the only accepted values for these
+        # options; local settings/MCP extensions can carry independent tools.
+        allowed = _setting_from_argv(args, ("--allowedTools", "--allowed-tools"))
+        denied = _setting_from_argv(args, ("--disallowedTools", "--disallowed-tools"))
+        mode = _setting_from_argv(args, ("--permission-mode",))
+        prompts = _setting_from_argv(args, ("--permission-prompts",))
+        expected = set(_CLAUDE_RO_FLAGS[1].split(","))
+        denied_set = set((denied or "").split(","))
+        if allowed != _CLAUDE_RO_FLAGS[1] or mode != "manual" or prompts != "none":
+            return False
+        if not {"Edit", "Write", "NotebookEdit", "MultiEdit", "Bash"}.issubset(denied_set):
+            return False
+        # Verify exactly one effective enforced allow/deny/mode trio.
+        return not any(arg.partition("=")[0] in unsafe_flags for arg in args if arg not in {
+            "--allowedTools", "--disallowedTools", "--permission-mode", "--permission-prompts",
+        }) and expected == set(allowed.split(","))
+    if binary == "codex":
+        if any(arg in {
+            "--dangerously-bypass-approvals-and-sandbox", "--approve-for-me", "--full-auto", "--yolo",
+            "--profile", "--remote", "--add-dir", "--ignore-rules",
+        } or arg.startswith(("--profile=", "--remote=", "--add-dir=", "--dangerously-bypass-"))
+               for arg in args):
+            return False
+        for i, arg in enumerate(args):
+            value = args[i + 1] if arg in ("-c", "--config") and i + 1 < len(args) else (
+                arg.split("=", 1)[1] if arg.startswith(("-c=", "--config=")) else ""
+            )
+            if value:
+                key, separator, _setting = value.partition("=")
+                if not separator or key.strip() not in {
+                    "model", "model_reasoning_effort", "mcp_servers.huddle.default_tools_approval_mode",
+                }:
+                    return False
+        sandbox = _setting_from_argv(args, ("-s", "--sandbox"))
+        approval = None
+        for i, arg in enumerate(args):
+            value = args[i + 1] if arg in ("-c", "--config") and i + 1 < len(args) else (
+                arg.split("=", 1)[1] if arg.startswith(("-c=", "--config=")) else ""
+            )
+            key, separator, configured_value = value.partition("=")
+            if separator and key.strip() == "mcp_servers.huddle.default_tools_approval_mode":
+                approval = configured_value.strip().strip("\"'")
+        return sandbox == "read-only" and approval == "approve"
+    return False
 
 
 def _raw_registry() -> list[SpawnSpec]:

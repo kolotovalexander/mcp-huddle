@@ -50,6 +50,25 @@ def test_spec_fingerprint_tracks_effective_launch_and_permission_settings():
     assert spec_fingerprint(changed_readonly) != spec_fingerprint(codex_shared)
 
 
+def test_spec_fingerprint_tracks_non_secret_token_limits():
+    baseline = {
+        "name": "Claude",
+        "enabled": True,
+        "cmd": ["claude", "--max-tokens", "2048", "-p", "{brief}"],
+    }
+    changed = {
+        **baseline,
+        "cmd": ["claude", "--max-tokens", "4096", "-p", "{brief}"],
+    }
+    token_limit = {
+        **baseline,
+        "token_limit": 4096,
+    }
+
+    assert spec_fingerprint(baseline) != spec_fingerprint(changed)
+    assert spec_fingerprint(baseline) != spec_fingerprint(token_limit)
+
+
 def test_spec_fingerprint_excludes_credential_values_but_keeps_env_names():
     first = {
         **BASE_SPEC,
