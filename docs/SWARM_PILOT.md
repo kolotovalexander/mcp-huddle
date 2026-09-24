@@ -7,14 +7,19 @@ existing behavior.
 ## Start
 
 Use `swarm_pilot_create(name, organizer, goal, mode, members, cwd,
-workspace_strategy, start)` with:
+workspace_strategy, start, write_policy="read_only")` with:
 
 - `mode`: `council`, `team`, `relay`, or `swarm`.
 - `members`: unique, enabled registry profile names; the organizer is separate.
-- `cwd`: an already prepared shared working directory. Huddle does not create a
-  Git worktree for the pilot.
-- `workspace_strategy`: `shared_only` or `allow_subworktrees`. The pilot records
-  this choice but does not create sub-worktrees or merge code automatically.
+- `cwd`: an already prepared shared working directory. For a write room it must
+  be the exact canonical Git worktree root in `MCP_HUDDLE_WRITE_ROOTS`.
+- `workspace_strategy`: `shared_only` or `allow_subworktrees`. With explicit
+  `write_policy="shared_write"`, the latter creates one detached local Git
+  worktree per member. Members coordinate their own changes and integration.
+- `write_policy`: `read_only` by default. `shared_write` requires the single
+  admin-approved root and supported Claude or Codex write profiles. Claude
+  additionally requires `MCP_HUDDLE_CLAUDE_GUARD_COMMAND` to match its
+  configured protective hook for both `Edit` and `Write`.
 - `start=False`: create state without dispatching agents. `start=True`: check
   the named profiles and send the initial addressed request(s).
 

@@ -32,6 +32,7 @@ from starlette.responses import FileResponse, JSONResponse, StreamingResponse
 from . import bus
 from . import child_processes
 from .claude_model_receipt import parse_claude_model_receipt
+from . import room_workspace
 from . import spawn
 from . import swarm_pilot
 from . import swarm_jev
@@ -408,6 +409,7 @@ _SWARM_JEV_HARNESSES = {
 def _swarm_client_request_fingerprint(
     name: str, organizer: str, goal: str, mode: str, members: list[str],
     cwd: str, workspace_strategy: str, start_requested: bool,
+    write_policy: str = room_workspace.READ_ONLY,
 ) -> str:
     payload = {
         "name": name,
@@ -419,6 +421,9 @@ def _swarm_client_request_fingerprint(
         "workspace_strategy": workspace_strategy,
         "start_requested": start_requested,
     }
+    if write_policy != room_workspace.READ_ONLY:
+        # Omitted for read-only so existing request fingerprints stay stable.
+        payload["write_policy"] = write_policy
     try:
         encoded = json.dumps(
             payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
@@ -515,7 +520,7 @@ def _swarm_existing_request(
         recomputed = _swarm_client_request_fingerprint(
             meta["name"], pilot["organizer"], pilot["goal"], pilot["mode"],
             pilot["members"], meta.get("cwd", ""), pilot["workspace_strategy"],
-            pilot["start_requested"],
+            pilot["start_requested"], room_workspace.write_policy(meta),
         )
     except (KeyError, TypeError, ValueError):
         raise ValueError("partial_room: stored request data is incomplete") from None
@@ -1054,12 +1059,23 @@ def swarm_pilot_create(
     client_request_id: str = "",
     expected_specs: dict[str, str] | None = None,
     plan_hash: str = "",
+    write_policy: str = "read_only",
 ) -> dict:
     """Create a pilot room; start exact enabled registry members when requested.
 
     ``start=False`` prepares durable state without launching CLI workers. This
     is useful for a dry run and never implies that model work was performed.
-    The pilot records workspace_strategy but does not create Git worktrees.
+    ``write_policy="read_only"`` (default) keeps members read-only discussants.
+    ``write_policy="shared_write"`` requires ``cwd`` to equal the single
+    admin-approved root in the server's ``MCP_HUDDLE_WRITE_ROOTS`` and be the
+    canonical top of an existing local Git worktree; members may then edit
+    files there (and nowhere else) with a bounded write mode derived from this
+    room. Only Codex, and Claude with a loopback ``mcp_url`` plus the user's
+    Edit/Write PreToolUse Guard hook, are accepted; anything else is rejected
+    before any room is created. With
+    ``workspace_strategy="allow_subworktrees"`` Huddle also creates one
+    detached subworktree per member (under the Huddle home) as that member's
+    cwd; the shared worktree stays writable for transferring changes.
     Supplying ``client_request_id`` makes retries idempotent for the exact
     request payload. ``expected_specs`` pins each selected profile to its
     current static registry fingerprint before creating a room. ``plan_hash``
@@ -1075,6 +1091,8 @@ def swarm_pilot_create(
         raise ValueError("plan_hash must be empty or a sha256 fingerprint")
     if not isinstance(start, bool):
         raise ValueError("start must be a boolean")
+    if write_policy not in room_workspace.WRITE_POLICIES:
+        raise ValueError(f"write_policy must be one of {sorted(room_workspace.WRITE_POLICIES)}")
 
     expected = _swarm_validate_expected_specs(
         members, expected_specs, check_registry=not bool(client_request_id),
@@ -1088,6 +1106,7 @@ def swarm_pilot_create(
             raise ValueError("members must be a list of participant names")
         request_fingerprint = _swarm_client_request_fingerprint(
             name, organizer, goal, mode, members, cwd, workspace_strategy, start,
+            write_policy,
         )
         deterministic_room_id = _swarm_request_room_id(organizer, client_request_id)
         existing = _swarm_existing_request(
@@ -1109,6 +1128,14 @@ def swarm_pilot_create(
         unavailable = [name for name in members if spawn.get_enabled_spec(name) is None]
         if unavailable:
             raise ValueError(f"unavailable registry members: {unavailable}")
+    if write_policy == room_workspace.SHARED_WRITE:
+        if workspace_strategy not in swarm_pilot.WORKSPACES:
+            raise ValueError(f"workspace_strategy must be one of {sorted(swarm_pilot.WORKSPACES)}")
+        profiles = {spec.get("name"): spec for spec in spawn._raw_registry()}
+        room_workspace.check_request(
+            cwd, workspace_strategy, list(members),
+            {member: profiles.get(member) for member in members},
+        )
     registry_checked = bool(start or expected is not None)
     try:
         room_id = swarm_pilot.create(
@@ -1134,6 +1161,12 @@ def swarm_pilot_create(
                 return existing
             raise ValueError("partial_room: deterministic room directory already exists") from None
         raise
+    if write_policy == room_workspace.SHARED_WRITE:
+        # Before any invite or request: until this record exists the room is
+        # read-only, so an interruption here can only fail closed.
+        room_workspace.install(
+            room_id, cwd, workspace_strategy, swarm_pilot.status(room_id)["member_ids"],
+        )
     if client_request_id:
         _swarm_mark_create_state(room_id, "preparing", expected, start, registry_checked)
     for name in members:
@@ -1277,6 +1310,7 @@ def _swarm_pilot_request(room_id: str, member: str) -> str:
         "message_post(kind='result', reply_to=<this request id>), then call "
         "swarm_pilot_round_done(room_id, member, summary). "
         "A message alone does not complete the round." + final_instruction
+        + room_workspace.brief_note(bus.get_room_info(room_id), member)
     )
 
 
@@ -1797,6 +1831,9 @@ def respond_via_agent(
                 {"model_settings": resume_settings}
                 if isinstance(resume_settings, dict) else {}
             )
+            cwd, write_roots = room_workspace.resume(meta, agent_name)
+            if write_roots is not None:
+                resume_kwargs["workspace_write_roots"] = write_roots
             pid = spawn.codex_resume(
                 thread_id, prompt, cwd, log_path, last_msg_path,
                 on_exit=_make_wake_done_callback(
@@ -4386,8 +4423,13 @@ def _wake_agents_for_request(
                         {"model_settings": resume_settings}
                         if isinstance(resume_settings, dict) else {}
                     )
+                    resume_cwd, write_roots = room_workspace.resume(
+                        bus.get_room_info(room_id), agent_name,
+                    )
+                    if write_roots is not None:
+                        resume_kwargs["workspace_write_roots"] = write_roots
                     pid = spawn.codex_resume(
-                        thread_id, prompt, cwd, log_path,
+                        thread_id, prompt, resume_cwd, log_path,
                         str(canonical_last),
                         on_exit=_make_wake_done_callback(room_id, agent_name, wake_id),
                         owner_room_id=room_id,
@@ -4735,10 +4777,14 @@ def _spawn_fresh_room_agent(
     if not spec:
         raise ValueError(f"Agent {agent_name} has no enabled spawn registry entry")
 
-    if _swarm_spec_drift(bus.get_room_info(room_id), agent_name, spec):
+    current_meta = bus.get_room_info(room_id)
+    if _swarm_spec_drift(current_meta, agent_name, spec):
         raise ValueError(
             f"spec_drift: refusing to launch {agent_name} with a changed swarm profile"
         )
+    # Permissions come from this room's persisted policy, re-validated per
+    # launch; a write room refuses unsupported profiles before Popen.
+    launch_spec, launch_cwd = room_workspace.launch(current_meta, agent_name, spec)
 
     if agent_name not in meta.get("participants", []):
         bus.invite_agent(room_id, agent_name)
@@ -4749,9 +4795,9 @@ def _spawn_fresh_room_agent(
     _set_agent_phase(room_id, agent_name, "starting", task_id=msg_id or "")
     try:
         pid, log_path, last_msg_path = spawn.spawn_agent(
-            spec,
+            launch_spec,
             prompt,
-            meta.get("cwd", "") or "",
+            launch_cwd,
             bus._room_dir(room_id) / "agents",
             on_exit=_make_wake_done_callback(room_id, agent_name, wake_id),
             owner_room_id=room_id,

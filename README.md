@@ -128,7 +128,7 @@ These are the tools exposed over MCP (decorated with `@mcp.tool()` in
 | `propose_resolution` | Propose a resolution to end discussion; returns `resolution_id`. |
 | `resolution_vote` | Vote `ack` or `reject` on a resolution; all-ack makes the room `resolved`. |
 | `notify_register` | Register a notification filename (or compatible absolute direct child) under `$MCP_HUDDLE_HOME/notifications/` for addressed `kind=request` messages. |
-| `swarm_pilot_create` | Create a durable pilot room in council, team, relay, or swarm mode; optionally dispatch explicitly named enabled agents. Does not create a Git worktree. |
+| `swarm_pilot_create` | Create a durable pilot room in council, team, relay, or swarm mode; optionally dispatch explicitly named enabled agents. Read-only by default; an explicitly authorized write room can use a shared worktree or Huddle-created member subworktrees. |
 | `swarm_pilot_pump` | Dispatch the next member(s): sequentially for council/relay, in parallel for team/swarm. |
 | `swarm_pilot_record` | Store a member-owned responsibility, task, decision, or fact in room metadata. |
 | `swarm_pilot_round_done` | Mark a member's turn done only after its addressed `result` was saved; dispatch the next sequential member. |
@@ -155,6 +155,8 @@ All configuration is via environment variables (defaults shown):
 | `MCP_HUDDLE_SESSION_ID` | (unset) | Explicit session-id fallback for non-Claude SessionEnd runners. Claude Code instead supplies `hook_event_name=SessionEnd` and `session_id` in hook JSON on stdin. |
 | `MCP_HUDDLE_SESSION_FILE` | (unset) | Optional compatibility fallback containing a session id. The SessionEnd hook accepts only an owned, non-symlink, non-group/world-writable regular file; it no longer reads a shared `/tmp/claude-session-id`. |
 | `MCP_HUDDLE_READONLY` | `1` | Apply Huddle's reviewed read-only command transform to supported CLIs (currently Claude and Codex). `0` requests full-access workers; it does not change unsupported CLIs such as Antigravity. |
+| `MCP_HUDDLE_WRITE_ROOTS` | (unset) | Enables pilot write rooms only when set to exactly one canonical Git worktree root. Every write room must use that exact `cwd`; unset means no write rooms. |
+| `MCP_HUDDLE_CLAUDE_GUARD_COMMAND` | (unset) | Exact existing Claude `PreToolUse` Guard command required for both `Edit` and `Write` in a Claude write room. An advice-only hook does not qualify. |
 | `MCP_HUDDLE_SPAWN_REGISTRY` | built-in reviewed slots | Path to a JSON file replacing the registry. Without it, `~/.mcp-huddle/registry.json` is merged by name over the built-in Codex, Antigravity, MiMo, OpenCode, Claude and fixed Opus profiles. See [`examples/registry.json`](examples/registry.json). |
 | `MCP_HUDDLE_CLAUDE_ENABLED` | `0` | Set to `1` to allow the legacy Claude slot. Opt-in avoids unsolicited usage; native account/API authentication determines the billing route. |
 | `MCP_HUDDLE_DIRECT_REVIEW_MCP_URL` | (required for direct Opus review) | Runtime loopback `http(s)://…/mcp` endpoint for the disabled `Claude Opus 5 (direct review)` profile. No credentials or query string; it is never stored in the registry. |

@@ -1689,6 +1689,11 @@ def readonly_enforced(spec: SpawnSpec) -> bool:
     """
     if not _readonly_enabled():
         return False
+    return _readonly_command_enforced(spec)
+
+
+def _readonly_command_enforced(spec: SpawnSpec) -> bool:
+    """Check the read-only transform of ``spec`` regardless of the env flag."""
     command = _apply_readonly(spec).get("cmd")
     if not isinstance(command, list) or not all(isinstance(arg, str) for arg in command):
         return False
@@ -1748,6 +1753,224 @@ def readonly_enforced(spec: SpawnSpec) -> bool:
                 approval = configured_value.strip().strip("\"'")
         return sandbox == "read-only" and approval == "approve"
     return False
+
+
+# Room-scoped write mode. A room that explicitly selects a shared worktree gets
+# a bounded write command built by Huddle — never the raw registry argv and
+# never MCP_HUDDLE_READONLY=0.
+# - Claude: a Huddle-built `--restricted` invocation (claude --help: ignores
+#   user/project/local settings files, so no inherited additionalDirectories or
+#   allow rules; confines file tools to cwd + --add-dir; removes code-running
+#   tools; refuses bypassPermissions). `--strict-mcp-config` exposes only the
+#   profile's loopback Huddle MCP. `acceptEdits` + `--permission-prompts none`
+#   auto-accepts in-bounds edits and denies everything that would prompt.
+#   Managed (admin policy) settings still apply by design. Because
+#   --restricted drops the user's settings file, the user's own Guard is
+#   re-supplied through a Huddle-generated `--settings` (which --restricted
+#   still honours): only PreToolUse hooks covering file tools plus
+#   permissions.deny/ask — never allow rules, additionalDirectories or mode.
+#   No mandatory Edit and Write Guard hook → Claude write is rejected.
+# - Codex: `workspace-write` with every inheritable workspace-write key pinned
+#   on the command line: exact writable_roots, no $TMPDIR, no /tmp, no network.
+_CLAUDE_WRITE_TOOLS = "Read,Glob,Grep,Edit,Write,ToolSearch"
+_CLAUDE_GUARDED_TOOLS = ("Edit", "Write")
+_CLAUDE_FILE_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+_CLAUDE_WRITE_FLAGS = [
+    "--restricted", "--setting-sources", "", "--strict-mcp-config",
+    "--tools", _CLAUDE_WRITE_TOOLS,
+    "--allowedTools", "Read,Glob,Grep,ToolSearch,mcp__huddle__*",
+    "--disallowedTools", "Bash,WebFetch,WebSearch",
+    "--permission-mode", "acceptEdits", "--permission-prompts", "none",
+    "--disable-slash-commands", "--no-chrome",
+]
+_WRITE_ROOT_RE = re.compile(r"/[A-Za-z0-9 ._@+/-]*\Z")
+
+
+class WritePolicyUnsupported(ValueError):
+    """The profile cannot enforce the room's bounded write policy."""
+
+
+def _validated_write_roots(roots: list[str]) -> list[str]:
+    checked = []
+    for root in roots:
+        if (not isinstance(root, str) or not _WRITE_ROOT_RE.fullmatch(root)
+                or "/../" in root + "/" or "/./" in root + "/"):
+            raise WritePolicyUnsupported("write root must be a plain absolute ASCII path")
+        checked.append(root)
+    return checked
+
+
+def _codex_workspace_write_config(extra_roots: list[str]) -> list[str]:
+    """Pin every workspace-write key so ~/.codex/config.toml cannot widen it.
+
+    ``writable_roots`` is always set (``[]`` for shared_only) because a
+    command-line value replaces an inherited array instead of merging with it.
+    """
+    value = ", ".join(f'"{root}"' for root in _validated_write_roots(extra_roots))
+    return [
+        "-c", f"sandbox_workspace_write.writable_roots=[{value}]",
+        "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+        "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
+        "-c", "sandbox_workspace_write.network_access=false",
+    ]
+
+
+def _claude_user_settings_path() -> Path:
+    base = os.environ.get("CLAUDE_CONFIG_DIR")
+    return (Path(base) if base else Path.home() / ".claude") / "settings.json"
+
+
+def _hook_matcher_covers(matcher: object, tool: str) -> bool:
+    if matcher is None or matcher in ("", "*"):
+        return True
+    if not isinstance(matcher, str):
+        return False
+    try:
+        return re.fullmatch(matcher, tool) is not None
+    except re.error:
+        return False
+
+
+def _claude_guard_settings() -> str:
+    """Return `--settings` JSON carrying only the user's file-tool Guard.
+
+    Re-read at every check/launch, so removing the Guard disables Claude write.
+    """
+    required_guard = os.environ.get("MCP_HUDDLE_CLAUDE_GUARD_COMMAND", "").strip()
+    if not required_guard:
+        raise WritePolicyUnsupported(
+            "Claude write rooms need MCP_HUDDLE_CLAUDE_GUARD_COMMAND set to the exact Guard hook command"
+        )
+    try:
+        data = json.loads(_claude_user_settings_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise WritePolicyUnsupported(
+            "Claude write rooms need readable user settings with the Edit/Write Guard hook"
+        ) from None
+    if not isinstance(data, dict) or data.get("disableAllHooks") is True:
+        raise WritePolicyUnsupported("Claude user settings disable or omit hooks")
+    hooks = data.get("hooks")
+    pre = hooks.get("PreToolUse") if isinstance(hooks, dict) else None
+    kept = [
+        entry for entry in (pre if isinstance(pre, list) else [])
+        if isinstance(entry, dict) and isinstance(entry.get("hooks"), list)
+        and any(_hook_matcher_covers(entry.get("matcher"), tool) for tool in _CLAUDE_FILE_TOOLS)
+    ]
+
+    def guarded(tool: str) -> bool:
+        return any(
+            _hook_matcher_covers(entry.get("matcher"), tool)
+            and any(isinstance(hook, dict) and hook.get("type") == "command"
+                    and hook.get("command") == required_guard
+                    for hook in entry["hooks"])
+            for entry in kept
+        )
+
+    missing = [tool for tool in _CLAUDE_GUARDED_TOOLS if not guarded(tool)]
+    if missing:
+        raise WritePolicyUnsupported(
+            f"Claude write rooms need the user's PreToolUse Guard hook for {', '.join(missing)}"
+        )
+    settings: dict = {"hooks": {"PreToolUse": kept}}
+    permissions = data.get("permissions")
+    if isinstance(permissions, dict):
+        rules = {
+            key: [rule for rule in permissions[key] if isinstance(rule, str)]
+            for key in ("deny", "ask") if isinstance(permissions.get(key), list)
+        }
+        if rules:
+            settings["permissions"] = rules
+    return json.dumps(settings, ensure_ascii=False, separators=(",", ":"))
+
+
+def _claude_write_argv(spec: SpawnSpec, cmd: list[str], cli_index: int,
+                       extra: list[str]) -> list[str]:
+    """Build the fixed Claude write invocation; registry flags are discarded."""
+    mcp_url = spec.get("mcp_url")
+    if not isinstance(mcp_url, str) or not mcp_url:
+        raise WritePolicyUnsupported(
+            "Claude write rooms need a loopback mcp_url in the registry profile"
+        )
+    try:
+        mcp_config = _direct_opus_review_endpoint_config(mcp_url)
+    except AgentSpawnError:
+        raise WritePolicyUnsupported("Claude mcp_url must be a loopback http(s) URL ending in /mcp") from None
+    args = cmd[cli_index + 1:]
+    passthrough: list[str] = []
+    output_format = _setting_from_argv(args, ("--output-format",))
+    if output_format in ("text", "json", "stream-json"):
+        passthrough += ["--output-format", output_format]
+    if "--verbose" in args:
+        passthrough.append("--verbose")
+    settings = model_settings_for_spec(spec)
+    model_args = [
+        *(["--model", settings["model"]] if settings.get("model") else []),
+        *(["--effort", settings["effort"]] if settings.get("effort") else []),
+    ]
+    return [
+        *cmd[:cli_index + 1], *_CLAUDE_WRITE_FLAGS,
+        "--settings", _claude_guard_settings(),
+        "--mcp-config", mcp_config,
+        *[arg for root in extra for arg in ("--add-dir", root)],
+        *model_args, *passthrough, "-p", "{brief}",
+    ]
+
+
+def apply_room_write_policy(spec: SpawnSpec, extra_roots: list[str] | None = None) -> SpawnSpec:
+    """Return a bounded write variant of ``spec`` for a write-enabled room.
+
+    The launch cwd is the room's worktree (or the member's subworktree);
+    ``extra_roots`` are additional writable directories. Raises
+    WritePolicyUnsupported when the profile cannot enforce the policy.
+    """
+    extra = _validated_write_roots(list(extra_roots or []))
+    if spec.get("profile") in {_DIRECT_OPUS_REVIEW_PROFILE, _SUBSCRIPTION_OPUS_REVIEW_PROFILE}:
+        raise WritePolicyUnsupported("typed review profiles are read-only by contract")
+    if not _readonly_command_enforced(spec):
+        raise WritePolicyUnsupported(
+            f"{spec.get('name', '?')} has no verified permission gate for a write room"
+        )
+    cmd = list(_apply_readonly(spec)["cmd"])
+    cli_index = _effective_binary_index(cmd)
+    binary = _effective_binary(cmd)
+    if cli_index is None:
+        raise WritePolicyUnsupported("profile executable is not recognized")
+    start = cli_index + 1
+    if binary == "claude":
+        return {**spec, "cmd": _claude_write_argv(spec, cmd, cli_index, extra)}
+    if binary == "codex":
+        args = cmd[start:]
+        if any(arg in ("-C", "--cd") or arg.startswith(("-C=", "--cd=")) for arg in args):
+            raise WritePolicyUnsupported("Codex workspace root must come from the room")
+        sandbox_at = [i for i in range(len(args) - 1)
+                      if args[i] in ("-s", "--sandbox") and args[i + 1] == "read-only"]
+        if len(sandbox_at) != 1:
+            raise WritePolicyUnsupported("Codex read-only sandbox was not found")
+        i = start + sandbox_at[0]
+        cmd[i:i + 2] = ["-s", "workspace-write", *_codex_workspace_write_config(extra)]
+        return {**spec, "cmd": cmd}
+    raise WritePolicyUnsupported(f"{spec.get('name', '?')} has no supported write policy")
+
+
+def _codex_resume_sandbox_args(write_roots: list[str] | None) -> list[str]:
+    """Sandbox/approval args for ``codex exec resume``.
+
+    ``write_roots=None`` keeps the process-wide read-only default; a list
+    selects the room's bounded ``workspace-write`` policy (cwd + those roots).
+    """
+    if write_roots is not None:
+        return [
+            "-c", 'sandbox_mode="workspace-write"',
+            "-c", "features.guardian_approval=false",
+            "-c", 'mcp_servers.huddle.default_tools_approval_mode="approve"',
+            *_codex_workspace_write_config(write_roots),
+        ]
+    readonly = _readonly_enabled()
+    sandbox = "read-only" if readonly else _CODEX_SANDBOX
+    args = ["-c", f'sandbox_mode="{sandbox}"', "-c", "features.guardian_approval=false"]
+    if readonly:
+        args += ["-c", 'mcp_servers.huddle.default_tools_approval_mode="approve"']
+    return args
 
 
 def _raw_registry() -> list[SpawnSpec]:
@@ -2707,7 +2930,8 @@ def codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str,
                  last_msg_path: str | None = None, on_exit=None,
                  owner_room_id: str = "",
                  process_handle: str | None = None,
-                 model_settings: dict[str, str] | None = None) -> int:
+                 model_settings: dict[str, str] | None = None,
+                 workspace_write_roots: list[str] | None = None) -> int:
     """Resume a Codex thread with a new prompt. Cheaper than fresh spawn —
     Codex remembers prior conversation via its rollout file.
 
@@ -2721,14 +2945,18 @@ def codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str,
     that `never` denies ("user cancelled MCP tool call"). `-a` is a top-level
     flag (before `exec`). A room's initial model settings are retained for
     resumed turns so a registry edit cannot switch models mid-session.
+    ``workspace_write_roots`` (a list, possibly empty) selects a write room's
+    bounded workspace-write sandbox instead of the process-wide default.
     """
+    if workspace_write_roots is not None and not _is_ascii(cwd or ""):
+        # The ASCII fallback cwd would silently move the writable root.
+        raise AgentSpawnError("write room cwd must be an ASCII path for Codex")
     cwd, prompt = _codex_safe_cwd_and_brief(cwd, prompt)
     # Read-only by default (matches the initial-spawn transform): pin
     # sandbox_mode=read-only and auto-approve the huddle MCP tools so the
     # resumed turn can still post without the restricted-sandbox approval that
     # `-a never` would otherwise cancel. MCP_HUDDLE_READONLY=0 → full access.
-    readonly = _readonly_enabled()
-    sandbox = "read-only" if readonly else _CODEX_SANDBOX
+    sandbox_args = _codex_resume_sandbox_args(workspace_write_roots)
     if model_settings is None:
         spec = get_enabled_spec("Codex")
         settings = model_settings_for_spec(spec) if spec else {}
@@ -2751,12 +2979,7 @@ def codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str,
     if effort:
         argv.extend(["-c", f'model_reasoning_effort="{effort}"'])
 
-    argv.extend([
-        "-c", f'sandbox_mode="{sandbox}"',               # resume has no -s flag; pin via -c
-        "-c", "features.guardian_approval=false",
-    ])
-    if readonly:
-        argv += ["-c", 'mcp_servers.huddle.default_tools_approval_mode="approve"']
+    argv.extend(sandbox_args)                            # resume has no -s flag; pin via -c
     if last_msg_path:
         argv += ["-o", last_msg_path]                    # short form of --output-last-message
     argv.append(prompt)
