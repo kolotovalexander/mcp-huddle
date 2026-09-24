@@ -709,7 +709,8 @@ def _validate_reply_to_locked(room_id: str, target_id: int, agent: str, kind: st
     the check is atomic with the append that follows.
 
     Rules:
-      * target must exist and be a `request`;
+      * target must exist; a `comment` can attach to any message (including
+        another annotation), while other kinds retain request-only replies;
       * the replying agent must have been an addressee (`to` empty / "all" /
         the agent itself) — Human/System bypass this;
       * a broadcast request (`to=all` / no `to`) expects one terminal reply
@@ -723,7 +724,9 @@ def _validate_reply_to_locked(room_id: str, target_id: int, agent: str, kind: st
     if target is None:
         raise ValueError("reply_to target not found")
     if target.get("kind") != "request":
-        raise ValueError("reply_to target must be a request")
+        if kind == "comment":
+            return
+        raise ValueError("reply_to target must be a request for this message kind")
     target_to = target.get("to")
     if (agent not in ("Human", "System")
             and target_to and target_to not in ("all", agent)):

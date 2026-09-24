@@ -236,6 +236,7 @@ const I18N = {
     'compose.as': 'From Human', 'compose.request': 'Request', 'compose.comment': 'Comment',
     'compose.system': 'Important', 'compose.to': 'To', 'compose.all': 'Everyone',
     'compose.hint': 'A request wakes its recipients. A comment does not.',
+    'compose.reply': 'Reply', 'compose.replyTo': 'Replying to {agent} · #{id}', 'compose.cancelReply': 'Cancel reply',
     'compose.placeholder': 'Write to the room… Ctrl+Enter to send',
     'footer.noRoom': 'Choose a room to view the discussion', 'footer.search': 'search',
     'footer.theme': 'Theme', 'footer.text': 'Text', 'footer.rows': 'Rows',
@@ -350,6 +351,7 @@ const I18N = {
     'compose.as': 'От имени Human', 'compose.request': 'Запрос', 'compose.comment': 'Комментарий',
     'compose.system': 'Важное', 'compose.to': 'Кому', 'compose.all': 'Всем',
     'compose.hint': 'Запрос разбудит адресатов. Комментарий — нет.',
+    'compose.reply': 'Ответить', 'compose.replyTo': 'Ответ на сообщение {agent} · №{id}', 'compose.cancelReply': 'Отменить ответ',
     'compose.placeholder': 'Написать в комнату… Ctrl+Enter — отправить',
     'footer.noRoom': 'Выберите комнату, чтобы читать обсуждение', 'footer.search': 'поиск',
     'footer.theme': 'Тема', 'footer.text': 'Текст', 'footer.rows': 'Строки',
@@ -580,6 +582,7 @@ let lastStatuses = {};    // {agentName: 'online'|'busy'|...} — latest room st
 let lastPhases = {};      // lifecycle phase explicitly reported by agent/server
 let lastHealth = {};      // wake-health from /api/room_agents (rate-limit window, last wake)
 let roomMessages = [], laneCollapsed = false, composerKind = 'request', lastRenderedRound = null;
+let selectedReplyTarget = null;
 let roomData = null;
 
 function metaBadge(meta) {
@@ -1113,6 +1116,10 @@ function buildChatShell(room) {
       'aria-pressed': String(composerKind === kind), text: t(`compose.${kind}`)});
     b.onclick = () => {
       composerKind = kind;
+      if (kind !== 'comment' && selectedReplyTarget) {
+        selectedReplyTarget = null;
+        renderComposerReplyTarget();
+      }
       document.querySelectorAll('.composer-kind').forEach(x => x.setAttribute('aria-pressed', String(x.dataset.kind === kind)));
       const hint = document.getElementById('composer-hint');
       if (hint) hint.textContent = kind === 'request' ? t('compose.hint') : '';
@@ -1126,10 +1133,12 @@ function buildChatShell(room) {
       el('label', {}, [t('compose.to') + ' ', recipient]),
       el('span', {class: 'composer-hint', id: 'composer-hint', text: composerKind === 'request' ? t('compose.hint') : ''}),
     ]),
+    el('div', {id: 'composer-reply-slot', class: 'composer-reply-slot'}),
     el('div', {class: 'input-row'}, [
       input, send,
     ]),
   ]);
+  renderComposerReplyTarget();
 
   chat.appendChild(header);
   chat.appendChild(lanes);
@@ -1257,6 +1266,7 @@ function renderSwarmPilot(room) {
 async function openRoom(id, owner) {
   currentRoom = id;
   currentOwner = owner;
+  selectedReplyTarget = null;
   history.replaceState(null, '', `${location.pathname}${location.search}#room=${encodeURIComponent(id)}`);
   lastId = 0;
   msgMap = {};
@@ -1872,7 +1882,7 @@ function updateAgentTranscripts(messages) {
 function renderOne(m) {
   const list = document.getElementById('messages');
   if (!list) return;
-  msgMap[m.id] = {body: m.body, agent: m.agent};
+  msgMap[m.id] = {id: Number(m.id), body: m.body, agent: m.agent};
   const round = Number(m.round) > 0 ? Number(m.round) : 0;
   if (round !== lastRenderedRound) {
     const label = round ? `${t('round.label')} ${round}` : t('round.discussion');
@@ -1886,6 +1896,7 @@ function renderOne(m) {
     const div = el('div', {class: 'msg is-system', dataset: {id: String(m.id)}}, [
       el('div', {class: 'msg-system-when', text: `${fmtTime(m.timestamp)} · #${m.id}`}),
       el('div', {class: 'msg-body', text: m.body}),
+      replyButton(m),
     ]);
     list.appendChild(div);
     list.scrollTop = list.scrollHeight;
@@ -1905,6 +1916,7 @@ function renderOne(m) {
     el('span', {class: `kind kind-${m.kind}`, text: messageKindLabel(m.kind)}),
     m.to ? el('span', {class: 'msg-to', text: '→ ' + messageRecipientLabel(m.to)}) : null,
     badge,
+    replyButton(m),
   ]);
 
   const bubble = el('div', {class: 'msg-bubble'});
@@ -2199,6 +2211,56 @@ async function fetchMessages(initial) {
   } catch(e) {}
 }
 
+function replyButton(message) {
+  const button = el('button', {
+    type: 'button', class: 'message-reply-action', text: t('compose.reply'),
+    title: t('compose.reply'), 'aria-label': `${t('compose.reply')} · ${message.agent} · #${message.id}`,
+  });
+  button.onclick = event => {
+    event.preventDefault();
+    event.stopPropagation();
+    const id = Number(message.id);
+    if (!Number.isSafeInteger(id) || id <= 0) return;
+    selectedReplyTarget = {id, agent: String(message.agent || '—'), body: String(message.body || '')};
+    composerKind = 'comment';
+    document.querySelectorAll('.composer-kind').forEach(x => x.setAttribute('aria-pressed', String(x.dataset.kind === 'comment')));
+    const hint = document.getElementById('composer-hint');
+    if (hint) hint.textContent = '';
+    renderComposerReplyTarget();
+    const input = document.getElementById('human-inp');
+    if (input) input.focus();
+  };
+  return button;
+}
+
+function renderComposerReplyTarget() {
+  const slot = document.getElementById('composer-reply-slot');
+  if (!slot) return;
+  slot.replaceChildren();
+  if (!selectedReplyTarget) { slot.hidden = true; return; }
+  const target = selectedReplyTarget;
+  const title = t('compose.replyTo').replace('{agent}', target.agent).replace('{id}', String(target.id));
+  const preview = target.body.length > 120 ? target.body.slice(0, 120) + '…' : target.body;
+  const clear = el('button', {
+    type: 'button', class: 'composer-reply-cancel', text: t('compose.cancelReply'),
+    'aria-label': t('compose.cancelReply'),
+  });
+  clear.onclick = () => {
+    selectedReplyTarget = null;
+    renderComposerReplyTarget();
+    document.getElementById('human-inp')?.focus();
+  };
+  slot.hidden = false;
+  slot.appendChild(el('div', {class: 'composer-reply-target'}, [
+    el('span', {class: 'composer-reply-bar', 'aria-hidden': 'true'}),
+    el('span', {class: 'composer-reply-copy'}, [
+      el('span', {class: 'composer-reply-title', text: title}),
+      el('span', {class: 'composer-reply-preview', text: preview}),
+    ]),
+    clear,
+  ]));
+}
+
 async function sendMsg() {
   if (!currentRoom) return;
   const inp = document.getElementById('human-inp');
@@ -2212,9 +2274,12 @@ async function sendMsg() {
     await apiFetch('/api/message_post', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({room_id: currentRoom, agent: 'Human', body, kind: composerKind, to}),
+      body: JSON.stringify({room_id: currentRoom, agent: 'Human', body, kind: composerKind, to,
+        ...(selectedReplyTarget ? {reply_to: Number(selectedReplyTarget.id)} : {})}),
     });
     inp.value = '';
+    selectedReplyTarget = null;
+    renderComposerReplyTarget();
     await fetchMessages(false);
   } catch(e) {
     showRequestError('Failed to send message', e);
@@ -2227,6 +2292,7 @@ async function sendMsg() {
 function clearSelectedRoom() {
   closeAgentStreams();
   currentRoom = null;
+  selectedReplyTarget = null;
   currentOwner = null;
   roomData = null;
   roomMessages = [];

@@ -596,6 +596,23 @@
       color: var(--text-muted);
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     }
+    .message-reply-action, .composer-reply-cancel {
+      flex: none; padding: 1px 4px; border: 0;
+      background: transparent; color: var(--text-muted); font: inherit;
+      font-size: 10px; text-decoration: underline; text-underline-offset: 2px;
+      cursor: pointer;
+    }
+    .message-reply-action:hover, .composer-reply-cancel:hover { color: var(--text); }
+    .composer-reply-slot[hidden] { display: none; }
+    .composer-reply-target {
+      display: flex; align-items: center; gap: 8px; min-width: 0;
+      padding: 5px 8px; border-left: 2px solid var(--c-human);
+      background: var(--reply-bg); color: var(--text-muted); font-size: 11px;
+    }
+    .composer-reply-bar { align-self: stretch; width: 2px; background: var(--c-human); }
+    .composer-reply-copy { display: grid; gap: 2px; min-width: 0; flex: 1; }
+    .composer-reply-title { color: var(--text); font-size: 10px; }
+    .composer-reply-preview { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
     /* ── Input ───────────────────────────────────────────────────── */
     .input-wrap { padding: 10px 14px 14px; flex-shrink: 0; }
@@ -2125,6 +2142,8 @@
 [data-skin="opus"] .composer-kind[aria-pressed="true"] { background: var(--text); color: var(--bg); }
 [data-skin="opus"] .composer-controls select { margin-left: 4px; background: var(--bg); color: var(--text); border: 1px solid var(--text); padding: 2px 5px; font: inherit; max-width: 140px; }
 [data-skin="opus"] .composer-hint { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+[data-skin="opus"] .composer-reply-target { border-left-width: 3px; font-family: var(--opus-mono); }
+[data-skin="opus"] .message-reply-action, [data-skin="opus"] .composer-reply-cancel { font-family: var(--opus-mono); }
 [data-skin="opus"] .input-row textarea { flex: 1; min-width: 0; min-height: 46px; max-height: 100px; resize: vertical; background: transparent; border: 0; outline: none; color: var(--text); font: calc(16.5px * var(--reading-scale, 1)) var(--opus-sans); }
 [data-skin="opus"] .input-row textarea::placeholder { color: var(--text-sub); }
 [data-skin="opus"] .dashboard-status { height: 38px; }
