@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from urllib import error as urlerror
 
 import pytest
 
@@ -142,3 +143,99 @@ def test_completion_accepts_nonempty_string_content(monkeypatch: pytest.MonkeyPa
 
     assert content == "answer"
     assert meta["tokens_total"] == 3
+
+
+def test_model_receipt_distinguishes_requested_and_provider_reported_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        runner.urlrequest,
+        "urlopen",
+        lambda request, timeout: _Response({
+            "model": "provider/model-y:free",
+            "choices": [{"message": {"content": "answer"}}],
+        }),
+    )
+
+    _, meta = runner.call_openai_compatible(
+        "https://user:secret@example.test/private/path?token=hidden",
+        "provider/model-x:free", [], "max", 1, api_key="never-log-key",
+    )
+
+    assert meta["model_receipt"] == {
+        "requested_model": "provider/model-x:free",
+        "actual_model": "provider/model-y:free",
+        "status": "mismatch",
+        "source": "api_response",
+        "claim_scope": "provider_reported_identifier",
+        "provider_host": "example.test",
+    }
+    assert meta["model"] == "provider/model-y:free"
+    assert all(secret not in json.dumps(meta) for secret in (
+        "secret", "private/path", "token=hidden", "never-log-key"
+    ))
+
+
+@pytest.mark.parametrize("provider_model", [
+    None,
+    "model\nAuthorization: Bearer secret",
+    "x" * 1000,
+    {"unexpected": "shape"},
+])
+def test_model_receipt_marks_missing_or_unsafe_provider_model_unknown(
+    provider_model: object, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        runner.urlrequest,
+        "urlopen",
+        lambda request, timeout: _Response({
+            "model": provider_model,
+            "choices": [{"message": {"content": "answer"}}],
+        }),
+    )
+
+    _, meta = runner.call_openai_compatible(
+        "http://127.0.0.1:1234", "requested-model", [], "max", 1
+    )
+
+    assert meta["model_receipt"]["actual_model"] is None
+    assert meta["model_receipt"]["status"] == "unknown"
+    assert meta["model_receipt"]["requested_model"] == "requested-model"
+    assert meta["model"] == "requested-model"
+
+
+@pytest.mark.parametrize("status,retry_count", [(503, 1), (400, 2)])
+def test_http_errors_emit_closed_provider_event_without_secrets_or_payload(
+    status: int, retry_count: int, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    attempts = []
+
+    def fail_urlopen(request, timeout):
+        attempts.append(request)
+        raise urlerror.HTTPError(
+            request.full_url,
+            status,
+            "provider failure: secret-body",
+            {"Authorization": "Bearer secret-header"},
+            None,
+        )
+
+    monkeypatch.setattr(runner.urlrequest, "urlopen", fail_urlopen)
+    with pytest.raises(RuntimeError, match="completion failed") as err:
+        runner.call_openai_compatible(
+            "https://user:secret-url@example.test/private?token=hidden",
+            "requested-model", [], "max", 1, api_key="never-log-key",
+        )
+
+    assert len(attempts) == retry_count
+    output = capsys.readouterr().out
+    events = [json.loads(line) for line in output.splitlines()]
+    assert len(events) == retry_count
+    assert all(event["type"] == "provider_unavailable" for event in events)
+    assert all(event["status"] == status for event in events)
+    assert all("secret" not in json.dumps(event) for event in events)
+    assert all(value not in output + str(err.value) for value in (
+        "secret-url", "private?token", "hidden", "secret-body",
+        "secret-header", "never-log-key",
+    ))

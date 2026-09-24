@@ -15,6 +15,7 @@ import sys
 import time
 from typing import Any
 from urllib import error as urlerror
+from urllib.parse import urlsplit
 from urllib import request as urlrequest
 
 from . import bus
@@ -141,6 +142,52 @@ def _completion_content(data: object) -> str:
     return content.strip()
 
 
+_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$")
+_HOST_RE = re.compile(r"^[A-Za-z0-9.-]{1,253}$")
+_IPV6_HOST_RE = re.compile(r"^[A-Fa-f0-9:]{1,45}$")
+
+
+def _safe_model_id(value: object) -> str | None:
+    """Return only a short identifier, never arbitrary provider text."""
+    if not isinstance(value, str) or not _MODEL_ID_RE.fullmatch(value):
+        return None
+    return value
+
+
+def _provider_host(base_url: str) -> str | None:
+    """Extract a hostname without URL credentials, path, query, or port."""
+    try:
+        hostname = urlsplit(base_url).hostname
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(hostname, str) or len(hostname) > 253:
+        return None
+    if _HOST_RE.fullmatch(hostname) or _IPV6_HOST_RE.fullmatch(hostname):
+        return hostname.lower()
+    return None
+
+
+def _model_receipt(requested: object, provider_model: object, base_url: str) -> dict[str, Any]:
+    requested_model = _safe_model_id(requested)
+    actual_model = _safe_model_id(provider_model)
+    if requested_model is None or actual_model is None:
+        status = "unknown"
+        actual_model = None
+    else:
+        status = "confirmed" if requested_model == actual_model else "mismatch"
+    receipt: dict[str, Any] = {
+        "requested_model": requested_model,
+        "actual_model": actual_model,
+        "status": status,
+        "source": "api_response",
+        "claim_scope": "provider_reported_identifier",
+    }
+    provider_host = _provider_host(base_url)
+    if provider_host:
+        receipt["provider_host"] = provider_host
+    return receipt
+
+
 def call_openai_compatible(
     base_url: str,
     model: str,
@@ -171,7 +218,10 @@ def call_openai_compatible(
             if not isinstance(usage, dict):
                 usage = {}
             return content, {
-                "model": data.get("model") or model,
+                # Keep the legacy summary key, but never copy arbitrary
+                # provider response text into room metadata.
+                "model": _safe_model_id(data.get("model")) or _safe_model_id(model) or "unknown",
+                "model_receipt": _model_receipt(model, data.get("model"), base_url),
                 "reasoning": reasoning if include_reasoning else f"{reasoning}:fallback-no-reasoning-fields",
                 "tokens_in": usage.get("prompt_tokens") or usage.get("input_tokens"),
                 "tokens_out": usage.get("completion_tokens") or usage.get("output_tokens"),
@@ -180,9 +230,11 @@ def call_openai_compatible(
             }
         except urlerror.HTTPError as exc:
             last_error = exc
-            if exc.code not in (400, 422):
+            retry_without_reasoning = exc.code in (400, 422)
+            _event("provider_unavailable", status=exc.code,
+                   retry_without_reasoning=retry_without_reasoning)
+            if not retry_without_reasoning:
                 break
-            _event("reasoning_fields_rejected", status=exc.code, retry_without_reasoning=True)
         except (OSError, ValueError) as exc:
             last_error = exc
             break
