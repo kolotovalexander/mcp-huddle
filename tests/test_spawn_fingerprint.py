@@ -21,8 +21,9 @@ def test_spec_fingerprint_is_stable_and_key_order_independent():
     reordered = dict(reversed(list(BASE_SPEC.items())))
 
     assert first == spec_fingerprint(reordered)
-    assert len(first) == 64
-    assert set(first) <= set("0123456789abcdef")
+    assert first.startswith("sha256:")
+    assert len(first.removeprefix("sha256:")) == 64
+    assert set(first.removeprefix("sha256:")) <= set("0123456789abcdef")
 
 
 def test_spec_fingerprint_tracks_effective_launch_and_permission_settings():

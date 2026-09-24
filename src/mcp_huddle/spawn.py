@@ -857,7 +857,7 @@ def spec_fingerprint(spec: SpawnSpec) -> str:
     payload = json.dumps(
         canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
     ).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+    return f"sha256:{hashlib.sha256(payload).hexdigest()}"
 
 
 def _resolve_spawn_args(
