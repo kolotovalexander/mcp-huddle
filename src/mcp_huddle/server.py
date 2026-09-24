@@ -968,12 +968,16 @@ def swarm_pilot_create(
         unavailable = [name for name in members if spawn.get_enabled_spec(name) is None]
         if unavailable:
             raise ValueError(f"unavailable registry members: {unavailable}")
+    registry_checked = bool(start or expected is not None)
     try:
         room_id = swarm_pilot.create(
             name, organizer, goal, mode, members, cwd, workspace_strategy,
             room_id=deterministic_room_id,
             client_request_fingerprint=request_fingerprint,
             plan_hash=plan_hash,
+            start_requested=start if client_request_id else None,
+            registry_availability_checked=(registry_checked if client_request_id else None),
+            expected_specs=(expected if client_request_id else None),
         )
     except FileExistsError:
         if deterministic_room_id:
@@ -989,7 +993,6 @@ def swarm_pilot_create(
                 return existing
             raise ValueError("partial_room: deterministic room directory already exists") from None
         raise
-    registry_checked = bool(start or expected is not None)
     if client_request_id:
         _swarm_mark_create_state(room_id, "preparing", expected, start, registry_checked)
     for name in members:
@@ -3879,6 +3882,10 @@ def _wake_agents_for_request(
                         ):
                             _clear_wake_claim(
                                 room_id, agent_name, wake_id, rollback=True,
+                            )
+                            _set_agent_phase(
+                                room_id, agent_name, "unavailable", msg_id,
+                                "spec_drift",
                             )
                             wakes.append({"agent": agent_name, "status": "spec_drift"})
                             continue

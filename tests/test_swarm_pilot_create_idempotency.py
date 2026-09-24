@@ -238,6 +238,82 @@ def test_pump_failure_leaves_retryable_identity_marked_partial(isolated_home, mo
     assert len(list((isolated_home / "rooms").glob("room_*"))) == 1
 
 
+def test_retry_recovers_crash_immediately_after_pilot_create(isolated_home, monkeypatch):
+    request = _create_kwargs(start=False)
+    mark = server._swarm_mark_create_state
+
+    def crash_after_room_initialized(room_id, state, *args, **kwargs):
+        if state == "preparing":
+            raise RuntimeError("server crashed after swarm_pilot.create")
+        return mark(room_id, state, *args, **kwargs)
+
+    monkeypatch.setattr(server, "_swarm_mark_create_state", crash_after_room_initialized)
+    with pytest.raises(RuntimeError, match="after swarm_pilot.create"):
+        server.swarm_pilot_create(**request)
+
+    room_id = server._swarm_request_room_id("Organizer", "request-001")
+    initial = swarm_pilot.status(room_id)
+    assert initial["server_create_state"] == "preparing"
+    assert initial["start_requested"] is False
+    assert initial["registry_availability_checked"] is False
+
+    monkeypatch.setattr(server, "_swarm_mark_create_state", mark)
+    resumed = server.swarm_pilot_create(**request)
+
+    assert resumed["room_id"] == room_id
+    assert resumed["reused"] is True
+    assert resumed["started"] is False
+    assert swarm_pilot.status(room_id)["server_create_state"] == "ready"
+    assert len(list((isolated_home / "rooms").glob("room_*"))) == 1
+
+
+def test_codex_resume_spec_drift_rolls_back_to_unavailable(isolated_home, monkeypatch):
+    expected = "sha256:" + "a" * 64
+    monkeypatch.setattr(server, "_swarm_plan_candidates", lambda: [
+        _candidate("Codex", expected),
+    ])
+    created = server.swarm_pilot_create(**_create_kwargs(
+        mode="council", members=["Codex"], start=False,
+        expected_specs={"Codex": expected},
+    ))
+    room_id = created["room_id"]
+    bus.register_external_agent(room_id, "Codex")
+    server._merge_agent_meta(room_id, "Codex", {
+        "thread_id": "thread-owned-by-room",
+        "model_settings": {"model": "test-model"},
+    })
+    msg_id = server._post_message_checked(
+        room_id, "Human", "continue", "request", to="Codex",
+    )
+
+    changed_spec = {"name": "Codex", "cmd": ["codex", "exec"]}
+    monkeypatch.setattr(server, "_wake_in_progress", lambda *_args: False)
+    monkeypatch.setattr(server, "_agent_in_rate_limit_cooldown", lambda *_args: False)
+    monkeypatch.setattr(server, "_next_pending_request", lambda *_args: {"id": msg_id})
+    monkeypatch.setattr(server, "_agent_replied_to_request", lambda *_args: False)
+    monkeypatch.setattr(server, "_is_thread_resumable", lambda _name: True)
+    monkeypatch.setattr(server, "_owned_codex_log_has_completed_turn", lambda *_args: True)
+    monkeypatch.setattr(server, "_build_codex_wakeup_prompt", lambda *_args: "resume")
+    monkeypatch.setattr(server.spawn, "get_enabled_spec", lambda _name: changed_spec)
+    fingerprints = iter([expected, "sha256:" + "b" * 64])
+    monkeypatch.setattr(server.spawn, "spec_fingerprint", lambda _spec: next(fingerprints))
+    resumed = []
+    monkeypatch.setattr(server.spawn, "codex_resume", lambda *args, **kwargs: resumed.append(args))
+
+    wakes = server._wake_agents_for_request(
+        room_id, "Human", "continue", "Codex", None, msg_id,
+    )
+
+    assert wakes == [{"agent": "Codex", "status": "spec_drift"}]
+    assert resumed == []
+    info = bus.get_room_info(room_id)["agent_meta"]["Codex"]
+    assert "wake_claim_id" not in info
+    assert "wake_id" not in info
+    lifecycle = bus.get_status_details(room_id)["Codex"]
+    assert lifecycle["phase"] == "unavailable"
+    assert lifecycle["detail"] == "spec_drift"
+
+
 def test_reused_start_false_reports_prepared_state(isolated_home):
     first = server.swarm_pilot_create(**_create_kwargs(start=False))
     second = server.swarm_pilot_create(**_create_kwargs(start=False))

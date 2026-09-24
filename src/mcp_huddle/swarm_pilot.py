@@ -31,6 +31,9 @@ def create(
     room_id: str | None = None,
     client_request_fingerprint: str = "",
     plan_hash: str = "",
+    start_requested: bool | None = None,
+    registry_availability_checked: bool | None = None,
+    expected_specs: dict[str, str] | None = None,
 ) -> str:
     if mode not in MODES:
         raise ValueError(f"mode must be one of {sorted(MODES)}")
@@ -50,6 +53,20 @@ def create(
     ):
         if not isinstance(value, str) or (value and not _FINGERPRINT_RE.fullmatch(value)):
             raise ValueError(f"{label} must be empty or sha256 followed by 64 lowercase hex digits")
+    if start_requested is not None and not isinstance(start_requested, bool):
+        raise ValueError("start_requested must be a boolean")
+    if registry_availability_checked is not None and not isinstance(registry_availability_checked, bool):
+        raise ValueError("registry_availability_checked must be a boolean")
+    if expected_specs is not None:
+        if not isinstance(expected_specs, dict) or set(expected_specs) != set(members):
+            raise ValueError("expected_specs keys must exactly match members")
+        if any(
+            not isinstance(fingerprint, str) or not _FINGERPRINT_RE.fullmatch(fingerprint)
+            for fingerprint in expected_specs.values()
+        ):
+            raise ValueError("expected_specs values must be sha256 fingerprints")
+    if start_requested is not None and registry_availability_checked is None:
+        raise ValueError("registry_availability_checked is required with start_requested")
     if (not members or len(members) > 8 or len(set(members)) != len(members)
             or organizer in members or {"Human", "System"}.intersection(members)):
         raise ValueError("members must be non-empty, unique and exclude organizer")
@@ -83,6 +100,17 @@ def create(
             meta["swarm_pilot"]["client_request_fingerprint"] = client_request_fingerprint
         if plan_hash:
             meta["swarm_pilot"]["plan_hash"] = plan_hash
+        # Keep deterministic-create retries recoverable if the server stops
+        # immediately after this room record is written. Legacy direct callers
+        # omit start_requested and retain the old metadata shape.
+        if client_request_fingerprint and start_requested is not None:
+            meta["swarm_pilot"].update({
+                "server_create_state": "preparing",
+                "start_requested": start_requested,
+                "registry_availability_checked": registry_availability_checked,
+            })
+            if expected_specs is not None:
+                meta["swarm_pilot"]["expected_specs"] = dict(expected_specs)
         return meta
 
     bus._update_meta_locked(room_id, init)
