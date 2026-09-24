@@ -584,7 +584,9 @@ def swarm_plan_preview(
     This is a static advisory preview. It checks the configured CLI executable,
     enabled flag, model settings, and enforced read-only argv. It does not test
     provider authentication or ask a model to answer the task. Jev receives
-    only the closed profile and safe candidate capability labels.
+    only the closed profile and safe candidate capability labels. The model
+    class sent to Jev is a rough label inferred from configured reasoning
+    effort; it is not a benchmark of the model's actual capability.
     """
     if not isinstance(profile, dict):
         raise ValueError("profile must be an object")
@@ -696,6 +698,10 @@ def swarm_plan_preview(
         "mode": {"choice": jev_mode, "reason": mode_reason},
         "first_participant": {"choice": roster_lead, "reason": roster_reason},
         "roster_note": roster_note,
+        "model_class_note": (
+            "Roughly inferred from configured reasoning effort; actual model "
+            "capability and provider route were not tested."
+        ),
     }
     plan["readiness"] = "static advisory only; provider authentication and response not verified"
     plan["side_effects"] = {"room_created": False, "child_processes_started": False}
