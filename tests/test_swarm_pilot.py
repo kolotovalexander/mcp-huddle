@@ -238,6 +238,44 @@ def test_intentional_pilot_stop_keeps_exit_code_without_counting_failure(
     assert drains == [(room, "A")]
 
 
+def test_wake_health_ignores_only_exact_intentional_pilot_sigterm():
+    completed_after_stop = server._agent_wake_health(
+        {
+            "wake_id": "wake-A-1",
+            "intentional_stop_wake_id": "wake-A-1",
+            "last_wake_rc": -15,
+            "wake_fail_count": 0,
+        }, "offline",
+    )
+    assert completed_after_stop["last_wake_rc"] == -15
+    assert not completed_after_stop["last_wake_failed"]
+
+    failed_wake = server._agent_wake_health(
+        {
+            "wake_id": "wake-A-2",
+            "intentional_stop_wake_id": "wake-A-2",
+            "last_wake_rc": 1,
+            "wake_fail_count": 1,
+        }, "offline",
+    )
+    assert failed_wake["last_wake_failed"]
+
+    unrelated_sigterm = server._agent_wake_health(
+        {
+            "wake_id": "wake-A-3",
+            "intentional_stop_wake_id": "wake-A-2",
+            "last_wake_rc": -15,
+        }, "offline",
+    )
+    assert unrelated_sigterm["last_wake_failed"]
+
+    # Preserve detection when an older or unrelated wake has no marker.
+    legacy_failed_wake = server._agent_wake_health(
+        {"last_wake_rc": 1}, "offline",
+    )
+    assert legacy_failed_wake["last_wake_failed"]
+
+
 def test_pilot_stop_never_uses_pid_or_marks_a_new_wake(
     isolated_home, monkeypatch,
 ):

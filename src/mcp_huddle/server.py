@@ -4347,6 +4347,11 @@ def _agent_wake_health(
     process_state = _owned_process_state(room_id, info) if pid else "unknown"
     pid_alive = process_state == "alive"
     rc = info.get("last_wake_rc")
+    intentional_pilot_stop = (
+        info.get("intentional_stop_wake_id") == info.get("wake_id")
+        and rc == -int(signal.SIGTERM)
+    )
+    fail_count = int(info.get("wake_fail_count", 0) or 0)
     return {
         "status": status or "offline",
         "wake_id": info.get("wake_id"),
@@ -4361,8 +4366,13 @@ def _agent_wake_health(
         "last_wake_msg_id": info.get("last_wake_msg_id"),
         "last_wake_at": info.get("last_wake_at"),
         "last_wake_rc": rc,
-        "last_wake_failed": rc is not None and rc != 0,
-        "wake_fail_count": int(info.get("wake_fail_count", 0) or 0),
+        # A completed Swarm turn may be intentionally SIGTERM'd after posting
+        # its result. Match the same exact-generation marker used by the exit
+        # handler; other nonzero exits remain failures.
+        "last_wake_failed": (
+            rc is not None and rc != 0 and not intentional_pilot_stop
+        ),
+        "wake_fail_count": fail_count,
         "rate_limited": _agent_in_rate_limit_cooldown(info),
         "rate_limited_until": int(info.get("rate_limited_until", 0) or 0),
         "rate_limit_reason": info.get("rate_limit_reason"),
