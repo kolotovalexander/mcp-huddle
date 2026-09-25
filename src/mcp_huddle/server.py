@@ -411,6 +411,7 @@ def _swarm_client_request_fingerprint(
     name: str, organizer: str, goal: str, mode: str, members: list[str],
     cwd: str, workspace_strategy: str, start_requested: bool,
     write_policy: str = room_workspace.READ_ONLY,
+    *, member_profiles: dict[str, str] | None = None,
 ) -> str:
     payload = {
         "name": name,
@@ -425,6 +426,9 @@ def _swarm_client_request_fingerprint(
     if write_policy != room_workspace.READ_ONLY:
         # Omitted for read-only so existing request fingerprints stay stable.
         payload["write_policy"] = write_policy
+    if member_profiles:
+        # Omitted when absent so existing request fingerprints stay stable.
+        payload["member_profiles"] = dict(member_profiles)
     try:
         encoded = json.dumps(
             payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
@@ -444,7 +448,9 @@ def _swarm_request_room_id(organizer: str, client_request_id: str) -> str:
 def _swarm_validate_expected_specs(
     members: list[str], expected_specs: dict[str, str] | None,
     *, check_registry: bool = True,
+    member_profiles: dict[str, str] | None = None,
 ) -> dict[str, str] | None:
+    """Pin each member to the fingerprint of the profile that launches it."""
     if expected_specs is None:
         return None
     if not isinstance(members, list) or not all(isinstance(item, str) for item in members):
@@ -461,8 +467,9 @@ def _swarm_validate_expected_specs(
 
     if check_registry:
         registry = {item["id"]: item for item in _swarm_plan_candidates()}
+        mapped = {"member_profiles": member_profiles or {}}
         for member in members:
-            current = registry.get(member)
+            current = registry.get(swarm_pilot.member_profile(mapped, member))
             if current is None or not current["enabled"] or not current["static_ok"]:
                 raise ValueError(f"participant is not statically available: {member}")
             if current["spec_fingerprint"] != expected_specs[member]:
@@ -522,6 +529,7 @@ def _swarm_existing_request(
             meta["name"], pilot["organizer"], pilot["goal"], pilot["mode"],
             pilot["members"], meta.get("cwd", ""), pilot["workspace_strategy"],
             pilot["start_requested"], room_workspace.write_policy(meta),
+            member_profiles=pilot.get("member_profiles"),
         )
     except (KeyError, TypeError, ValueError):
         raise ValueError("partial_room: stored request data is incomplete") from None
@@ -541,7 +549,9 @@ def _swarm_existing_request(
         stored_specs = pilot.get("expected_specs")
         if stored_specs is not None and stored_specs != expected_specs:
             raise ValueError("client_request_id conflict: expected agent specs differ from stored request")
-        _swarm_validate_expected_specs(members, expected_specs)
+        _swarm_validate_expected_specs(
+            members, expected_specs, member_profiles=pilot.get("member_profiles"),
+        )
     result = {
         "room_id": room_id,
         "mode": pilot.get("mode"),
@@ -597,12 +607,13 @@ def _swarm_resume_preparing(
     start_requested: bool, registry_checked: bool,
 ) -> dict:
     """Idempotently finish invites and dispatch for a deterministic partial room."""
+    pilot = swarm_pilot.status(room_id)
     if start_requested:
-        unavailable = [member for member in members if spawn.get_enabled_spec(member) is None]
+        unavailable = [member for member in members
+                       if spawn.get_enabled_spec(swarm_pilot.member_profile(pilot, member)) is None]
         if unavailable:
             raise ValueError(f"unavailable registry members while resuming partial room: {unavailable}")
-    for member in members:
-        room_invite(room_id, member, by=organizer)
+    _swarm_invite_members(room_id, organizer, members)
     _swarm_seed_council_organizer(room_id, organizer)
     new_dispatch = swarm_pilot_pump(room_id) if start_requested else []
     if start_requested and swarm_pilot.due_members(room_id):
@@ -630,6 +641,20 @@ def _swarm_resume_preparing(
             "provider_response_verified": False,
         },
     }
+
+
+def _swarm_invite_members(room_id: str, organizer: str, members: list[str]) -> None:
+    """Invite members; reserve a wake slot for those launched via a mapped profile.
+
+    ``room_invite`` reserves a slot only when the member name is itself an
+    enabled profile, so a mapped member needs the same reservation here.
+    """
+    pilot = swarm_pilot.status(room_id)
+    for member in members:
+        room_invite(room_id, member, by=organizer)
+        profile = swarm_pilot.member_profile(pilot, member)
+        if profile != member and spawn.get_enabled_spec(profile) is not None:
+            bus.register_external_agent(room_id, member)
 
 
 def _swarm_seed_council_organizer(room_id: str, organizer: str) -> None:
@@ -1129,6 +1154,7 @@ def swarm_pilot_create(
     expected_specs: dict[str, str] | None = None,
     plan_hash: str = "",
     write_policy: str = "read_only",
+    member_profiles: dict[str, str] | None = None,
 ) -> dict:
     """Create a pilot room; start exact enabled registry members when requested.
 
@@ -1151,7 +1177,24 @@ def swarm_pilot_create(
     is stored for audit only; it does not grant permissions. For compatibility,
     response field ``started`` mirrors the ``start`` request; it does not prove
     that a child process launched or that a provider returned a response.
+    Optional ``member_profiles`` maps a member name to the registry profile
+    that launches it, so several uniquely named members (each with its own
+    member_id, log and wake claim) can share one profile. Unmapped members
+    launch the profile with their own name, as before; ``expected_specs``
+    then pins the mapped profile's fingerprint.
     """
+    if not isinstance(members, list) or not all(isinstance(member, str) for member in members):
+        raise ValueError("members must be a list of participant names")
+    profiles_by_member = swarm_pilot.validate_member_profiles(members, member_profiles)
+    profile_state = {"member_profiles": profiles_by_member}
+    if profiles_by_member:
+        registry = {spec.get("name"): spec for spec in spawn._raw_registry()}
+        for member, profile in profiles_by_member.items():
+            if not _swarm_mapped_profile_supported(registry.get(profile)):
+                raise ValueError(
+                    f"member_profiles: {member} -> {profile} is not a supported "
+                    "Codex or Claude CLI profile"
+                )
     if not isinstance(client_request_id, str):
         raise ValueError("client_request_id must be a string")
     if client_request_id and not _SWARM_CLIENT_REQUEST_ID_RE.fullmatch(client_request_id):
@@ -1165,6 +1208,7 @@ def swarm_pilot_create(
 
     expected = _swarm_validate_expected_specs(
         members, expected_specs, check_registry=not bool(client_request_id),
+        member_profiles=profiles_by_member,
     )
     request_fingerprint = ""
     deterministic_room_id = None
@@ -1175,7 +1219,7 @@ def swarm_pilot_create(
             raise ValueError("members must be a list of participant names")
         request_fingerprint = _swarm_client_request_fingerprint(
             name, organizer, goal, mode, members, cwd, workspace_strategy, start,
-            write_policy,
+            write_policy, member_profiles=profiles_by_member,
         )
         deterministic_room_id = _swarm_request_room_id(organizer, client_request_id)
         existing = _swarm_existing_request(
@@ -1192,9 +1236,14 @@ def swarm_pilot_create(
     # Check expected static registry fingerprints before the old live
     # availability probe or any persistent room creation.
     if client_request_id:
-        expected = _swarm_validate_expected_specs(members, expected_specs)
+        expected = _swarm_validate_expected_specs(
+            members, expected_specs, member_profiles=profiles_by_member,
+        )
     if start:
-        unavailable = [name for name in members if spawn.get_enabled_spec(name) is None]
+        unavailable = [
+            name for name in members
+            if spawn.get_enabled_spec(swarm_pilot.member_profile(profile_state, name)) is None
+        ]
         if unavailable:
             raise ValueError(f"unavailable registry members: {unavailable}")
     if write_policy == room_workspace.SHARED_WRITE:
@@ -1203,7 +1252,8 @@ def swarm_pilot_create(
         profiles = {spec.get("name"): spec for spec in spawn._raw_registry()}
         room_workspace.check_request(
             cwd, workspace_strategy, list(members),
-            {member: profiles.get(member) for member in members},
+            {member: profiles.get(swarm_pilot.member_profile(profile_state, member))
+             for member in members},
         )
     registry_checked = bool(start or expected is not None)
     try:
@@ -1215,6 +1265,7 @@ def swarm_pilot_create(
             start_requested=start if client_request_id else None,
             registry_availability_checked=(registry_checked if client_request_id else None),
             expected_specs=(expected if client_request_id else None),
+            member_profiles=profiles_by_member,
         )
     except FileExistsError:
         if deterministic_room_id:
@@ -1238,8 +1289,7 @@ def swarm_pilot_create(
         )
     if client_request_id:
         _swarm_mark_create_state(room_id, "preparing", expected, start, registry_checked)
-    for name in members:
-        room_invite(room_id, name, by=organizer)
+    _swarm_invite_members(room_id, organizer, members)
     _swarm_seed_council_organizer(room_id, organizer)
     dispatch = swarm_pilot_pump(room_id) if start else []
     if client_request_id and start and swarm_pilot.due_members(room_id):
@@ -1333,7 +1383,8 @@ def swarm_pilot_status(room_id: str) -> dict:
         member_detail = {
             "member_id": state["member_ids"][member],
             "name": member,
-            "profile": _swarm_route_profile(info) or member,
+            "profile": (_swarm_route_profile(info)
+                        or swarm_pilot.member_profile(state, member)),
             "native_session": native_session,
             "process_generation": generation,
             "delivery_cursor": cursor,
@@ -1746,12 +1797,30 @@ def _swarm_route_profile(info: dict) -> str | None:
     return profile if isinstance(profile, str) and profile else None
 
 
+def _swarm_assigned_profile(meta: dict, agent_name: str) -> str:
+    """Profile chosen for a member at creation (``member_profiles``), else its name."""
+    return swarm_pilot.member_profile(meta.get("swarm_pilot") or {}, agent_name)
+
+
+def _swarm_mapped_profile_supported(spec: dict | None) -> bool:
+    """A mapped profile must be a CLI that takes its member name from the brief."""
+    if not isinstance(spec, dict) or spec.get("profile"):
+        return False  # missing, or a typed reviewer with its own fixed contract
+    cmd = spec.get("cmd")
+    if not isinstance(cmd, list) or "--agent" in cmd:
+        return False
+    return spawn._effective_binary(cmd) in swarm_pilot.MAPPED_PROFILE_BINARIES
+
+
 def _member_launch_spec(meta: dict, agent_name: str) -> tuple[dict | None, bool]:
     """Return (enabled spec, drift) for the profile currently running a member."""
     info = (meta.get("agent_meta") or {}).get(agent_name) or {}
     profile = _swarm_route_profile(info)
     if profile is None:
-        spec = spawn.get_enabled_spec(agent_name)
+        assigned = _swarm_assigned_profile(meta, agent_name)
+        spec = spawn.get_enabled_spec(assigned)
+        if assigned != agent_name and spec is not None and not _swarm_mapped_profile_supported(spec):
+            return None, True  # the registry changed after creation: fail closed
         return spec, _swarm_spec_drift(meta, agent_name, spec)
     spec = spawn.get_enabled_spec(profile)
     if spec is None or spec.get("swarm_replacement") is not True:
@@ -1780,7 +1849,8 @@ def _swarm_replacement_candidates(meta: dict, agent_name: str, writes: bool) -> 
     for spec in spawn.load_registry():
         name = spec.get("name")
         if (not spec.get("enabled") or spec.get("swarm_replacement") is not True
-                or not isinstance(name, str) or name == agent_name):
+                or not isinstance(name, str) or name == agent_name
+                or name == _swarm_assigned_profile(meta, agent_name)):
             continue
         can_limit = True
         if writes:
@@ -1843,9 +1913,10 @@ def _swarm_replace_failed_member(
         return False
 
     route = info.get("swarm_route") if isinstance(info.get("swarm_route"), dict) else {}
-    current_profile = _swarm_route_profile(info) or agent_name
+    assigned_profile = _swarm_assigned_profile(meta, agent_name)
+    current_profile = _swarm_route_profile(info) or assigned_profile
     attempts = list(route.get("attempts") or []) or [
-        _swarm_route_attempt(agent_name, spawn.get_enabled_spec(agent_name))]
+        _swarm_route_attempt(assigned_profile, spawn.get_enabled_spec(assigned_profile))]
     try:
         writes = room_workspace.write_policy(meta) == room_workspace.SHARED_WRITE
     except ValueError:
@@ -4816,8 +4887,11 @@ def _wake_agents_for_request(
             wake_id = uuid.uuid4().hex[:12]
 
             # A replaced member always launches its route profile fresh.
+            # So does a member mapped to another profile: resume reads the
+            # default Codex profile, not the member's assigned one.
             resumable = (_is_thread_resumable(agent_name)
-                         and _swarm_route_profile(info) is None)
+                         and _swarm_route_profile(info) is None
+                         and _swarm_assigned_profile(fresh, agent_name) == agent_name)
             # A newly invited Codex has no native thread yet. The first pilot
             # turn must start a registry-backed process; later turns resume
             # the captured thread just like an ordinary room.

@@ -36,6 +36,7 @@ def create(
     start_requested: bool | None = None,
     registry_availability_checked: bool | None = None,
     expected_specs: dict[str, str] | None = None,
+    member_profiles: dict[str, str] | None = None,
 ) -> str:
     if mode not in MODES:
         raise ValueError(f"mode must be one of {sorted(MODES)}")
@@ -74,6 +75,11 @@ def create(
         raise ValueError("members must be non-empty, unique and exclude organizer")
     for member in members:
         bus._safe_path_component(member, "member")
+    if len({name.lower() for name in [organizer, *members]}) != len(members) + 1:
+        # Agent log and last-message paths are lower-cased names. The council
+        # organizer may also get a wake slot, so include that name too.
+        raise ValueError("members must stay unique when compared case-insensitively")
+    member_profiles = validate_member_profiles(members, member_profiles)
     # A swarm survives organizer session exit. Ordinary rooms retain their
     # existing owner_pid/SessionEnd lifecycle.
     room_id = bus.create_room(name, organizer, 0, cwd, "", room_id=room_id)
@@ -99,6 +105,9 @@ def create(
             "phase": "working",
             "created_at": now,
         }
+        if member_profiles:
+            # Absent for legacy rooms: each member launches its own name.
+            meta["swarm_pilot"]["member_profiles"] = dict(member_profiles)
         if client_request_fingerprint:
             meta["swarm_pilot"]["client_request_fingerprint"] = client_request_fingerprint
         if plan_hash:
@@ -141,6 +150,41 @@ def resolve_member(room_id: str, reference: str, *, allow_organizer: bool = Fals
     if len(matches) > 1:
         raise ValueError("member reference is ambiguous")
     raise ValueError("unknown swarm member")
+
+
+def validate_member_profiles(
+    members: list[str], member_profiles: dict[str, str] | None,
+) -> dict[str, str]:
+    """Validate an optional member -> registry profile mapping.
+
+    Unmapped members launch the profile named like themselves, as before.
+    Several members may share one profile; each keeps its own name,
+    member_id, log path and wake claim. Identity entries are dropped.
+    """
+    if member_profiles is None:
+        return {}
+    if not isinstance(member_profiles, dict):
+        raise ValueError("member_profiles must map member names to profile names")
+    if set(member_profiles) - set(members):
+        raise ValueError("member_profiles keys must be pilot members")
+    for member, profile in member_profiles.items():
+        if not isinstance(profile, str) or not profile.strip() or len(profile) > 120:
+            raise ValueError(f"member_profiles value for {member} must be a profile name")
+    return {member: profile for member, profile in member_profiles.items()
+            if profile != member}
+
+
+# Harnesses that learn the member name from the Huddle brief. Runner profiles
+# (MiMo, OpenAI-compatible) bake their room identity into ``--agent`` and would
+# ignore requests addressed to a differently named member.
+MAPPED_PROFILE_BINARIES = frozenset({"codex", "claude"})
+
+
+def member_profile(state: dict, member: str) -> str:
+    """Registry profile that launches ``member`` (its own name by default)."""
+    mapping = state.get("member_profiles") if isinstance(state, dict) else None
+    profile = mapping.get(member) if isinstance(mapping, dict) else None
+    return profile if isinstance(profile, str) and profile else member
 
 
 def due_members(room_id: str) -> list[str]:
