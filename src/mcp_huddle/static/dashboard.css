@@ -2219,6 +2219,10 @@
 .swarm-child-exited { border-left-color: var(--c-mimo); }
 .swarm-child-failed { border-left-color: var(--c-human); }
 .swarm-child-status { color: var(--text-muted); }
+.swarm-child-room-link { flex-basis: 100%; width: fit-content; padding: 0; border: 0; background: transparent; color: var(--c-codex); font: inherit; font-size: 10px; text-align: left; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; overflow-wrap: anywhere; }
+.swarm-child-context-note, .swarm-child-relay { color: var(--text-muted); font-size: 10px; }
+.swarm-child-context-note { flex-basis: 100%; }
+.swarm-child-relay.failed { color: var(--c-human); }
 @media (max-width: 720px) {
   .swarm-pilot { max-height: 24vh !important; }
 }

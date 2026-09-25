@@ -225,6 +225,11 @@ const I18N = {
     'swarm.childProfiles': 'Allowed profiles', 'swarm.childParent': 'parent',
     'swarm.childRunning': 'running', 'swarm.childStarting': 'starting',
     'swarm.childExited': 'finished', 'swarm.childFailed': 'failed', 'swarm.childUnknown': 'status unavailable',
+    'swarm.childOpenRoom': 'Open child room', 'swarm.childHistoryNone': 'Context: task only',
+    'swarm.childHistoryRecent': 'Context: last 10 room messages',
+    'swarm.childContextNote': 'Context selection does not restrict file or tool access.',
+    'swarm.childRelaySent': 'Result sent to parent room', 'swarm.childRelayFailed': 'Result could not be sent',
+    'swarm.childRelayOff': 'Result forwarding is off', 'swarm.childRelayPending': 'Result forwarding pending',
     'lanes.title': 'Agents', 'lanes.collapse': 'Collapse', 'lanes.expand': 'Expand',
     'lanes.waiting': 'Waiting', 'lanes.working': 'Working', 'lanes.done': 'Finished',
     'lanes.offline': 'Offline', 'lanes.online': 'Online', 'lanes.unknown': 'No status',
@@ -346,6 +351,11 @@ const I18N = {
     'swarm.childProfiles': 'Разрешённые профили', 'swarm.childParent': 'родитель',
     'swarm.childRunning': 'работает', 'swarm.childStarting': 'запускается',
     'swarm.childExited': 'завершил', 'swarm.childFailed': 'ошибка', 'swarm.childUnknown': 'статус неизвестен',
+    'swarm.childOpenRoom': 'Открыть дочернюю комнату', 'swarm.childHistoryNone': 'Контекст: только задание',
+    'swarm.childHistoryRecent': 'Контекст: последние 10 сообщений комнаты',
+    'swarm.childContextNote': 'Выбор контекста не ограничивает доступ к файлам и инструментам.',
+    'swarm.childRelaySent': 'Результат передан в родительскую комнату', 'swarm.childRelayFailed': 'Не удалось передать результат',
+    'swarm.childRelayOff': 'Передача результата выключена', 'swarm.childRelayPending': 'Передача результата ожидает завершения',
     'lanes.title': 'Агенты', 'lanes.collapse': 'Свернуть', 'lanes.expand': 'Развернуть',
     'lanes.waiting': 'Ждёт', 'lanes.working': 'Работает', 'lanes.done': 'Закончил',
     'lanes.offline': 'Не в сети', 'lanes.online': 'На связи', 'lanes.unknown': 'Нет статуса',
@@ -1339,11 +1349,33 @@ function renderSwarmPilot(room) {
             : child.status === 'running' ? 'running' : 'unknown';
       const identity = [child.parent ? `${t('swarm.childParent')}: ${child.parent}` : '',
         typeof child.profile === 'string' ? child.profile : ''].filter(Boolean).join(' · ');
-      childList.appendChild(el('li', {class: `swarm-child swarm-child-${statusClass}`}, [
+      const childItem = el('li', {class: `swarm-child swarm-child-${statusClass}`}, [
         el('span', {class: 'swarm-child-name', text: name}),
         identity ? el('span', {class: 'swarm-child-meta', text: identity}) : null,
         el('span', {class: 'swarm-child-status', text: t(statusKey)}),
-      ]));
+      ]);
+      if (child.invite === 'child_room') {
+        const childRoom = typeof child.child_room === 'string' ? child.child_room : '';
+        if (childRoom) {
+          const roomLink = el('button', {type: 'button', class: 'swarm-child-room-link',
+            text: `${t('swarm.childOpenRoom')} · ${childRoom}`});
+          roomLink.addEventListener('click', () => {
+            const linkedRoom = rooms.find(r => r.id === childRoom);
+            openRoom(childRoom, linkedRoom ? linkedRoom.owner : 'System');
+          });
+          childItem.appendChild(roomLink);
+        }
+        const historyLabel = child.history === 'recent' ? 'swarm.childHistoryRecent' : 'swarm.childHistoryNone';
+        childItem.appendChild(el('span', {class: 'swarm-child-meta', text: t(historyLabel)}));
+        childItem.appendChild(el('span', {class: 'swarm-child-context-note', text: t('swarm.childContextNote')}));
+        const relayLabel = child.relay === 'none' ? 'swarm.childRelayOff'
+          : child.relay_status === 'sent' ? 'swarm.childRelaySent'
+            : child.relay_status === 'failed' || child.delivery === 'relay_failed' ? 'swarm.childRelayFailed'
+              : 'swarm.childRelayPending';
+        childItem.appendChild(el('span', {class: `swarm-child-relay${relayLabel === 'swarm.childRelayFailed' ? ' failed' : ''}`,
+          text: t(relayLabel)}));
+      }
+      childList.appendChild(childItem);
     }
     childSection.appendChild(childList);
     body.appendChild(childSection);
@@ -1831,7 +1863,17 @@ function isSwarmChildFailed(room, name) {
 
 function swarmAgentOutcome(room, name) {
   if (isSwarmChildFailed(room, name)) return 'failed';
-  return isSwarmMemberDone(room, name) ? 'done' : '';
+  if (isSwarmMemberDone(room, name)) return 'done';
+  const current = room || roomData || {};
+  if (current.status === 'closed' || current.status === 'resolved') {
+    const health = lastHealth[name];
+    // A closed room alone is not proof the agent finished. Require the server's
+    // process check; retain an explicit failed-exit signal as an error.
+    if (health && health.process_state === 'exited') {
+      return health.last_wake_failed ? 'failed' : 'done';
+    }
+  }
+  return '';
 }
 
 function swarmOutcomeText(outcome) {
