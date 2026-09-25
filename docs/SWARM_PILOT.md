@@ -49,6 +49,13 @@ reporter transfer sends the new reporter a fresh final request (key suffix
 reporter: the organizer's final request stays in the room until the organizer
 publishes the final word, and Huddle does not wake the organizer.
 
+Pilot tools accept either a member's configured profile name or its stable
+`member_id` in `member` and `to_member`. Huddle resolves the ID to the name
+before checking the room state or matching the member's result message.
+`message_post(agent=...)` still uses the configured member name. Unknown or
+ambiguous references are rejected. These values identify a room slot; they
+do not authenticate the native CLI process.
+
 Use `swarm_pilot_status` for responsibilities, tasks, facts, decisions, and the
 final result. The pilot records one deliberate round. Other participants can
 communicate with the existing `message_post` and `messages_read` tools. This

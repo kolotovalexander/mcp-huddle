@@ -1369,6 +1369,9 @@ def _swarm_pilot_request(room_id: str, member: str) -> str:
     return (
         f"Huddle swarm pilot, mode={mode}, round={state['round']}. "
         f"You are {member}; peers are agents, not the human user.\n"
+        f"For pilot tool arguments named member, use {member!r}; your "
+        f"stable member_id is {state['member_ids'][member]!r} and is also accepted. "
+        "For message_post(agent=...), always use your member name.\n"
         f"Goal: {state['goal']}\n{mode_instruction}\n"
         f"Use {read_call} to read room context; "
         "use swarm_pilot_record for responsibility/task/decision/fact. "
@@ -1890,6 +1893,8 @@ def _swarm_replace_failed_member(
             f"{member_id}) on profile {profile} because the previous route "
             f"{current_profile} failed ({plan['failure_class']}). Keep the same "
             f"responsibility{': ' + responsibility if responsibility else ''}. "
+            f"For swarm_pilot_* member arguments use {agent_name!r}; the "
+            "member_id is also accepted. For message_post agent use the name. "
             "Read the room history before answering this same request.")
     prompt = _build_registry_agent_wakeup_prompt(
         room_id, agent_name, request.get("agent", ""),
@@ -1943,6 +1948,7 @@ def swarm_pilot_record(
     room_id: str, member: str, kind: str, key: str, value: str,
 ) -> dict:
     """Record a responsibility, task, decision or fact in the pilot room."""
+    member = swarm_pilot.resolve_member(room_id, member)
     updated = swarm_pilot.record(room_id, member, kind, key, value)
 
     advanced = _swarm_advance(room_id) if (
@@ -1964,6 +1970,8 @@ def swarm_pilot_transfer(
     ``transfers``. A reporter transfer sends the new reporter a fresh final
     request. Council keeps the organizer's final word and refuses reporter.
     """
+    member = swarm_pilot.resolve_member(room_id, member)
+    to_member = swarm_pilot.resolve_member(room_id, to_member)
     updated = swarm_pilot.transfer_responsibility(room_id, member, key, to_member, reason)
     transfer = updated["transfers"][-1]
     try:
@@ -1987,6 +1995,7 @@ def swarm_pilot_transfer(
 @mcp.tool()
 def swarm_pilot_round_done(room_id: str, member: str, summary: str) -> dict:
     """Consciously finish this member's turn, then wake the next if sequential."""
+    member = swarm_pilot.resolve_member(room_id, member)
     state = swarm_pilot.status(room_id)
     request_id = state["dispatched"].get(member)
     if request_id is None:
@@ -2027,6 +2036,7 @@ def swarm_pilot_round_done(room_id: str, member: str, summary: str) -> dict:
 @mcp.tool()
 def swarm_pilot_finish(room_id: str, member: str, result: str) -> dict:
     """Record the council organizer's last word or the swarm reporter's final."""
+    member = swarm_pilot.resolve_member(room_id, member, allow_organizer=True)
     state = swarm_pilot.status(room_id)
     final_request_key = _swarm_final_request_key(room_id, state)
     if not any(

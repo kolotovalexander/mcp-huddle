@@ -129,6 +129,20 @@ def status(room_id: str) -> dict:
     return _expose_member_ids(room_id, state)
 
 
+def resolve_member(room_id: str, reference: str, *, allow_organizer: bool = False) -> str:
+    """Resolve a pilot member's profile name or stable slot ID to its name."""
+    state = status(room_id)
+    matches = [name for name in state["members"]
+               if reference == name or reference == state["member_ids"][name]]
+    if allow_organizer and reference == state["organizer"]:
+        matches.append(state["organizer"])
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ValueError("member reference is ambiguous")
+    raise ValueError("unknown swarm member")
+
+
 def due_members(room_id: str) -> list[str]:
     state = status(room_id)
     if state["phase"] != "working":
