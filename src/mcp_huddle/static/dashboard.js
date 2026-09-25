@@ -845,6 +845,7 @@ function setLang(lang) {
   try { localStorage.setItem('agentbus-lang', lang); } catch (_) {}
   applyI18n();
   if (roomData) renderSwarmPilot(roomData);
+  updateActivityStatuses(lastStatuses);
   document.querySelectorAll('.agent-transcript').forEach(transcript => {
     const content = transcript.querySelector('.agent-transcript-scroll');
     const summary = transcript.querySelector('summary');
@@ -1589,9 +1590,15 @@ async function streamAgentEvents(baseUrl, name, stream) {
               }
               if (Number.isSafeInteger(parsedOffset)) stream.offset = parsedOffset;
               const node = status();
-              if (node) node.textContent = event.event === 'open'
-                ? `● ${t('activity.liveStatus')}`
-                : `↻ ${t('activity.resetStatus')}`;
+              if (node) {
+                if (isSwarmMemberDone(roomData, name)) {
+                  node.textContent = t('lanes.done');
+                } else {
+                  node.textContent = event.event === 'open'
+                    ? `● ${t('activity.liveStatus')}`
+                    : `↻ ${t('activity.resetStatus')}`;
+                }
+              }
             } else if (event.event === 'error') {
               const node = status();
               if (node) node.textContent = `× ${t('activity.errorStatus')}`;
@@ -1626,7 +1633,13 @@ async function streamAgentEvents(baseUrl, name, stream) {
       stream.attempt = Math.min((stream.attempt || 0) + 1, 5);
       const delayMs = Math.min(1000 * (2 ** (stream.attempt - 1)), 10000);
       const node = status();
-      if (node) node.textContent = `↻ ${t('activity.retrying')} · ${delayMs / 1000}s`;
+      if (node) {
+        if (isSwarmMemberDone(roomData, name)) {
+          node.textContent = t('lanes.done');
+        } else {
+          node.textContent = `↻ ${t('activity.retrying')} · ${delayMs / 1000}s`;
+        }
+      }
       await reconnectDelay(stream, delayMs);
     }
   } finally {
@@ -1670,7 +1683,7 @@ async function attachAgentPanels(roomId) {
   // Show EVERY participant — not just huddle-spawned ones. The room owner
   // (Claude) has no spawned process / event log, but the user still wants to
   // see that it is in the room and its online/busy status.
-  const room = rooms.find(x => x.id === roomId) || {};
+  const room = (roomData && roomData.id === roomId) ? roomData : (rooms.find(x => x.id === roomId) || roomData || {});
   const seen = new Set();
   const participants = [];
   for (const p of (room.participants || [])) { if (!seen.has(p)) { seen.add(p); participants.push(p); } }
@@ -1688,16 +1701,17 @@ async function attachAgentPanels(roomId) {
 
   for (const name of participants) {
     const isSpawned = !!spawned[name];
+    const isDone = isSwarmMemberDone(room, name);
     const healthSpan = el('span', {class: 'agent-panel-health', id: `agent-health-${name}`});
 
     const summary = el('summary', {class: 'agent-panel-summary'}, [
       avatar(name, 'avatar-sm'),
       el('span', {class: 'agent-panel-name', text: name}),
       el('span', {class: 'agent-status-dot offline', id: `agent-sdot-${name}`,
-                  title: `${name}: offline`}),
+                  title: isDone ? `${name}: ${t('lanes.done')}` : `${name}: offline`}),
       el('span', {class: 'agent-panel-totals', id: `agent-totals-${name}`, text: ''}),
       el('span', {class: 'agent-panel-status', id: `agent-status-${name}`,
-                  text: isSpawned ? t('activity.pending') : t('activity.noStream')}),
+                  text: isDone ? t('lanes.done') : (isSpawned ? t('activity.pending') : t('activity.noStream'))}),
       healthSpan,
     ]);
 
@@ -1732,6 +1746,20 @@ async function attachAgentPanels(roomId) {
   updateActivityStatuses(lastStatuses);
 }
 
+// Check whether an agent has finished their part in a Swarm room.
+function isSwarmMemberDone(room, name) {
+  const current = room || roomData || (currentRoom ? rooms.find(x => x.id === currentRoom) : null);
+  const pilot = current && current.swarm_pilot;
+  if (!pilot || typeof pilot !== 'object') return false;
+  const done = pilot.done && typeof pilot.done === 'object' ? pilot.done : {};
+  if (name in done) return true;
+  if (pilot.phase === 'completed') {
+    const members = Array.isArray(pilot.members) ? pilot.members : [];
+    if (!members.length || members.includes(name)) return true;
+  }
+  return false;
+}
+
 // Wake-health label for an agent panel (from /api/room_agents `health`).
 function activityHealthLabel(h) {
   if (!h) return '';
@@ -1747,10 +1775,20 @@ function updateActivityStatuses(statuses) {
   statuses = statuses || {};
   document.querySelectorAll('[id^="agent-sdot-"]').forEach(dot => {
     const name = dot.id.slice('agent-sdot-'.length);
+    const isDone = isSwarmMemberDone(roomData, name);
     const st = statuses[name] || 'offline';
-    const cls = st === 'busy' ? 'busy' : st === 'online' ? 'online' : 'offline';
+    const cls = isDone ? 'offline' : (st === 'busy' ? 'busy' : st === 'online' ? 'online' : 'offline');
     dot.className = 'agent-status-dot ' + cls;
-    dot.title = `${name}: ${t(`status.${st}`)}`;
+    dot.title = `${name}: ${isDone ? t('lanes.done') : t(`status.${st}`)}`;
+
+    const statusNode = document.getElementById(`agent-status-${name}`);
+    if (statusNode) {
+      if (isDone) {
+        statusNode.textContent = t('lanes.done');
+      } else if (statusNode.textContent === t('lanes.done')) {
+        statusNode.textContent = agentStreams[name] ? `● ${t('activity.liveStatus')}` : t('activity.pending');
+      }
+    }
   });
 }
 
