@@ -221,6 +221,10 @@ const I18N = {
     'swarm.empty': 'Nothing recorded yet', 'swarm.owner': 'Owner', 'swarm.reporter': 'Reporter',
     'swarm.members': 'Members', 'swarm.memberDone': 'done', 'swarm.memberActive': 'working',
     'swarm.memberWaiting': 'waiting', 'swarm.noRole': 'no role yet',
+    'swarm.childAgents': 'Child agents', 'swarm.childQuota': 'Limit',
+    'swarm.childProfiles': 'Allowed profiles', 'swarm.childParent': 'parent',
+    'swarm.childRunning': 'running', 'swarm.childStarting': 'starting',
+    'swarm.childExited': 'finished', 'swarm.childFailed': 'failed', 'swarm.childUnknown': 'status unavailable',
     'lanes.title': 'Agents', 'lanes.collapse': 'Collapse', 'lanes.expand': 'Expand',
     'lanes.waiting': 'Waiting', 'lanes.working': 'Working', 'lanes.done': 'Finished',
     'lanes.offline': 'Offline', 'lanes.online': 'Online', 'lanes.unknown': 'No status',
@@ -338,6 +342,10 @@ const I18N = {
     'swarm.empty': 'Пока ничего не записано', 'swarm.owner': 'Ответственный', 'swarm.reporter': 'Сводит результат',
     'swarm.members': 'Участники', 'swarm.memberDone': 'готово', 'swarm.memberActive': 'в работе',
     'swarm.memberWaiting': 'ждёт', 'swarm.noRole': 'роли нет',
+    'swarm.childAgents': 'Дочерние агенты', 'swarm.childQuota': 'Лимит',
+    'swarm.childProfiles': 'Разрешённые профили', 'swarm.childParent': 'родитель',
+    'swarm.childRunning': 'работает', 'swarm.childStarting': 'запускается',
+    'swarm.childExited': 'завершил', 'swarm.childFailed': 'ошибка', 'swarm.childUnknown': 'статус неизвестен',
     'lanes.title': 'Агенты', 'lanes.collapse': 'Свернуть', 'lanes.expand': 'Развернуть',
     'lanes.waiting': 'Ждёт', 'lanes.working': 'Работает', 'lanes.done': 'Закончил',
     'lanes.offline': 'Не в сети', 'lanes.online': 'На связи', 'lanes.unknown': 'Нет статуса',
@@ -1299,6 +1307,46 @@ function renderSwarmPilot(room) {
       ]));
     }
     body.appendChild(strip);
+  }
+
+  const childPolicy = state.child_agents && typeof state.child_agents === 'object' ? state.child_agents : null;
+  const childRecords = state.children && typeof state.children === 'object' ? Object.entries(state.children)
+    .filter(([, child]) => child && typeof child === 'object') : [];
+  // Keep the child section out of ordinary pilots; once children exist, show
+  // both the room's configured allowance and the readable child roster.
+  if (childRecords.length) {
+    const childSection = el('section', {class: 'swarm-children'});
+    childSection.appendChild(el('h3', {text: t('swarm.childAgents')}));
+    if (childPolicy) {
+      const policyParts = [];
+      if (Number.isInteger(childPolicy.max_children)) {
+        policyParts.push(`${t('swarm.childQuota')}: ${childPolicy.max_children}`);
+      }
+      if (Array.isArray(childPolicy.profiles) && childPolicy.profiles.length) {
+        policyParts.push(`${t('swarm.childProfiles')}: ${childPolicy.profiles.filter(x => typeof x === 'string').join(', ')}`);
+      }
+      if (policyParts.length) childSection.appendChild(el('p', {class: 'swarm-child-policy', text: policyParts.join(' · ')}));
+    }
+    const childList = el('ul', {class: 'swarm-child-list'});
+    for (const [name, child] of childRecords) {
+      const statusKey = child.status === 'failed' ? 'swarm.childFailed'
+        : child.status === 'exited' ? 'swarm.childExited'
+          : child.status === 'reserved' ? 'swarm.childStarting'
+            : child.status === 'running' ? 'swarm.childRunning' : 'swarm.childUnknown';
+      const statusClass = child.status === 'failed' ? 'failed'
+        : child.status === 'exited' ? 'exited'
+          : child.status === 'reserved' ? 'starting'
+            : child.status === 'running' ? 'running' : 'unknown';
+      const identity = [child.parent ? `${t('swarm.childParent')}: ${child.parent}` : '',
+        typeof child.profile === 'string' ? child.profile : ''].filter(Boolean).join(' · ');
+      childList.appendChild(el('li', {class: `swarm-child swarm-child-${statusClass}`}, [
+        el('span', {class: 'swarm-child-name', text: name}),
+        identity ? el('span', {class: 'swarm-child-meta', text: identity}) : null,
+        el('span', {class: 'swarm-child-status', text: t(statusKey)}),
+      ]));
+    }
+    childSection.appendChild(childList);
+    body.appendChild(childSection);
   }
 
   const grid = el('div', {class: 'swarm-grid'});
