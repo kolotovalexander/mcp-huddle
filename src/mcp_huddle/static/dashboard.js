@@ -213,6 +213,7 @@ const I18N = {
     'room.owner': 'Owner', 'room.round': 'Round', 'room.noRound': 'No recorded round', 'room.messages': 'messages',
     'room.created': 'Created', 'room.updated': 'Updated',
     'room.copyName': 'Copy name', 'room.copyId': 'Copy room ID',
+    'room.copied': 'Copied', 'room.copyFailed': 'Copy failed',
     'swarm.title': 'Team brief', 'swarm.goal': 'Goal', 'swarm.mode': 'Mode',
     'swarm.phase': 'Phase', 'swarm.round': 'Round', 'swarm.responsibilities': 'Responsibilities',
     'swarm.tasks': 'Tasks', 'swarm.decisions': 'Decisions', 'swarm.facts': 'Facts',
@@ -329,6 +330,7 @@ const I18N = {
     'room.owner': 'Владелец', 'room.round': 'Раунд', 'room.noRound': 'Раунд не задан', 'room.messages': 'сообщений',
     'room.created': 'Создана', 'room.updated': 'Обновлена',
     'room.copyName': 'Копировать имя', 'room.copyId': 'Копировать ID комнаты',
+    'room.copied': 'Скопировано', 'room.copyFailed': 'Не удалось скопировать',
     'swarm.title': 'План команды', 'swarm.goal': 'Цель', 'swarm.mode': 'Режим',
     'swarm.phase': 'Этап', 'swarm.round': 'Раунд', 'swarm.responsibilities': 'Обязанности',
     'swarm.tasks': 'Задачи', 'swarm.decisions': 'Решения', 'swarm.facts': 'Факты',
@@ -1052,6 +1054,59 @@ function renderRooms() {
 }
 
 // ── Chat ──────────────────────────────────────────────────
+async function copyRoomValue(btn, text, defaultLabelKey) {
+  if (!btn) return;
+  const originalText = t(defaultLabelKey);
+  clearTimeout(btn._copyTimer);
+  btn.classList.remove('is-copied', 'is-failed');
+
+  let ok = false;
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+    try {
+      await navigator.clipboard.writeText(text);
+      ok = true;
+    } catch (_) {}
+  }
+  if (!ok) {
+    let ta;
+    try {
+      ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.top = '-9999px';
+      ta.style.left = '-9999px';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      ok = Boolean(document.execCommand && document.execCommand('copy'));
+    } catch (_) {
+      ok = false;
+    } finally {
+      if (ta && ta.parentNode) ta.parentNode.removeChild(ta);
+    }
+  }
+
+  if (ok) {
+    btn.textContent = t('room.copied');
+    btn.classList.add('is-copied');
+    btn.title = '';
+    btn._copyTimer = setTimeout(() => {
+      btn.textContent = originalText;
+      btn.classList.remove('is-copied');
+    }, 1500);
+  } else {
+    btn.textContent = t('room.copyFailed');
+    btn.classList.add('is-failed');
+    btn.title = text;
+    btn._copyTimer = setTimeout(() => {
+      btn.textContent = originalText;
+      btn.classList.remove('is-failed');
+    }, 2500);
+  }
+}
+
 function buildChatShell(room) {
   const chat = document.getElementById('chat-area');
   chat.innerHTML = '';
@@ -1166,8 +1221,14 @@ function buildChatShell(room) {
     send.onclick = sendMsg;
     input.onkeydown = e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendMsg(); } };
   }
-  document.getElementById('copy-room-name').onclick = () => navigator.clipboard.writeText(room.name || room.id || '');
-  document.getElementById('copy-room-id').onclick = () => navigator.clipboard.writeText(room.id);
+  const btnCopyName = document.getElementById('copy-room-name');
+  if (btnCopyName) {
+    btnCopyName.onclick = () => copyRoomValue(btnCopyName, room.name || room.id || '', 'room.copyName');
+  }
+  const btnCopyId = document.getElementById('copy-room-id');
+  if (btnCopyId) {
+    btnCopyId.onclick = () => copyRoomValue(btnCopyId, room.id, 'room.copyId');
+  }
   renderSwarmPilot(room);
 }
 

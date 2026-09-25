@@ -1981,6 +1981,8 @@
   font: 11px ui-monospace, "SF Mono", Menlo, monospace; cursor: pointer;
 }
 [data-skin="opus"] .room-actions .danger { color: var(--opus-accent); }
+[data-skin="opus"] .room-text-action.is-copied { color: var(--text); }
+[data-skin="opus"] .room-text-action.is-failed { color: var(--opus-accent); }
 [data-skin="opus"] .room-lanes { flex: none; max-height: 31vh; overflow: auto; background: var(--opus-paper-2); padding: 7px 32px 10px; border-bottom: 1px solid var(--text); }
 [data-skin="opus"] .swarm-pilot { flex: none; max-height: 31vh; overflow: auto; background: var(--opus-paper-2); padding: 0 32px 8px; border-bottom: 1px solid var(--text); }
 [data-skin="opus"] .swarm-details > summary { position: sticky; top: 0; z-index: 1; display: flex; align-items: baseline; gap: 9px; padding: 7px 0; background: var(--opus-paper-2); color: var(--text); cursor: pointer; list-style: none; }
@@ -2163,6 +2165,8 @@
 :root:not([data-skin="opus"]) .room-heading { min-width: 0; }
 :root:not([data-skin="opus"]) .room-actions { display: flex; gap: 8px; align-items: center; justify-content: flex-end; flex-wrap: wrap; }
 :root:not([data-skin="opus"]) .room-text-action { border: 0; background: transparent; color: var(--text-muted); font: inherit; cursor: pointer; }
+:root:not([data-skin="opus"]) .room-text-action.is-copied { color: var(--accent, #3b82f6); }
+:root:not([data-skin="opus"]) .room-text-action.is-failed { color: var(--danger, #ef4444); }
 :root:not([data-skin="opus"]) .room-lanes { flex: none; max-height: 25vh; overflow: auto; padding: 8px 16px; border-bottom: 1px solid var(--panel-border); }
 :root:not([data-skin="opus"]) .swarm-pilot { flex: none; max-height: 30vh; overflow: auto; padding: 8px 16px; border-bottom: 1px solid var(--panel-border); background: var(--active-bg); }
 :root:not([data-skin="opus"]) .swarm-details > summary { cursor: pointer; }
