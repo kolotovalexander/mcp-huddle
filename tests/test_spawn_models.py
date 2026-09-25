@@ -177,6 +177,32 @@ def test_codex_resume_uses_room_pinned_settings_not_mutable_registry(monkeypatch
     assert "changed" not in argv
 
 
+def test_codex_resume_keeps_room_huddle_route(monkeypatch, tmp_path):
+    route = "http://127.0.0.1:8014/mcp"
+    spec = {"name": "Codex", "cmd": ["codex", "exec", "{brief}"], "mcp_url": route}
+    assert _placeholder_agent_meta(spec, "brief", tmp_path)["mcp_url"] == route
+
+    captured = {}
+
+    class Proc:
+        pid = 9876
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", lambda argv, **kwargs: captured.update(argv=argv) or Proc())
+    monkeypatch.setattr(spawn, "_reap_in_background", lambda *args, **kwargs: None)
+    codex_resume(
+        "thread", "prompt", str(tmp_path), str(tmp_path / "events.jsonl"),
+        model_settings={"model": "pinned", "effort": "low"}, mcp_url=route,
+    )
+    assert ('mcp_servers={huddle={url="http://127.0.0.1:8014/mcp",'
+            'default_tools_approval_mode="approve"}}') in captured["argv"]
+    assert captured["argv"][-1] == "prompt"
+    with pytest.raises(AgentSpawnError):
+        codex_resume(
+            "thread", "prompt", str(tmp_path), str(tmp_path / "events.jsonl"),
+            model_settings={}, mcp_url="https://example.com/mcp",
+        )
+
+
 def test_codex_resume_keeps_implicit_effort_implicit(monkeypatch, tmp_path):
     captured = {}
 

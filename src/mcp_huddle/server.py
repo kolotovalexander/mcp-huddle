@@ -2243,6 +2243,8 @@ def respond_via_agent(
                 {"model_settings": resume_settings}
                 if isinstance(resume_settings, dict) else {}
             )
+            if "mcp_url" in info:
+                resume_kwargs["mcp_url"] = info["mcp_url"]
             cwd, write_roots = room_workspace.resume(meta, agent_name)
             if write_roots is not None:
                 resume_kwargs["workspace_write_roots"] = write_roots
@@ -4862,6 +4864,8 @@ def _wake_agents_for_request(
                         {"model_settings": resume_settings}
                         if isinstance(resume_settings, dict) else {}
                     )
+                    if "mcp_url" in info:
+                        resume_kwargs["mcp_url"] = info["mcp_url"]
                     resume_cwd, write_roots = room_workspace.resume(
                         bus.get_room_info(room_id), agent_name,
                     )
@@ -5261,6 +5265,9 @@ def _spawn_fresh_room_agent(
     model_settings = spawn.model_settings_for_spec(spec)
     if model_settings:
         fields["model_settings"] = model_settings
+    if ("mcp_url" in launch_spec
+            and spawn._effective_binary(launch_spec.get("cmd") or []) == "codex"):
+        fields["mcp_url"] = spawn._codex_loopback_mcp_url(launch_spec["mcp_url"])
     if msg_id is not None:
         fields["last_wake_msg_id"] = msg_id
         fields["last_seen_id"] = msg_id

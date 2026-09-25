@@ -83,8 +83,9 @@ It does not remove other MCP servers from the user's Codex configuration:
 through an aggregator. `~/.codex/config.toml` is not changed; sandbox,
 approval, model and effort arguments stay as enforced. Without `mcp_url` the
 Codex command is unchanged. The URL's digest is part of `spec_fingerprint`,
-so changing it in a pinned room is spec drift. Resumed turns of the default
-`Codex` profile (`codex exec resume`) do not yet read this field.
+so changing it in a pinned room is spec drift. Huddle stores the validated
+URL with the initial Codex room slot and passes that same URL to
+`codex exec resume`; an unpinned slot keeps the existing resume behavior.
 
 ## Later rounds
 

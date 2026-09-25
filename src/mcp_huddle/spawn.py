@@ -2599,6 +2599,8 @@ def _placeholder_agent_meta(
     settings = model_settings_for_spec({**spec, "cmd": argv})
     if settings:
         result["model_settings"] = settings
+    if "mcp_url" in spec and _effective_binary(spec.get("cmd") or []) == "codex":
+        result["mcp_url"] = _codex_loopback_mcp_url(spec["mcp_url"])
     return result
 
 
@@ -3081,7 +3083,8 @@ def codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str,
                  owner_room_id: str = "",
                  process_handle: str | None = None,
                  model_settings: dict[str, str] | None = None,
-                 workspace_write_roots: list[str] | None = None) -> int:
+                 workspace_write_roots: list[str] | None = None,
+                 mcp_url: str | None = None) -> int:
     """Resume a Codex thread with a new prompt. Cheaper than fresh spawn —
     Codex remembers prior conversation via its rollout file.
 
@@ -3094,7 +3097,8 @@ def codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str,
     cancelled: under a restricted sandbox + `-a never`, MCP calls need approval
     that `never` denies ("user cancelled MCP tool call"). `-a` is a top-level
     flag (before `exec`). A room's initial model settings are retained for
-    resumed turns so a registry edit cannot switch models mid-session.
+    resumed turns so a registry edit cannot switch models mid-session. A
+    supplied ``mcp_url`` likewise pins the room's original Huddle endpoint.
     ``workspace_write_roots`` (a list, possibly empty) selects a write room's
     bounded workspace-write sandbox instead of the process-wide default.
     """
@@ -3130,6 +3134,12 @@ def codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str,
         argv.extend(["-c", f'model_reasoning_effort="{effort}"'])
 
     argv.extend(sandbox_args)                            # resume has no -s flag; pin via -c
+    if mcp_url is not None:
+        url = _codex_loopback_mcp_url(mcp_url)
+        argv.extend([
+            "-c", "mcp_servers={huddle={url=" + json.dumps(url)
+            + ',default_tools_approval_mode="approve"}}',
+        ])
     if last_msg_path:
         argv += ["-o", last_msg_path]                    # short form of --output-last-message
     argv.append(prompt)
