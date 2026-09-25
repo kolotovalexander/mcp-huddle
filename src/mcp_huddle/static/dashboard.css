@@ -746,6 +746,7 @@
       font-family: ui-monospace, monospace;
       flex-shrink: 0;
     }
+    .agent-panel-status.failed { color: #cf222e; font-weight: 600; }
     /* Wake-health badge: stale lease / failed wake (N4 health view). */
     .agent-panel-health {
       font-size: 10px;
@@ -856,6 +857,7 @@
     .agent-status-dot.online  { background: var(--c-codex); }
     .agent-status-dot.busy    { background: #d29922; }
     .agent-status-dot.offline { background: var(--c-system); opacity: 0.5; }
+    .agent-status-dot.failed { background: #cf222e; }
 
     /* ════════════════════════════════════════════════════════════════
        SKINS — selectable visual identities (orthogonal to data-theme).

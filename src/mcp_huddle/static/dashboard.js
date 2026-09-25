@@ -1591,8 +1591,9 @@ async function streamAgentEvents(baseUrl, name, stream) {
               if (Number.isSafeInteger(parsedOffset)) stream.offset = parsedOffset;
               const node = status();
               if (node) {
-                if (isSwarmMemberDone(roomData, name)) {
-                  node.textContent = t('lanes.done');
+                const outcome = swarmAgentOutcome(roomData, name);
+                if (outcome) {
+                  node.textContent = swarmOutcomeText(outcome);
                 } else {
                   node.textContent = event.event === 'open'
                     ? `● ${t('activity.liveStatus')}`
@@ -1634,8 +1635,9 @@ async function streamAgentEvents(baseUrl, name, stream) {
       const delayMs = Math.min(1000 * (2 ** (stream.attempt - 1)), 10000);
       const node = status();
       if (node) {
-        if (isSwarmMemberDone(roomData, name)) {
-          node.textContent = t('lanes.done');
+        const outcome = swarmAgentOutcome(roomData, name);
+        if (outcome) {
+          node.textContent = swarmOutcomeText(outcome);
         } else {
           node.textContent = `↻ ${t('activity.retrying')} · ${delayMs / 1000}s`;
         }
@@ -1701,17 +1703,18 @@ async function attachAgentPanels(roomId) {
 
   for (const name of participants) {
     const isSpawned = !!spawned[name];
-    const isDone = isSwarmMemberDone(room, name);
+    const outcome = swarmAgentOutcome(room, name);
+    const isFailed = outcome === 'failed';
     const healthSpan = el('span', {class: 'agent-panel-health', id: `agent-health-${name}`});
 
     const summary = el('summary', {class: 'agent-panel-summary'}, [
       avatar(name, 'avatar-sm'),
       el('span', {class: 'agent-panel-name', text: name}),
-      el('span', {class: 'agent-status-dot offline', id: `agent-sdot-${name}`,
-                  title: isDone ? `${name}: ${t('lanes.done')}` : `${name}: offline`}),
+      el('span', {class: `agent-status-dot ${isFailed ? 'failed' : 'offline'}`, id: `agent-sdot-${name}`,
+                  title: outcome ? `${name}: ${swarmOutcomeText(outcome)}` : `${name}: offline`}),
       el('span', {class: 'agent-panel-totals', id: `agent-totals-${name}`, text: ''}),
-      el('span', {class: 'agent-panel-status', id: `agent-status-${name}`,
-                  text: isDone ? t('lanes.done') : (isSpawned ? t('activity.pending') : t('activity.noStream'))}),
+      el('span', {class: `agent-panel-status${isFailed ? ' failed' : ''}`, id: `agent-status-${name}`,
+                  text: outcome ? swarmOutcomeText(outcome) : (isSpawned ? t('activity.pending') : t('activity.noStream'))}),
       healthSpan,
     ]);
 
@@ -1751,6 +1754,13 @@ function isSwarmMemberDone(room, name) {
   const current = room || roomData || (currentRoom ? rooms.find(x => x.id === currentRoom) : null);
   const pilot = current && current.swarm_pilot;
   if (!pilot || typeof pilot !== 'object') return false;
+  // A child has its own lifecycle; it is not a pilot member and must not be
+  // inferred complete from the team's final phase.
+  const children = pilot.children && typeof pilot.children === 'object' ? pilot.children : {};
+  if (Object.prototype.hasOwnProperty.call(children, name)) {
+    const child = children[name];
+    return !!child && child.status === 'exited' && child.returncode === 0;
+  }
   const done = pilot.done && typeof pilot.done === 'object' ? pilot.done : {};
   if (name in done) return true;
   if (pilot.phase === 'completed') {
@@ -1758,6 +1768,26 @@ function isSwarmMemberDone(room, name) {
     if (!members.length || members.includes(name)) return true;
   }
   return false;
+}
+
+function isSwarmChildFailed(room, name) {
+  const current = room || roomData || (currentRoom ? rooms.find(x => x.id === currentRoom) : null);
+  const pilot = current && current.swarm_pilot;
+  const children = pilot && pilot.children && typeof pilot.children === 'object' ? pilot.children : {};
+  if (!Object.prototype.hasOwnProperty.call(children, name)) return false;
+  const child = children[name];
+  return !!child && (child.status === 'failed'
+    || (child.status === 'exited' && child.returncode !== undefined
+      && child.returncode !== null && Number(child.returncode) !== 0));
+}
+
+function swarmAgentOutcome(room, name) {
+  if (isSwarmChildFailed(room, name)) return 'failed';
+  return isSwarmMemberDone(room, name) ? 'done' : '';
+}
+
+function swarmOutcomeText(outcome) {
+  return outcome === 'failed' ? `✗ ${t('activity.failed')}` : t('lanes.done');
 }
 
 // Wake-health label for an agent panel (from /api/room_agents `health`).
@@ -1775,17 +1805,22 @@ function updateActivityStatuses(statuses) {
   statuses = statuses || {};
   document.querySelectorAll('[id^="agent-sdot-"]').forEach(dot => {
     const name = dot.id.slice('agent-sdot-'.length);
-    const isDone = isSwarmMemberDone(roomData, name);
+    const outcome = swarmAgentOutcome(roomData, name);
+    const isDone = outcome === 'done';
+    const isFailed = outcome === 'failed';
     const st = statuses[name] || 'offline';
-    const cls = isDone ? 'offline' : (st === 'busy' ? 'busy' : st === 'online' ? 'online' : 'offline');
+    const cls = isDone ? 'offline' : isFailed ? 'failed'
+      : (st === 'busy' ? 'busy' : st === 'online' ? 'online' : 'offline');
     dot.className = 'agent-status-dot ' + cls;
-    dot.title = `${name}: ${isDone ? t('lanes.done') : t(`status.${st}`)}`;
+    dot.title = `${name}: ${outcome ? swarmOutcomeText(outcome) : t(`status.${st}`)}`;
 
     const statusNode = document.getElementById(`agent-status-${name}`);
     if (statusNode) {
-      if (isDone) {
-        statusNode.textContent = t('lanes.done');
-      } else if (statusNode.textContent === t('lanes.done')) {
+      statusNode.classList.toggle('failed', isFailed);
+      if (outcome) {
+        statusNode.textContent = swarmOutcomeText(outcome);
+      } else if (statusNode.textContent === t('lanes.done')
+          || statusNode.textContent === `✗ ${t('activity.failed')}`) {
         statusNode.textContent = agentStreams[name] ? `● ${t('activity.liveStatus')}` : t('activity.pending');
       }
     }
