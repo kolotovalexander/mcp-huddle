@@ -1973,7 +1973,7 @@
 }
 [data-skin="opus"] .chat-header { gap: 16px; align-items: end; }
 [data-skin="opus"] .chat-title { flex-wrap: wrap; }
-[data-skin="opus"] .room-actions { display: flex; gap: 12px; align-items: center; flex: none; }
+[data-skin="opus"] .room-actions { display: flex; gap: 8px 12px; align-items: center; justify-content: flex-end; flex-wrap: wrap; flex: none; }
 [data-skin="opus"] .room-text-action,
 [data-skin="opus"] .room-actions .lq-btn {
   border: 0; border-bottom: 1px solid currentColor; border-radius: 0;
@@ -2161,7 +2161,7 @@
 .dashboard-status kbd { border: 1px solid var(--text-muted); padding: 0 4px; }
 :root:not([data-skin="opus"]) .room-crumb { color: var(--text-muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 :root:not([data-skin="opus"]) .room-heading { min-width: 0; }
-:root:not([data-skin="opus"]) .room-actions { display: flex; gap: 8px; align-items: center; }
+:root:not([data-skin="opus"]) .room-actions { display: flex; gap: 8px; align-items: center; justify-content: flex-end; flex-wrap: wrap; }
 :root:not([data-skin="opus"]) .room-text-action { border: 0; background: transparent; color: var(--text-muted); font: inherit; cursor: pointer; }
 :root:not([data-skin="opus"]) .room-lanes { flex: none; max-height: 25vh; overflow: auto; padding: 8px 16px; border-bottom: 1px solid var(--panel-border); }
 :root:not([data-skin="opus"]) .swarm-pilot { flex: none; max-height: 30vh; overflow: auto; padding: 8px 16px; border-bottom: 1px solid var(--panel-border); background: var(--active-bg); }

@@ -211,7 +211,8 @@ const I18N = {
     'btn.view': 'View', 'btn.live': 'live', 'btn.copy': 'Copy', 'btn.send': 'Send',
     'btn.search': 'Search',
     'room.owner': 'Owner', 'room.round': 'Round', 'room.noRound': 'No recorded round', 'room.messages': 'messages',
-    'room.updated': 'Updated', 'room.copyName': 'Copy name',
+    'room.created': 'Created', 'room.updated': 'Updated',
+    'room.copyName': 'Copy name', 'room.copyId': 'Copy room ID',
     'swarm.title': 'Team brief', 'swarm.goal': 'Goal', 'swarm.mode': 'Mode',
     'swarm.phase': 'Phase', 'swarm.round': 'Round', 'swarm.responsibilities': 'Responsibilities',
     'swarm.tasks': 'Tasks', 'swarm.decisions': 'Decisions', 'swarm.facts': 'Facts',
@@ -326,7 +327,8 @@ const I18N = {
     'btn.view': 'Вид', 'btn.live': 'онлайн', 'btn.copy': 'Копировать', 'btn.send': 'Отправить',
     'btn.search': 'Поиск', 'search.placeholder': 'Название комнаты или слова из переписки',
     'room.owner': 'Владелец', 'room.round': 'Раунд', 'room.noRound': 'Раунд не задан', 'room.messages': 'сообщений',
-    'room.updated': 'Обновлена', 'room.copyName': 'Копировать имя',
+    'room.created': 'Создана', 'room.updated': 'Обновлена',
+    'room.copyName': 'Копировать имя', 'room.copyId': 'Копировать ID комнаты',
     'swarm.title': 'План команды', 'swarm.goal': 'Цель', 'swarm.mode': 'Режим',
     'swarm.phase': 'Этап', 'swarm.round': 'Раунд', 'swarm.responsibilities': 'Обязанности',
     'swarm.tasks': 'Задачи', 'swarm.decisions': 'Решения', 'swarm.facts': 'Факты',
@@ -553,6 +555,13 @@ function renderMarkdown(src) {
 
 function fmtTime(ts) {
   return new Date((ts || 0) * 1000).toLocaleTimeString('ru', {hour:'2-digit', minute:'2-digit'});
+}
+
+function fmtDateTime(ts) {
+  return new Date(ts * 1000).toLocaleString(LANG || 'en', {
+    day: '2-digit', month: '2-digit', year: 'numeric',
+    hour: '2-digit', minute: '2-digit',
+  });
 }
 
 function messageCount(n) {
@@ -930,6 +939,7 @@ function roomItem(r, label, indent = 46) {
     class: 'room-item' + (active ? ' active' : ''),
     dataset: {id: r.id, owner: r.owner},
     style: `padding-left:${indent}px`,
+    title: r.created_at ? `${t('room.created')} ${fmtDateTime(r.created_at)}` : '',
   }, [
     el('div', {class: 'room-name'}, [
       el('span', {class: `dot dot-${r.status}` + (r.status === 'open' ? ' pulse' : '')}),
@@ -1077,6 +1087,7 @@ function buildChatShell(room) {
     ]),
     el('div', {class: 'room-actions'}, [
       el('button', {class: 'room-text-action', id: 'copy-room-name', text: t('room.copyName')}),
+      el('button', {class: 'room-text-action', id: 'copy-room-id', text: t('room.copyId')}),
       actionBtn,
     ]),
   ]);
@@ -1156,6 +1167,7 @@ function buildChatShell(room) {
     input.onkeydown = e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendMsg(); } };
   }
   document.getElementById('copy-room-name').onclick = () => navigator.clipboard.writeText(room.name || room.id || '');
+  document.getElementById('copy-room-id').onclick = () => navigator.clipboard.writeText(room.id);
   renderSwarmPilot(room);
 }
 
@@ -2167,7 +2179,8 @@ function renderChatMeta(room, statuses) {
   details.push(activeRound ? `${t('room.round')} ${activeRound}` : t('room.noRound'));
   if (room.owner) details.push(`${t('room.owner')} ${room.owner}`);
   details.push(messageCount(roomMessages.length));
-  if (room.last_activity) details.push(`${t('room.updated')} ${fmtTime(room.last_activity)}`);
+  if (room.created_at) details.push(`${t('room.created')} ${fmtDateTime(room.created_at)}`);
+  if (room.last_activity) details.push(`${t('room.updated')} ${fmtDateTime(room.last_activity)}`);
   meta.textContent = details.join('  /  ');
   const crumb = document.getElementById('room-crumb');
   if (crumb) crumb.textContent = room.cwd || room.project || '';
