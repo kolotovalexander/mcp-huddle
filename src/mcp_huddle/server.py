@@ -603,6 +603,7 @@ def _swarm_resume_preparing(
             raise ValueError(f"unavailable registry members while resuming partial room: {unavailable}")
     for member in members:
         room_invite(room_id, member, by=organizer)
+    _swarm_seed_council_organizer(room_id, organizer)
     new_dispatch = swarm_pilot_pump(room_id) if start_requested else []
     if start_requested and swarm_pilot.due_members(room_id):
         blocked = [
@@ -629,6 +630,15 @@ def _swarm_resume_preparing(
             "provider_response_verified": False,
         },
     }
+
+
+def _swarm_seed_council_organizer(room_id: str, organizer: str) -> None:
+    """Make a registry-backed council organizer wakeable for the final only."""
+    if (swarm_pilot.status(room_id)["mode"] == "council"
+            and spawn.get_enabled_spec(organizer) is not None):
+        # Invite reserves a wake slot; it does not launch a CLI turn. The
+        # organizer's PID/session is still absent from room ownership.
+        room_invite(room_id, organizer, by=organizer)
 
 
 def _swarm_cli_exists(command: str) -> bool:
@@ -1230,6 +1240,7 @@ def swarm_pilot_create(
         _swarm_mark_create_state(room_id, "preparing", expected, start, registry_checked)
     for name in members:
         room_invite(room_id, name, by=organizer)
+    _swarm_seed_council_organizer(room_id, organizer)
     dispatch = swarm_pilot_pump(room_id) if start else []
     if client_request_id and start and swarm_pilot.due_members(room_id):
         blocked = [

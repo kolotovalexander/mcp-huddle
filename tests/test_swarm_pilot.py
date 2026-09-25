@@ -432,6 +432,20 @@ def test_pilot_room_survives_organizer_session_close(isolated_home):
     assert bus.get_room_info(room)["status"] == "open"
 
 
+def test_council_registry_organizer_has_final_wake_slot_without_initial_spawn(
+    isolated_home, monkeypatch,
+):
+    monkeypatch.setattr(server.spawn, "get_enabled_spec", lambda name: {"name": name})
+    created = server.swarm_pilot_create(
+        "council", "Organizer", "Decide", "council", ["A"], start=False,
+    )
+    room = bus.get_room_info(created["room_id"])
+    assert room["owner_pid"] == 0
+    assert "Organizer" in room["agent_meta"]
+    assert "last_wake_pid" not in room["agent_meta"]["Organizer"]
+    assert swarm_pilot.due_members(created["room_id"]) == ["A"]
+
+
 @pytest.mark.parametrize("mode", ["council", "team", "relay", "swarm"])
 def test_public_pilot_workflow_in_all_modes(isolated_home, monkeypatch, mode):
     """Exercise Huddle tools with simulated members, not live models."""

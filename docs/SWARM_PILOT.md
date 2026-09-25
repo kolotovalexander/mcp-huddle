@@ -36,6 +36,13 @@ request to the organizer to keep the final word.
 `swarm_pilot_finish` accepts the final only after that addressed request is
 present in the room; a concurrent early finish cannot leave a stale request
 after the room is completed. A late reporter claim returns `final_request`.
+In council, if the organizer's name is an enabled registry profile, creation
+reserves a wake slot for that profile without spawning it. The final request
+can then start a fresh CLI turn after the participants finish. This fresh
+turn reads the room history; it does not resume the organizer's original
+native session. Other organizers retain the final request in the room until
+they return and publish the final themselves. The room remains independent
+of the organizer's PID.
 
 A claimed responsibility moves only through `swarm_pilot_transfer(room_id,
 member, key, to_member, reason)`. The owner may hand it to another member at
@@ -47,7 +54,7 @@ reporter transfer sends the new reporter a fresh final request (key suffix
 `:transfer-<n>`); the old reporter's request is superseded and its
 `swarm_pilot_finish` is refused. Council does not have a transferable
 reporter: the organizer's final request stays in the room until the organizer
-publishes the final word, and Huddle does not wake the organizer.
+publishes the final word. A registry-backed organizer may be woken as above.
 
 Pilot tools accept either a member's configured profile name or its stable
 `member_id` in `member` and `to_member`. Huddle resolves the ID to the name
