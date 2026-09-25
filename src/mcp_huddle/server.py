@@ -1493,6 +1493,20 @@ def swarm_pilot_pump(room_id: str) -> list[dict]:
     return dispatched
 
 
+def _swarm_final_request_key(room_id: str, state: dict) -> str:
+    """Key of the final request for the current final owner.
+
+    Each reporter transfer gets its own key, so the new reporter receives a
+    fresh addressed request while the earlier one stays in history.
+    """
+    key = f"swarm-pilot:{room_id}:{state.get('round', 1)}:final-request"
+    if state.get("mode") != "council":
+        transfers = swarm_pilot.reporter_transfer_count(state)
+        if transfers:
+            key += f":transfer-{transfers}"
+    return key
+
+
 def _swarm_advance(room_id: str) -> dict:
     """Publish missing pilot requests after a tool turn or server restart.
 
@@ -1542,7 +1556,8 @@ def _swarm_advance(room_id: str) -> dict:
                 "One member must claim the reporter responsibility with "
                 "swarm_pilot_record(room_id, member, 'responsibility', 'reporter', '<description>')."
             )
-    key = f"swarm-pilot:{room_id}:{round_no}:{suffix}"
+    key = (_swarm_final_request_key(room_id, state) if suffix == "final-request"
+           else f"swarm-pilot:{room_id}:{round_no}:{suffix}")
     existing = next(
         (msg for msg in bus._load_messages(room_id)
          if msg.get("idempotency_key") == key), None,
@@ -1639,7 +1654,7 @@ def _post_swarm_final_if_missing(room_id: str, state: dict) -> int | None:
     if not member or not result:
         return None
     messages = bus._load_messages(room_id)
-    key = f"swarm-pilot:{room_id}:{state.get('round', 1)}:final-request"
+    key = _swarm_final_request_key(room_id, state)
     request = next((msg for msg in messages
                     if msg.get("idempotency_key") == key
                     and msg.get("kind") == "request"
@@ -1939,6 +1954,37 @@ def swarm_pilot_record(
 
 
 @mcp.tool()
+def swarm_pilot_transfer(
+    room_id: str, member: str, key: str, to_member: str, reason: str,
+) -> dict:
+    """Transfer a claimed responsibility (e.g. reporter) to another member.
+
+    The owner may hand it off; another member may take it over only after the
+    round is complete and the owner is not running a turn. The move is kept in
+    ``transfers``. A reporter transfer sends the new reporter a fresh final
+    request. Council keeps the organizer's final word and refuses reporter.
+    """
+    updated = swarm_pilot.transfer_responsibility(room_id, member, key, to_member, reason)
+    transfer = updated["transfers"][-1]
+    try:
+        _post_message_checked(
+            room_id, "System",
+            f"Responsibility '{key}' moved from {transfer['from']} to {to_member} "
+            f"(by {member}): {reason}",
+            kind="system",
+            idempotency_key=(f"swarm-pilot:{room_id}:transfer:{key}:"
+                             f"{transfer['version']}"),
+        )
+    except Exception as exc:
+        print(f"[huddle] swarm transfer notice failed ({room_id}): {exc}",
+              flush=True)
+    advanced = _swarm_advance(room_id) if (
+        key == "reporter" and len(updated["done"]) == len(updated["members"])
+    ) else None
+    return {**updated, "final_request": advanced["final_request"] if advanced else None}
+
+
+@mcp.tool()
 def swarm_pilot_round_done(room_id: str, member: str, summary: str) -> dict:
     """Consciously finish this member's turn, then wake the next if sequential."""
     state = swarm_pilot.status(room_id)
@@ -1982,9 +2028,7 @@ def swarm_pilot_round_done(room_id: str, member: str, summary: str) -> dict:
 def swarm_pilot_finish(room_id: str, member: str, result: str) -> dict:
     """Record the council organizer's last word or the swarm reporter's final."""
     state = swarm_pilot.status(room_id)
-    final_request_key = (
-        f"swarm-pilot:{room_id}:{state.get('round', 1)}:final-request"
-    )
+    final_request_key = _swarm_final_request_key(room_id, state)
     if not any(
         msg.get("idempotency_key") == final_request_key
         and msg.get("to") == member
@@ -2298,7 +2342,10 @@ def _swarm_pilot_request_superseded(
     suffix = key[len(prefix):]
     if suffix == "final-request-missing-reporter":
         return bool(pilot.get("responsibilities", {}).get("reporter", {}).get("member"))
-    if suffix == "final-request" and pilot.get("phase") == "completed":
+    if suffix.startswith("final-request") and key != _swarm_final_request_key(room_id, pilot):
+        # An earlier reporter's final request, replaced by a transfer.
+        return True
+    if suffix.startswith("final-request") and pilot.get("phase") == "completed":
         final_member = (pilot.get("final") or {}).get("member")
         return any(
             msg.get("idempotency_key") == f"swarm-pilot:{room_id}:final"

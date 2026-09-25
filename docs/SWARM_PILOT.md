@@ -37,6 +37,18 @@ request to the organizer to keep the final word.
 present in the room; a concurrent early finish cannot leave a stale request
 after the room is completed. A late reporter claim returns `final_request`.
 
+A claimed responsibility moves only through `swarm_pilot_transfer(room_id,
+member, key, to_member, reason)`. The owner may hand it to another member at
+any time. Another member may take it over for themselves only after every
+member finished the round and the owner is not running a turn (no active wake
+claim). Both sides must be room members, the room must still be working, and
+each move is appended to `transfers`, with a system message in the room. A
+reporter transfer sends the new reporter a fresh final request (key suffix
+`:transfer-<n>`); the old reporter's request is superseded and its
+`swarm_pilot_finish` is refused. Council does not have a transferable
+reporter: the organizer's final request stays in the room until the organizer
+publishes the final word, and Huddle does not wake the organizer.
+
 Use `swarm_pilot_status` for responsibilities, tasks, facts, decisions, and the
 final result. The pilot records one deliberate round. Other participants can
 communicate with the existing `message_post` and `messages_read` tools. This
@@ -50,6 +62,21 @@ room's `messages.jsonl` and agent event logs. It sets `owner_pid=0` and an empty
 `session_id` so the organizer's process ending does not close this pilot room.
 No background service is activated by importing these tools; Python server
 changes take effect after the server running this checkout is started.
+
+## Pinning a Codex member's Huddle URL
+
+A Codex registry profile may set `"mcp_url": "http://127.0.0.1:<port>/mcp"`
+(loopback host, explicit port, path `/mcp`, no credentials or query). At
+launch Huddle then passes one `-c mcp_servers={huddle={url=...,
+default_tools_approval_mode="approve"}}` override, after the read-only and
+room write transforms. This pins the child's `huddle` MCP server to that URL.
+It does not remove other MCP servers from the user's Codex configuration:
+`codex mcp list` still shows them, so an agent can still reach another Huddle
+through an aggregator. `~/.codex/config.toml` is not changed; sandbox,
+approval, model and effort arguments stay as enforced. Without `mcp_url` the
+Codex command is unchanged. The URL's digest is part of `spec_fingerprint`,
+so changing it in a pinned room is spec drift. Resumed turns of the default
+`Codex` profile (`codex exec resume`) do not yet read this field.
 
 ## Bounded replacement after a failed turn
 

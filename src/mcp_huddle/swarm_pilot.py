@@ -194,6 +194,71 @@ def record(room_id: str, member: str, kind: str, key: str, value: str) -> dict:
     return _expose_member_ids(room_id, state)
 
 
+def transfer_responsibility(
+    room_id: str, member: str, key: str, to_member: str, reason: str,
+) -> dict:
+    """Move a claimed responsibility to another member, keeping its history.
+
+    The current owner may hand it off at any time. Another member may take it
+    over only after every member finished the round and the owner holds no
+    active wake claim, i.e. the owner is not running a turn that could still
+    finish. Council's final word stays with the organizer, so its reporter
+    responsibility is not transferable.
+    """
+    if not key.strip() or not reason.strip():
+        raise ValueError("key and reason must be non-empty")
+    if len(key) > 160 or len(reason) > 1000:
+        raise ValueError("transfer key or reason is too long")
+
+    def update(meta: dict) -> dict:
+        state = _state(meta)
+        members = state["members"]
+        if member not in members or to_member not in members:
+            raise PermissionError("only swarm members can transfer a responsibility")
+        if state["phase"] != "working" or state.get("final") is not None:
+            raise ValueError("swarm is no longer working")
+        if key == "reporter" and state["mode"] == "council":
+            raise ValueError("council final word belongs to the organizer")
+        prior = state["responsibilities"].get(key)
+        if not isinstance(prior, dict) or not prior.get("member"):
+            raise ValueError("responsibility is not claimed; claim it with swarm_pilot_record")
+        owner = prior["member"]
+        if owner == to_member:
+            raise ValueError("member already owns this responsibility")
+        if member != owner:
+            if member != to_member:
+                raise PermissionError("only the owner or the taking-over member can transfer")
+            if len(state["done"]) != len(members):
+                raise ValueError("takeover is allowed only after every member finished the round")
+            owner_info = (meta.get("agent_meta") or {}).get(owner) or {}
+            if owner_info.get("wake_claim_id"):
+                raise ValueError("current owner is still running a turn; wait for it to end")
+        now = int(time.time())
+        version = prior.get("version", 0) + 1
+        state["responsibilities"][key] = {
+            **prior, "member": to_member, "version": version, "updated_at": now,
+        }
+        state.setdefault("transfers", []).append({
+            "key": key, "from": owner, "to": to_member, "by": member,
+            "reason": reason, "round": state.get("round", 1),
+            "version": version, "at": now,
+        })
+        return meta
+
+    state = bus._update_meta_locked(room_id, update)["swarm_pilot"]
+    return _expose_member_ids(room_id, state)
+
+
+def reporter_transfer_count(state: dict) -> int:
+    """Reporter transfers in the current round; versions the final request."""
+    round_no = state.get("round", 1)
+    return sum(
+        1 for item in state.get("transfers") or []
+        if isinstance(item, dict) and item.get("key") == "reporter"
+        and item.get("round", 1) == round_no
+    )
+
+
 def round_done(room_id: str, member: str, summary: str) -> dict:
     if not summary.strip():
         raise ValueError("summary must be non-empty")

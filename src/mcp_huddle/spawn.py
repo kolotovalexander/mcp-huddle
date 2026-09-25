@@ -90,8 +90,11 @@ class SpawnSpec(TypedDict):
     # A named profile is a fixed, reviewed runner contract. It is deliberately
     # narrower than a generic environment/configuration API for registry JSON.
     profile: NotRequired[str]
-    # Local endpoint for the owner-enabled subscription reviewer. Validated
-    # before spawn; credentials and remote URLs are never accepted here.
+    # Local Huddle MCP endpoint (loopback, path /mcp). Used by the
+    # owner-enabled subscription reviewer, Claude write rooms, and — when set
+    # on a Codex profile — to pin that child's `huddle` MCP URL. Other
+    # configured MCP servers are not removed. Credentials and remote URLs are
+    # never accepted here.
     mcp_url: NotRequired[str]
     # Additional parent environment variable names that this child explicitly
     # needs. Values stay out of registry JSON and logs; only the named values
@@ -946,8 +949,10 @@ def spec_fingerprint(spec: SpawnSpec) -> str:
     Pass a spec from :func:`_raw_registry`; its ``cmd`` already contains the
     read-only transform when enabled. This function applies model controls to
     that command once and deliberately does not reapply read-only rewriting.
-    Environment values and endpoint/probe fields are never read or included;
-    only explicitly passed environment variable names are part of the digest.
+    Environment values and probe fields are never read or included; only
+    explicitly passed environment variable names are part of the digest. A
+    profile ``mcp_url`` enters only as its own SHA-256 digest, so a changed
+    endpoint is spec drift while the result carries no URL text.
     """
     cmd = list(spec.get("cmd") or [])
     effective_argv = _apply_model_effort_variant(spec, cmd)
@@ -966,6 +971,11 @@ def spec_fingerprint(spec: SpawnSpec) -> str:
     ):
         if key in spec:
             canonical[key] = _fingerprint_safe_value(spec[key])
+    if "mcp_url" in spec:
+        # Absent for most profiles, so their existing fingerprints are unchanged.
+        canonical["mcp_url_sha256"] = hashlib.sha256(
+            str(spec["mcp_url"]).encode("utf-8")
+        ).hexdigest()
     for key, value in spec.items():
         if _FINGERPRINT_PERMISSION_KEY.search(str(key)):
             canonical[str(key)] = _fingerprint_safe_value(value)
@@ -986,6 +996,7 @@ def _resolve_spawn_args(
     last_msg_path: str | None = None
 
     template = _apply_model_effort_variant(spec, list(spec.get("cmd") or []))
+    template = _apply_codex_mcp_route(spec, template)
 
     argv = []
     for arg in template:
@@ -996,6 +1007,48 @@ def _resolve_spawn_args(
             arg = arg.replace("{last_message}", last_msg_path)
         argv.append(arg)
     return argv, last_msg_path
+
+
+def _codex_loopback_mcp_url(raw_url: object) -> str:
+    """Rebuild a validated loopback ``/mcp`` URL from its parsed parts only."""
+    if not isinstance(raw_url, str):
+        raise AgentSpawnError("Codex mcp_url must be a loopback http(s) URL ending in /mcp")
+    try:
+        _direct_opus_review_endpoint_config(raw_url)
+    except AgentSpawnError:
+        raise AgentSpawnError(
+            "Codex mcp_url must be a loopback http(s) URL ending in /mcp"
+        ) from None
+    parsed = urlparse(raw_url)
+    host = f"[{parsed.hostname}]" if parsed.hostname == "::1" else parsed.hostname
+    return f"{parsed.scheme}://{host}:{parsed.port}/mcp"
+
+
+def _apply_codex_mcp_route(spec: SpawnSpec, template: list[str]) -> list[str]:
+    """Pin a Codex child's ``huddle`` MCP URL to the profile's ``mcp_url``.
+
+    Opt-in: without ``mcp_url`` the argv is unchanged. With it, one ``-c``
+    sets the ``huddle`` server to that URL with Huddle tool approval. Observed
+    with ``codex mcp list``: the ``huddle`` entry shows this URL, and the other
+    globally configured MCP servers (for example aggregators) remain, so this
+    does not stop an agent from reaching another Huddle through them. It adds
+    no server and leaves sandbox, approval, model and effort arguments from
+    the enforced transforms as they are. Runs at launch, after the read-only
+    and room write transforms.
+    """
+    if "mcp_url" not in spec or _effective_binary(template) != "codex":
+        return template
+    url = _codex_loopback_mcp_url(spec.get("mcp_url"))
+    route = [
+        "-c",
+        "mcp_servers={huddle={url=" + json.dumps(url)
+        + ',default_tools_approval_mode="approve"}}',
+    ]
+    # Keep the prompt positional last, like the read-only transform does.
+    for index in range(len(template) - 1, -1, -1):
+        if "{brief}" in template[index]:
+            return [*template[:index], *route, *template[index:]]
+    return [*template, *route]
 
 
 def _open_standalone_log(path: Path, *, create_parent: bool) -> BinaryIO:
