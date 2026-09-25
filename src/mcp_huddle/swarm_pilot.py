@@ -195,12 +195,14 @@ def record(room_id: str, member: str, kind: str, key: str, value: str) -> dict:
         prior = bucket.get(key)
         if kind in ("responsibility", "task") and prior and prior["member"] != member:
             raise ValueError("responsibility has another owner; agree on transfer first")
-        if prior and prior["member"] == member and prior["value"] == value:
+        if (prior and prior["member"] == member and prior["value"] == value
+                and prior.get("round", 1) == state.get("round", 1)):
             return meta
         bucket[key] = {
             "member": member, "value": value,
             "version": (prior or {}).get("version", 0) + 1,
             "updated_at": int(time.time()),
+            "round": state.get("round", 1),
         }
         return meta
 
@@ -326,6 +328,87 @@ def finish(room_id: str, member: str, result: str) -> dict:
             "member": member, "result": result, "updated_at": int(time.time()),
         }
         state["phase"] = "completed"
+        return meta
+
+    state = bus._update_meta_locked(room_id, update)["swarm_pilot"]
+    return _expose_member_ids(room_id, state)
+
+
+MAX_ROUNDS = 8
+NEXT_ROUND_DECISION = "next_round"
+
+
+def open_round(room_id: str, by: str, reason: str, from_round: int) -> dict:
+    """Deliberately open round ``from_round + 1`` after that round's final.
+
+    Only the organizer, or a member after some member recorded the decision
+    ``next_round`` during the round being closed, may open it. Per-round
+    ``dispatched``/``done``/``final`` move into ``round_history``;
+    responsibilities, tasks, decisions, facts and messages stay. Nothing opens
+    a round automatically, and ``MAX_ROUNDS`` bounds the total. Repeating the
+    same call after success returns the state unchanged.
+    """
+    if not isinstance(from_round, int) or isinstance(from_round, bool) or from_round < 1:
+        raise ValueError("from_round must be a positive integer")
+    if not reason.strip():
+        raise ValueError("reason must be non-empty")
+    if len(reason) > 1000:
+        raise ValueError("reason is too long")
+
+    def update(meta: dict) -> dict:
+        state = _state(meta)
+        current = state.get("round", 1)
+        history = state.get("round_history") or []
+        if current == from_round + 1:
+            last = history[-1] if history else {}
+            if (last.get("round") == from_round
+                    and last.get("next_round_opened_by") == by
+                    and last.get("next_round_reason") == reason):
+                return meta
+            raise ValueError("round was already advanced")
+        if current != from_round:
+            raise ValueError("from_round does not match the current round")
+        if meta.get("status") not in ("open", "idle"):
+            raise ValueError("room is not open")
+        if state["phase"] != "completed" or state.get("final") is None:
+            raise ValueError("current round has no final yet; finish it first")
+        if current >= MAX_ROUNDS:
+            raise ValueError(f"round limit {MAX_ROUNDS} reached")
+        agent_meta = meta.get("agent_meta") or {}
+        busy = sorted(
+            name for name in state["members"]
+            if ((agent_meta.get(name) or {}).get("wake_claim_id"))
+        )
+        if busy:
+            # Fail closed: a member CLI from the closing round still holds
+            # its wake claim, so a new dispatch could run on top of it.
+            raise ValueError(
+                "members still running a turn: " + ", ".join(busy)
+                + "; open the next round after they exit"
+            )
+        if by != state["organizer"]:
+            if by not in state["members"]:
+                raise PermissionError("only the organizer or a member can open a round")
+            decision = state["decisions"].get(NEXT_ROUND_DECISION)
+            if not isinstance(decision, dict) or decision.get("round", 1) != current:
+                raise PermissionError(
+                    "a member may open a round only after the room recorded "
+                    f"decision '{NEXT_ROUND_DECISION}' in this round"
+                )
+        now = int(time.time())
+        state["round_history"] = [*history, {
+            "round": current,
+            "dispatched": state["dispatched"],
+            "done": state["done"],
+            "final": state["final"],
+            "next_round_opened_by": by,
+            "next_round_reason": reason,
+            "next_round_opened_at": now,
+        }]
+        state.update({
+            "round": current + 1, "dispatched": {}, "done": {}, "final": None,
+            "phase": "working", "round_started_at": now,
+        })
         return meta
 
     state = bus._update_meta_locked(room_id, update)["swarm_pilot"]

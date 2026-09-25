@@ -57,7 +57,8 @@ ambiguous references are rejected. These values identify a room slot; they
 do not authenticate the native CLI process.
 
 Use `swarm_pilot_status` for responsibilities, tasks, facts, decisions, and the
-final result. The pilot records one deliberate round. Other participants can
+final result of the current round; `round_history` holds earlier rounds.
+Every round ends with its own final (see Later rounds). Other participants can
 communicate with the existing `message_post` and `messages_read` tools. This
 does not stream new user input into a busy model process; a request received
 mid-turn is queued for a later wake. The member's asserted name is not yet
@@ -84,6 +85,35 @@ approval, model and effort arguments stay as enforced. Without `mcp_url` the
 Codex command is unchanged. The URL's digest is part of `spec_fingerprint`,
 so changing it in a pinned room is spec drift. Resumed turns of the default
 `Codex` profile (`codex exec resume`) do not yet read this field.
+
+## Later rounds
+
+A round ends with its final. A room stays completed until someone opens the
+next round with `swarm_pilot_open_round(room_id, by, reason, from_round)`;
+Huddle never opens one by itself.
+
+- `by` is the organizer, or a member (name or `member_id`). A member may open
+  it only if someone recorded `swarm_pilot_record(..., kind="decision",
+  key="next_round", ...)` during the round being closed. Member prompts
+  mention this decision.
+- `from_round` must equal the current round and that round must have its
+  final. Repeating the same successful call returns the state unchanged; any
+  other retry is refused, so a round cannot be skipped or opened twice.
+- At most 8 rounds per room (`swarm_pilot.MAX_ROUNDS`).
+- The round's `dispatched`, `done` and `final` move to `round_history` with who
+  opened the next round and why. Responsibilities (including `reporter`),
+  tasks, decisions, facts, transfers and all messages stay. A system divider
+  message marks the new round.
+- The new round is dispatched like the first: council and relay one member at
+  a time, team and swarm all at once. Council again ends with the organizer's
+  final; other modes send the final request to the current reporter.
+  Requests from earlier rounds no longer count as pending work.
+- Opening is refused while any member still holds a wake claim (its CLI turn
+  from the closing round has not exited); retry after it ends.
+- Round 1 keeps the final message key `swarm-pilot:<room>:final`. Later round
+  finals and dividers use a separate namespace,
+  `swarm-pilot-round:<room>:<round>:final` and `...:open`, so no member name
+  can collide with them.
 
 ## Bounded replacement after a failed turn
 

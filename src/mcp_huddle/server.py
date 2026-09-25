@@ -1379,6 +1379,12 @@ def _swarm_pilot_request(room_id: str, member: str) -> str:
         "message_post(kind='result', reply_to=<this request id>), then call "
         "swarm_pilot_round_done(room_id, member, summary). "
         "A message alone does not complete the round." + final_instruction
+        + (f" Round {state['round']} continues earlier rounds: their results, "
+           "responsibilities and decisions are in the room history and "
+           "swarm_pilot_status; build on them." if state["round"] > 1 else "")
+        + (f" If the group agrees another round is needed, record "
+           f"kind='decision', key='{swarm_pilot.NEXT_ROUND_DECISION}' before "
+           "round_done; a round never opens by itself.")
         + room_workspace.brief_note(bus.get_room_info(room_id), member)
     )
 
@@ -1510,6 +1516,19 @@ def _swarm_final_request_key(room_id: str, state: dict) -> str:
     return key
 
 
+def _swarm_final_key(room_id: str, state: dict) -> str:
+    """Key of the round's published final; round 1 keeps its original key.
+
+    Later rounds use a separate ``swarm-pilot-round:`` namespace so no member
+    name can collide with a per-member ``swarm-pilot:<room>:<round>:<member>``
+    dispatch key.
+    """
+    round_no = state.get("round", 1)
+    if round_no == 1:
+        return f"swarm-pilot:{room_id}:final"
+    return f"swarm-pilot-round:{room_id}:{round_no}:final"
+
+
 def _swarm_advance(room_id: str) -> dict:
     """Publish missing pilot requests after a tool turn or server restart.
 
@@ -1601,7 +1620,8 @@ def _recover_swarm_pilots() -> list[dict]:
                 continue
             if (state.get("phase") != "working"
                     or not (state.get("start_requested") is True
-                            or state.get("dispatched") or state.get("done"))):
+                            or state.get("dispatched") or state.get("done")
+                            or state.get("round", 1) > 1)):
                 continue
             advanced = _swarm_advance(room_id)
             dispatched = [item for item in advanced["next_dispatch"]
@@ -1664,7 +1684,7 @@ def _post_swarm_final_if_missing(room_id: str, state: dict) -> int | None:
                     and msg.get("to") == member), None)
     if request is None:
         raise ValueError("final request has not been delivered to this member")
-    final_key = f"swarm-pilot:{room_id}:final"
+    final_key = _swarm_final_key(room_id, state)
     existing = next((msg for msg in messages
                      if msg.get("idempotency_key") == final_key), None)
     if existing is not None:
@@ -2052,6 +2072,41 @@ def swarm_pilot_finish(room_id: str, member: str, result: str) -> dict:
 
 
 @mcp.tool()
+def swarm_pilot_open_round(
+    room_id: str, by: str, reason: str, from_round: int,
+) -> dict:
+    """Deliberately open the next pilot round after the current round's final.
+
+    ``by`` is the organizer, or a member (name or member_id) once the room
+    recorded decision ``next_round`` in the round being closed. ``from_round``
+    must equal the current round, so a retry cannot skip a round. Earlier
+    per-round progress moves to ``round_history``; responsibilities, tasks,
+    decisions, facts and messages stay. The next round is dispatched by the
+    same path as the first. Council stays sequential with the organizer's
+    final word. Rounds never open automatically and are capped.
+    """
+    by = swarm_pilot.resolve_member(room_id, by, allow_organizer=True)
+    state = swarm_pilot.status(room_id)
+    if state.get("phase") == "completed" and state.get("final"):
+        # A crash between finish and its post must not lose the round final.
+        _post_swarm_final_if_missing(room_id, state)
+    updated = swarm_pilot.open_round(room_id, by, reason, from_round)
+    round_no = updated["round"]
+    try:
+        _post_message_checked(
+            room_id, "System",
+            f"━━━ Swarm round {round_no} opened by {by}: {reason} ━━━",
+            kind="system",
+            idempotency_key=f"swarm-pilot-round:{room_id}:{round_no}:open",
+        )
+    except Exception as exc:
+        print(f"[huddle] swarm round notice failed ({room_id}): {exc}", flush=True)
+    advanced = _swarm_advance(room_id)
+    return {"state": swarm_pilot.status(room_id), "round": round_no,
+            "next_dispatch": advanced["next_dispatch"]}
+
+
+@mcp.tool()
 def room_list() -> list:
     """List all rooms (open and closed)."""
     return bus.list_rooms()
@@ -2345,8 +2400,15 @@ def _swarm_pilot_request_superseded(
     """Whether durable pilot state has replaced this request's work."""
     if not isinstance(pilot, dict) or message.get("kind") != "request":
         return False
-    prefix = f"swarm-pilot:{room_id}:{pilot.get('round', 1)}:"
     key = message.get("idempotency_key")
+    room_prefix = f"swarm-pilot:{room_id}:"
+    if isinstance(key, str) and key.startswith(room_prefix):
+        # An earlier round only opens after its final, so its pilot requests
+        # are settled history, not work for the current round.
+        round_part = key[len(room_prefix):].split(":", 1)[0]
+        if round_part.isdigit() and int(round_part) < pilot.get("round", 1):
+            return True
+    prefix = f"swarm-pilot:{room_id}:{pilot.get('round', 1)}:"
     if not isinstance(key, str) or not key.startswith(prefix):
         return False
     suffix = key[len(prefix):]
@@ -2358,7 +2420,7 @@ def _swarm_pilot_request_superseded(
     if suffix.startswith("final-request") and pilot.get("phase") == "completed":
         final_member = (pilot.get("final") or {}).get("member")
         return any(
-            msg.get("idempotency_key") == f"swarm-pilot:{room_id}:final"
+            msg.get("idempotency_key") == _swarm_final_key(room_id, pilot)
             and msg.get("agent") == final_member and msg.get("kind") == "final"
             for msg in (messages or [])
         )
