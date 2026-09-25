@@ -53,6 +53,7 @@ from __future__ import annotations
 import _thread
 import hashlib
 import json
+import secrets
 import os
 import re
 import shutil
@@ -991,12 +992,13 @@ def _resolve_spawn_args(
     brief: str,
     log_dir: Path,
     log_name: str | None = None,
+    member_header: bool = False,
 ) -> tuple[list[str], str | None]:
     name = bus._safe_path_component(log_name or spec["name"], "agent_name")
     last_msg_path: str | None = None
 
     template = _apply_model_effort_variant(spec, list(spec.get("cmd") or []))
-    template = _apply_codex_mcp_route(spec, template)
+    template = _apply_codex_mcp_route(spec, template, member_header)
 
     argv = []
     for arg in template:
@@ -1024,7 +1026,46 @@ def _codex_loopback_mcp_url(raw_url: object) -> str:
     return f"{parsed.scheme}://{host}:{parsed.port}/mcp"
 
 
-def _apply_codex_mcp_route(spec: SpawnSpec, template: list[str]) -> list[str]:
+# Per-wake member identity for Codex Swarm members on an HTTP Huddle route.
+# The raw secret lives only in the child's environment; Codex reads it into
+# this header via ``env_http_headers``. It is never placed in argv or logs and
+# is separate from the global MCP_HUDDLE_TOKEN guard.
+MEMBER_TOKEN_ENV = "HUDDLE_MEMBER_TOKEN"
+MEMBER_TOKEN_HEADER = "X-Huddle-Member"
+
+
+def new_member_token() -> tuple[str, str]:
+    """Return a fresh (secret, sha256 hex digest); store only the digest."""
+    secret = secrets.token_urlsafe(32)
+    return secret, member_token_digest(secret)
+
+
+def member_token_digest(secret: str) -> str:
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+
+def member_identity_supported(spec: SpawnSpec) -> bool:
+    """Only a Codex profile with an explicit loopback HTTP ``mcp_url`` qualifies.
+
+    Without ``mcp_url`` the child's ``huddle`` server may be stdio, which has no
+    HTTP headers; such launches keep the legacy unauthenticated behavior.
+    """
+    return "mcp_url" in spec and _effective_binary(list(spec.get("cmd") or [])) == "codex"
+
+
+def _codex_huddle_server_config(url: str, member_header: bool) -> str:
+    """One inline ``mcp_servers`` override for the pinned Huddle endpoint."""
+    table = ("{huddle={url=" + json.dumps(url)
+             + ',default_tools_approval_mode="approve"')
+    if member_header:
+        table += (',env_http_headers={' + json.dumps(MEMBER_TOKEN_HEADER)
+                  + "=" + json.dumps(MEMBER_TOKEN_ENV) + "}")
+    return "mcp_servers=" + table + "}}"
+
+
+def _apply_codex_mcp_route(
+    spec: SpawnSpec, template: list[str], member_header: bool = False,
+) -> list[str]:
     """Pin a Codex child's ``huddle`` MCP URL to the profile's ``mcp_url``.
 
     Opt-in: without ``mcp_url`` the argv is unchanged. With it, one ``-c``
@@ -1039,11 +1080,7 @@ def _apply_codex_mcp_route(spec: SpawnSpec, template: list[str]) -> list[str]:
     if "mcp_url" not in spec or _effective_binary(template) != "codex":
         return template
     url = _codex_loopback_mcp_url(spec.get("mcp_url"))
-    route = [
-        "-c",
-        "mcp_servers={huddle={url=" + json.dumps(url)
-        + ',default_tools_approval_mode="approve"}}',
-    ]
+    route = ["-c", _codex_huddle_server_config(url, member_header)]
     # Keep the prompt positional last, like the read-only transform does.
     for index in range(len(template) - 1, -1, -1):
         if "{brief}" in template[index]:
@@ -2218,8 +2255,13 @@ def spawn_agent(
     on_log_open: Callable[[int, str], None] | None = None,
     on_log_open_identity: Callable[[int, str, int, int], None] | None = None,
     log_name: str | None = None,
+    member_token: str | None = None,
 ) -> tuple[int, str, str | None]:
     """Spawn one agent.
+
+    member_token: optional per-wake secret. Used only when
+    :func:`member_identity_supported`; it is put in the child environment and
+    sent by Codex as ``X-Huddle-Member``. Otherwise it is ignored.
 
     Returns (pid, log_path, last_message_path).
     last_message_path is None for agents whose argv doesn't reference {last_message}.
@@ -2271,8 +2313,14 @@ def spawn_agent(
                 shutil.rmtree(cleanup_dir, ignore_errors=True)
                 raise
     else:
-        argv, last_msg_path = _resolve_spawn_args(spec, brief, log_dir, name)
+        member_header = bool(member_token) and member_identity_supported(spec)
+        argv, last_msg_path = _resolve_spawn_args(
+            spec, brief, log_dir, name, member_header=member_header,
+        )
         env = _spawn_environment(spec, argv)
+        env.pop(MEMBER_TOKEN_ENV, None)  # never inherit a stale parent value
+        if member_header:
+            env[MEMBER_TOKEN_ENV] = member_token
     # A batch stagger cannot cover separate rooms, separate Huddle processes,
     # or wake-path launches. Serialize the complete lifetime of every
     # OpenCode CLI child on the shared Huddle home instead.
@@ -3084,7 +3132,8 @@ def codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str,
                  process_handle: str | None = None,
                  model_settings: dict[str, str] | None = None,
                  workspace_write_roots: list[str] | None = None,
-                 mcp_url: str | None = None) -> int:
+                 mcp_url: str | None = None,
+                 member_token: str | None = None) -> int:
     """Resume a Codex thread with a new prompt. Cheaper than fresh spawn —
     Codex remembers prior conversation via its rollout file.
 
@@ -3134,12 +3183,11 @@ def codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str,
         argv.extend(["-c", f'model_reasoning_effort="{effort}"'])
 
     argv.extend(sandbox_args)                            # resume has no -s flag; pin via -c
+    # A member token needs the pinned HTTP route; without it the token is unused.
+    member_header = bool(member_token) and mcp_url is not None
     if mcp_url is not None:
         url = _codex_loopback_mcp_url(mcp_url)
-        argv.extend([
-            "-c", "mcp_servers={huddle={url=" + json.dumps(url)
-            + ',default_tools_approval_mode="approve"}}',
-        ])
+        argv.extend(["-c", _codex_huddle_server_config(url, member_header)])
     if last_msg_path:
         argv += ["-o", last_msg_path]                    # short form of --output-last-message
     argv.append(prompt)
@@ -3168,6 +3216,10 @@ def codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str,
         log_file = os.fdopen(log_fd, "ab", buffering=0)
     else:
         log_file = _open_standalone_log(Path(log_path), create_parent=False)
+    resume_env = build_sanitized_environment()
+    resume_env.pop(MEMBER_TOKEN_ENV, None)
+    if member_header:
+        resume_env[MEMBER_TOKEN_ENV] = member_token
     try:
         proc = subprocess.Popen(
             argv,
@@ -3175,7 +3227,7 @@ def codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str,
             stdin=subprocess.DEVNULL,
             stdout=log_file,
             stderr=subprocess.STDOUT,
-            env=build_sanitized_environment(),
+            env=resume_env,
         )
     except BaseException:
         _close_parent_log_safely(log_file)

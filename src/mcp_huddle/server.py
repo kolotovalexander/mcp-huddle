@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, StreamingResponse
 
@@ -1319,6 +1319,100 @@ def swarm_pilot_create(
     }
 
 
+# ── Swarm member identity (Codex over HTTP MCP only) ─────────────────────────
+# Each wake of a Codex member with a pinned loopback ``mcp_url`` gets a fresh
+# 32-byte secret in its environment; Codex sends it as X-Huddle-Member. Only
+# its SHA-256 is stored, bound to the exact wake claim. The global
+# MCP_HUDDLE_TOKEN guard is unchanged and still decides HTTP access.
+
+
+def _issue_member_token(room_id: str, agent_name: str, wake_id: str) -> str | None:
+    """Mint a secret for this member's claimed wake; None when not applicable."""
+    secret, digest = spawn.new_member_token()
+    issued = False
+
+    def _update(meta: dict) -> dict:
+        nonlocal issued
+        pilot = meta.get("swarm_pilot")
+        info = (meta.get("agent_meta") or {}).get(agent_name)
+        if (not isinstance(pilot, dict) or agent_name not in pilot.get("members", [])
+                or not isinstance(info, dict) or info.get("wake_claim_id") != wake_id):
+            return meta
+        info["member_token_sha256"] = digest
+        info["member_token_wake_id"] = wake_id
+        issued = True
+        return meta
+
+    bus._update_meta_locked(room_id, _update)
+    return secret if issued else None
+
+
+def _request_member_secret(ctx: Context | None) -> str:
+    """Return the X-Huddle-Member header of the current HTTP MCP call, or ''."""
+    try:
+        request = ctx.request_context.request if ctx is not None else None
+    except (AttributeError, LookupError, ValueError):
+        return ""
+    headers = getattr(request, "headers", None)
+    if headers is None:
+        return ""  # stdio or another transport without HTTP headers
+    value = headers.get(spawn.MEMBER_TOKEN_HEADER, "")
+    return value if isinstance(value, str) and 0 < len(value) <= 256 else ""
+
+
+def _verified_member(ctx: Context | None, room_id: str,
+                     member: str | None = None) -> dict | None:
+    """Principal for future privileged tools, or None.
+
+    Valid only while the member's current ``wake_claim_id`` is the wake the
+    secret was minted for. ``member`` (name or member_id), when given, must
+    match the verified caller.
+    """
+    secret = _request_member_secret(ctx)
+    if not secret:
+        return None
+    digest = spawn.member_token_digest(secret)
+    try:
+        meta = bus.get_room_info(room_id)
+    except ValueError:
+        return None
+    pilot = meta.get("swarm_pilot")
+    if meta.get("status") not in ("open", "idle") or not isinstance(pilot, dict):
+        return None
+    member_ids = swarm_pilot.status(room_id)["member_ids"]
+    agent_meta = meta.get("agent_meta") or {}
+    found = None
+    for name in pilot.get("members", []):
+        info = agent_meta.get(name) or {}
+        stored = info.get("member_token_sha256")
+        claim = info.get("wake_claim_id")
+        # Compare every member so timing does not reveal which slot matched.
+        matched = isinstance(stored, str) and _constant_equal(stored, digest)
+        if (matched and claim and info.get("member_token_wake_id") == claim
+                and found is None):
+            found = {"room_id": room_id, "member": name,
+                     "member_id": member_ids[name], "wake_id": claim}
+    if found is None:
+        return None
+    if member is not None and member not in (found["member"], found["member_id"]):
+        return None
+    return found
+
+
+@mcp.tool()
+def swarm_whoami(room_id: str, ctx: Context) -> dict:
+    """Return the caller's own verified pilot identity, or a refusal.
+
+    Side-effect free. Verified only for a Codex member launched by Huddle over
+    HTTP MCP with a pinned ``mcp_url`` while its turn holds the wake claim.
+    Other callers, including stdio clients, get ``verified: false``.
+    """
+    principal = _verified_member(ctx, room_id)
+    if principal is None:
+        return {"verified": False, "room_id": room_id}
+    return {"verified": True, **principal}
+
+
 @mcp.tool()
 def swarm_pilot_status(room_id: str) -> dict:
     """Read pilot state and the current per-member runtime snapshot.
@@ -2327,6 +2421,9 @@ def respond_via_agent(
             )
             if "mcp_url" in info:
                 resume_kwargs["mcp_url"] = info["mcp_url"]
+                member_token = _issue_member_token(room_id, agent_name, wake_id)
+                if member_token:
+                    resume_kwargs["member_token"] = member_token
             cwd, write_roots = room_workspace.resume(meta, agent_name)
             if write_roots is not None:
                 resume_kwargs["workspace_write_roots"] = write_roots
@@ -4262,7 +4359,10 @@ def _clear_wake_claim(
         info = (meta.get("agent_meta") or {}).get(agent_name)
         if not isinstance(info, dict) or info.get("wake_claim_id") != wake_id:
             return meta
-        for field in ("wake_claim_id", "wake_claim_msg_id", "wake_claimed_at"):
+        for field in (
+            "wake_claim_id", "wake_claim_msg_id", "wake_claimed_at",
+            "member_token_sha256", "member_token_wake_id",
+        ):
             info.pop(field, None)
         if rollback and info.get("wake_id") == wake_id:
             info.pop("wake_id", None)
@@ -4961,6 +5061,9 @@ def _wake_agents_for_request(
                     )
                     if "mcp_url" in info:
                         resume_kwargs["mcp_url"] = info["mcp_url"]
+                        member_token = _issue_member_token(room_id, agent_name, wake_id)
+                        if member_token:
+                            resume_kwargs["member_token"] = member_token
                     resume_cwd, write_roots = room_workspace.resume(
                         bus.get_room_info(room_id), agent_name,
                     )
@@ -5332,6 +5435,10 @@ def _spawn_fresh_room_agent(
     session_id = meta.get("session_id", "")
     _set_agent_phase(room_id, agent_name, "starting", task_id=msg_id or "")
     identity = {"log_name": agent_name} if spec.get("name") != agent_name else {}
+    if spawn.member_identity_supported(launch_spec):
+        member_token = _issue_member_token(room_id, agent_name, wake_id)
+        if member_token:
+            identity["member_token"] = member_token
     try:
         pid, log_path, last_msg_path = spawn.spawn_agent(
             launch_spec,
