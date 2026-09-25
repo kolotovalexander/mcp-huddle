@@ -1467,12 +1467,13 @@ def _swarm_child_policy(child_agents: dict | None) -> dict | None:
 
 def _swarm_reserve_child(
     room_id: str, parent: str, parent_wake: str, parent_digest: str,
-    profile: str, child_wake: str,
+    profile: str, child_wake: str, *, same_room: bool = True,
 ) -> str:
     """Under one meta lock: re-check the parent's claim, the policy, reserve a slot.
 
-    Returns the child name. The reservation is also the child's wake claim, so
-    no ordinary wake can launch it concurrently.
+    Returns the child name. In ``same_room`` mode the reservation is also the
+    child's wake claim in this room, so no ordinary wake can launch it
+    concurrently. A ``child_room`` child gets its claim in its own room.
     """
     reserved: dict[str, str] = {}
 
@@ -1515,14 +1516,16 @@ def _swarm_reserve_child(
         children[name] = {
             "parent": parent, "parent_wake_id": parent_wake, "profile": profile,
             "wake_id": child_wake, "status": "reserved", "created_at": now,
+            "invite": "same_room" if same_room else "child_room",
         }
-        agent_meta[name] = {
-            "wake_claim_id": child_wake, "wake_claimed_at": now,
-            "wake_id": child_wake, "last_wake_pid": None,
-            "swarm_child_of": parent,
-        }
-        if name not in meta.setdefault("participants", []):
-            meta["participants"].append(name)
+        if same_room:
+            agent_meta[name] = {
+                "wake_claim_id": child_wake, "wake_claimed_at": now,
+                "wake_id": child_wake, "last_wake_pid": None,
+                "swarm_child_of": parent,
+            }
+            if name not in meta.setdefault("participants", []):
+                meta["participants"].append(name)
         reserved["name"] = name
         return meta
 
@@ -1552,16 +1555,27 @@ def _swarm_child_status(room_id: str, name: str) -> str | None:
     return child.get("status") if isinstance(child, dict) else None
 
 
-def _swarm_child_mark_running(room_id: str, name: str, child_wake: str) -> str | None:
-    """reserved -> running only while this exact wake still holds the claim."""
+def _swarm_child_mark_running(room_id: str, name: str, child_wake: str,
+                              claim_room: str | None = None) -> str | None:
+    """reserved -> running only while this exact wake still holds the claim.
+
+    With ``claim_room`` the claim is read from the child's own room first (two
+    rooms are never locked together). A child that exited in between is
+    already terminal, and the CAS below never regresses it.
+    """
     result: dict[str, str] = {}
+    if claim_room is not None:
+        claim_info = (bus.get_room_info(claim_room).get("agent_meta") or {}).get(name) or {}
+        if claim_info.get("wake_claim_id") != child_wake:
+            return None
 
     def _update(meta: dict) -> dict:
         child = ((meta.get("swarm_pilot") or {}).get("children") or {}).get(name)
         info = (meta.get("agent_meta") or {}).get(name) or {}
+        claim_ok = (claim_room is not None
+                    or info.get("wake_claim_id") == child_wake)
         if (isinstance(child, dict) and child.get("wake_id") == child_wake
-                and child.get("status") == "reserved"
-                and info.get("wake_claim_id") == child_wake):
+                and child.get("status") == "reserved" and claim_ok):
             child["status"] = "running"
             result["status"] = "running"
         return meta
@@ -1599,26 +1613,187 @@ def _make_child_done_callback(room_id: str, name: str, child_wake: str):
 
 def _swarm_set_child_field(room_id: str, name: str, child_wake: str,
                            key: str, value) -> None:
+    _swarm_set_child_fields(room_id, name, child_wake, {key: value})
+
+
+def _swarm_set_child_fields(room_id: str, name: str, child_wake: str,
+                            fields: dict) -> None:
     def _update(meta: dict) -> dict:
         child = ((meta.get("swarm_pilot") or {}).get("children") or {}).get(name)
         if isinstance(child, dict) and child.get("wake_id") == child_wake:
-            child[key] = value
+            child.update(fields)
         return meta
     bus._update_meta_locked(room_id, _update)
 
 
+_SWARM_CHILD_RECENT = 10
+_SWARM_CHILD_RELAY_CHARS = 2000
+_SWARM_CHILD_ROOM_NOTE = (
+    "Context selection only, not confidentiality or isolation: a read-only "
+    "Codex/Claude child can still read local files and reach other MCP "
+    "servers, including this Huddle."
+)
+
+
+def _swarm_child_room_result(child_room: str, name: str, request_id) -> tuple[int, str] | None:
+    """The child's own ``result`` reply to its request, validated for relay."""
+    for msg in reversed(bus._load_messages(child_room)):
+        if (msg.get("agent") == name and msg.get("kind") == "result"
+                and msg.get("reply_to") == request_id):
+            body = msg.get("body")
+            if isinstance(body, str) and body.strip():
+                return int(msg["id"]), body.strip()
+    return None
+
+
+def _swarm_deliver_child_room(room_id: str, child_room: str, name: str,
+                              child_wake: str, returncode) -> None:
+    """After a child_room child exits: record and optionally relay its result.
+
+    The exit callback closes the child's room independently of parent state.
+    """
+    child = ((bus.get_room_info(room_id).get("swarm_pilot") or {})
+             .get("children") or {}).get(name) or {}
+    if child.get("wake_id") != child_wake:
+        return
+    if child.get("delivery") and (
+        child.get("relay") != "result" or child.get("relay_status") == "sent"
+    ):
+        return
+    found = _swarm_child_room_result(child_room, name, child.get("request_id"))
+    fields = {"delivery": "result" if found else "no_result"}
+    if found:
+        fields["result_message_id"], text = found[0], found[1]
+        fields["result_chars"] = len(text)
+    if child.get("relay") == "result" and child.get("relay_status") != "sent":
+        if found:
+            clipped = text if len(text) <= _SWARM_CHILD_RELAY_CHARS else (
+                text[:_SWARM_CHILD_RELAY_CHARS] + " […truncated]")
+            body = f"Result from child {name} (room {child_room}):\n{clipped}"
+        else:
+            body = (f"Child {name} ended without a result (exit {returncode}); "
+                    f"see room {child_room}.")
+        try:
+            fields["relay_message_id"] = _post_message_checked(
+                room_id, "System", body, "comment", to=child.get("parent"),
+                idempotency_key=f"swarm-child-relay:{room_id}:{name}:{child_wake}",
+            )
+            fields["relay_status"] = "sent"
+            fields["relay_error"] = ""
+        except Exception as exc:
+            fields["delivery"] = "relay_failed"
+            fields["relay_status"] = "failed"
+            fields["relay_error"] = type(exc).__name__
+    _swarm_set_child_fields(room_id, name, child_wake, fields)
+
+
+def _swarm_close_child_room(room_id: str, child_room: str, name: str,
+                            child_wake: str) -> None:
+    """Close the child's room even if its parent was closed or deleted."""
+    try:
+        if bus.get_room_info(child_room).get("status") != "closed":
+            bus.close_room(child_room, "System")
+    except Exception as exc:
+        print(f"[huddle] child room close failed ({child_room}): "
+              f"{type(exc).__name__}", flush=True)
+        return
+    try:
+        _swarm_set_child_field(room_id, name, child_wake, "child_room_closed", True)
+    except Exception:
+        # Parent deletion must never keep a finished child room open.
+        pass
+
+
+def _make_child_room_done_callback(room_id: str, child_room: str, name: str,
+                                   child_wake: str):
+    """Exit handling in the child's room, then delivery into the parent room."""
+    def _callback(returncode) -> None:
+        with _wake_lock(child_room, name):
+            try:
+                _on_wake_exit(child_room, name, child_wake, returncode)
+                try:
+                    # Keep the parent waiting until delivery was attempted.
+                    _swarm_deliver_child_room(room_id, child_room, name, child_wake, returncode)
+                finally:
+                    _swarm_child_mark_exited(room_id, name, child_wake, returncode)
+            except Exception as exc:  # never let a callback kill the reaper thread
+                print(f"[huddle] child room exit callback error ({name}@{child_room}): "
+                      f"{type(exc).__name__}", flush=True)
+            finally:
+                _swarm_close_child_room(room_id, child_room, name, child_wake)
+    return _callback
+
+
+def _swarm_open_child_room(room_id: str, parent: str, name: str, child_wake: str,
+                           history: str) -> str:
+    """Create the child's own room with its one-shot claim and chosen context."""
+    parent_meta = bus.get_room_info(room_id)
+    child_room = bus.create_room(
+        f"{parent_meta.get('name', room_id)} / {name}", "System", 0,
+        parent_meta.get("cwd", "") or "",
+    )
+    try:
+        bus.invite_agent(child_room, name)
+
+        def _claim(meta: dict) -> dict:
+            meta.setdefault("agent_meta", {})[name] = {
+                "wake_claim_id": child_wake, "wake_claimed_at": int(time.time()),
+                "wake_id": child_wake, "last_wake_pid": None,
+                "swarm_child_of": parent, "swarm_child_parent_room": room_id,
+            }
+            return meta
+        bus._update_meta_locked(child_room, _claim)
+        if history == "recent":
+            # read_messages retains the newest `limit` messages, in order.
+            excerpt = bus.read_messages(room_id, since_id=0, limit=_SWARM_CHILD_RECENT,
+                                        max_chars=1000)
+            _post_message_checked(
+                child_room, "System",
+                f"Recent context from room {room_id} (last {_SWARM_CHILD_RECENT} "
+                f"messages, selected by Huddle):\n{excerpt}",
+                "comment", idempotency_key=f"swarm-child-context:{child_room}",
+            )
+    except Exception:
+        with contextlib.suppress(Exception):
+            bus.close_room(child_room, "System")
+        raise
+    return child_room
+
+
 @mcp.tool()
-def swarm_spawn_child(room_id: str, profile: str, task: str, ctx: Context) -> dict:
+def swarm_spawn_child(room_id: str, profile: str, task: str, ctx: Context,
+                      invite: str = "same_room", history: str = "none",
+                      relay: str = "result") -> dict:
     """Start one read-only child agent for the calling pilot member.
 
     The parent is the verified caller (``swarm_whoami``), never a supplied
     name. Allowed only when the room enabled ``child_agents`` and within its
-    limit and exact profile list. The child joins this room, sees the full
-    history, answers the addressed request once and ends. It never gets more
-    rights than read-only, and it cannot start children itself.
+    limit and exact profile list. It never gets more rights than read-only,
+    answers once and ends, and cannot start children itself.
+
+    ``invite="same_room"`` (default): the child joins this room and sees the
+    full history; ``history``/``relay`` do not apply.
+    ``invite="child_room"``: Huddle creates a separate room; the child is not
+    invited here. ``history="none"`` gives it only the task,
+    ``history="recent"`` also the last 10 messages of this room.
+    ``relay="result"`` posts its result (or a no-result notice) as a short
+    comment to the parent here; ``relay="none"`` only records it. The child
+    room closes when its process exits. Closing the parent does not stop an
+    already started child; it finishes independently. If its parent is gone,
+    relay cannot be delivered, but the child room still closes. A relay
+    failure is recorded as ``delivery="relay_failed"`` without automatic
+    retry. This is context selection only, NOT
+    confidentiality or isolation: the child can still read local files and
+    reach other MCP servers, including this Huddle.
     """
     if not isinstance(task, str) or not task.strip() or len(task) > 4000:
         raise ValueError("task must be 1-4000 characters")
+    if invite not in ("same_room", "child_room"):
+        raise ValueError('invite must be "same_room" or "child_room"')
+    if history not in ("none", "recent") or relay not in ("result", "none"):
+        raise ValueError('history must be "none"/"recent" and relay "result"/"none"')
+    if invite == "same_room" and (history != "none" or relay != "result"):
+        raise ValueError("history and relay apply only to invite=\"child_room\"")
     principal = _verified_member(ctx, room_id)
     if principal is None:
         raise PermissionError("caller is not a verified swarm member")
@@ -1631,7 +1806,12 @@ def swarm_spawn_child(room_id: str, profile: str, task: str, ctx: Context) -> di
     child_wake = uuid.uuid4().hex[:12]
     child = _swarm_reserve_child(
         room_id, parent, principal["wake_id"], parent_digest, profile, child_wake,
+        same_room=(invite == "same_room"),
     )
+    if invite == "child_room":
+        return _swarm_spawn_child_room(
+            room_id, parent, child, child_wake, profile, spec, task, history, relay,
+        )
     try:
         bus.invite_agent(room_id, child)
         request_id = _post_message_checked(
@@ -1673,6 +1853,63 @@ def swarm_spawn_child(room_id: str, profile: str, task: str, ctx: Context) -> di
     status = status or _swarm_child_status(room_id, child)
     return {"child": child, "parent": parent, "profile": profile,
             "request_id": request_id, "status": status}
+
+
+def _swarm_spawn_child_room(room_id: str, parent: str, child: str, child_wake: str,
+                            profile: str, spec: dict, task: str, history: str,
+                            relay: str) -> dict:
+    """Launch a reserved child in its own room (see ``swarm_spawn_child``)."""
+    for key, value in (("invite", "child_room"), ("history", history), ("relay", relay)):
+        _swarm_set_child_field(room_id, child, child_wake, key, value)
+    child_room = None
+    try:
+        child_room = _swarm_open_child_room(room_id, parent, child, child_wake, history)
+        _swarm_set_child_field(room_id, child, child_wake, "child_room", child_room)
+        request_id = _post_message_checked(
+            child_room, parent, task, "request", to=child,
+            idempotency_key=f"swarm-child:{child_room}:{child}:{child_wake}",
+        )
+        _merge_agent_meta_if_claim(child_room, child, child_wake, {
+            "last_wake_msg_id": request_id, "last_seen_id": request_id,
+        })
+        _swarm_set_child_field(room_id, child, child_wake, "request_id", request_id)
+        note = (
+            f"\n\n[Huddle] You are {child}, a read-only helper started by "
+            f"{parent} in its own room. Answer this one request here, then end "
+            f"your turn. You cannot start other agents. {_SWARM_CHILD_ROOM_NOTE}"
+        )
+        prompt = _build_registry_agent_wakeup_prompt(
+            child_room, child, parent, task + note, child, request_id, 0,
+            bus.read_messages(child_room, since_id=0, limit=50),
+        )
+        _set_agent_phase(child_room, child, "starting", task_id=request_id)
+        pid, log_path, last_msg_path = spawn.spawn_agent(
+            spawn._apply_readonly(spec), prompt,
+            bus.get_room_info(room_id).get("cwd", "") or "",
+            bus._room_dir(child_room) / "agents",
+            on_exit=_make_child_room_done_callback(room_id, child_room, child, child_wake),
+            owner_room_id=child_room, process_handle=child_wake, log_name=child,
+        )
+    except Exception as exc:
+        # Release only this reservation; the failed child room is closed.
+        _swarm_set_child_status(room_id, child, child_wake, "failed", str(exc))
+        if child_room is not None:
+            _clear_wake_claim(child_room, child, child_wake, rollback=True)
+            _set_agent_phase(child_room, child, "unavailable", detail=str(exc)[:300])
+            with contextlib.suppress(Exception):
+                bus.close_room(child_room, "System")
+        raise ValueError(f"child agent launch failed: {exc}") from None
+    published = _publish_wake_started(child_room, child, child_wake, {
+        "log_path": log_path, "last_message_path": last_msg_path,
+        "last_wake_pid": pid, "last_wake_at": int(time.time()),
+    }, task_id=request_id)
+    status = (_swarm_child_mark_running(room_id, child, child_wake, claim_room=child_room)
+              if published else None)
+    status = status or _swarm_child_status(room_id, child)
+    return {"child": child, "parent": parent, "profile": profile,
+            "invite": "child_room", "child_room": child_room, "history": history,
+            "relay": relay, "request_id": request_id, "status": status,
+            "note": _SWARM_CHILD_ROOM_NOTE}
 
 
 @mcp.tool()
@@ -2937,9 +3174,10 @@ def _pending_requests(
 def room_status(room_id: str) -> dict:
     """Return an actionable lifecycle snapshot for orchestrators.
 
-    ``wait_recommended`` is true while an agent is starting/working/responding
-    or while a request still has one or more expected replies. A live process
-    is never treated as completed merely because its output log is quiet.
+    ``wait_recommended`` is true while an agent is starting/working/responding,
+    a request still expects replies, or a separate child room has an active
+    reservation. A live process is never treated as completed merely because
+    its output log is quiet.
     """
     meta = bus.get_room_info(room_id)
     participants = list(meta.get("participants", []))
@@ -2984,13 +3222,25 @@ def room_status(room_id: str) -> dict:
         or (agent.get("health") or {}).get("claim_active")
         for agent in agents.values()
     )
-    waiting = bool(pending) or active
+    pilot = meta.get("swarm_pilot") or {}
+    children = pilot.get("children") if isinstance(pilot, dict) else None
+    if not isinstance(children, dict):
+        children = {}
+    pending_child_rooms = [
+        {"child": name, "room_id": child.get("child_room"),
+         "status": child.get("status")}
+        for name, child in children.items()
+        if isinstance(child, dict) and child.get("invite") == "child_room"
+        and child.get("status") in {"reserved", "running"}
+    ]
+    waiting = bool(pending) or active or bool(pending_child_rooms)
     return {
         "room_id": room_id,
         "room_status": meta.get("status", "unknown"),
         "participants": participants,
         "agents": agents,
         "pending_requests": pending,
+        "pending_child_rooms": pending_child_rooms,
         "wait_recommended": waiting,
         "all_terminal": not waiting,
     }
