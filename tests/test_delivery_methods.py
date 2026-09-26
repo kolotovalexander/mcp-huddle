@@ -371,3 +371,13 @@ def test_spool_writes_envelope_to_file(tmp_path, monkeypatch, cfg):
     written = list((tmp_path / "huddle" / "delivery" / "spool" / "agy").rglob("msg-123.md"))
     assert len(written) == 1
     assert written[0].read_text(encoding="utf-8") == ENVELOPE
+
+
+def test_value_flags_are_not_followed_by_double_dash():
+    """`-q`/`-p` consume the next token as their value; a "--" there would
+    become the prompt itself (regression for hermes.resume / agy.resume)."""
+    from mcp_huddle.delivery.config import DEFAULT_ARGV
+    for key in ("hermes.resume", "agy.resume"):
+        argv = DEFAULT_ARGV[key]
+        flag = "-q" if key == "hermes.resume" else "-p"
+        assert argv[argv.index(flag) + 1] == "{text}", key
