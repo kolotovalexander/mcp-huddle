@@ -9,6 +9,7 @@ raised.
 
 from __future__ import annotations
 
+import errno
 import json
 import shutil
 import socket
@@ -222,6 +223,20 @@ def hermes_resume(target: Target, envelope_text: str, cfg: delivery_config.Deliv
     return MethodResult(True, "hermes.resume", f"started (unverified template); log: {log_path}")
 
 
+def _is_connection_refused(exc: BaseException) -> bool:
+    """True only for a bare "nothing is listening on this address at all"
+    failure (``ECONNREFUSED``), possibly wrapped in a ``urllib.error.URLError``.
+    This is the one connection failure that proves there was never a live
+    opencode server on the configured URL to collide with -- every other
+    connection failure (reset mid-request, DNS, generic OSError) leaves open
+    the possibility that a live process was actually reached, so it stays
+    ambiguous."""
+    reason = getattr(exc, "reason", exc)
+    if isinstance(reason, ConnectionRefusedError):
+        return True
+    return isinstance(reason, OSError) and reason.errno == errno.ECONNREFUSED
+
+
 # ── OpenCode ─────────────────────────────────────────────────────────────────
 
 def opencode_native(target: Target, envelope_text: str, cfg: delivery_config.DeliveryConfig) -> MethodResult:
@@ -257,14 +272,25 @@ def opencode_native(target: Target, envelope_text: str, cfg: delivery_config.Del
         return MethodResult(False, "opencode.native", f"timed out (ambiguous -- delivery status unknown): {exc}",
                              ambiguous=True)
     except urllib.error.HTTPError as exc:
-        # The server actually answered with a definite error status -- it
-        # processed (and rejected) the request, so this is not ambiguous.
-        return MethodResult(False, "opencode.native", f"http error: {exc}")
+        # The server answered with an HTTP error status (401/403/409/429/
+        # 500/503/...). That proves *something* handled the connection, but
+        # it does NOT prove there's no live owner of the session, and a 5xx
+        # in particular says nothing about whether the request had a side
+        # effect. Codex review finding B: this used to be treated as a
+        # definite, non-ambiguous failure, which let `auto` mode fall
+        # through to `opencode.resume` on nothing more than an auth/server
+        # error. Ambiguous, must not auto-resume.
+        return MethodResult(False, "opencode.native", f"http error (ambiguous -- delivery status unknown): {exc}",
+                             ambiguous=True)
     except (urllib.error.URLError, ConnectionError, OSError) as exc:
         # Connection dropped/reset with no confirmed response (e.g. reset
-        # right after we sent the body) -- upstream bug #46842 means a busy
-        # session can silently drop the turn either way, so we can't tell if
-        # the prompt landed. Ambiguous, must not auto-resume.
+        # right after we sent the body), or a URLError wrapping some other
+        # OSError -- upstream bug #46842 means a busy session can silently
+        # drop the turn either way, so we can't tell if the prompt landed,
+        # UNLESS the underlying cause is specifically "connection refused"
+        # (nothing listening at all -- server not running, safe to resume).
+        if _is_connection_refused(exc):
+            return MethodResult(False, "opencode.native", f"connection refused (server not running): {exc}")
         return MethodResult(False, "opencode.native", f"connection error (ambiguous -- delivery status unknown): {exc}",
                              ambiguous=True)
     if 200 <= status < 300:

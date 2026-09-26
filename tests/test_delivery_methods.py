@@ -445,6 +445,47 @@ def test_opencode_native_connection_reset_is_ambiguous(monkeypatch, cfg):
     assert result.ambiguous is True
 
 
+def test_opencode_native_http_error_is_ambiguous(monkeypatch, cfg):
+    """Regression for Codex review finding B (second independent review):
+    a real urllib.error.HTTPError (401/500/503/...) must be ambiguous, not a
+    definite failure -- it doesn't prove there's no live session owner, and
+    a 5xx especially doesn't prove the request had no side effect. This used
+    to auto-authorize opencode.resume."""
+    import urllib.error
+
+    raw_cfg = delivery_config.DeliveryConfig({"opencode": {"server_url": "http://127.0.0.1:9999"}})
+    for status in (401, 500, 503):
+        def urlopen_for_status(req, timeout=None, _status=status):
+            if req.full_url.endswith("/session/status"):
+                raise OSError("no status endpoint")
+            raise urllib.error.HTTPError(req.full_url, _status, "err", {}, None)
+        monkeypatch.setattr(methods.urllib.request, "urlopen", urlopen_for_status)
+        target = Target(harness="opencode", id=f"sess-http-{status}")
+        result = methods.opencode_native(target, ENVELOPE, raw_cfg)
+        assert result.ok is False
+        assert result.ambiguous is True, f"status {status} must be ambiguous"
+
+
+def test_opencode_native_connection_refused_is_not_ambiguous(monkeypatch, cfg):
+    """The one connection failure that DOES prove there's no live server to
+    collide with: nothing is listening on server_url at all. Safe to fall
+    through to opencode.resume."""
+    import urllib.error
+
+    def fake_urlopen(req, timeout=None):
+        if req.full_url.endswith("/session/status"):
+            raise OSError("no status endpoint")
+        raise urllib.error.URLError(ConnectionRefusedError(61, "Connection refused"))
+
+    monkeypatch.setattr(methods.urllib.request, "urlopen", fake_urlopen)
+    raw_cfg = delivery_config.DeliveryConfig({"opencode": {"server_url": "http://127.0.0.1:9999"}})
+    target = Target(harness="opencode", id="sess-refused")
+    result = methods.opencode_native(target, ENVELOPE, raw_cfg)
+    assert result.ok is False
+    assert result.ambiguous is False
+    assert "refused" in result.detail
+
+
 def test_opencode_native_non_definitive_status_is_ambiguous(monkeypatch, cfg):
     # A non-2xx status that reaches here without urlopen raising HTTPError
     # (e.g. via a custom opener) is a non-definitive outcome per the review

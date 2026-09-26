@@ -226,6 +226,33 @@ def test_live_claude_never_resumes(claude_dir, tmp_path, monkeypatch):
     assert out["delivered"] is True
 
 
+def test_claude_old_name_lookup_never_resumes_a_live_session(claude_dir, tmp_path, monkeypatch):
+    """Regression for Codex review finding A (second independent review): a
+    stale record under an old name sharing the sessionId of a live record
+    under a new name must not cause auto mode to dispatch claude.resume
+    against that live session."""
+    sock = tmp_path / "old-name-live.sock"
+    sock.write_text("")
+    _write_claude_session(claude_dir, "1.json", pid=_dead_pid(), sessionId="renamed-session",
+                           name="old-name", messagingSocketPath=str(sock))
+    _write_claude_session(claude_dir, "2.json", pid=os.getpid(), sessionId="renamed-session",
+                           name="new-name", messagingSocketPath=str(sock), cwd=str(tmp_path))
+
+    resume_calls = []
+
+    def recording_resume(target, text, cfg):
+        resume_calls.append(1)
+        return methods.MethodResult(True, "claude.resume", "started")
+
+    monkeypatch.setitem(methods.DISPATCH, "claude.resume", recording_resume)
+
+    out = json.loads(core.message_send("claude:old-name", "hi"))
+    assert resume_calls == [], "claude.resume must never run: the session is actually live"
+    resume_attempt = next(a for a in out["attempts"] if a["method"] == "claude.resume")
+    assert resume_attempt["ok"] is False
+    assert "live" in resume_attempt["detail"]
+
+
 def test_claude_unknown_liveness_blocks_native_and_resume_falls_to_spool(claude_dir, tmp_path):
     """Regression for Codex review defect #2: an alive pid whose socket can't
     be confirmed used to be reported live=False, so `auto` mode would run
@@ -279,6 +306,32 @@ def test_hermes_session_target_never_uses_native(monkeypatch):
     assert out["method"] == "hermes.resume"
     native_attempt = next(a for a in out["attempts"] if a["method"] == "hermes.native")
     assert native_attempt["ok"] is False
+
+
+def test_opencode_http_error_blocks_resume_in_auto_mode(monkeypatch):
+    """Regression for Codex review finding B (second independent review):
+    an HTTPError (401/500/503/...) from opencode.native does NOT prove the
+    target has no live owner -- it must be ambiguous and block the paired
+    opencode.resume, same as a timeout or connection reset."""
+    import urllib.error
+
+    def http_error_native(target, text, cfg):
+        exc = urllib.error.HTTPError("http://x", 500, "Internal Server Error", {}, None)
+        return methods.MethodResult(False, "opencode.native", f"http error: {exc}", ambiguous=True)
+
+    def unexpected_resume(target, text, cfg):
+        raise AssertionError("opencode.resume must not run after an HTTPError from opencode.native")
+
+    monkeypatch.setitem(methods.DISPATCH, "opencode.native", http_error_native)
+    monkeypatch.setitem(methods.DISPATCH, "opencode.resume", unexpected_resume)
+    cfg_path = delivery_config.config_path()
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(json.dumps({"opencode": {"server_url": "http://127.0.0.1:9999"}}))
+    out = json.loads(core.message_send("opencode:sess-http-err", "hi"))
+    assert out["method"] == "spool"
+    resume_attempt = next(a for a in out["attempts"] if a["method"] == "opencode.resume")
+    assert resume_attempt["ok"] is False
+    assert "ambiguous" in resume_attempt["detail"]
 
 
 def test_opencode_ambiguous_native_failure_blocks_resume(monkeypatch):
@@ -452,9 +505,12 @@ def test_parallel_message_send_same_key_sends_exactly_once(codex_home, monkeypat
     assert len(_spool_files()) == 1
 
 
-def test_reserved_key_stale_after_owner_death_is_taken_over(codex_home):
-    """A crashed sender's reservation (owner pid confirmably dead, older than
-    the stale window) must eventually be retriable, not stuck forever."""
+def test_dead_owner_reservation_yields_unknown_outcome_not_a_resend(codex_home, monkeypatch):
+    """Regression for Codex review finding D (second independent review): a
+    crashed sender's reservation must NOT be auto-taken-over and resent --
+    the owner might have already delivered the message before dying, and a
+    stale-takeover resend could double-send it. `message_send` must instead
+    surface `unknown_outcome` and never call a send method again."""
     from mcp_huddle.delivery import idempotency
 
     _write_codex_index(codex_home, [{"id": "th-stale", "thread_name": "x", "updated_at": 1}])
@@ -462,14 +518,35 @@ def test_reserved_key_stale_after_owner_death_is_taken_over(codex_home):
     path.parent.mkdir(parents=True, exist_ok=True)
     dead_pid = _dead_pid()
     path.write_text(json.dumps({
-        "status": "reserved", "msg_id": "abandoned-msg", "pid": dead_pid,
-        "ts": time.time() - idempotency.RESERVATION_STALE_SECONDS - 10,
+        "status": "reserved", "msg_id": "abandoned-msg", "pid": dead_pid, "ts": time.time(),
     }))
 
+    real_spool = core.methods.spool
+    resend_allowed = {"value": False}
+
+    def guarded_spool(*a, **kw):
+        if not resend_allowed["value"]:
+            raise AssertionError("a dead-owner reservation must never trigger an automatic resend")
+        return real_spool(*a, **kw)
+
+    monkeypatch.setattr(core.methods, "spool", guarded_spool)
+
     out = json.loads(core.message_send("codex:th-stale", "hi", mode="spool", idempotency_key="stale-key"))
-    assert out["delivered"] is True
-    assert out["method"] == "spool"
-    assert out["msg_id"] != "abandoned-msg"
+    assert out["status"] == "unknown_outcome"
+    assert out["msg_id"] == "abandoned-msg"
+    assert out["delivered"] is None
+    assert _spool_files() == []
+
+    # A repeat with the SAME key stays "unknown" -- still never resent.
+    out2 = json.loads(core.message_send("codex:th-stale", "hi", mode="spool", idempotency_key="stale-key"))
+    assert out2["status"] == "unknown_outcome"
+    assert out2["msg_id"] == "abandoned-msg"
+
+    # A caller that actually wants delivery must use a NEW idempotency_key.
+    resend_allowed["value"] = True
+    out3 = json.loads(core.message_send("codex:th-stale", "hi", mode="spool", idempotency_key="fresh-key"))
+    assert out3["delivered"] is True
+    assert out3["method"] == "spool"
 
 
 # ── missing binary falls through the chain ──────────────────────────────────
