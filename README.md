@@ -136,6 +136,7 @@ These are the tools exposed over MCP (decorated with `@mcp.tool()` in
 | `swarm_pilot_finish` | Save the organizer's council conclusion or a reporter's team/relay/swarm conclusion. |
 
 The pilot tools are documented in [docs/SWARM_PILOT.md](docs/SWARM_PILOT.md).
+| `message_send` / `message_targets` | Native cross-harness delivery to another agent session outside a room (Claude/Codex/Hermes/OpenCode/agy) — see [`docs/delivery.md`](docs/delivery.md). |
 
 Room lifecycle operations (request-close, close, delete, close-session) remain
 human/server-owned. Agent work status is exposed through `room_status`; agents
