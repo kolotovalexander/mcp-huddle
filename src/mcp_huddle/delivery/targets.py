@@ -164,21 +164,44 @@ def _claude_target(session: dict, state: Optional[str] = None) -> Target:
     )
 
 
+def _merge_claude_group(group: list) -> Target:
+    """Build one :class:`Target` for a set of registry entries that all share
+    the same sessionId. Same rule for the id path and the name path: a stale
+    duplicate must never shadow a live entry for the same sessionId."""
+    if len(group) == 1:
+        return _claude_target(group[0])
+    merged_state = _merge_claude_states(group)
+    pick = next((s for s in group if _claude_session_state(s) == merged_state), group[0])
+    return _claude_target(pick, state=merged_state)
+
+
 def _find_claude(query: str) -> list:
     sessions = _load_claude_sessions()
     by_id = [s for s in sessions if str(s.get("sessionId", "")) == query]
     if by_id:
-        if len(by_id) == 1:
-            return [_claude_target(by_id[0])]
         # Same sessionId in more than one registry file: not genuinely
         # ambiguous (it's one logical session), so merge rather than raising
         # AmbiguousTarget -- and never let a live entry be shadowed by a
         # stale/dead one for the same id.
-        merged_state = _merge_claude_states(by_id)
-        pick = next((s for s in by_id if _claude_session_state(s) == merged_state), by_id[0])
-        return [_claude_target(pick, state=merged_state)]
+        return [_merge_claude_group(by_id)]
     by_name = [s for s in sessions if str(s.get("name", "")) == query]
-    return [_claude_target(s) for s in by_name]
+    if not by_name:
+        return []
+    # A name match only tells us which sessionId(s) to resolve -- the actual
+    # liveness/socket must come from the SAME merge across every registry
+    # entry for that sessionId (not just the ones that happen to still carry
+    # this name), otherwise a stale record under an old name can shadow a
+    # live entry for the same session (Codex review finding A).
+    seen_ids: list = []
+    for s in by_name:
+        sid = str(s.get("sessionId", ""))
+        if sid not in seen_ids:
+            seen_ids.append(sid)
+    out = []
+    for sid in seen_ids:
+        group = [s for s in sessions if str(s.get("sessionId", "")) == sid]
+        out.append(_merge_claude_group(group))
+    return out
 
 
 # ── Codex session index ─────────────────────────────────────────────────────

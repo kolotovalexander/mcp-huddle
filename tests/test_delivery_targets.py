@@ -193,6 +193,29 @@ def test_resolve_claude_permission_error_is_unknown_not_alive(claude_dir, monkey
     assert t.extra["live_state"] == "unknown"
 
 
+def test_resolve_claude_by_old_name_merges_liveness_across_same_sessionid(claude_dir, tmp_path):
+    """Regression for Codex review finding A (second independent review): a
+    stale registry record under an OLD name must not shadow a live record
+    for the SAME sessionId under a different (current) name. Resolving by
+    the old name used to skip the same-sessionId merge that resolving by id
+    already got, so `claude:old-name` reported live=False (and auto mode
+    would dispatch claude.resume) even though the session was actually
+    alive under `new-name`."""
+    import os
+    sock = tmp_path / "merge-by-name.sock"
+    sock.write_text("")
+    _write_claude_session(claude_dir, "old.json", pid=_dead_pid(), sessionId="same-session",
+                           name="old-name", messagingSocketPath=str(sock))
+    _write_claude_session(claude_dir, "new.json", pid=os.getpid(), sessionId="same-session",
+                           name="new-name", messagingSocketPath=str(sock))
+
+    by_id = targets.resolve("claude:same-session")
+    by_old_name = targets.resolve("claude:old-name")
+    assert by_id.live is True
+    assert by_old_name.live is True  # merged with the live "new-name" entry, not shadowed
+    assert by_old_name.id == "same-session"
+
+
 def test_same_sessionid_in_two_entries_one_alive_is_alive(claude_dir, tmp_path):
     """Regression for Codex review defect #2's last requirement: the same
     sessionId open in another live registry entry must be treated as alive

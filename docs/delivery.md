@@ -90,7 +90,12 @@ refused immediately, with an empty `attempts` list -- never dispatched.
   same `sessionId` appears in more than one registry entry (e.g. a stale file
   left behind alongside a fresh one), the entries are merged rather than
   treated as ambiguous, and the merged state is "alive" if *any* entry
-  independently reads as alive.
+  independently reads as alive. This merge applies identically whether the
+  session was found by id or by name: resolving `claude:<name>` first finds
+  every entry with a matching name, then merges *all* registry entries that
+  share the resulting sessionId(s) -- not just the ones that still carry that
+  name -- so a stale record under an old name can never shadow a live entry
+  for the same session (e.g. after a rename).
 - **Codex**: reads `~/.codex/session_index.jsonl` (override with
   `MCP_HUDDLE_DELIVERY_CODEX_HOME`), lines of `{"id", "thread_name",
   "updated_at"}`. The last line for a given `id` wins. There is no live
@@ -112,7 +117,7 @@ argv list — never `shell=True`.
 | `codex.resume` | Detached: `codex exec resume -- <id> <envelope>`. Auto mode never runs this right after an ambiguous `codex.native` failure. |
 | `hermes.native` | Only for a **peer** target. `hermes peer dm <peer[/agent]> <envelope>`, waited up to 120s. A timeout, or any nonzero exit (there's no known-safe "peer unreachable" signal to distinguish from an ambiguous one), is **ambiguous** and blocks the paired `hermes.resume`. |
 | `hermes.resume` | Only for a **session** target. Detached: `hermes --resume=<session> chat -q <envelope>`. **Unverified** — this argv is a config-default template, not something exercised against a real `hermes` binary. |
-| `opencode.native` | Only if `opencode.server_url` is configured. Best-effort `GET {server_url}/session/status` (ignored on failure — see [upstream bug #46842](https://github.com/sst/opencode/issues/46842), a busy session can silently drop the turn), then `POST {server_url}/session/{id}/prompt_async` with `{"parts":[{"type":"text","text":<envelope>}]}` via `urllib`. A timeout, a dropped/reset connection, or any non-2xx status that doesn't come back as a definite HTTP error response, is **ambiguous** and blocks the paired `opencode.resume`. |
+| `opencode.native` | Only if `opencode.server_url` is configured. Best-effort `GET {server_url}/session/status` (ignored on failure — see [upstream bug #46842](https://github.com/sst/opencode/issues/46842), a busy session can silently drop the turn), then `POST {server_url}/session/{id}/prompt_async` with `{"parts":[{"type":"text","text":<envelope>}]}` via `urllib`. A timeout, an HTTP error response (401/403/409/429/500/503/...), a dropped/reset connection, or any non-2xx status that doesn't come back as a definite HTTP error response, is **ambiguous** and blocks the paired `opencode.resume`. The only exception is a bare "connection refused" (`ECONNREFUSED`) — nothing is listening on `server_url` at all, which is proof there's no live server to collide with — that is not ambiguous and lets `auto` fall through to `opencode.resume`. |
 | `opencode.resume` | Detached: `opencode run --session <id> <envelope>`. |
 | `agy.resume` | Detached: `agy --conversation <id> -p <envelope>`. |
 | `spool` | Always available, last resort for every harness. Atomically writes the envelope to `$MCP_HUDDLE_HOME/delivery/spool/<harness>/<target_id>/<msg_id>.md` for a harness-side hook to pick up later. |
@@ -179,20 +184,36 @@ refuse an innocent one.
 
 **Idempotency**: a repeated `idempotency_key` within 24h returns the exact
 same result JSON as the first call and sends nothing new. This is enforced
-with an atomic cross-process reservation (`src/mcp_huddle/delivery/
-idempotency.py`): the first caller to atomically create
-`$MCP_HUDDLE_HOME/delivery/reservations/<sha256(key)>.json`
-(`os.open(..., O_CREAT|O_EXCL)`) owns the key and is the only one that ever
-sends; this happens *before* any send is attempted. A concurrent call with
-the same key while the first is still in flight (file exists, `status:
-"reserved"`) sends nothing and returns a different, minimal shape instead of
-the usual result: `{"status": "in_progress", "msg_id": <the in-flight call's
-msg_id>}`. Once the owner finishes, it overwrites the file with `{"status":
-"done", "msg_id", "ts", "result"}`, which is what a same-key retry gets back
-verbatim (and which expires after 24h same as before). A `"reserved"` entry
-whose owning pid is confirmably dead *and* older than 5 minutes is
-considered abandoned (the owner crashed mid-send) and may be taken over by
-the next caller.
+with a per-key cross-process **lock** (`src/mcp_huddle/delivery/
+idempotency.py`): every read and write of
+`$MCP_HUDDLE_HOME/delivery/reservations/<sha256(key)>.json` happens while
+holding an `fcntl.flock` on a sibling `<sha256(key)>.json.lock` file (created
+once, never deleted, so every process locks the same inode), and every write
+is published atomically (tmp file in the same directory, `fsync`,
+`os.replace`). The first caller to see no existing entry (still under the
+lock) writes `{"status": "reserved", "msg_id", "pid", "ts"}` and is the only
+one that ever sends; this happens *before* any send is attempted. A
+concurrent call with the same key while the first is still in flight (owner
+pid confirmably alive) sends nothing and returns a different, minimal shape
+instead of the usual result: `{"status": "in_progress", "msg_id": <the
+in-flight call's msg_id>}`. Once the owner finishes, it overwrites the file
+with `{"status": "done", "msg_id", "ts", "result"}` (but only if the entry
+still names its own `msg_id` -- an owner check, so a reservation reassigned
+out from under it is never clobbered), which is what a same-key retry gets
+back verbatim (and which expires after 24h same as before).
+
+If a `"reserved"` entry's owning pid is confirmably dead, the key moves to
+`{"status": "unknown", "msg_id", "ts"}` -- **not** taken over and retried.
+Whether that owner delivered the message before it died is indistinguishable
+from a crash before ever sending, and guessing either way risks a silent
+double-send or a silently dropped message; this used to auto-resend after a
+5-minute staleness window, which could deliver the same message twice if the
+first sender died just after a successful send but before recording it
+(Codex review finding D). A same-key call against an `"unknown"` entry
+returns `{"status": "unknown_outcome", "msg_id": <the original msg_id>,
+"delivered": null, "note": "..."}` and this never changes on its own -- a
+caller that needs a guaranteed resend must supply a **new**
+`idempotency_key`.
 
 **Harness enabled**: `delivery.json`'s `harnesses.<harness>.enabled` (see
 Configuration below) is checked once the target resolves, before either auto

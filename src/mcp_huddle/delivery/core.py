@@ -138,6 +138,19 @@ def message_send(to: str, text: str, mode: str = "auto", from_name: str = "",
             return reservation.result
         if reservation.status == "in_progress":
             return json.dumps({"status": "in_progress", "msg_id": reservation.msg_id})
+        if reservation.status == "unknown":
+            # A prior owner for this key died before recording whether it
+            # delivered. Never auto-retried -- see idempotency.py. Surface it
+            # distinctly (delivered=None, not False) so a caller doesn't
+            # mistake "we don't know" for "it definitely failed".
+            return json.dumps({
+                "status": "unknown_outcome",
+                "msg_id": reservation.msg_id,
+                "delivered": None,
+                "note": ("a prior sender for this idempotency_key died before its outcome was "
+                         "recorded; whether it delivered is unknown and this is never "
+                         "automatically retried -- use a new idempotency_key to force a resend"),
+            })
         msg_id = reservation.msg_id  # == our own msg_id in the normal (uncontended) case
 
     def _finish(result_json: str) -> str:
