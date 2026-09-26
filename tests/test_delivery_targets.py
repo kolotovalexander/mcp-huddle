@@ -76,14 +76,19 @@ def test_resolve_claude_not_live_when_pid_dead(claude_dir, tmp_path):
     assert t.live is False
 
 
-def test_resolve_claude_not_live_when_socket_missing(claude_dir):
+def test_resolve_claude_unknown_when_alive_but_socket_missing(claude_dir):
+    """Regression for Codex review defect #2: a live pid whose socket can't
+    be confirmed must be "unknown", never "dead" -- treating it as dead would
+    let `auto` mode fall through to `claude.resume` against a session that's
+    actually still running."""
     import os
     _write_claude_session(
         claude_dir, "4.json", pid=os.getpid(), sessionId="sess-4", name="dana",
         messagingSocketPath="/does/not/exist.sock", cwd="/proj",
     )
     t = targets.resolve("claude:sess-4")
-    assert t.live is False
+    assert t.live is None
+    assert t.extra["live_state"] == "unknown"
 
 
 def test_resolve_claude_ambiguous_name(claude_dir, tmp_path):
@@ -160,6 +165,83 @@ def test_resolve_codex_not_found(codex_home):
     _write_codex_index(codex_home, [])
     with pytest.raises(targets.TargetNotFound):
         targets.resolve("codex:missing")
+
+
+# ── Claude tri-state liveness + same-sessionId merge ────────────────────────
+
+def test_resolve_claude_permission_error_is_unknown_not_alive(claude_dir, monkeypatch):
+    """Regression for Codex review defect #2: `PermissionError` from the
+    signal-0 existence probe must be "unknown", not treated as a confirmed
+    live process (which would make `claude.native` look eligible even though
+    we can't actually confirm the process is ours to reach)."""
+    sock_dir = claude_dir.parent / "sockets"
+    sock_dir.mkdir()
+    sock = sock_dir / "perm.sock"
+    sock.write_text("")
+    _write_claude_session(
+        claude_dir, "perm.json", pid=4242, sessionId="sess-perm", name="perm",
+        messagingSocketPath=str(sock), cwd="/proj",
+    )
+
+    def fake_kill(pid, sig):
+        raise PermissionError("not our process")
+
+    monkeypatch.setattr(targets.os, "kill", fake_kill)
+    t = targets.resolve("claude:sess-perm")
+    assert t.live is None
+    assert t.extra["live_state"] == "unknown"
+
+
+def test_same_sessionid_in_two_entries_one_alive_is_alive(claude_dir, tmp_path):
+    """Regression for Codex review defect #2's last requirement: the same
+    sessionId open in another live registry entry must be treated as alive
+    overall, even if a stale duplicate file for that id looks dead."""
+    import os
+    sock = tmp_path / "merge.sock"
+    sock.write_text("")
+    _write_claude_session(claude_dir, "stale.json", pid=_dead_pid(), sessionId="sess-merge",
+                           name="stale-copy", messagingSocketPath=str(sock))
+    _write_claude_session(claude_dir, "fresh.json", pid=os.getpid(), sessionId="sess-merge",
+                           name="fresh-copy", messagingSocketPath=str(sock))
+    t = targets.resolve("claude:sess-merge")
+    assert t.live is True  # not ambiguous, not shadowed by the dead duplicate
+
+
+# ── Hermes peer vs. session target model ────────────────────────────────────
+
+def test_resolve_hermes_explicit_peer_prefix():
+    t = targets.resolve("hermes:peer:desktop/reviewer")
+    assert t.extra["hermes_kind"] == "peer"
+    assert t.extra["peer"] == "desktop"
+
+
+def test_resolve_hermes_explicit_session_prefix():
+    t = targets.resolve("hermes:session:sess-abc")
+    assert t.extra["hermes_kind"] == "session"
+    assert t.id == "sess-abc"
+    assert "peer" not in t.extra
+
+
+def test_resolve_hermes_bare_form_defaults_to_peer():
+    t = targets.resolve("hermes:desktop")
+    assert t.extra["hermes_kind"] == "peer"
+
+
+# ── Strict id allowlist (defense in depth against argv injection) ──────────
+
+def test_resolve_agy_rejects_flag_like_id():
+    with pytest.raises(targets.TargetNotFound):
+        targets.resolve("agy:--dangerously-skip-permissions")
+
+
+def test_resolve_hermes_session_rejects_flag_like_id():
+    with pytest.raises(targets.TargetNotFound):
+        targets.resolve("hermes:session:--resume")
+
+
+def test_resolve_opencode_rejects_flag_like_id():
+    with pytest.raises(targets.TargetNotFound):
+        targets.resolve("opencode:--session")
 
 
 # ── Other harnesses (no registry; id passed through) ────────────────────────

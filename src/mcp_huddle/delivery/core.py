@@ -52,12 +52,25 @@ def _applicability_skip_reason(method_id: str, target: targets_mod.Target,
                                 cfg: delivery_config.DeliveryConfig) -> Optional[str]:
     """Return why `method_id` should not even be attempted for this target,
     or None if it's worth trying."""
-    if method_id == "claude.native" and not target.live:
-        return "target is not live"
-    if method_id == "claude.resume" and target.live:
-        return "target is live; claude.native is used instead"
-    if method_id == "hermes.native" and not (target.extra or {}).get("peer"):
-        return "no peer name given"
+    if method_id == "claude.native" and target.live is not True:
+        # Tri-state: only a confirmed-alive session (pid alive AND socket
+        # reachable) is native-eligible -- an "unknown" state (None) must
+        # not be treated as good enough, same as a confirmed-dead one.
+        return "target is not live" if target.live is False else "target liveness is unknown"
+    if method_id == "claude.resume" and target.live is not False:
+        # Only a *confirmed dead* session may be resumed -- "live" and
+        # "unknown" both block it (an unknown state falls through to spool
+        # instead of risking a fork of a possibly-live session's history).
+        return "target is live; claude.native is used instead" if target.live else \
+            "target liveness is unknown; refusing to risk forking a possibly-live session"
+    hermes_kind = (target.extra or {}).get("hermes_kind")
+    if method_id == "hermes.native":
+        if hermes_kind == "session":
+            return "target is a hermes session id, not a peer -- hermes.native needs hermes:peer:<peer[/agent]>"
+        if not (target.extra or {}).get("peer"):
+            return "no peer name given"
+    if method_id == "hermes.resume" and hermes_kind == "peer":
+        return "target is a hermes peer, not a session id -- hermes.resume needs hermes:session:<id>"
     if method_id == "opencode.native" and not cfg.opencode_server_url():
         return "opencode.server_url not configured"
     return None
@@ -92,13 +105,10 @@ def _log_attempt(msg_id: str, to: str, harness: str, method: str, ok: bool,
         fh.write(json.dumps(entry) + "\n")
 
 
-def _refusal(msg_id: str, note: str, idempotency_key: str) -> str:
-    result = json.dumps({
+def _refusal(msg_id: str, note: str) -> str:
+    return json.dumps({
         "msg_id": msg_id, "delivered": False, "method": None, "attempts": [], "note": note,
     })
-    if idempotency_key:
-        idempotency.store(idempotency_key, result)
-    return result
 
 
 def message_send(to: str, text: str, mode: str = "auto", from_name: str = "",
@@ -110,31 +120,66 @@ def message_send(to: str, text: str, mode: str = "auto", from_name: str = "",
     Honesty: ``delivered=True`` for a ``*.resume`` method means the resume
     process was *started*, not that it was read; for ``spool`` it means the
     envelope was written for a hook to pick up later, not that it was read.
-    """
-    cached = idempotency.get_cached(idempotency_key) if idempotency_key else None
-    if cached is not None:
-        return cached
 
+    Idempotency: when ``idempotency_key`` is given, the key is atomically
+    reserved *before* anything is sent (see ``idempotency.reserve``). A
+    concurrent call with the same key while the first is still in flight
+    never sends and returns ``{"status": "in_progress", "msg_id": <the
+    in-flight call's msg_id>}`` instead of the usual result shape -- there is
+    no result yet to hand back. A repeat after the first call finished
+    returns that finished call's result JSON verbatim.
+    """
     msg_id = uuid.uuid4().hex[:16]
     cfg = delivery_config.load()
+
+    if idempotency_key:
+        reservation = idempotency.reserve(idempotency_key, msg_id)
+        if reservation.status == "done":
+            return reservation.result
+        if reservation.status == "in_progress":
+            return json.dumps({"status": "in_progress", "msg_id": reservation.msg_id})
+        msg_id = reservation.msg_id  # == our own msg_id in the normal (uncontended) case
+
+    def _finish(result_json: str) -> str:
+        if idempotency_key:
+            idempotency.finish(idempotency_key, msg_id, result_json)
+        return result_json
 
     try:
         hops = envelope_mod.next_hops(text, cfg.hops_limit())
     except envelope_mod.HopsExceeded as exc:
-        return _refusal(msg_id, f"refused: hops {exc.hops} >= limit {exc.limit}", idempotency_key)
+        return _finish(_refusal(msg_id, f"refused: hops {exc.hops} >= limit {exc.limit}"))
 
     try:
         target = targets_mod.resolve(to)
     except targets_mod.AmbiguousTarget as exc:
-        return _refusal(msg_id, "ambiguous target: " + ", ".join(exc.candidates), idempotency_key)
+        return _finish(_refusal(msg_id, "ambiguous target: " + ", ".join(exc.candidates)))
     except targets_mod.TargetNotFound as exc:
-        return _refusal(msg_id, f"target not found: {exc}", idempotency_key)
+        return _finish(_refusal(msg_id, f"target not found: {exc}"))
+
+    if not cfg.harness_enabled(target.harness):
+        return _finish(_refusal(msg_id, f"refused: harness {target.harness!r} is disabled by config"))
 
     if mode == "auto":
         order_tokens = cfg.order(target.harness)
         method_ids = [_method_id(target.harness, tok) for tok in order_tokens]
     else:
-        method_ids = [mode if "." in mode or mode == "spool" else _method_id(target.harness, mode)]
+        method_id = mode if "." in mode or mode == "spool" else _method_id(target.harness, mode)
+        if method_id != "spool":
+            # A forced full method id (e.g. "claude.resume") must belong to
+            # the harness the target actually resolved to -- otherwise a
+            # caller could force e.g. `to="agy:..."` with `mode="claude.resume"`
+            # and have it dispatch a Claude resume against an agy id (the
+            # `claude -p --resume ...` cross-harness dispatch this guards
+            # against). Refuse before attempting anything.
+            forced_harness = method_id.split(".", 1)[0]
+            if forced_harness != target.harness:
+                return _finish(_refusal(
+                    msg_id,
+                    f"refused: forced mode {mode!r} belongs to harness {forced_harness!r} "
+                    f"but {to!r} resolved to harness {target.harness!r}",
+                ))
+        method_ids = [method_id]
 
     attempts = []
     delivered = False
@@ -186,9 +231,7 @@ def message_send(to: str, text: str, mode: str = "auto", from_name: str = "",
         "attempts": attempts,
         "note": note,
     })
-    if idempotency_key:
-        idempotency.store(idempotency_key, out)
-    return out
+    return _finish(out)
 
 
 def message_targets(harness: str = "") -> list:

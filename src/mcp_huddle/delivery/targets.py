@@ -13,11 +13,21 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 HARNESS_PREFIXES = ("claude", "codex", "hermes", "opencode", "agy")
+
+# A caller-controlled id/peer/session that will end up as its own argv token
+# (or a merged --flag=value) for a subprocess-based method must never be
+# free-form: something like "--dangerously-skip-permissions" must never reach
+# that far. This is defense in depth on top of the merged-flag argv templates
+# in config.py -- never a leading '-' (which a CLI could parse as an option),
+# and only characters that legitimate session ids / peer names / thread ids
+# plausibly use.
+_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,199}$")
 
 
 class AmbiguousTarget(Exception):
@@ -29,6 +39,12 @@ class AmbiguousTarget(Exception):
 
 class TargetNotFound(Exception):
     pass
+
+
+def _require_safe_id(harness: str, value: str) -> str:
+    if not _SAFE_ID_RE.match(value or ""):
+        raise TargetNotFound(f"invalid id for harness {harness!r}: {value!r}")
+    return value
 
 
 @dataclass
@@ -66,28 +82,75 @@ def _load_claude_sessions() -> list:
     return out
 
 
-def _claude_live(session: dict) -> bool:
-    pid = session.get("pid")
-    sock = session.get("messagingSocketPath")
-    if not pid or not sock:
-        return False
+def _claude_pid_state(pid) -> str:
+    """Tri-state read of whether ``pid`` is a live process: ``"alive"``,
+    ``"dead"``, or ``"unknown"``. Only ``"dead"`` (``ProcessLookupError``, a
+    definitive "no such process") ever licenses ``claude.resume`` -- anything
+    else (including ``PermissionError``, which some sandboxes/hardened setups
+    raise even for a signal-0 existence probe) must not be treated as proof
+    of death."""
+    if not pid:
+        return "unknown"
     try:
         os.kill(int(pid), 0)
     except ProcessLookupError:
-        return False
+        return "dead"
     except PermissionError:
-        pass  # process exists, just owned by someone else
+        return "unknown"
     except (TypeError, ValueError, OSError):
-        return False
-    return Path(sock).exists()
+        return "unknown"
+    return "alive"
 
 
-def _claude_target(session: dict) -> Target:
+def _claude_session_state(session: dict) -> str:
+    """Tri-state liveness for one registry entry: ``"alive"`` (native is
+    reachable), ``"dead"`` (resume is safe), or ``"unknown"`` (neither --
+    e.g. the process is alive but its messaging socket can't be confirmed,
+    which used to be misreported as "not live" and could send `claude.resume`
+    at a live session). Process-alive-ness and socket-reachability are
+    checked separately on purpose: only "alive + socket reachable" is
+    `claude.native`-eligible, and only a *confirmed* dead pid is
+    `claude.resume`-eligible."""
+    pid = session.get("pid")
+    sock = session.get("messagingSocketPath")
+    proc_state = _claude_pid_state(pid)
+    if proc_state != "alive":
+        return proc_state  # "dead" or "unknown"
+    if not sock or not Path(sock).exists():
+        # Process is confirmably alive, but we can't confirm the socket is
+        # reachable -- unknown, not dead. Resuming here could fork a live
+        # session's history.
+        return "unknown"
+    return "alive"
+
+
+def _merge_claude_states(sessions: list) -> str:
+    """Merge the tri-states of several registry entries that share the same
+    sessionId (e.g. a stale file left behind by a prior process alongside a
+    fresh one for the current process). If *any* entry independently reads
+    as alive, the sessionId as a whole is alive -- a live session must never
+    be treated as resumable just because one on-disk record about it looks
+    stale."""
+    states = [_claude_session_state(s) for s in sessions]
+    if "alive" in states:
+        return "alive"
+    if "unknown" in states:
+        return "unknown"
+    return "dead"
+
+
+def _state_to_live(state: str) -> Optional[bool]:
+    return {"alive": True, "dead": False}.get(state)  # "unknown" -> None
+
+
+def _claude_target(session: dict, state: Optional[str] = None) -> Target:
+    if state is None:
+        state = _claude_session_state(session)
     return Target(
         harness="claude",
         id=str(session.get("sessionId", "")),
         name=str(session.get("name", "")),
-        live=_claude_live(session),
+        live=_state_to_live(state),
         cwd=str(session.get("cwd", "")),
         socket_path=str(session.get("messagingSocketPath", "")),
         extra={
@@ -95,6 +158,7 @@ def _claude_target(session: dict) -> Target:
             "status": session.get("status"),
             "entrypoint": session.get("entrypoint"),
             "kind": session.get("kind"),
+            "live_state": state,
         },
     )
 
@@ -103,7 +167,15 @@ def _find_claude(query: str) -> list:
     sessions = _load_claude_sessions()
     by_id = [s for s in sessions if str(s.get("sessionId", "")) == query]
     if by_id:
-        return [_claude_target(s) for s in by_id]
+        if len(by_id) == 1:
+            return [_claude_target(by_id[0])]
+        # Same sessionId in more than one registry file: not genuinely
+        # ambiguous (it's one logical session), so merge rather than raising
+        # AmbiguousTarget -- and never let a live entry be shadowed by a
+        # stale/dead one for the same id.
+        merged_state = _merge_claude_states(by_id)
+        pick = next((s for s in by_id if _claude_session_state(s) == merged_state), by_id[0])
+        return [_claude_target(pick, state=merged_state)]
     by_name = [s for s in sessions if str(s.get("name", "")) == query]
     return [_claude_target(s) for s in by_name]
 
@@ -157,9 +229,16 @@ def _find_codex(query: str) -> list:
 
 # ── Other harnesses (no discoverable registry; the id is taken as-is) ──────
 
-def _hermes_target(spec: str) -> Target:
+def _hermes_target(spec: str, kind: str) -> Target:
+    """``kind`` is ``"peer"`` (a DM-able peer[/agent], usable only with
+    ``hermes.native``) or ``"session"`` (a resumable session id, usable only
+    with ``hermes.resume``). A hermes peer name is never a session id and
+    must never be substituted for one -- see docs/delivery.md."""
+    if kind == "session":
+        return Target(harness="hermes", id=spec, name=spec, extra={"hermes_kind": "session"})
     peer, _, agent = spec.partition("/")
-    return Target(harness="hermes", id=spec, name=spec, extra={"peer": peer, "agent": agent})
+    return Target(harness="hermes", id=spec, name=spec,
+                   extra={"peer": peer, "agent": agent, "hermes_kind": "peer"})
 
 
 # ── Public API ───────────────────────────────────────────────────────────────
@@ -196,10 +275,27 @@ def resolve(to: str) -> Target:
                 raise AmbiguousTarget(f"codex:{m.id}" for m in matches)
             return matches[0]
         if prefix == "hermes":
-            return _hermes_target(rest)
+            if rest.startswith("peer:"):
+                sub = rest[len("peer:"):].strip()
+                if not sub:
+                    raise TargetNotFound("empty hermes peer")
+                _require_safe_id("hermes", sub)
+                return _hermes_target(sub, kind="peer")
+            if rest.startswith("session:"):
+                sub = rest[len("session:"):].strip()
+                if not sub:
+                    raise TargetNotFound("empty hermes session id")
+                _require_safe_id("hermes", sub)
+                return _hermes_target(sub, kind="session")
+            # Backward-compatible bare form: `hermes:<peer[/agent]>` is a peer
+            # target (the original, still-supported syntax).
+            _require_safe_id("hermes", rest)
+            return _hermes_target(rest, kind="peer")
         if prefix == "opencode":
+            _require_safe_id("opencode", rest)
             return Target(harness="opencode", id=rest, name=rest)
         if prefix == "agy":
+            _require_safe_id("agy", rest)
             return Target(harness="agy", id=rest, name=rest)
 
     # Bare name: search across Claude + Codex.

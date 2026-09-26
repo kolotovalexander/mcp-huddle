@@ -190,13 +190,23 @@ def hermes_native(target: Target, envelope_text: str, cfg: delivery_config.Deliv
     try:
         proc = subprocess.run(argv, capture_output=True, timeout=timeout, text=True)
     except subprocess.TimeoutExpired:
-        return MethodResult(False, "hermes.native", "timed out")
+        # A timeout tells us nothing about whether the peer actually received
+        # the DM -- `hermes peer dm` could have delivered it and then hung on
+        # something else. Ambiguous, same reasoning as codex.native: never
+        # let the caller auto-fall-through to a paired resume.
+        return MethodResult(False, "hermes.native", "timed out (ambiguous -- delivery status unknown)",
+                             ambiguous=True)
     except OSError as exc:
+        # The binary itself failed to exec -- this says nothing about the
+        # peer's state, so it's a definite (non-ambiguous) failure.
         return MethodResult(False, "hermes.native", f"exec failed: {exc}")
     if proc.returncode == 0:
         return MethodResult(True, "hermes.native", "sent")
     detail = (proc.stderr or proc.stdout or "").strip()[:200]
-    return MethodResult(False, "hermes.native", f"exit {proc.returncode}: {detail}")
+    # There's no known-safe "peer definitely unreachable" signal for hermes
+    # (unlike codex's "not loaded"/"unknown thread" strings), so any nonzero
+    # exit is an unrecognized/ambiguous error.
+    return MethodResult(False, "hermes.native", f"exit {proc.returncode}: {detail}", ambiguous=True)
 
 
 def hermes_resume(target: Target, envelope_text: str, cfg: delivery_config.DeliveryConfig) -> MethodResult:
@@ -241,11 +251,28 @@ def opencode_native(target: Target, envelope_text: str, cfg: delivery_config.Del
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             status = resp.status
-    except urllib.error.URLError as exc:
+    except (socket.timeout, TimeoutError) as exc:
+        # We can't tell whether the server received/queued the prompt before
+        # the read timed out -- ambiguous, must not auto-resume.
+        return MethodResult(False, "opencode.native", f"timed out (ambiguous -- delivery status unknown): {exc}",
+                             ambiguous=True)
+    except urllib.error.HTTPError as exc:
+        # The server actually answered with a definite error status -- it
+        # processed (and rejected) the request, so this is not ambiguous.
         return MethodResult(False, "opencode.native", f"http error: {exc}")
+    except (urllib.error.URLError, ConnectionError, OSError) as exc:
+        # Connection dropped/reset with no confirmed response (e.g. reset
+        # right after we sent the body) -- upstream bug #46842 means a busy
+        # session can silently drop the turn either way, so we can't tell if
+        # the prompt landed. Ambiguous, must not auto-resume.
+        return MethodResult(False, "opencode.native", f"connection error (ambiguous -- delivery status unknown): {exc}",
+                             ambiguous=True)
     if 200 <= status < 300:
         return MethodResult(True, "opencode.native", f"posted (status {status})")
-    return MethodResult(False, "opencode.native", f"http status {status}")
+    # A non-2xx status that didn't raise HTTPError (unusual, but possible via
+    # a custom opener/mock) is a non-definitive outcome -- ambiguous.
+    return MethodResult(False, "opencode.native", f"http status {status} (ambiguous -- delivery status unknown)",
+                         ambiguous=True)
 
 
 def opencode_resume(target: Target, envelope_text: str, cfg: delivery_config.DeliveryConfig) -> MethodResult:

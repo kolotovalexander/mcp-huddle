@@ -145,8 +145,9 @@ def test_claude_resume_spawns_detached_with_envelope(fake_bin, cfg, tmp_path):
     assert result.ok is True
     records = _read_records(fake_bin["out"])
     assert records[0]["argv"][-1] == ENVELOPE  # text unchanged, passed as argv, not shell
-    assert "--resume" in records[0]["argv"]
-    assert "sess-2" in records[0]["argv"]
+    # {id} is merged into "--resume=<id>" (not a bare token after --resume)
+    # so a malicious id starting with "-" can never be parsed as its own flag.
+    assert "--resume=sess-2" in records[0]["argv"]
     assert records[0]["cwd"] == str(tmp_path)
 
 
@@ -371,6 +372,94 @@ def test_spool_writes_envelope_to_file(tmp_path, monkeypatch, cfg):
     written = list((tmp_path / "huddle" / "delivery" / "spool" / "agy").rglob("msg-123.md"))
     assert len(written) == 1
     assert written[0].read_text(encoding="utf-8") == ENVELOPE
+
+
+def test_claude_resume_id_cannot_smuggle_a_flag(fake_bin, cfg, tmp_path):
+    """Regression for Codex review defect #1: a malicious/forged id like
+    `--dangerously-skip-permissions` must never appear as its own argv token
+    next to `--resume` -- it must always be merged into a single
+    `--resume=<id>` token, so a real `claude` CLI parses it as the value of
+    `--resume`, never as a new flag."""
+    target = Target(harness="claude", id="--dangerously-skip-permissions", live=False, cwd=str(tmp_path))
+    result = methods.claude_resume(target, ENVELOPE, cfg)
+    assert result.ok is True
+    records = _read_records(fake_bin["out"])
+    argv = records[0]["argv"]
+    assert "--dangerously-skip-permissions" not in argv  # never its own token
+    assert "--resume=--dangerously-skip-permissions" in argv
+
+
+def test_hermes_native_timeout_is_ambiguous(monkeypatch, cfg):
+    import subprocess as sp
+
+    def fake_run(*a, **kw):
+        raise sp.TimeoutExpired(cmd=a[0], timeout=kw.get("timeout"))
+
+    monkeypatch.setattr(methods.shutil, "which", lambda name: f"/bin/{name}")
+    monkeypatch.setattr(methods.subprocess, "run", fake_run)
+    target = Target(harness="hermes", id="desktop", extra={"peer": "desktop"})
+    result = methods.hermes_native(target, ENVELOPE, cfg)
+    assert result.ok is False
+    assert result.ambiguous is True
+
+
+def test_hermes_native_unrecognized_failure_is_ambiguous(monkeypatch, cfg):
+    class FakeProc:
+        returncode = 1
+        stdout = ""
+        stderr = "connection reset"
+
+    monkeypatch.setattr(methods.shutil, "which", lambda name: f"/bin/{name}")
+    monkeypatch.setattr(methods.subprocess, "run", lambda *a, **kw: FakeProc())
+    target = Target(harness="hermes", id="desktop", extra={"peer": "desktop"})
+    result = methods.hermes_native(target, ENVELOPE, cfg)
+    assert result.ok is False
+    assert result.ambiguous is True
+
+
+def test_opencode_native_timeout_is_ambiguous(monkeypatch, cfg):
+    def fake_urlopen(req, timeout=None):
+        if req.full_url.endswith("/session/status"):
+            raise OSError("no status endpoint")
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(methods.urllib.request, "urlopen", fake_urlopen)
+    raw_cfg = delivery_config.DeliveryConfig({"opencode": {"server_url": "http://127.0.0.1:9999"}})
+    target = Target(harness="opencode", id="sess-7")
+    result = methods.opencode_native(target, ENVELOPE, raw_cfg)
+    assert result.ok is False
+    assert result.ambiguous is True
+
+
+def test_opencode_native_connection_reset_is_ambiguous(monkeypatch, cfg):
+    def fake_urlopen(req, timeout=None):
+        if req.full_url.endswith("/session/status"):
+            raise OSError("no status endpoint")
+        raise ConnectionResetError("connection reset by peer")
+
+    monkeypatch.setattr(methods.urllib.request, "urlopen", fake_urlopen)
+    raw_cfg = delivery_config.DeliveryConfig({"opencode": {"server_url": "http://127.0.0.1:9999"}})
+    target = Target(harness="opencode", id="sess-8")
+    result = methods.opencode_native(target, ENVELOPE, raw_cfg)
+    assert result.ok is False
+    assert result.ambiguous is True
+
+
+def test_opencode_native_non_definitive_status_is_ambiguous(monkeypatch, cfg):
+    # A non-2xx status that reaches here without urlopen raising HTTPError
+    # (e.g. via a custom opener) is a non-definitive outcome per the review
+    # defect -- ambiguous, not a confirmed failure.
+    def fake_urlopen(req, timeout=None):
+        if req.full_url.endswith("/session/status"):
+            raise OSError("no status endpoint")
+        return _FakeResponse(500)
+
+    monkeypatch.setattr(methods.urllib.request, "urlopen", fake_urlopen)
+    raw_cfg = delivery_config.DeliveryConfig({"opencode": {"server_url": "http://127.0.0.1:9999"}})
+    target = Target(harness="opencode", id="sess-9b")
+    result = methods.opencode_native(target, ENVELOPE, raw_cfg)
+    assert result.ok is False
+    assert result.ambiguous is True
 
 
 def test_value_flags_are_not_followed_by_double_dash():

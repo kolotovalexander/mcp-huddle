@@ -41,19 +41,56 @@ returns tokens, sockets, or file contents.
 | `claude:<name\|sessionId>` | Claude session, by registry name or session id |
 | `codex:<threadId\|thread_name>` | Codex thread, by id or name |
 | `codex://threads/<id>` | Codex thread, by id (URI form) |
-| `hermes:<peer[/agent]\|session>` | Hermes peer (optionally `/agent`) or session |
+| `hermes:peer:<peer[/agent]>` | Hermes **peer** target (DM-able) -- `hermes.native` only |
+| `hermes:session:<id>` | Hermes **session** target (resumable) -- `hermes.resume` only |
+| `hermes:<peer[/agent]>` | Backward-compatible bare form; equivalent to `hermes:peer:<peer[/agent]>` |
 | `opencode:<sessionId>` | OpenCode session id |
 | `agy:<conversationId>` | agy conversation id |
 | `<bare name>` | searched across Claude + Codex; ambiguous match is an error listing every candidate as `harness:id` |
+
+A hermes **peer** name is never a session id and is never substituted for
+one, and vice versa: a peer target only ever tries `hermes.native` (falling
+through to `spool`, never `hermes.resume`), and a session target only ever
+tries `hermes.resume` (never `hermes.native`, which has no peer to DM). Using
+a peer name as a session id used to be possible and risked a double turn
+against a live peer session -- see the "Honesty" and ambiguous-failure
+sections below.
+
+Every `<id>` (Claude sessionId, Codex thread id, Hermes peer/session,
+OpenCode session id, agy conversation id) is validated against a strict
+allowlist (`^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,199}$`, never a leading `-`)
+before it's used anywhere, both at resolution time (for the harnesses with no
+local registry to validate against: hermes/opencode/agy) and in every argv
+template (every `{id}`/`{peer}` placeholder is bound the same way `{text}`
+already was -- merged into a single `--flag=value` token, or placed after a
+literal `--`, so it can never be parsed as a separate CLI flag no matter what
+the caller passed in `to`).
+
+A forced `mode` that names a full method id (e.g. `"claude.resume"`) is also
+checked against the *resolved* target's harness before anything is
+attempted: forcing a Claude method against a target that resolved to a
+different harness (e.g. `to="agy:..."` with `mode="claude.resume"`) is
+refused immediately, with an empty `attempts` list -- never dispatched.
 
 ## Target resolution
 
 - **Claude**: reads `~/.claude/sessions/<pid>.json` (override the directory
   with `MCP_HUDDLE_DELIVERY_CLAUDE_SESSIONS_DIR`, used by tests). Expected
   fields: `pid`, `sessionId`, `name`, `status`, `messagingSocketPath`, `cwd`,
-  `entrypoint`, `kind`. A session is **live** only if `os.kill(pid, 0)`
-  succeeds (or raises `PermissionError`, meaning the process exists but is
-  owned by someone else) *and* `messagingSocketPath` exists on disk.
+  `entrypoint`, `kind`. Liveness is a **tri-state**, not a bool: `target.live`
+  is `True` (alive -- `claude.native`-eligible), `False` (confirmed dead --
+  `claude.resume`-eligible), or `None`/"unknown" (neither -- falls through to
+  `spool`). Process-alive-ness and socket-reachability are checked
+  separately: `os.kill(pid, 0)` raising `ProcessLookupError` is the *only*
+  thing that counts as confirmed-dead; a `PermissionError` (or any other
+  doubt) is unknown, never dead. A confirmed-alive process whose
+  `messagingSocketPath` can't be confirmed to exist is also unknown, not
+  dead -- this used to be misreported as "not live", which let
+  `claude.resume` run against a session that might still be running. If the
+  same `sessionId` appears in more than one registry entry (e.g. a stale file
+  left behind alongside a fresh one), the entries are merged rather than
+  treated as ambiguous, and the merged state is "alive" if *any* entry
+  independently reads as alive.
 - **Codex**: reads `~/.codex/session_index.jsonl` (override with
   `MCP_HUDDLE_DELIVERY_CODEX_HOME`), lines of `{"id", "thread_name",
   "updated_at"}`. The last line for a given `id` wins. There is no live
@@ -73,9 +110,9 @@ argv list — never `shell=True`.
 | `claude.resume` | Only if the target is **not** live. Detached: `claude -p --resume <sessionId> <envelope>`, cwd = the session's cwd. |
 | `codex.native` | `codex queue --thread=<id> --message=<envelope>`, waited up to 30s; ok iff exit 0. A timeout, or a nonzero exit whose stderr/stdout doesn't contain `"not loaded"` / `"no active session"` / `"unknown thread"`, is **ambiguous** (see below) and blocks the automatic fall-through to `codex.resume`. |
 | `codex.resume` | Detached: `codex exec resume -- <id> <envelope>`. Auto mode never runs this right after an ambiguous `codex.native` failure. |
-| `hermes.native` | Only if a peer name is available. `hermes peer dm <peer[/agent]> <envelope>`, waited up to 120s. |
-| `hermes.resume` | Detached: `hermes --resume <session> chat -q <envelope>`. **Unverified** — this argv is a config-default template, not something exercised against a real `hermes` binary. |
-| `opencode.native` | Only if `opencode.server_url` is configured. Best-effort `GET {server_url}/session/status` (ignored on failure — see [upstream bug #46842](https://github.com/sst/opencode/issues/46842), a busy session can silently drop the turn), then `POST {server_url}/session/{id}/prompt_async` with `{"parts":[{"type":"text","text":<envelope>}]}` via `urllib`. |
+| `hermes.native` | Only for a **peer** target. `hermes peer dm <peer[/agent]> <envelope>`, waited up to 120s. A timeout, or any nonzero exit (there's no known-safe "peer unreachable" signal to distinguish from an ambiguous one), is **ambiguous** and blocks the paired `hermes.resume`. |
+| `hermes.resume` | Only for a **session** target. Detached: `hermes --resume=<session> chat -q <envelope>`. **Unverified** — this argv is a config-default template, not something exercised against a real `hermes` binary. |
+| `opencode.native` | Only if `opencode.server_url` is configured. Best-effort `GET {server_url}/session/status` (ignored on failure — see [upstream bug #46842](https://github.com/sst/opencode/issues/46842), a busy session can silently drop the turn), then `POST {server_url}/session/{id}/prompt_async` with `{"parts":[{"type":"text","text":<envelope>}]}` via `urllib`. A timeout, a dropped/reset connection, or any non-2xx status that doesn't come back as a definite HTTP error response, is **ambiguous** and blocks the paired `opencode.resume`. |
 | `opencode.resume` | Detached: `opencode run --session <id> <envelope>`. |
 | `agy.resume` | Detached: `agy --conversation <id> -p <envelope>`. |
 | `spool` | Always available, last resort for every harness. Atomically writes the envelope to `$MCP_HUDDLE_HOME/delivery/spool/<harness>/<target_id>/<msg_id>.md` for a harness-side hook to pick up later. |
@@ -106,8 +143,13 @@ a definite "not loaded" signal makes falling through to `codex.resume` safe;
 anything else the failure could mean (a timeout, an unrecognized error) is
 treated as ambiguous, and `auto` mode skips `codex.resume` entirely rather
 than risk forking a live thread's history — it falls straight through to
-`spool`. This generalizes to any harness whose native method reports a
-failure as ambiguous.
+`spool`. This generalizes to every harness whose native method reports a
+failure as ambiguous: `hermes.native` and `opencode.native` do the same (see
+the methods table above). Hermes's peer/session split means this rarely
+comes up in practice for hermes specifically (a peer target's order never
+includes `hermes.resume` to begin with), but the mechanism in `core.py` is
+harness-agnostic and applies to any harness whose configured order still
+puts a `*.native` immediately before a `*.resume` for the same target.
 
 ## Envelope
 
@@ -136,7 +178,26 @@ message that should be refused slip past the loop guard, or spuriously
 refuse an innocent one.
 
 **Idempotency**: a repeated `idempotency_key` within 24h returns the exact
-same result JSON as the first call and sends nothing new.
+same result JSON as the first call and sends nothing new. This is enforced
+with an atomic cross-process reservation (`src/mcp_huddle/delivery/
+idempotency.py`): the first caller to atomically create
+`$MCP_HUDDLE_HOME/delivery/reservations/<sha256(key)>.json`
+(`os.open(..., O_CREAT|O_EXCL)`) owns the key and is the only one that ever
+sends; this happens *before* any send is attempted. A concurrent call with
+the same key while the first is still in flight (file exists, `status:
+"reserved"`) sends nothing and returns a different, minimal shape instead of
+the usual result: `{"status": "in_progress", "msg_id": <the in-flight call's
+msg_id>}`. Once the owner finishes, it overwrites the file with `{"status":
+"done", "msg_id", "ts", "result"}`, which is what a same-key retry gets back
+verbatim (and which expires after 24h same as before). A `"reserved"` entry
+whose owning pid is confirmably dead *and* older than 5 minutes is
+considered abandoned (the owner crashed mid-send) and may be taken over by
+the next caller.
+
+**Harness enabled**: `delivery.json`'s `harnesses.<harness>.enabled` (see
+Configuration below) is checked once the target resolves, before either auto
+or forced mode picks a method — a disabled harness is refused immediately
+with an empty `attempts` list, in both modes.
 
 ## Configuration
 
