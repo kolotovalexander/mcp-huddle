@@ -72,9 +72,11 @@ DEFAULT_ARGV = {
     "codex.resume": ["codex", "exec", "resume", "--", "{id}", "{text}"],
     "hermes.native": ["hermes", "peer", "dm", "--", "{peer}", "{text}"],
     # Unverified config default template -- see docs/delivery.md.
-    "hermes.resume": ["hermes", "--resume", "{id}", "chat", "-q", "--", "{text}"],
+    # -q / -p take the value right after them, so no "--" here; {text} is the
+    # envelope, which always starts with "<", never "-".
+    "hermes.resume": ["hermes", "--resume", "{id}", "chat", "-q", "{text}"],
     "opencode.resume": ["opencode", "run", "--session", "{id}", "--", "{text}"],
-    "agy.resume": ["agy", "--conversation", "{id}", "-p", "--", "{text}"],
+    "agy.resume": ["agy", "--conversation", "{id}", "-p", "{text}"],
 }
 
 DEFAULT_TIMEOUT = {
