@@ -28,6 +28,7 @@ HARNESS_PREFIXES = ("claude", "codex", "hermes", "opencode", "agy")
 # and only characters that legitimate session ids / peer names / thread ids
 # plausibly use.
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,199}$")
+_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 
 class AmbiguousTarget(Exception):
@@ -224,6 +225,10 @@ def _find_codex(query: str) -> list:
     if query in idx:
         return [_codex_target(query, idx[query])]
     matches = [(tid, rec) for tid, rec in idx.items() if rec.get("thread_name") == query]
+    if not matches and _UUID_RE.match(query):
+        # Unnamed threads have no session_index entry; a well-formed thread
+        # UUID is still a valid `codex queue --thread` target.
+        return [_codex_target(query, None)]
     return [_codex_target(tid, rec) for tid, rec in matches]
 
 
@@ -250,8 +255,8 @@ def resolve(to: str) -> Target:
 
     if to.startswith("codex://threads/"):
         thread_id = to[len("codex://threads/"):].strip()
-        if not thread_id:
-            raise TargetNotFound("empty codex thread id")
+        if not _UUID_RE.match(thread_id):
+            raise TargetNotFound(f"codex thread id must be a UUID: {thread_id!r}")
         idx = _load_codex_index()
         return _codex_target(thread_id, idx.get(thread_id))
 

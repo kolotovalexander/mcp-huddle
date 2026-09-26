@@ -310,3 +310,13 @@ def test_list_targets_filters_by_harness(claude_dir, codex_home, tmp_path):
 
     everything = targets.list_targets()
     assert {t.harness for t in everything} == {"claude", "codex"}
+
+
+def test_codex_url_rejects_non_uuid_and_bare_uuid_resolves_without_index(tmp_path, monkeypatch):
+    from mcp_huddle.delivery import targets
+    monkeypatch.setenv("MCP_HUDDLE_DELIVERY_CODEX_HOME", str(tmp_path))
+    with pytest.raises(targets.TargetNotFound):
+        targets.resolve("codex://threads/-x")
+    uid = "01a0c68f-e601-71c2-9b23-1cc08ba347d4"
+    assert targets.resolve(f"codex:{uid}").id == uid
+    assert targets.resolve(f"codex://threads/{uid}").id == uid
