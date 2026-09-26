@@ -139,11 +139,19 @@ def message_send(to: str, text: str, mode: str = "auto", from_name: str = "",
     attempts = []
     delivered = False
     delivered_method = None
+    # Set when a `*.native` attempt fails ambiguously (e.g. a timeout) --
+    # meaning we can't rule out the target session being live. The paired
+    # `*.resume` method for the SAME harness is then never auto-attempted:
+    # resuming a possibly-live session would risk forking its history.
+    resume_blocked = False
     for method_id in method_ids:
         if not cfg.method_enabled(method_id):
             attempts.append({"method": method_id, "ok": False, "detail": "disabled by config"})
             continue
         skip_reason = _applicability_skip_reason(method_id, target, cfg)
+        if not skip_reason and resume_blocked and method_id.endswith(".resume"):
+            skip_reason = ("skipped: the preceding native attempt failed ambiguously "
+                            "(timeout or unrecognized error) -- resuming could fork a live session")
         if skip_reason:
             attempts.append({"method": method_id, "ok": False, "detail": skip_reason})
             continue
@@ -155,6 +163,8 @@ def message_send(to: str, text: str, mode: str = "auto", from_name: str = "",
         result = _run_method(method_id, target, env_text, cfg, msg_id)
         _log_attempt(msg_id, to, target.harness, method_id, result.ok, result.detail, text)
         attempts.append({"method": method_id, "ok": result.ok, "detail": result.detail})
+        if method_id.endswith(".native") and not result.ok and result.ambiguous:
+            resume_blocked = True
         if result.ok:
             delivered = True
             delivered_method = method_id

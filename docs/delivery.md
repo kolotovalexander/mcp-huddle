@@ -71,8 +71,8 @@ argv list — never `shell=True`.
 |---|---|
 | `claude.native` | Only if the target is live. Connects `AF_UNIX` to `messagingSocketPath` (5s timeout) and writes one line: `{"type":"user","message":{"role":"user","content":<envelope>}}\n`, then closes. This wire format is the one used by the [openmsg](https://github.com/steipete/openmsg) project; Anthropic's own docs (<https://code.claude.com/docs/en/cross-session-messaging>) document only the socket and an optional `{"type":"auth","token":...}` line, which we deliberately never send — we don't own the receiver's token. |
 | `claude.resume` | Only if the target is **not** live. Detached: `claude -p --resume <sessionId> <envelope>`, cwd = the session's cwd. |
-| `codex.native` | `codex queue --thread <id> --message <envelope>`, waited up to 30s; ok iff exit 0. |
-| `codex.resume` | Detached: `codex exec resume <id> <envelope>`. |
+| `codex.native` | `codex queue --thread=<id> --message=<envelope>`, waited up to 30s; ok iff exit 0. A timeout, or a nonzero exit whose stderr/stdout doesn't contain `"not loaded"` / `"no active session"` / `"unknown thread"`, is **ambiguous** (see below) and blocks the automatic fall-through to `codex.resume`. |
+| `codex.resume` | Detached: `codex exec resume -- <id> <envelope>`. Auto mode never runs this right after an ambiguous `codex.native` failure. |
 | `hermes.native` | Only if a peer name is available. `hermes peer dm <peer[/agent]> <envelope>`, waited up to 120s. |
 | `hermes.resume` | Detached: `hermes --resume <session> chat -q <envelope>`. **Unverified** — this argv is a config-default template, not something exercised against a real `hermes` binary. |
 | `opencode.native` | Only if `opencode.server_url` is configured. Best-effort `GET {server_url}/session/status` (ignored on failure — see [upstream bug #46842](https://github.com/sst/opencode/issues/46842), a busy session can silently drop the turn), then `POST {server_url}/session/{id}/prompt_async` with `{"parts":[{"type":"text","text":<envelope>}]}` via `urllib`. |
@@ -99,6 +99,16 @@ applicable to the resolved target (e.g. `claude.native` when the session
 isn't live, or `claude.resume` when it **is** live — a live Claude session
 never gets resumed), stopping at the first method that succeeds.
 
+**Double-writer guard**: Claude's live-check already makes `claude.resume`
+safe (it's only tried when the session is provably not live). Codex has no
+such live-check, so `codex.native`'s own exit signal must decide it instead:
+a definite "not loaded" signal makes falling through to `codex.resume` safe;
+anything else the failure could mean (a timeout, an unrecognized error) is
+treated as ambiguous, and `auto` mode skips `codex.resume` entirely rather
+than risk forking a live thread's history — it falls straight through to
+`spool`. This generalizes to any harness whose native method reports a
+failure as ambiguous.
+
 ## Envelope
 
 ```
@@ -113,11 +123,17 @@ sender-identity contract yet (agreed with the parallel Codex-side work on
 this repo), so a recipient must not treat `from` as authenticated.
 
 **Hops limit** (default 4, configurable via `delivery.json`'s `hops_limit`):
-if the incoming `text` already contains an `<agent-message>` envelope whose
-`hops` attribute is at or past the limit, `message_send` refuses immediately
-and sends nothing (`delivered: false`, `note` explains why). Otherwise a
-fresh send starts at `hops="1"`; relaying an already-enveloped message
-increments it.
+if the incoming `text` *is itself* an `<agent-message>` envelope (the tag
+must open at the very start of `text`, modulo incidental leading whitespace
+— not merely appear somewhere inside it) whose `hops` attribute is at or
+past the limit, `message_send` refuses immediately and sends nothing
+(`delivered: false`, `note` explains why). Otherwise a fresh send starts at
+`hops="1"`; relaying an already-enveloped message increments it. Anchoring
+the check at the start of `text` matters: a message that merely quotes or
+discusses the envelope syntax (or a forged tag an attacker embeds mid-body)
+must not be mistaken for a real forwarded envelope — that could either let a
+message that should be refused slip past the loop guard, or spuriously
+refuse an innocent one.
 
 **Idempotency**: a repeated `idempotency_key` within 24h returns the exact
 same result JSON as the first call and sends nothing new.
@@ -142,7 +158,13 @@ to `~/.mcp-huddle`, same as the rest of huddle):
 
 Argv templates are always lists (`{id}`, `{peer}`, `{text}`, `{cwd}`
 placeholders) — never a shell string. Anything omitted falls back to the
-built-in default in `src/mcp_huddle/delivery/config.py`.
+built-in default in `src/mcp_huddle/delivery/config.py`. `text` is arbitrary,
+fully caller-controlled content, so every default template guards against it
+being parsed as a CLI flag when it starts with `-`: a literal `--`
+"end of options" token immediately before it where it's a trailing
+positional argument, or a merged `--flag={text}` token where it's a named
+option's value. A custom template overriding these should keep the same
+guard.
 
 ## Logging
 

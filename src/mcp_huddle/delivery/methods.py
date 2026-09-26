@@ -13,8 +13,10 @@ import json
 import shutil
 import socket
 import subprocess
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,12 +25,28 @@ from typing import Optional
 from . import config as delivery_config
 from .targets import Target
 
+# The Claude cross-session messaging socket rejects (or hangs on) payloads
+# much past this; refuse locally instead of blocking on an oversized write.
+_CLAUDE_SOCKET_MAX_CHARS = 1_000_000
+
+# Substrings in a failed `codex queue`'s stderr/stdout that positively mean
+# "no such thread is currently loaded" -- the only condition under which
+# falling through to `codex.resume` cannot fork a live thread's history. Any
+# other failure (including a timeout) is ambiguous and must not auto-resume.
+_CODEX_NOT_LOADED_SIGNALS = ("not loaded", "no active session", "unknown thread")
+
 
 @dataclass
 class MethodResult:
     ok: bool
     method: str
     detail: str
+    # Only meaningful when ok is False for a `*.native` method: True means we
+    # can't tell whether the target session is actually live, so the caller
+    # must not fall through to the paired `*.resume` method (that could fork
+    # a live session's history). Defaults to False (safe to fall through) for
+    # every method that doesn't set it explicitly.
+    ambiguous: bool = False
 
 
 def _fill(argv, **values) -> list:
@@ -49,7 +67,7 @@ def _log_dir() -> Path:
 def _spawn_detached(argv, *, cwd: str = "", label: str) -> Path:
     log_path = _log_dir() / f"{label}-{int(time.time() * 1000)}.log"
     with open(log_path, "wb") as fh:
-        subprocess.Popen(
+        proc = subprocess.Popen(
             argv,
             cwd=cwd or None,
             stdout=fh,
@@ -58,6 +76,13 @@ def _spawn_detached(argv, *, cwd: str = "", label: str) -> Path:
             start_new_session=True,
             close_fds=True,
         )
+    # start_new_session=True detaches the child from our process group, but
+    # it stays our child in the process-table sense: nothing ever calls
+    # wait()/poll() on it otherwise, so it becomes a zombie the moment it
+    # exits (the Popen object above is never referenced again and there's no
+    # SIGCHLD handler). A daemon thread blocking on wait() reaps it without
+    # making the caller wait for the detached process to finish.
+    threading.Thread(target=proc.wait, daemon=True).start()
     return log_path
 
 
@@ -74,6 +99,12 @@ def claude_native(target: Target, envelope_text: str, cfg: delivery_config.Deliv
         return MethodResult(False, "claude.native", "target is not live")
     if not target.socket_path:
         return MethodResult(False, "claude.native", "no messagingSocketPath on session")
+    if len(envelope_text) > _CLAUDE_SOCKET_MAX_CHARS:
+        return MethodResult(
+            False, "claude.native",
+            f"envelope too large for the messaging socket "
+            f"({len(envelope_text)} > {_CLAUDE_SOCKET_MAX_CHARS} chars)",
+        )
     timeout = cfg.timeout("claude.native") or 5.0
     payload = json.dumps({"type": "user", "message": {"role": "user", "content": envelope_text}}) + "\n"
     try:
@@ -115,13 +146,20 @@ def codex_native(target: Target, envelope_text: str, cfg: delivery_config.Delive
     try:
         proc = subprocess.run(argv, capture_output=True, timeout=timeout, text=True)
     except subprocess.TimeoutExpired:
-        return MethodResult(False, "codex.native", "timed out")
+        # A timeout tells us nothing about whether the thread is loaded --
+        # it could just as well mean the Codex app has it open and busy.
+        # Falling through to `codex.resume` here would risk forking that
+        # live thread's history, so this is always ambiguous.
+        return MethodResult(False, "codex.native", "timed out (ambiguous -- thread state unknown)",
+                             ambiguous=True)
     except OSError as exc:
         return MethodResult(False, "codex.native", f"exec failed: {exc}")
     if proc.returncode == 0:
         return MethodResult(True, "codex.native", "queued")
     detail = (proc.stderr or proc.stdout or "").strip()[:200]
-    return MethodResult(False, "codex.native", f"exit {proc.returncode}: {detail}")
+    not_loaded = any(sig in detail.lower() for sig in _CODEX_NOT_LOADED_SIGNALS)
+    return MethodResult(False, "codex.native", f"exit {proc.returncode}: {detail}",
+                         ambiguous=not not_loaded)
 
 
 def codex_resume(target: Target, envelope_text: str, cfg: delivery_config.DeliveryConfig) -> MethodResult:
@@ -189,8 +227,13 @@ def opencode_native(target: Target, envelope_text: str, cfg: delivery_config.Del
     except Exception:
         pass
     body = json.dumps({"parts": [{"type": "text", "text": envelope_text}]}).encode("utf-8")
+    # target.id for opencode is taken as-is from `to` (no local registry to
+    # validate it against, unlike claude/codex) -- URL-encode it so a crafted
+    # id such as "../admin" or "x?y=z" can't alter the request path or add
+    # query parameters against the local opencode server.
+    safe_id = urllib.parse.quote(str(target.id), safe="")
     req = urllib.request.Request(
-        f"{base}/session/{target.id}/prompt_async",
+        f"{base}/session/{safe_id}/prompt_async",
         data=body,
         headers={"Content-Type": "application/json"},
         method="POST",
