@@ -159,6 +159,43 @@ def test_auto_order_falls_back_when_native_fails(codex_home, monkeypatch):
     assert out["attempts"][1]["ok"] is True
 
 
+def test_ambiguous_native_failure_blocks_resume_falls_to_spool(codex_home, monkeypatch):
+    _write_codex_index(codex_home, [{"id": "th-amb", "thread_name": "x", "updated_at": 1}])
+
+    def ambiguous_native(target, text, cfg):
+        return methods.MethodResult(False, "codex.native", "timed out (ambiguous)", ambiguous=True)
+
+    def unexpected_resume(target, text, cfg):
+        raise AssertionError("codex.resume must not run after an ambiguous native failure")
+
+    monkeypatch.setitem(methods.DISPATCH, "codex.native", ambiguous_native)
+    monkeypatch.setitem(methods.DISPATCH, "codex.resume", unexpected_resume)
+
+    out = json.loads(core.message_send("codex:th-amb", "hi"))
+    assert out["delivered"] is True
+    assert out["method"] == "spool"
+    resume_attempt = next(a for a in out["attempts"] if a["method"] == "codex.resume")
+    assert resume_attempt["ok"] is False
+    assert "ambiguous" in resume_attempt["detail"]
+
+
+def test_non_ambiguous_native_failure_still_allows_resume(codex_home, monkeypatch):
+    _write_codex_index(codex_home, [{"id": "th-safe", "thread_name": "x", "updated_at": 1}])
+
+    def not_loaded_native(target, text, cfg):
+        return methods.MethodResult(False, "codex.native", "exit 7: thread not loaded", ambiguous=False)
+
+    def ok_resume(target, text, cfg):
+        return methods.MethodResult(True, "codex.resume", "started")
+
+    monkeypatch.setitem(methods.DISPATCH, "codex.native", not_loaded_native)
+    monkeypatch.setitem(methods.DISPATCH, "codex.resume", ok_resume)
+
+    out = json.loads(core.message_send("codex:th-safe", "hi"))
+    assert out["delivered"] is True
+    assert out["method"] == "codex.resume"
+
+
 def test_live_claude_never_resumes(claude_dir, tmp_path, monkeypatch):
     sock = tmp_path / "live.sock"
     sock.write_text("")

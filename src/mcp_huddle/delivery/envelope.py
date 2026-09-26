@@ -30,12 +30,22 @@ def _escape(value) -> str:
 
 
 def existing_hops(text: str):
-    """Return the ``hops`` attribute of the first ``<agent-message>`` opening
-    tag found in ``text``, or ``None`` if there is no such envelope / no hops
-    attribute / it isn't an integer."""
+    """Return the ``hops`` attribute of the ``<agent-message>`` opening tag
+    that wraps ``text``, or ``None`` if ``text`` isn't itself an envelope (no
+    hops attribute / not an integer).
+
+    Anchored at the start of ``text`` (after stripping incidental leading
+    whitespace) rather than searched anywhere in it: a genuine forwarded
+    envelope always begins with the tag (see ``build_envelope``), and
+    anchoring keeps a forged ``<agent-message hops="0" ...>`` string embedded
+    or quoted inside an unrelated free-form message from being picked up as
+    real hop-count metadata -- which would either let a message that should
+    be refused slip through the loop guard, or spuriously refuse an innocent
+    message that happens to mention the tag syntax.
+    """
     if not text:
         return None
-    match = _OPEN_TAG_RE.search(text)
+    match = _OPEN_TAG_RE.match(text.lstrip())
     if not match:
         return None
     attrs = dict(_ATTR_RE.findall(match.group(1)))

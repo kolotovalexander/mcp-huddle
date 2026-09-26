@@ -162,7 +162,7 @@ def test_codex_native_success_and_failure(fake_bin, cfg):
     ok_result = methods.codex_native(target, ENVELOPE, cfg)
     assert ok_result.ok is True
     records = _read_records(fake_bin["out"])
-    assert records[0]["argv"][-1] == ENVELOPE
+    assert records[0]["argv"][-1] == f"--message={ENVELOPE}"  # merged flag=value, text unchanged
 
     os.environ["FAKE_BIN_EXIT"] = "1"
     try:
@@ -171,6 +171,95 @@ def test_codex_native_success_and_failure(fake_bin, cfg):
         del os.environ["FAKE_BIN_EXIT"]
     assert fail_result.ok is False
     assert "exit 1" in fail_result.detail
+    # unrecognized nonzero exit: can't tell if the thread is loaded ->
+    # ambiguous, must not let the caller auto-fall-through to codex.resume
+    assert fail_result.ambiguous is True
+
+
+def test_codex_native_timeout_is_ambiguous(monkeypatch, cfg):
+    import subprocess as sp
+
+    def fake_run(*a, **kw):
+        raise sp.TimeoutExpired(cmd=a[0], timeout=kw.get("timeout"))
+
+    monkeypatch.setattr(methods.shutil, "which", lambda name: f"/bin/{name}")
+    monkeypatch.setattr(methods.subprocess, "run", fake_run)
+    target = Target(harness="codex", id="th-1")
+    result = methods.codex_native(target, ENVELOPE, cfg)
+    assert result.ok is False
+    assert result.ambiguous is True
+    assert "timed out" in result.detail
+
+
+def test_codex_native_not_loaded_signal_is_not_ambiguous(monkeypatch, cfg):
+    import subprocess as sp
+
+    class FakeProc:
+        returncode = 7
+        stdout = ""
+        stderr = "error: thread not loaded"
+
+    monkeypatch.setattr(methods.shutil, "which", lambda name: f"/bin/{name}")
+    monkeypatch.setattr(methods.subprocess, "run", lambda *a, **kw: FakeProc())
+    target = Target(harness="codex", id="th-1")
+    result = methods.codex_native(target, ENVELOPE, cfg)
+    assert result.ok is False
+    assert result.ambiguous is False  # safe to fall through to codex.resume
+
+
+def test_claude_native_rejects_oversized_envelope(cfg):
+    target = Target(harness="claude", id="sess-1", live=True, socket_path="/whatever")
+    huge = "x" * (methods._CLAUDE_SOCKET_MAX_CHARS + 1)
+    result = methods.claude_native(target, huge, cfg)
+    assert result.ok is False
+    assert "too large" in result.detail
+
+
+def test_opencode_native_encodes_target_id_in_url(monkeypatch, cfg):
+    urls = []
+
+    def fake_urlopen(req, timeout=None):
+        urls.append(req.full_url)
+        if req.full_url.endswith("/session/status"):
+            raise OSError("no status endpoint")
+        return _FakeResponse(200)
+
+    monkeypatch.setattr(methods.urllib.request, "urlopen", fake_urlopen)
+    raw_cfg = delivery_config.DeliveryConfig({"opencode": {"server_url": "http://127.0.0.1:9999"}})
+    target = Target(harness="opencode", id="../admin?x=y")
+    result = methods.opencode_native(target, ENVELOPE, raw_cfg)
+    assert result.ok is True
+    prompt_urls = [u for u in urls if "prompt_async" in u]
+    assert len(prompt_urls) == 1
+    assert "../admin" not in prompt_urls[0]
+    assert "?x=y" not in prompt_urls[0]  # id was encoded, not left as a live query string
+
+
+def test_detached_process_is_reaped_not_left_a_zombie(fake_bin, cfg):
+    captured = []
+    real_popen = methods.subprocess.Popen
+
+    def recording_popen(*a, **kw):
+        proc = real_popen(*a, **kw)
+        captured.append(proc)
+        return proc
+
+    import unittest.mock
+    with unittest.mock.patch.object(methods.subprocess, "Popen", recording_popen):
+        target = Target(harness="codex", id="th-reap")
+        methods.codex_resume(target, ENVELOPE, cfg)
+
+    _read_records(fake_bin["out"])  # wait for the (fast-exiting) fake binary to run
+    assert len(captured) == 1
+    proc = captured[0]
+    # If nothing ever reaps it, returncode stays None forever even long after
+    # the OS process has exited (Popen only learns the exit status via
+    # wait()/poll()). The background thread in _spawn_detached should have
+    # already called wait() for us.
+    deadline = time.time() + 5.0
+    while proc.returncode is None and time.time() < deadline:
+        time.sleep(0.05)
+    assert proc.returncode is not None, "detached child was never reaped -- zombie risk"
 
 
 def test_codex_resume_spawns_detached(fake_bin, cfg):
