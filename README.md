@@ -128,6 +128,7 @@ These are the tools exposed over MCP (decorated with `@mcp.tool()` in
 | `propose_resolution` | Propose a resolution to end discussion; returns `resolution_id`. |
 | `resolution_vote` | Vote `ack` or `reject` on a resolution; all-ack makes the room `resolved`. |
 | `notify_register` | Register a notification filename (or compatible absolute direct child) under `$MCP_HUDDLE_HOME/notifications/` for addressed `kind=request` messages. |
+| `message_send` / `message_targets` | Native cross-harness delivery to another agent session outside a room (Claude/Codex/Hermes/OpenCode/agy) — see [`docs/delivery.md`](docs/delivery.md). |
 
 Room lifecycle operations (request-close, close, delete, close-session) remain
 human/server-owned. Agent work status is exposed through `room_status`; agents

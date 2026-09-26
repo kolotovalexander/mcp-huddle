@@ -26,6 +26,7 @@ from starlette.responses import FileResponse, JSONResponse, StreamingResponse
 
 from . import bus
 from . import child_processes
+from . import delivery
 from . import spawn
 
 # Shown to LLM clients in the `initialize` response. Keep tight — every agent
@@ -809,6 +810,39 @@ def notify_register(room_id: str, agent: str, notify_file_path: str) -> str:
     """
     bus.register_notify(room_id, agent, notify_file_path)
     return "ok"
+
+
+# ── Native cross-harness message delivery ──────────────────────────────────────
+
+@mcp.tool()
+def message_send(to: str, text: str, mode: str = "auto", from_name: str = "",
+                  reply_to: str = "", idempotency_key: str = "") -> str:
+    """Deliver `text` to another agent session outside this room, picking a
+    deterministic "postman" per harness (no LLM) and trying methods in order.
+    `text` is sent unchanged inside a small envelope.
+
+    `to`: 'claude:<name|sessionId>', 'codex:<threadId|thread_name>',
+    'codex://threads/<id>', 'hermes:<peer[/agent]|session>',
+    'opencode:<sessionId>', 'agy:<conversationId>', or a bare name.
+    `mode`: 'auto' (default) or a forced method id, e.g. 'claude.native'.
+
+    Returns JSON: {msg_id, delivered, method, attempts, note}. `delivered`
+    for a resume/spool method means the attempt started/was queued, not that
+    it was read. See docs/delivery.md.
+    """
+    return delivery.message_send(
+        to, text, mode=mode, from_name=from_name, reply_to=reply_to,
+        idempotency_key=idempotency_key,
+    )
+
+
+@mcp.tool()
+def message_targets(harness: str = "") -> list:
+    """List resolvable cross-harness targets (Claude/Codex session registries),
+    optionally filtered by harness ('claude', 'codex', ...). Never returns
+    tokens or file contents -- see docs/delivery.md.
+    """
+    return delivery.message_targets(harness)
 
 
 # ── Background tasks ──────────────────────────────────────────────────────────
