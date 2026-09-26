@@ -56,27 +56,35 @@ DEFAULT_ORDER = {
 # argv templates. Placeholders: {id} {peer} {text} {cwd}. Always a list
 # (never shell=True); the first element is resolved with shutil.which.
 #
-# `text` is the fully attacker/model-controlled message body, so any
-# template where it lands as its own argv token could have it parsed as a
-# CLI flag if it happens to start with "-" (a plain positional arg starting
-# with "-" is commonly misread as an option by argparse-style parsers).
-# Templates guard against that in one of two ways:
-#  - a literal "--" token immediately before {text} where it's the trailing
-#    positional argument (the GNU/POSIX "end of options" convention), or
-#  - a merged "--flag={text}" single token where {text} is a named option's
-#    value (a "--" between the flag and its value would just be consumed as
-#    the terminator and never attached to the flag).
+# `text` AND `{id}`/`{peer}` are caller-controlled: `text` is the fully
+# attacker/model-controlled message body, and `{id}`/`{peer}` come straight
+# from the caller's `to` string for harnesses with no local registry to
+# validate them against (hermes/opencode/agy) -- see targets.py's
+# `_require_safe_id`. Either one landing as its own bare argv token could be
+# parsed as a CLI flag if it happens to start with "-" (a positional arg
+# starting with "-" is commonly misread as an option by argparse-style
+# parsers) -- this is exactly how a forced `claude.resume` against a
+# malicious id used to be able to smuggle in extra flags. Templates guard
+# against that for every placeholder in one of two ways:
+#  - a literal "--" token immediately before the placeholder where it's the
+#    trailing positional argument (the GNU/POSIX "end of options"
+#    convention), or
+#  - a merged "--flag={placeholder}" single token where it's a named
+#    option's value (a "--" between the flag and its value would just be
+#    consumed as the terminator and never attached to the flag).
+# A custom template overriding these should keep the same guard for every
+# placeholder, not just {text}.
 DEFAULT_ARGV = {
-    "claude.resume": ["claude", "-p", "--resume", "{id}", "--", "{text}"],
+    "claude.resume": ["claude", "-p", "--resume={id}", "--", "{text}"],
     "codex.native": ["codex", "queue", "--thread={id}", "--message={text}"],
     "codex.resume": ["codex", "exec", "resume", "--", "{id}", "{text}"],
     "hermes.native": ["hermes", "peer", "dm", "--", "{peer}", "{text}"],
     # Unverified config default template -- see docs/delivery.md.
-    # -q / -p take the value right after them, so no "--" here; {text} is the
-    # envelope, which always starts with "<", never "-".
-    "hermes.resume": ["hermes", "--resume", "{id}", "chat", "-q", "{text}"],
-    "opencode.resume": ["opencode", "run", "--session", "{id}", "--", "{text}"],
-    "agy.resume": ["agy", "--conversation", "{id}", "-p", "{text}"],
+    # -q takes the value right after it, so no "--" needed there; {text} is
+    # the envelope, which always starts with "<", never "-".
+    "hermes.resume": ["hermes", "--resume={id}", "chat", "-q", "{text}"],
+    "opencode.resume": ["opencode", "run", "--session={id}", "--", "{text}"],
+    "agy.resume": ["agy", "--conversation={id}", "-p", "{text}"],
 }
 
 DEFAULT_TIMEOUT = {
