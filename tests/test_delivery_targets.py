@@ -138,8 +138,9 @@ def test_resolve_codex_uri_form(codex_home):
 
 def test_resolve_codex_uri_form_unknown_id_still_resolves(codex_home):
     _write_codex_index(codex_home, [])
-    t = targets.resolve("codex://threads/th-unknown")
-    assert t.id == "th-unknown"
+    uid = "11111111-2222-3333-4444-555555555555"
+    t = targets.resolve(f"codex://threads/{uid}")
+    assert t.id == uid
     assert t.name == ""
 
 

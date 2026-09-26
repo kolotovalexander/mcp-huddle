@@ -255,9 +255,9 @@ def resolve(to: str) -> Target:
 
     if to.startswith("codex://threads/"):
         thread_id = to[len("codex://threads/"):].strip()
-        if not _UUID_RE.match(thread_id):
-            raise TargetNotFound(f"codex thread id must be a UUID: {thread_id!r}")
         idx = _load_codex_index()
+        if thread_id not in idx and not _UUID_RE.match(thread_id):
+            raise TargetNotFound(f"codex thread id must be a UUID or indexed: {thread_id!r}")
         return _codex_target(thread_id, idx.get(thread_id))
 
     prefix, sep, rest = to.partition(":")
