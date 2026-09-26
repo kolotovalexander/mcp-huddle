@@ -35,6 +35,8 @@ const labels = {
   'activity.retrying': 'Retrying',
 };
 global.t = key => labels[key] || key;
+global.roomData = {};
+global.swarmAgentOutcome = () => '';
 global.appendAgentEvent = (_name, data) => rendered.push(data);
 global.showAuthRequired = () => {};
 global.HuddleHTTPError = class extends Error { constructor(status, message) { super(message); this.status = status; } };
