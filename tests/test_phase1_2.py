@@ -181,6 +181,53 @@ def test_opencode_slot_is_opt_in_timeout_wrapped_and_uses_local_model_config() -
     assert not any("9router" in arg for arg in spec["cmd"])
 
 
+def test_opencode_child_gets_parent_http_mcp_config_without_token(monkeypatch) -> None:
+    monkeypatch.setattr(spawn.sys, "argv", ["mcp-huddle", "--http", "--port", "8014"])
+    monkeypatch.setenv("MCP_HUDDLE_TOKEN", "must-not-reach-opencode")
+    spec = {
+        "name": "OpenCode-cohere",
+        "cmd": ["/opt/homebrew/bin/timeout", "1200", "/opt/homebrew/bin/opencode",
+                "run", "-m", "openrouter/cohere/north-mini-code:free", "{brief}"],
+        "enabled": True,
+    }
+
+    env = spawn._spawn_environment(spec, spec["cmd"])
+
+    config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
+    assert config["mcp"]["huddle"] == {"enabled": False}
+    assert config["mcp"]["huddle_parent"] == {
+        "type": "remote",
+        "url": "http://127.0.0.1:8014/mcp",
+        "enabled": True,
+        "oauth": False,
+    }
+    assert "must-not-reach-opencode" not in env["OPENCODE_CONFIG_CONTENT"]
+    assert "MCP_HUDDLE_TOKEN" not in env
+
+
+def test_opencode_parent_mcp_override_uses_cli_port_then_port_env(monkeypatch) -> None:
+    monkeypatch.setattr(spawn.sys, "argv", ["mcp-huddle", "--http", "--port=45111"])
+    monkeypatch.setenv("PORT", "8014")
+    assert spawn._opencode_parent_mcp_url() == "http://127.0.0.1:45111/mcp"
+
+    monkeypatch.setattr(spawn.sys, "argv", ["mcp-huddle", "--http"])
+    monkeypatch.setenv("PORT", "45112")
+    assert spawn._opencode_parent_mcp_url() == "http://127.0.0.1:45112/mcp"
+
+
+def test_opencode_parent_mcp_override_is_absent_outside_http_mode(monkeypatch) -> None:
+    monkeypatch.setattr(spawn.sys, "argv", ["mcp-huddle"])
+    monkeypatch.delenv("MCP_HUDDLE_HTTP", raising=False)
+    assert spawn._opencode_parent_mcp_url() is None
+
+    opencode = {"name": "OpenCode", "cmd": ["opencode", "run", "{brief}"], "enabled": True}
+    codex = {"name": "Codex", "cmd": ["codex", "exec", "{brief}"], "enabled": True}
+    assert "OPENCODE_CONFIG_CONTENT" not in spawn._spawn_environment(opencode, opencode["cmd"])
+
+    monkeypatch.setattr(spawn.sys, "argv", ["mcp-huddle", "--http"])
+    assert "OPENCODE_CONFIG_CONTENT" not in spawn._spawn_environment(codex, codex["cmd"])
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [("not-a-number", "1200"), ("0", "1200"), ("-1", "1200"), ("45", "45")],
@@ -1419,6 +1466,7 @@ def test_request_message_wakes_existing_codex_thread(tmp_path: Path, monkeypatch
             "log_path": str(log_path),
             "last_message_path": str(isolated_bus._room_dir(room_id) / "agents" / "codex.last_message.txt"),
             "last_seen_id": 1,
+            "model_settings": {"model": "pinned-gpt", "effort": "high"},
         }
     }
     isolated_bus._write_json(isolated_bus._room_dir(room_id) / "meta.json", meta)
@@ -1444,6 +1492,9 @@ def test_request_message_wakes_existing_codex_thread(tmp_path: Path, monkeypatch
     updated = isolated_bus.get_room_info(room_id)["agent_meta"]["Codex"]
     assert calls[0]["spawn_kwargs"]["owner_room_id"] == room_id
     assert calls[0]["spawn_kwargs"]["process_handle"] == updated["wake_id"]
+    assert calls[0]["spawn_kwargs"]["model_settings"] == {
+        "model": "pinned-gpt", "effort": "high",
+    }
     assert updated["thread_id"] == "thread-123"
     assert updated["last_wake_msg_id"] == 2
     assert updated["last_seen_id"] == 2
@@ -2490,6 +2541,114 @@ def test_readonly_default_on_codex_and_claude(monkeypatch: pytest.MonkeyPatch) -
     assert claude[claude.index("--permission-mode") + 1] == "manual"
 
 
+@pytest.mark.parametrize(
+    ("name", "cmd", "expected_binary"),
+    [
+        ("Codex Worktree", ["codex", "exec", "{brief}"], "codex"),
+        ("Claude Reviewer", ["claude", "-p", "{brief}"], "claude"),
+    ],
+)
+def test_readonly_uses_cli_for_renamed_codex_and_claude_profiles(
+    name: str, cmd: list[str], expected_binary: str,
+) -> None:
+    """Read-only flags follow the executable, not a registry display label."""
+    rewritten = spawn._apply_readonly({"name": name, "cmd": cmd, "enabled": True})["cmd"]
+
+    if expected_binary == "codex":
+        assert "read-only" in rewritten
+        assert 'mcp_servers.huddle.default_tools_approval_mode="approve"' in rewritten
+        assert "--allowedTools" not in rewritten
+    else:
+        assert "--allowedTools" in rewritten
+        assert "--disallowedTools" in rewritten
+        assert "read-only" not in rewritten
+
+
+@pytest.mark.parametrize(
+    ("name", "cmd"),
+    [
+        ("Codex", ["opencode", "run", "{brief}"]),
+        ("Claude", ["agy", "-p", "{brief}"]),
+    ],
+)
+def test_readonly_does_not_apply_cli_flags_to_misnamed_nonmatching_runner(
+    name: str, cmd: list[str],
+) -> None:
+    """A display-name collision must not inject flags for another CLI."""
+    rewritten = spawn._apply_readonly({"name": name, "cmd": cmd, "enabled": True})["cmd"]
+    assert rewritten == cmd
+
+
+def test_readonly_claude_flags_follow_cli_when_timeout_wrapped() -> None:
+    cmd = ["timeout", "-s", "TERM", "120", "claude", "-p", "{brief}"]
+
+    rewritten = spawn._apply_readonly(
+        {"name": "Claude Reviewer", "cmd": cmd, "enabled": True}
+    )["cmd"]
+
+    assert rewritten[:5] == cmd[:5]
+    assert rewritten[4] == "claude"
+    assert rewritten[5:5 + len(spawn._CLAUDE_RO_FLAGS)] == spawn._CLAUDE_RO_FLAGS
+
+
+def test_readonly_codex_flags_preserve_timeout_signal_and_follow_cli() -> None:
+    cmd = ["timeout", "-s", "TERM", "120", "codex", "exec", "-s",
+           "danger-full-access", "{brief}"]
+
+    rewritten = spawn._apply_readonly(
+        {"name": "Codex Worker", "cmd": cmd, "enabled": True}
+    )["cmd"]
+
+    assert rewritten[:5] == cmd[:5]
+    codex_index = rewritten.index("codex")
+    assert rewritten[codex_index + 1] == "exec"
+    assert "read-only" in rewritten[codex_index + 1:]
+    assert "danger-full-access" not in rewritten
+    assert rewritten.count("-s") == 2  # timeout signal and Codex sandbox
+
+
+@pytest.mark.parametrize("unsafe_setting", ["--settings unsafe.json", "--mcp-config=config.json"])
+def test_readonly_strips_claude_permission_overrides_and_rejects_external_tool_config(
+    unsafe_setting: str,
+) -> None:
+    cmd = [
+        "claude", "--permission-mode", "bypassPermissions", "--allowedTools", "Bash,Edit",
+        "--dangerously-skip-permissions", *unsafe_setting.split(), "-p", "{brief}",
+    ]
+
+    rewritten = spawn._apply_readonly({"name": "Claude", "cmd": cmd})["cmd"]
+
+    assert "bypassPermissions" not in rewritten
+    assert "Bash,Edit" not in rewritten
+    assert "--dangerously-skip-permissions" not in rewritten
+    assert rewritten[rewritten.index("--allowedTools") + 1] == (
+        "Read,Glob,Grep,WebFetch,WebSearch,mcp__huddle__*"
+    )
+    assert rewritten[rewritten.index("--permission-mode") + 1] == "manual"
+    assert not spawn.readonly_enforced({"name": "Claude", "cmd": cmd})
+
+
+@pytest.mark.parametrize("unsafe", [
+    "--dangerously-bypass-approvals-and-sandbox", "--approve-for-me", "--full-auto", "--yolo",
+])
+def test_readonly_strips_codex_bypass_flags_and_honors_readonly_gate(unsafe: str) -> None:
+    cmd = ["codex", unsafe, "exec", "--profile", "permissive", "-s", "danger-full-access", "{brief}"]
+
+    rewritten = spawn._apply_readonly({"name": "Codex", "cmd": cmd})["cmd"]
+
+    assert unsafe not in rewritten
+    assert "permissive" not in rewritten
+    assert "danger-full-access" not in rewritten
+    assert spawn.readonly_enforced({"name": "Codex", "cmd": cmd})
+
+
+def test_readonly_rejects_codex_custom_mcp_config_override() -> None:
+    cmd = ["codex", "exec", "-c", 'mcp_servers.other.command="mutator"', "{brief}"]
+    rewritten = spawn._apply_readonly({"name": "Codex", "cmd": cmd})["cmd"]
+    assert 'mcp_servers.other.command="mutator"' not in rewritten
+    assert spawn.readonly_enforced({"name": "Codex", "cmd": cmd})
+
+
 def test_readonly_opt_out_restores_full_access(monkeypatch: pytest.MonkeyPatch) -> None:
     """MCP_HUDDLE_READONLY=0 restores the full-access spawn (worker mode)."""
     monkeypatch.setenv("MCP_HUDDLE_READONLY", "0")
@@ -2621,7 +2780,7 @@ def test_direct_anthropic_opus_spawn_uses_only_direct_api_environment(
     assert "--allowedTools" in captured["argv"]
     argv = captured["argv"]
     assert "--bare" in argv and "--restricted" in argv and "--strict-mcp-config" in argv
-    assert argv[argv.index("--model") + 1] == "claude-opus-5"
+    assert argv[argv.index("--model") + 1] == "claude-opus-5-5"
     assert argv[argv.index("--add-dir") + 1] == str(project.resolve())
     mcp_config = json.loads(argv[argv.index("--mcp-config") + 1])
     assert mcp_config["mcpServers"]["huddle"]["url"] == "http://127.0.0.1:45111/mcp"

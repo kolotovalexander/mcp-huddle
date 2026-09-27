@@ -51,7 +51,9 @@ Phase 1 changes (2026-04-30):
 """
 from __future__ import annotations
 import _thread
+import hashlib
 import json
+import secrets
 import os
 import re
 import shutil
@@ -62,7 +64,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import BinaryIO, NamedTuple, NotRequired, TypedDict
+from typing import BinaryIO, Callable, Literal, NamedTuple, NotRequired, TypedDict
 from urllib import error as urlerror
 from urllib import request as urlrequest
 from urllib.parse import urlparse
@@ -89,18 +91,33 @@ class SpawnSpec(TypedDict):
     # A named profile is a fixed, reviewed runner contract. It is deliberately
     # narrower than a generic environment/configuration API for registry JSON.
     profile: NotRequired[str]
-    # Local endpoint for the owner-enabled subscription reviewer. Validated
-    # before spawn; credentials and remote URLs are never accepted here.
+    # Local Huddle MCP endpoint (loopback, path /mcp). Used by the
+    # owner-enabled subscription reviewer, Claude write rooms, and — when set
+    # on a Codex profile — to pin that child's `huddle` MCP URL. Other
+    # configured MCP servers are not removed. Credentials and remote URLs are
+    # never accepted here.
     mcp_url: NotRequired[str]
     # Additional parent environment variable names that this child explicitly
     # needs. Values stay out of registry JSON and logs; only the named values
     # are copied at spawn time. Provider runners also opt in their
     # ``--api-key-env`` variable automatically.
     pass_env: NotRequired[list[str]]
+    model: NotRequired[str]
+    effort: NotRequired[str]
+    variant: NotRequired[str]
 
 
 class AgentSpawnError(RuntimeError):
     """Raised when a process starts but fails the optional health check."""
+
+
+class CliLoginProbe(TypedDict):
+    status: Literal["authenticated", "unauthenticated", "unknown"]
+    reason: Literal[
+        "cli_login_present", "cli_logged_out", "unsupported_harness",
+        "non_native_profile", "probe_unavailable", "probe_timeout",
+        "unrecognized_output",
+    ]
 
 
 class _RetainedChild(NamedTuple):
@@ -581,15 +598,410 @@ def _validate_protected_profile_names(registry: list[SpawnSpec]) -> None:
             raise AgentSpawnError("protected Opus profile must use its canonical registry name")
 
 
+_VALID_CODEX_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+_VALID_CLAUDE_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+_VALID_AGY_EFFORTS = {"low", "medium", "high"}
+
+# Exact-model preflights are intentionally short and process-local. The key
+# contains only non-secret routing inputs; native CLI auth remains in its own
+# config/keychain and candidate registry `pass_env` values are never copied.
+_MODEL_PREFLIGHT_CACHE: dict[tuple[str, str, str, str, str], tuple[float, dict[str, str]]] = {}
+_MODEL_PREFLIGHT_LOCK = threading.Lock()
+_MODEL_PREFLIGHT_TTL_SEC = 60.0
+_MODEL_PREFLIGHT_TIMEOUT_SEC = 45
+_MODEL_PREFLIGHT_SENTINEL = "Reply with exactly this text and nothing else: HUDDLE PREFLIGHT OK"
+_MODEL_PREFLIGHT_EXPECTED = "HUDDLE PREFLIGHT OK"
+
+
+def probe_cli_model_response(spec: SpawnSpec, cwd: str) -> dict[str, str]:
+    """Make one bounded sentinel request using an explicitly pinned model/effort.
+
+    Only native Claude and Codex CLIs are supported. The prompt is a fixed
+    public sentinel, and the process runs outside the project in an isolated
+    no-tools/read-only invocation. Raw CLI output is never returned or logged.
+    Missing explicit model or effort is reported as unsupported because a
+    harness default cannot prove which exact route answered.
+    """
+    command = spec.get("cmd", [])
+    if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
+        return {"status": "unsupported", "reason": "unsupported_harness"}
+    binary_index = _effective_binary_index(command)
+    if binary_index is None:
+        return {"status": "unsupported", "reason": "unsupported_harness"}
+    binary = command[binary_index]
+    harness = Path(binary).name
+    if harness not in {"claude", "codex"}:
+        return {"status": "unsupported", "reason": "unsupported_harness"}
+    try:
+        settings = model_settings_for_spec(spec)
+    except Exception:
+        return {"status": "unsupported", "reason": "invalid_model_settings"}
+    model, effort = settings.get("model"), settings.get("effort")
+    if not model or not effort:
+        return {"status": "unsupported", "reason": "model_effort_not_explicit"}
+
+    cache_key = (
+        str(Path(binary).expanduser()), model, effort,
+        os.environ.get("CODEX_HOME", ""), os.environ.get("CLAUDE_CONFIG_DIR", ""),
+    )
+    now = time.monotonic()
+    with _MODEL_PREFLIGHT_LOCK:
+        cached = _MODEL_PREFLIGHT_CACHE.get(cache_key)
+        if cached and now - cached[0] < _MODEL_PREFLIGHT_TTL_SEC:
+            return dict(cached[1])
+        if cached:
+            _MODEL_PREFLIGHT_CACHE.pop(cache_key, None)
+
+    if harness == "claude":
+        argv = [
+            binary, "--restricted", "--strict-mcp-config", "--setting-sources", "",
+            "--tools", "", "--permission-prompts", "none",
+            "--no-session-persistence", "--model", model, "--effort", effort,
+            "-p", _MODEL_PREFLIGHT_SENTINEL,
+        ]
+    else:
+        argv = [
+            binary, "exec", "--ephemeral",
+            "--skip-git-repo-check", "--sandbox", "read-only",
+            "-c", "mcp_servers={}",
+            "--model", model, "-c", f'model_reasoning_effort="{effort}"',
+            _MODEL_PREFLIGHT_SENTINEL,
+        ]
+
+    try:
+        result = subprocess.run(
+            argv, cwd=cwd, env=build_sanitized_environment(),
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            timeout=_MODEL_PREFLIGHT_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        probe = {"status": "failed", "reason": "response_timeout"}
+    except (OSError, ValueError):
+        probe = {"status": "unknown", "reason": "probe_unavailable"}
+    else:
+        stdout = result.stdout if isinstance(result.stdout, str) else ""
+        if result.returncode != 0:
+            probe = {"status": "failed", "reason": "provider_request_failed"}
+        elif stdout.strip() == _MODEL_PREFLIGHT_EXPECTED:
+            probe = {"status": "passed", "reason": "sentinel_response_received"}
+        else:
+            probe = {"status": "failed", "reason": "sentinel_response_not_received"}
+
+    with _MODEL_PREFLIGHT_LOCK:
+        if len(_MODEL_PREFLIGHT_CACHE) >= 128:
+            _MODEL_PREFLIGHT_CACHE.clear()
+        _MODEL_PREFLIGHT_CACHE[cache_key] = (time.monotonic(), dict(probe))
+    return probe
+
+
+def _validated_model_overrides(spec: SpawnSpec, binary: str) -> dict[str, str]:
+    """Validate registry model controls and return only explicitly supplied ones."""
+    values: dict[str, str] = {}
+    for key in ("model", "effort", "variant"):
+        if key not in spec:
+            continue
+        value = spec[key]
+        if not isinstance(value, str) or not value.strip():
+            raise AgentSpawnError(
+                f"{spec.get('name', binary)} {key} must be a non-empty string"
+            )
+        values[key] = value.strip()
+
+    if binary == "codex":
+        if "variant" in values:
+            raise AgentSpawnError("Codex does not support 'variant'; use 'effort'")
+        if values.get("effort") and values["effort"] not in _VALID_CODEX_EFFORTS:
+            raise AgentSpawnError(f"Codex unsupported effort '{values['effort']}'")
+    elif binary == "claude":
+        if "variant" in values:
+            raise AgentSpawnError("Claude does not support 'variant'; use 'effort'")
+        if values.get("effort") and values["effort"] not in _VALID_CLAUDE_EFFORTS:
+            raise AgentSpawnError(f"Claude unsupported effort '{values['effort']}'")
+    elif binary == "agy":
+        if "variant" in values:
+            raise AgentSpawnError("Antigravity does not support 'variant'; use 'effort'")
+        if values.get("effort") and values["effort"] not in _VALID_AGY_EFFORTS:
+            raise AgentSpawnError(f"Antigravity unsupported effort '{values['effort']}'")
+    elif binary == "opencode":
+        if "effort" in values:
+            raise AgentSpawnError("OpenCode does not support 'effort'; use 'variant'")
+    elif values:
+        raise AgentSpawnError(
+            f"Agent {spec.get('name', binary)} ({binary}) does not support model/effort/variant overrides"
+        )
+    return values
+
+
+def _remove_option_values(
+    argv: list[str], options: tuple[str, ...], should_remove,
+) -> list[str]:
+    """Remove selected option/value pairs, including --option=value forms."""
+    result: list[str] = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        option = next((name for name in options if arg == name), None)
+        if option is not None and i + 1 < len(argv):
+            value = argv[i + 1]
+            if should_remove(value):
+                i += 2
+                continue
+        else:
+            option = next((name for name in options if arg.startswith(name + "=")), None)
+            if option is not None and should_remove(arg[len(option) + 1:]):
+                i += 1
+                continue
+        result.append(arg)
+        i += 1
+    return result
+
+
+def _setting_from_argv(argv: list[str], options: tuple[str, ...]) -> str | None:
+    """Read the last effective spelling of an option from a CLI template."""
+    result = None
+    for i, arg in enumerate(argv):
+        option = next((name for name in options if arg == name), None)
+        if option is not None and i + 1 < len(argv):
+            result = argv[i + 1]
+            continue
+        option = next((name for name in options if arg.startswith(name + "=")), None)
+        if option is not None:
+            result = arg[len(option) + 1:]
+    return result
+
+
+def _codex_effort_from_argv(argv: list[str]) -> str | None:
+    value = None
+    for i, arg in enumerate(argv):
+        config = None
+        if arg in ("-c", "--config") and i + 1 < len(argv):
+            config = argv[i + 1]
+        elif arg.startswith("-c="):
+            config = arg[3:]
+        elif arg.startswith("--config="):
+            config = arg[len("--config="):]
+        if config:
+            key, separator, configured_value = config.partition("=")
+            if separator and key.strip() == "model_reasoning_effort":
+                value = configured_value.strip().strip("\"'")
+    return value
+
+
+def model_settings_for_spec(spec: SpawnSpec) -> dict[str, str]:
+    """Return effective explicit CLI model settings to pin to a room session."""
+    argv = _apply_model_effort_variant(spec, list(spec.get("cmd") or []))
+    binary = _effective_binary(spec.get("cmd") or [])
+    settings: dict[str, str] = {}
+    model = _setting_from_argv(argv, ("--model", "-m"))
+    if model:
+        settings["model"] = model
+    if binary == "codex":
+        effort = _codex_effort_from_argv(argv)
+        if effort:
+            settings["effort"] = effort
+    else:
+        effort = _setting_from_argv(argv, ("--effort",))
+        variant = _setting_from_argv(argv, ("--variant",))
+        if effort:
+            settings["effort"] = effort
+        if variant:
+            settings["variant"] = variant
+    return settings
+
+
+def _apply_model_effort_variant(spec: SpawnSpec, argv: list[str]) -> list[str]:
+    binary = _effective_binary(spec.get("cmd") or [])
+    overrides = _validated_model_overrides(spec, binary)
+    model = overrides.get("model")
+    effort = overrides.get("effort")
+    variant = overrides.get("variant")
+
+    if not overrides:
+        return argv
+
+    out = list(argv)
+    if model is not None:
+        out = _remove_option_values(out, ("--model", "-m"), lambda _value: True)
+    if effort is not None and binary in ("claude", "agy"):
+        out = _remove_option_values(out, ("--effort",), lambda _value: True)
+    if variant is not None and binary == "opencode":
+        out = _remove_option_values(out, ("--variant",), lambda _value: True)
+    if effort is not None and binary == "codex":
+        def is_effort_setting(value: str) -> bool:
+            key, separator, _configured_value = value.partition("=")
+            return bool(separator and key.strip() == "model_reasoning_effort")
+        out = _remove_option_values(out, ("-c", "--config"), is_effort_setting)
+
+    # Inject before -p or {brief} or at the end
+    inject_idx = len(out)
+    for idx, arg in enumerate(out):
+        if arg == "-p" or "{brief}" in arg:
+            inject_idx = idx
+            break
+
+    injects = []
+    if binary in ("claude", "agy"):
+        if model: injects.extend(["--model", model])
+        if effort: injects.extend(["--effort", effort])
+    elif binary == "opencode":
+        if model: injects.extend(["-m", model])
+        if variant: injects.extend(["--variant", variant])
+    elif binary == "codex":
+        if model: injects.extend(["-m", model])
+        if effort: injects.extend(["-c", f'model_reasoning_effort="{effort}"'])
+
+    return out[:inject_idx] + injects + out[inject_idx:]
+
+
+_FINGERPRINT_PERMISSION_KEY = re.compile(
+    r"(?:permission|sandbox|approval|allowed.?tools|deny.?tools|read.?only|readonly|"
+    r"writ(?:e|able)|access|trust|guard)", re.IGNORECASE,
+)
+_FINGERPRINT_SECRET_ARG = re.compile(
+    r"(?i)^--?(?:api[_-]?(?:key|token)|access[_-]?token|refresh[_-]?token|token|secret|"
+    r"password|credential|authorization|auth(?:orization)?-header)$"
+)
+_FINGERPRINT_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)(\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|"
+    r"password|credential|authorization)\b\s*[=:]\s*)([^\s,;]+)"
+)
+_FINGERPRINT_AUTH_SCHEME = re.compile(
+    r"(?i)(\bauthorization\s*:\s*(?:bearer|basic)\s+)[^\s,;]+"
+)
+_FINGERPRINT_SECRET_QUERY = re.compile(
+    r"(?i)([?&](?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|"
+    r"password|credential)=)[^&#\s]+"
+)
+_FINGERPRINT_URL_CREDENTIALS = re.compile(r"(://)[^/@\s]+@")
+
+
+def _fingerprint_safe_value(value):
+    """Drop credential values recursively while keeping non-secret settings."""
+    if isinstance(value, dict):
+        return {
+            str(key): (
+                "<redacted>" if _fingerprint_secret_name(str(key))
+                else _fingerprint_safe_value(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_fingerprint_safe_value(item) for item in value]
+    if isinstance(value, str):
+        safe = _FINGERPRINT_AUTH_SCHEME.sub(r"\1<redacted>", value)
+        safe = _FINGERPRINT_SECRET_ASSIGNMENT.sub(r"\1<redacted>", safe)
+        safe = _FINGERPRINT_SECRET_QUERY.sub(r"\1<redacted>", safe)
+        return _FINGERPRINT_URL_CREDENTIALS.sub(r"\1<redacted>@", safe)
+    return value
+
+
+def _fingerprint_secret_name(value: str) -> bool:
+    """Match credential fields without treating limits as credentials."""
+    normalized = re.sub(r"[^a-z0-9]", "", value.lower())
+    return (
+        normalized in {"token", "authorization", "auth"}
+        or normalized.endswith((
+            "apikey", "apitoken", "accesstoken", "refreshtoken", "secret", "password",
+            "credential", "authorization", "authheader",
+        ))
+        or _FINGERPRINT_SECRET_ARG.fullmatch(value) is not None
+    )
+
+
+def _fingerprint_safe_argv(argv: list[str]) -> list[str]:
+    """Keep effective argv shape while removing values passed as credentials."""
+    result: list[str] = []
+    redact_next = False
+    keep_env_name_next = False
+    for arg in argv:
+        if keep_env_name_next:
+            result.append(arg)
+            keep_env_name_next = False
+            continue
+        if redact_next:
+            result.append("<redacted>")
+            redact_next = False
+            continue
+        if re.match(r"^--[\w-]+-env=", arg):
+            result.append(arg)
+            continue
+        if re.match(r"^--[\w-]+-env$", arg):
+            result.append(arg)
+            keep_env_name_next = True
+            continue
+        if _FINGERPRINT_AUTH_SCHEME.search(arg):
+            result.append(_FINGERPRINT_AUTH_SCHEME.sub(r"\1<redacted>", arg))
+            continue
+        if _fingerprint_secret_name(arg) and "=" not in arg and not arg.endswith("-env"):
+            result.append(arg)
+            redact_next = True
+            continue
+        safe = _FINGERPRINT_AUTH_SCHEME.sub(r"\1<redacted>", arg)
+        safe = _FINGERPRINT_SECRET_ASSIGNMENT.sub(r"\1<redacted>", safe)
+        safe = _FINGERPRINT_SECRET_QUERY.sub(r"\1<redacted>", safe)
+        safe = _FINGERPRINT_URL_CREDENTIALS.sub(r"\1<redacted>@", safe)
+        result.append(safe)
+    return result
+
+
+def spec_fingerprint(spec: SpawnSpec) -> str:
+    """Return a stable SHA-256 fingerprint of an effective registry profile.
+
+    Pass a spec from :func:`_raw_registry`; its ``cmd`` already contains the
+    read-only transform when enabled. This function applies model controls to
+    that command once and deliberately does not reapply read-only rewriting.
+    Environment values and probe fields are never read or included; only
+    explicitly passed environment variable names are part of the digest. A
+    profile ``mcp_url`` enters only as its own SHA-256 digest, so a changed
+    endpoint is spec drift while the result carries no URL text.
+    """
+    cmd = list(spec.get("cmd") or [])
+    effective_argv = _apply_model_effort_variant(spec, cmd)
+    canonical: dict[str, object] = {
+        "name": spec.get("name", ""),
+        "enabled": spec.get("enabled", True),
+        "auto": spec.get("auto", True),
+        "argv": _fingerprint_safe_argv(effective_argv),
+        "pass_env": sorted(
+            name for name in spec.get("pass_env", []) if isinstance(name, str)
+        ),
+    }
+    for key in (
+        "model", "effort", "variant", "profile", "max_tokens", "max_output_tokens",
+        "token_limit", "max_completion_tokens",
+    ):
+        if key in spec:
+            canonical[key] = _fingerprint_safe_value(spec[key])
+    if "mcp_url" in spec:
+        # Absent for most profiles, so their existing fingerprints are unchanged.
+        canonical["mcp_url_sha256"] = hashlib.sha256(
+            str(spec["mcp_url"]).encode("utf-8")
+        ).hexdigest()
+    for key, value in spec.items():
+        if _FINGERPRINT_PERMISSION_KEY.search(str(key)):
+            canonical[str(key)] = _fingerprint_safe_value(value)
+
+    payload = json.dumps(
+        canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(payload).hexdigest()}"
+
+
 def _resolve_spawn_args(
     spec: SpawnSpec,
     brief: str,
     log_dir: Path,
+    log_name: str | None = None,
+    member_header: bool = False,
 ) -> tuple[list[str], str | None]:
-    name = bus._safe_path_component(spec["name"], "agent_name")
+    name = bus._safe_path_component(log_name or spec["name"], "agent_name")
     last_msg_path: str | None = None
+
+    template = _apply_model_effort_variant(spec, list(spec.get("cmd") or []))
+    template = _apply_codex_mcp_route(spec, template, member_header)
+
     argv = []
-    for arg in spec["cmd"]:
+    for arg in template:
         if "{brief}" in arg:
             arg = arg.replace("{brief}", brief)
         if "{last_message}" in arg:
@@ -597,6 +1009,83 @@ def _resolve_spawn_args(
             arg = arg.replace("{last_message}", last_msg_path)
         argv.append(arg)
     return argv, last_msg_path
+
+
+def _codex_loopback_mcp_url(raw_url: object) -> str:
+    """Rebuild a validated loopback ``/mcp`` URL from its parsed parts only."""
+    if not isinstance(raw_url, str):
+        raise AgentSpawnError("Codex mcp_url must be a loopback http(s) URL ending in /mcp")
+    try:
+        _direct_opus_review_endpoint_config(raw_url)
+    except AgentSpawnError:
+        raise AgentSpawnError(
+            "Codex mcp_url must be a loopback http(s) URL ending in /mcp"
+        ) from None
+    parsed = urlparse(raw_url)
+    host = f"[{parsed.hostname}]" if parsed.hostname == "::1" else parsed.hostname
+    return f"{parsed.scheme}://{host}:{parsed.port}/mcp"
+
+
+# Per-wake member identity for Codex Swarm members on an HTTP Huddle route.
+# The raw secret lives only in the child's environment; Codex reads it into
+# this header via ``env_http_headers``. It is never placed in argv or logs and
+# is separate from the global MCP_HUDDLE_TOKEN guard.
+MEMBER_TOKEN_ENV = "HUDDLE_MEMBER_TOKEN"
+MEMBER_TOKEN_HEADER = "X-Huddle-Member"
+
+
+def new_member_token() -> tuple[str, str]:
+    """Return a fresh (secret, sha256 hex digest); store only the digest."""
+    secret = secrets.token_urlsafe(32)
+    return secret, member_token_digest(secret)
+
+
+def member_token_digest(secret: str) -> str:
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+
+def member_identity_supported(spec: SpawnSpec) -> bool:
+    """Only a Codex profile with an explicit loopback HTTP ``mcp_url`` qualifies.
+
+    Without ``mcp_url`` the child's ``huddle`` server may be stdio, which has no
+    HTTP headers; such launches keep the legacy unauthenticated behavior.
+    """
+    return "mcp_url" in spec and _effective_binary(list(spec.get("cmd") or [])) == "codex"
+
+
+def _codex_huddle_server_config(url: str, member_header: bool) -> str:
+    """One inline ``mcp_servers`` override for the pinned Huddle endpoint."""
+    table = ("{huddle={url=" + json.dumps(url)
+             + ',default_tools_approval_mode="approve"')
+    if member_header:
+        table += (',env_http_headers={' + json.dumps(MEMBER_TOKEN_HEADER)
+                  + "=" + json.dumps(MEMBER_TOKEN_ENV) + "}")
+    return "mcp_servers=" + table + "}}"
+
+
+def _apply_codex_mcp_route(
+    spec: SpawnSpec, template: list[str], member_header: bool = False,
+) -> list[str]:
+    """Pin a Codex child's ``huddle`` MCP URL to the profile's ``mcp_url``.
+
+    Opt-in: without ``mcp_url`` the argv is unchanged. With it, one ``-c``
+    sets the ``huddle`` server to that URL with Huddle tool approval. Observed
+    with ``codex mcp list``: the ``huddle`` entry shows this URL, and the other
+    globally configured MCP servers (for example aggregators) remain, so this
+    does not stop an agent from reaching another Huddle through them. It adds
+    no server and leaves sandbox, approval, model and effort arguments from
+    the enforced transforms as they are. Runs at launch, after the read-only
+    and room write transforms.
+    """
+    if "mcp_url" not in spec or _effective_binary(template) != "codex":
+        return template
+    url = _codex_loopback_mcp_url(spec.get("mcp_url"))
+    route = ["-c", _codex_huddle_server_config(url, member_header)]
+    # Keep the prompt positional last, like the read-only transform does.
+    for index in range(len(template) - 1, -1, -1):
+        if "{brief}" in template[index]:
+            return [*template[:index], *route, *template[index:]]
+    return [*template, *route]
 
 
 def _open_standalone_log(path: Path, *, create_parent: bool) -> BinaryIO:
@@ -725,7 +1214,7 @@ def _direct_opus_review_argv(brief: str, read_root: str, mcp_config: str) -> lis
         "--strict-mcp-config",
         "--mcp-config", mcp_config,
         "--add-dir", read_root,
-        "--model", "claude-opus-5",
+        "--model", "claude-opus-5-5",
         "-p", (
             f"{brief}\n\n"
             "For this direct-review turn, use Huddle only to return one `result` "
@@ -775,6 +1264,70 @@ def _verify_subscription_auth(env: dict[str, str], cwd: str) -> None:
         and auth.get("subscriptionType")
     ):
         raise AgentSpawnError("subscription review requires an existing claude.ai subscription login")
+
+
+def probe_cli_login(spec: SpawnSpec, cwd: str) -> CliLoginProbe:
+    """Check a known CLI's local login without issuing a model request.
+
+    The status proves only that the CLI recognizes a local login. It does not
+    prove that the requested model, provider route, or current quota works.
+    Output is deliberately limited to closed status/reason codes because CLI
+    stdout and stderr can contain account identities or credential material.
+    Native config paths and Keychain access remain available through the same
+    minimal HOME/CODEX_HOME/CLAUDE_CONFIG_DIR child environment as a spawn.
+    Provider credential variables and registry pass_env values are not copied.
+    """
+    if spec.get("profile") == _DIRECT_OPUS_REVIEW_PROFILE:
+        return {"status": "unknown", "reason": "non_native_profile"}
+    command = spec.get("cmd", [])
+    if not isinstance(command, list) or not all(isinstance(x, str) for x in command):
+        return {"status": "unknown", "reason": "unsupported_harness"}
+    binary_index = _effective_binary_index(command)
+    if binary_index is None:
+        return {"status": "unknown", "reason": "unsupported_harness"}
+    binary = command[binary_index]
+    harness = Path(binary).name
+    if harness == "claude":
+        argv = [binary, "auth", "status", "--json"]
+    elif harness == "codex":
+        argv = [binary, "login", "status"]
+    else:
+        return {"status": "unknown", "reason": "unsupported_harness"}
+
+    try:
+        result = subprocess.run(
+            argv, cwd=cwd, env=build_sanitized_environment(),
+            capture_output=True, text=True, timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        return {"status": "unknown", "reason": "probe_timeout"}
+    except (OSError, ValueError):
+        return {"status": "unknown", "reason": "probe_unavailable"}
+
+    if harness == "claude":
+        try:
+            payload = json.loads(result.stdout)
+        except (TypeError, ValueError):
+            return {"status": "unknown", "reason": "unrecognized_output"}
+        if isinstance(payload, dict) and payload.get("loggedIn") is False:
+            return {"status": "unauthenticated", "reason": "cli_logged_out"}
+        if result.returncode == 0 and isinstance(payload, dict) and payload.get("loggedIn") is True:
+            return {"status": "authenticated", "reason": "cli_login_present"}
+        return {"status": "unknown", "reason": "unrecognized_output"}
+
+    # Codex versions may write login status to stdout or stderr. Inspect only
+    # recognized whole lines, never return or log either raw stream. Conflicting
+    # signals fail closed even when the process exits successfully.
+    lines = result.stdout.splitlines() + result.stderr.splitlines()
+    logged_out = any(re.fullmatch(r"Not logged in\s*", line, re.IGNORECASE) for line in lines)
+    logged_in = any(re.fullmatch(r"Logged in using .+", line, re.IGNORECASE) for line in lines)
+    if logged_out and logged_in:
+        return {"status": "unknown", "reason": "unrecognized_output"}
+    if logged_out:
+        return {"status": "unauthenticated", "reason": "cli_logged_out"}
+    if result.returncode == 0 and logged_in:
+        return {"status": "authenticated", "reason": "cli_login_present"}
+    return {"status": "unknown", "reason": "unrecognized_output"}
 
 
 def log_spawn_failure(
@@ -1188,7 +1741,7 @@ def _preserve_direct_opus_profile_contract(registry: list[SpawnSpec]) -> list[Sp
 _CLAUDE_RO_FLAGS = [
     "--allowedTools", "Read,Glob,Grep,WebFetch,WebSearch,mcp__huddle__*",
     "--disallowedTools", "Edit,Write,NotebookEdit,MultiEdit,Bash",
-    "--permission-mode", "manual",
+    "--permission-mode", "manual", "--permission-prompts", "none",
 ]
 
 
@@ -1210,29 +1763,396 @@ def _apply_readonly(spec: SpawnSpec) -> SpawnSpec:
       which `-a never` would cancel). Cross-model council, 2026-06-19.
     Other agents are returned unchanged (no confirmed read-only flag yet).
     """
-    profile = spec.get("profile")
-    name = spec.get("name")
     cmd = list(spec.get("cmd") or [])
-    if profile in {_DIRECT_OPUS_REVIEW_PROFILE, _SUBSCRIPTION_OPUS_REVIEW_PROFILE} or name == "Claude":
-        cmd = [c for c in cmd if c != "--dangerously-skip-permissions"]
-        if cmd and "--allowedTools" not in cmd:
-            cmd = [cmd[0], *_CLAUDE_RO_FLAGS, *cmd[1:]]
-    elif name == "Codex":
-        out: list[str] = []
+    cli_index = _effective_binary_index(cmd)
+    binary = _effective_binary(cmd)
+    if binary == "claude":
+        prefix = cmd[: (cli_index + 1)] if cli_index is not None else []
+        claude_args = cmd[(cli_index + 1):] if cli_index is not None else cmd
+        # A registry-supplied allowlist, denylist, or permission mode must not
+        # weaken the enforced set. These list-valued switches end at the next
+        # CLI option; `{brief}` is also a boundary for bare prompt templates.
+        claude_args = _remove_variadic_options(
+            claude_args,
+            ("--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools"),
+        )
+        claude_args = _remove_option_values(
+            claude_args, ("--permission-mode", "--permission-prompts"), lambda _value: True,
+        )
+        claude_args = [
+            arg for arg in claude_args
+            if arg not in ("--dangerously-skip-permissions", "--allow-dangerously-skip-permissions")
+            and not arg.startswith((
+                "--dangerously-skip-permissions=", "--allow-dangerously-skip-permissions=",
+            ))
+        ]
+        cmd = [*prefix, *_CLAUDE_RO_FLAGS, *claude_args]
+    elif binary == "codex":
+        # Leave timeout's own options (for example ``timeout -s TERM``)
+        # untouched. Only rewrite Codex sandbox options after its executable.
+        prefix = cmd[: (cli_index + 1)] if cli_index is not None else []
+        codex_args = cmd[(cli_index + 1):] if cli_index is not None else cmd
+        out: list[str] = list(prefix)
         i = 0
-        while i < len(cmd):
-            out.append(cmd[i])
-            if cmd[i] == "-s" and i + 1 < len(cmd):
-                out.append("read-only")  # replace the sandbox value
+        while i < len(codex_args):
+            arg = codex_args[i]
+            if arg in ("--dangerously-bypass-approvals-and-sandbox", "--approve-for-me",
+                       "--dangerously-bypass-hook-trust", "--full-auto", "--yolo",
+                       "--ignore-rules") or arg.startswith("--dangerously-bypass-"):
+                i += 1
+                continue
+            if arg in ("--profile", "-p", "--add-dir", "--remote", "--remote-auth-token-env"):
                 i += 2
                 continue
+            if arg.startswith(("--profile=", "--add-dir=", "--remote=", "--remote-auth-token-env=")):
+                i += 1
+                continue
+            if arg in ("-s", "--sandbox"):
+                # Remove any registry-provided sandbox so the enforced value
+                # cannot be overridden by a later duplicate flag.
+                i += 2
+                continue
+            if arg.startswith("--sandbox=") or arg.startswith("-s="):
+                i += 1
+                continue
+            if arg in ("-c", "--config"):
+                value = codex_args[i + 1] if i + 1 < len(codex_args) else ""
+                key, separator, _configured_value = value.partition("=")
+                if separator and key.strip() in ("model", "model_reasoning_effort"):
+                    out.extend((arg, value))
+                i += 2
+                continue
+            if arg.startswith("--config=") or arg.startswith("-c="):
+                value = arg.split("=", 1)[1]
+                key, separator, _configured_value = value.partition("=")
+                if separator and key.strip() in ("model", "model_reasoning_effort"):
+                    out.append(arg)
+                i += 1
+                continue
+            out.append(arg)
             i += 1
         # Auto-approve huddle MCP tools so read-only doesn't cancel them;
         # insert before the trailing positional ({brief}).
-        approve = ["-c", 'mcp_servers.huddle.default_tools_approval_mode="approve"']
-        out = [*out[:-1], *approve, out[-1]] if out else out
+        readonly = ["-s", "read-only", "-c", 'mcp_servers.huddle.default_tools_approval_mode="approve"']
+        if out and out[-1] == "{brief}":
+            out = [*out[:-1], *readonly, out[-1]]
+        else:
+            out.extend(readonly)
         cmd = out
     return {**spec, "cmd": cmd}
+
+
+def _remove_variadic_options(argv: list[str], options: tuple[str, ...]) -> list[str]:
+    """Remove list-valued switches and their values until the next option."""
+    result: list[str] = []
+    i = 0
+    removing_values = False
+    while i < len(argv):
+        arg = argv[i]
+        option = next((name for name in options if arg == name or arg.startswith(name + "=")), None)
+        if option is not None:
+            removing_values = "=" not in arg
+            i += 1
+            continue
+        if removing_values and not arg.startswith("-") and "{brief}" not in arg:
+            i += 1
+            continue
+        removing_values = False
+        result.append(arg)
+        i += 1
+    return result
+
+
+def readonly_enforced(spec: SpawnSpec) -> bool:
+    """Return whether the effective CLI has Huddle's supported read-only gate.
+
+    This checks explicit CLI overrides as well as Huddle's injected flags. It
+    does not claim OS-level sandboxing for runners without a verified gate.
+    """
+    if not _readonly_enabled():
+        return False
+    return _readonly_command_enforced(spec)
+
+
+def _readonly_command_enforced(spec: SpawnSpec) -> bool:
+    """Check the read-only transform of ``spec`` regardless of the env flag."""
+    command = _apply_readonly(spec).get("cmd")
+    if not isinstance(command, list) or not all(isinstance(arg, str) for arg in command):
+        return False
+    cli_index = _effective_binary_index(command)
+    if cli_index is None:
+        return False
+    binary = _effective_binary(command)
+    args = command[cli_index + 1:]
+    if binary == "claude":
+        unsafe_flags = {
+            "--settings", "--setting-sources", "--mcp-config", "--add-dir",
+            "--plugin-dir", "--agents", "--permission-mode", "--permission-prompts",
+            "--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools",
+            "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
+        }
+        # The flags injected above are the only accepted values for these
+        # options; local settings/MCP extensions can carry independent tools.
+        allowed = _setting_from_argv(args, ("--allowedTools", "--allowed-tools"))
+        denied = _setting_from_argv(args, ("--disallowedTools", "--disallowed-tools"))
+        mode = _setting_from_argv(args, ("--permission-mode",))
+        prompts = _setting_from_argv(args, ("--permission-prompts",))
+        expected = set(_CLAUDE_RO_FLAGS[1].split(","))
+        denied_set = set((denied or "").split(","))
+        if allowed != _CLAUDE_RO_FLAGS[1] or mode != "manual" or prompts != "none":
+            return False
+        if not {"Edit", "Write", "NotebookEdit", "MultiEdit", "Bash"}.issubset(denied_set):
+            return False
+        # Verify exactly one effective enforced allow/deny/mode trio.
+        return not any(arg.partition("=")[0] in unsafe_flags for arg in args if arg not in {
+            "--allowedTools", "--disallowedTools", "--permission-mode", "--permission-prompts",
+        }) and expected == set(allowed.split(","))
+    if binary == "codex":
+        if any(arg in {
+            "--dangerously-bypass-approvals-and-sandbox", "--approve-for-me", "--full-auto", "--yolo",
+            "--profile", "--remote", "--add-dir", "--ignore-rules",
+        } or arg.startswith(("--profile=", "--remote=", "--add-dir=", "--dangerously-bypass-"))
+               for arg in args):
+            return False
+        for i, arg in enumerate(args):
+            value = args[i + 1] if arg in ("-c", "--config") and i + 1 < len(args) else (
+                arg.split("=", 1)[1] if arg.startswith(("-c=", "--config=")) else ""
+            )
+            if value:
+                key, separator, _setting = value.partition("=")
+                if not separator or key.strip() not in {
+                    "model", "model_reasoning_effort", "mcp_servers.huddle.default_tools_approval_mode",
+                }:
+                    return False
+        sandbox = _setting_from_argv(args, ("-s", "--sandbox"))
+        approval = None
+        for i, arg in enumerate(args):
+            value = args[i + 1] if arg in ("-c", "--config") and i + 1 < len(args) else (
+                arg.split("=", 1)[1] if arg.startswith(("-c=", "--config=")) else ""
+            )
+            key, separator, configured_value = value.partition("=")
+            if separator and key.strip() == "mcp_servers.huddle.default_tools_approval_mode":
+                approval = configured_value.strip().strip("\"'")
+        return sandbox == "read-only" and approval == "approve"
+    return False
+
+
+# Room-scoped write mode. A room that explicitly selects a shared worktree gets
+# a bounded write command built by Huddle — never the raw registry argv and
+# never MCP_HUDDLE_READONLY=0.
+# - Claude: a Huddle-built `--restricted` invocation (claude --help: ignores
+#   user/project/local settings files, so no inherited additionalDirectories or
+#   allow rules; confines file tools to cwd + --add-dir; removes code-running
+#   tools; refuses bypassPermissions). `--strict-mcp-config` exposes only the
+#   profile's loopback Huddle MCP. `acceptEdits` + `--permission-prompts none`
+#   auto-accepts in-bounds edits and denies everything that would prompt.
+#   Managed (admin policy) settings still apply by design. Because
+#   --restricted drops the user's settings file, the user's own Guard is
+#   re-supplied through a Huddle-generated `--settings` (which --restricted
+#   still honours): only PreToolUse hooks covering file tools plus
+#   permissions.deny/ask — never allow rules, additionalDirectories or mode.
+#   No mandatory Edit and Write Guard hook → Claude write is rejected.
+# - Codex: `workspace-write` with every inheritable workspace-write key pinned
+#   on the command line: exact writable_roots, no $TMPDIR, no /tmp, no network.
+_CLAUDE_WRITE_TOOLS = "Read,Glob,Grep,Edit,Write,ToolSearch"
+_CLAUDE_GUARDED_TOOLS = ("Edit", "Write")
+_CLAUDE_FILE_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+_CLAUDE_WRITE_FLAGS = [
+    "--restricted", "--setting-sources", "", "--strict-mcp-config",
+    "--tools", _CLAUDE_WRITE_TOOLS,
+    "--allowedTools", "Read,Glob,Grep,ToolSearch,mcp__huddle__*",
+    "--disallowedTools", "Bash,WebFetch,WebSearch",
+    "--permission-mode", "acceptEdits", "--permission-prompts", "none",
+    "--disable-slash-commands", "--no-chrome",
+]
+_WRITE_ROOT_RE = re.compile(r"/[A-Za-z0-9 ._@+/-]*\Z")
+
+
+class WritePolicyUnsupported(ValueError):
+    """The profile cannot enforce the room's bounded write policy."""
+
+
+def _validated_write_roots(roots: list[str]) -> list[str]:
+    checked = []
+    for root in roots:
+        if (not isinstance(root, str) or not _WRITE_ROOT_RE.fullmatch(root)
+                or "/../" in root + "/" or "/./" in root + "/"):
+            raise WritePolicyUnsupported("write root must be a plain absolute ASCII path")
+        checked.append(root)
+    return checked
+
+
+def _codex_workspace_write_config(extra_roots: list[str]) -> list[str]:
+    """Pin every workspace-write key so ~/.codex/config.toml cannot widen it.
+
+    ``writable_roots`` is always set (``[]`` for shared_only) because a
+    command-line value replaces an inherited array instead of merging with it.
+    """
+    value = ", ".join(f'"{root}"' for root in _validated_write_roots(extra_roots))
+    return [
+        "-c", f"sandbox_workspace_write.writable_roots=[{value}]",
+        "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+        "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
+        "-c", "sandbox_workspace_write.network_access=false",
+    ]
+
+
+def _claude_user_settings_path() -> Path:
+    base = os.environ.get("CLAUDE_CONFIG_DIR")
+    return (Path(base) if base else Path.home() / ".claude") / "settings.json"
+
+
+def _hook_matcher_covers(matcher: object, tool: str) -> bool:
+    if matcher is None or matcher in ("", "*"):
+        return True
+    if not isinstance(matcher, str):
+        return False
+    try:
+        return re.fullmatch(matcher, tool) is not None
+    except re.error:
+        return False
+
+
+def _claude_guard_settings() -> str:
+    """Return `--settings` JSON carrying only the user's file-tool Guard.
+
+    Re-read at every check/launch, so removing the Guard disables Claude write.
+    """
+    required_guard = os.environ.get("MCP_HUDDLE_CLAUDE_GUARD_COMMAND", "").strip()
+    if not required_guard:
+        raise WritePolicyUnsupported(
+            "Claude write rooms need MCP_HUDDLE_CLAUDE_GUARD_COMMAND set to the exact Guard hook command"
+        )
+    try:
+        data = json.loads(_claude_user_settings_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise WritePolicyUnsupported(
+            "Claude write rooms need readable user settings with the Edit/Write Guard hook"
+        ) from None
+    if not isinstance(data, dict) or data.get("disableAllHooks") is True:
+        raise WritePolicyUnsupported("Claude user settings disable or omit hooks")
+    hooks = data.get("hooks")
+    pre = hooks.get("PreToolUse") if isinstance(hooks, dict) else None
+    kept = [
+        entry for entry in (pre if isinstance(pre, list) else [])
+        if isinstance(entry, dict) and isinstance(entry.get("hooks"), list)
+        and any(_hook_matcher_covers(entry.get("matcher"), tool) for tool in _CLAUDE_FILE_TOOLS)
+    ]
+
+    def guarded(tool: str) -> bool:
+        return any(
+            _hook_matcher_covers(entry.get("matcher"), tool)
+            and any(isinstance(hook, dict) and hook.get("type") == "command"
+                    and hook.get("command") == required_guard
+                    for hook in entry["hooks"])
+            for entry in kept
+        )
+
+    missing = [tool for tool in _CLAUDE_GUARDED_TOOLS if not guarded(tool)]
+    if missing:
+        raise WritePolicyUnsupported(
+            f"Claude write rooms need the user's PreToolUse Guard hook for {', '.join(missing)}"
+        )
+    settings: dict = {"hooks": {"PreToolUse": kept}}
+    permissions = data.get("permissions")
+    if isinstance(permissions, dict):
+        rules = {
+            key: [rule for rule in permissions[key] if isinstance(rule, str)]
+            for key in ("deny", "ask") if isinstance(permissions.get(key), list)
+        }
+        if rules:
+            settings["permissions"] = rules
+    return json.dumps(settings, ensure_ascii=False, separators=(",", ":"))
+
+
+def _claude_write_argv(spec: SpawnSpec, cmd: list[str], cli_index: int,
+                       extra: list[str]) -> list[str]:
+    """Build the fixed Claude write invocation; registry flags are discarded."""
+    mcp_url = spec.get("mcp_url")
+    if not isinstance(mcp_url, str) or not mcp_url:
+        raise WritePolicyUnsupported(
+            "Claude write rooms need a loopback mcp_url in the registry profile"
+        )
+    try:
+        mcp_config = _direct_opus_review_endpoint_config(mcp_url)
+    except AgentSpawnError:
+        raise WritePolicyUnsupported("Claude mcp_url must be a loopback http(s) URL ending in /mcp") from None
+    args = cmd[cli_index + 1:]
+    passthrough: list[str] = []
+    output_format = _setting_from_argv(args, ("--output-format",))
+    if output_format in ("text", "json", "stream-json"):
+        passthrough += ["--output-format", output_format]
+    if "--verbose" in args:
+        passthrough.append("--verbose")
+    settings = model_settings_for_spec(spec)
+    model_args = [
+        *(["--model", settings["model"]] if settings.get("model") else []),
+        *(["--effort", settings["effort"]] if settings.get("effort") else []),
+    ]
+    return [
+        *cmd[:cli_index + 1], *_CLAUDE_WRITE_FLAGS,
+        "--settings", _claude_guard_settings(),
+        "--mcp-config", mcp_config,
+        *[arg for root in extra for arg in ("--add-dir", root)],
+        *model_args, *passthrough, "-p", "{brief}",
+    ]
+
+
+def apply_room_write_policy(spec: SpawnSpec, extra_roots: list[str] | None = None) -> SpawnSpec:
+    """Return a bounded write variant of ``spec`` for a write-enabled room.
+
+    The launch cwd is the room's worktree (or the member's subworktree);
+    ``extra_roots`` are additional writable directories. Raises
+    WritePolicyUnsupported when the profile cannot enforce the policy.
+    """
+    extra = _validated_write_roots(list(extra_roots or []))
+    if spec.get("profile") in {_DIRECT_OPUS_REVIEW_PROFILE, _SUBSCRIPTION_OPUS_REVIEW_PROFILE}:
+        raise WritePolicyUnsupported("typed review profiles are read-only by contract")
+    if not _readonly_command_enforced(spec):
+        raise WritePolicyUnsupported(
+            f"{spec.get('name', '?')} has no verified permission gate for a write room"
+        )
+    cmd = list(_apply_readonly(spec)["cmd"])
+    cli_index = _effective_binary_index(cmd)
+    binary = _effective_binary(cmd)
+    if cli_index is None:
+        raise WritePolicyUnsupported("profile executable is not recognized")
+    start = cli_index + 1
+    if binary == "claude":
+        return {**spec, "cmd": _claude_write_argv(spec, cmd, cli_index, extra)}
+    if binary == "codex":
+        args = cmd[start:]
+        if any(arg in ("-C", "--cd") or arg.startswith(("-C=", "--cd=")) for arg in args):
+            raise WritePolicyUnsupported("Codex workspace root must come from the room")
+        sandbox_at = [i for i in range(len(args) - 1)
+                      if args[i] in ("-s", "--sandbox") and args[i + 1] == "read-only"]
+        if len(sandbox_at) != 1:
+            raise WritePolicyUnsupported("Codex read-only sandbox was not found")
+        i = start + sandbox_at[0]
+        cmd[i:i + 2] = ["-s", "workspace-write", *_codex_workspace_write_config(extra)]
+        return {**spec, "cmd": cmd}
+    raise WritePolicyUnsupported(f"{spec.get('name', '?')} has no supported write policy")
+
+
+def _codex_resume_sandbox_args(write_roots: list[str] | None) -> list[str]:
+    """Sandbox/approval args for ``codex exec resume``.
+
+    ``write_roots=None`` keeps the process-wide read-only default; a list
+    selects the room's bounded ``workspace-write`` policy (cwd + those roots).
+    """
+    if write_roots is not None:
+        return [
+            "-c", 'sandbox_mode="workspace-write"',
+            "-c", "features.guardian_approval=false",
+            "-c", 'mcp_servers.huddle.default_tools_approval_mode="approve"',
+            *_codex_workspace_write_config(write_roots),
+        ]
+    readonly = _readonly_enabled()
+    sandbox = "read-only" if readonly else _CODEX_SANDBOX
+    args = ["-c", f'sandbox_mode="{sandbox}"', "-c", "features.guardian_approval=false"]
+    if readonly:
+        args += ["-c", 'mcp_servers.huddle.default_tools_approval_mode="approve"']
+    return args
 
 
 def _raw_registry() -> list[SpawnSpec]:
@@ -1332,18 +2252,33 @@ def spawn_agent(
     on_exit=None,
     owner_room_id: str = "",
     process_handle: str | None = None,
+    on_log_open: Callable[[int, str], None] | None = None,
+    on_log_open_identity: Callable[[int, str, int, int], None] | None = None,
+    log_name: str | None = None,
+    member_token: str | None = None,
 ) -> tuple[int, str, str | None]:
     """Spawn one agent.
 
+    member_token: optional per-wake secret. Used only when
+    :func:`member_identity_supported`; it is put in the child environment and
+    sent by Codex as ``X-Huddle-Member``. Otherwise it is ignored.
+
     Returns (pid, log_path, last_message_path).
     last_message_path is None for agents whose argv doesn't reference {last_message}.
+    log_name: room participant whose log/last-message paths this turn owns.
+    Defaults to the profile name; a Swarm replacement profile passes the
+    original member so readers and receipts keep one room identity.
 
     on_exit: optional callable(returncode) fired when the process exits.
+    on_log_open: optional callable(start_offset, log_path) fired after opening
+    the append log and before Popen. Its offset is the open fd's byte size at
+    that instant. An exception prevents launch and closes the descriptor.
 
     Side effects: creates log_dir, opens log file, redirects stdout+stderr to it.
     """
     _validate_protected_profile_names([spec])
-    name = bus._safe_path_component(spec["name"], "agent_name")
+    profile_name = bus._safe_path_component(spec["name"], "agent_name")
+    name = bus._safe_path_component(log_name or profile_name, "agent_name")
     # Allocate the ownership generation before any resource or Popen: even
     # handle generation failure must leave no child or profile temp cwd.
     process_handle = process_handle or child_processes.new_handle()
@@ -1353,7 +2288,7 @@ def spawn_agent(
     else:
         log_path = log_dir / f"{name.lower()}.events.jsonl"
     cleanup_dir: str | None = None
-    if name == "Codex":
+    if profile_name == "Codex":
         cwd, brief = _codex_safe_cwd_and_brief(cwd, brief)
     if spec.get("profile") in {_DIRECT_OPUS_REVIEW_PROFILE, _SUBSCRIPTION_OPUS_REVIEW_PROFILE}:
         # This typed profile deliberately ignores registry argv: it always has
@@ -1378,8 +2313,18 @@ def spawn_agent(
                 shutil.rmtree(cleanup_dir, ignore_errors=True)
                 raise
     else:
-        argv, last_msg_path = _resolve_spawn_args(spec, brief, log_dir)
+        member_header = bool(member_token) and member_identity_supported(spec)
+        argv, last_msg_path = _resolve_spawn_args(
+            spec, brief, log_dir, name, member_header=member_header,
+        )
         env = _spawn_environment(spec, argv)
+        env.pop(MEMBER_TOKEN_ENV, None)  # never inherit a stale parent value
+        if member_header:
+            env[MEMBER_TOKEN_ENV] = member_token
+    # A batch stagger cannot cover separate rooms, separate Huddle processes,
+    # or wake-path launches. Serialize the complete lifetime of every
+    # OpenCode CLI child on the shared Huddle home instead.
+    argv = _serialize_opencode_argv(argv)
     try:
         if owner_room_id:
             log_fd = bus._safe_open_fd(
@@ -1393,6 +2338,15 @@ def spawn_agent(
             shutil.rmtree(cleanup_dir, ignore_errors=True)
         raise
     try:
+        if on_log_open is not None or on_log_open_identity is not None:
+            log_stat = os.fstat(log_file.fileno())
+            if on_log_open is not None:
+                on_log_open(log_stat.st_size, str(log_path))
+            if on_log_open_identity is not None:
+                on_log_open_identity(
+                    log_stat.st_size, str(log_path),
+                    log_stat.st_dev, log_stat.st_ino,
+                )
         proc = subprocess.Popen(
             argv,
             cwd=cwd or None,
@@ -1402,8 +2356,8 @@ def spawn_agent(
             env=env,
         )
     except BaseException:
-        # Preserve the original Popen failure even if closing its unused log
-        # descriptor also fails.
+        # Preserve the callback or Popen failure even if closing its unused
+        # log descriptor also fails.
         _close_parent_log_safely(log_file)
         if cleanup_dir is not None:
             shutil.rmtree(cleanup_dir, ignore_errors=True)
@@ -1501,7 +2455,29 @@ def _spawn_environment(spec: SpawnSpec, argv: list[str] | None = None) -> dict[s
             )
         return build_sanitized_environment()
     if spec.get("profile") != _DIRECT_OPUS_REVIEW_PROFILE:
-        return build_sanitized_environment(explicit_names)
+        env = build_sanitized_environment(explicit_names)
+        if argv and _effective_binary(argv) == "opencode":
+            endpoint = _opencode_parent_mcp_url()
+            if endpoint:
+                env["OPENCODE_CONFIG_CONTENT"] = json.dumps(
+                    {
+                        "mcp": {
+                            # Inline config merges with user config. Disable the
+                            # stale global connection, then add a clean endpoint
+                            # under a fresh name so old auth headers cannot be
+                            # inherited or sent to this server.
+                            "huddle": {"enabled": False},
+                            "huddle_parent": {
+                                "type": "remote",
+                                "url": endpoint,
+                                "enabled": True,
+                                "oauth": False,
+                            },
+                        },
+                    },
+                    separators=(",", ":"),
+                )
+        return env
     required = (
         "ANTHROPIC_API_KEY",
         _DIRECT_OPUS_WORKSPACE_ENV,
@@ -1516,6 +2492,47 @@ def _spawn_environment(spec: SpawnSpec, argv: list[str] | None = None) -> dict[s
     env["ANTHROPIC_BASE_URL"] = "https://api.anthropic.com"
     env["ANTHROPIC_CUSTOM_HEADERS"] = env.pop(_DIRECT_OPUS_WORKSPACE_ENV)
     return env
+
+
+def _opencode_parent_mcp_url() -> str | None:
+    """Resolve this Huddle HTTP process endpoint for OpenCode child MCP config.
+
+    The CLI is the source of truth: `--port` overrides `PORT`, then Huddle's
+    default port applies. Stdio Huddle has no HTTP endpoint and leaves the
+    user's OpenCode MCP config untouched.
+    """
+    args = sys.argv[1:]
+    if "--http" not in args and not os.environ.get("MCP_HUDDLE_HTTP"):
+        return None
+
+    # Keep aligned with mcp_huddle.__main__.DEFAULT_PORT.
+    port = 8014
+    raw_port = os.environ.get("PORT")
+    if raw_port:
+        try:
+            candidate = int(raw_port)
+            if 1 <= candidate <= 65535:
+                port = candidate
+        except (TypeError, ValueError):
+            pass  # __main__ warns and falls back to DEFAULT_PORT.
+
+    for index, arg in enumerate(args):
+        raw = None
+        if arg == "--port" and index + 1 < len(args):
+            raw = args[index + 1]
+        elif arg.startswith("--port="):
+            raw = arg.partition("=")[2]
+        if raw is not None:
+            try:
+                candidate = int(raw)
+            except (TypeError, ValueError):
+                return None
+            if not 1 <= candidate <= 65535:
+                return None
+            port = candidate
+            break
+
+    return f"http://127.0.0.1:{port}/mcp"
 
 
 # ── Same-binary spawn stagger ────────────────────────────────────────────────
@@ -1536,13 +2553,26 @@ def _effective_binary(cmd: list[str]) -> str:
     bare one of the same underlying binary are recognized as the same thing.
     Empty cmd → "" (never staggered against anything).
     """
+    idx = _effective_binary_index(cmd)
+    return Path(cmd[idx]).name if idx is not None else ""
+
+
+def _effective_binary_index(cmd: list[str]) -> int | None:
+    """Return the argv index of the executed program, skipping timeout args."""
     if not cmd:
-        return ""
+        return None
     idx = 0
     if Path(cmd[0]).name == "timeout":
         idx = 1
         while idx < len(cmd):
             tok = cmd[idx]
+            if tok in ("-s", "--signal", "-k", "--kill-after"):
+                # These timeout options consume a value before the duration.
+                idx += 2
+                continue
+            if tok.startswith("--signal=") or tok.startswith("--kill-after="):
+                idx += 1
+                continue
             if tok.startswith("-"):
                 idx += 1
                 continue
@@ -1550,9 +2580,23 @@ def _effective_binary(cmd: list[str]) -> str:
                 idx += 1
                 continue
             break
-    if idx >= len(cmd):
-        return ""
-    return Path(cmd[idx]).name
+    return idx if idx < len(cmd) else None
+
+
+def _serialize_opencode_argv(argv: list[str]) -> list[str]:
+    """Wrap OpenCode so its shared local database stays locked for its lifetime.
+
+    The wrapper replaces itself with the original argv after taking a
+    process-shared advisory lock. Because the descriptor is explicitly
+    inherited across exec, the lock remains held by OpenCode (or its outer
+    timeout command) until the spawned process exits, including when Huddle
+    terminates the exact registered Popen.
+    """
+    if _effective_binary(argv) != "opencode":
+        return argv
+    lock_path = bus.HUDDLE_HOME / "internal" / "opencode-run.lock"
+    helper = Path(__file__).with_name("opencode_serial.py")
+    return [sys.executable, str(helper), str(lock_path), "--", *argv]
 
 
 def _same_bin_stagger_sec() -> float:
@@ -1592,14 +2636,20 @@ def compute_stagger_delays(
 
 def _placeholder_agent_meta(
     spec: SpawnSpec, brief: str, log_dir: Path
-) -> dict[str, str | None]:
+) -> dict[str, object]:
     """Deterministic {log_path, last_message_path} for a spec, computable
     without actually spawning a process — lets a delayed (staggered) spawn's
     identity be registered in agent_meta immediately, before its process
     exists, so the room already knows it's coming."""
-    _, last_msg_path = _resolve_spawn_args(spec, brief, log_dir)
+    argv, last_msg_path = _resolve_spawn_args(spec, brief, log_dir)
     log_path = log_dir / f"{spec['name'].lower()}.events.jsonl"
-    return {"log_path": str(log_path), "last_message_path": last_msg_path}
+    result = {"log_path": str(log_path), "last_message_path": last_msg_path}
+    settings = model_settings_for_spec({**spec, "cmd": argv})
+    if settings:
+        result["model_settings"] = settings
+    if "mcp_url" in spec and _effective_binary(spec.get("cmd") or []) == "codex":
+        result["mcp_url"] = _codex_loopback_mcp_url(spec["mcp_url"])
+    return result
 
 
 def _schedule_delayed_spawn(
@@ -1614,6 +2664,8 @@ def _schedule_delayed_spawn(
     on_spawned=None,
     owner_room_id: str = "",
     process_handle: str | None = None,
+    on_log_open: Callable[[int, str], None] | None = None,
+    on_log_open_identity: Callable[[int, str, int, int], None] | None = None,
 ) -> threading.Timer:
     """Fire spawn_agent(spec, ...) after `delay` seconds on a daemon timer
     thread, without blocking the caller. Spawn failures are logged/notified
@@ -1648,6 +2700,8 @@ def _schedule_delayed_spawn(
             pid, _, _ = spawn_agent(
                 spec, brief, cwd, log_dir, on_exit=on_exit,
                 owner_room_id=owner_room_id, process_handle=process_handle,
+                on_log_open=on_log_open,
+                on_log_open_identity=on_log_open_identity,
             )
         except (FileNotFoundError, PermissionError, AgentSpawnError, OSError) as exc:
             log_spawn_failure(spec, brief, cwd, log_dir, exc)
@@ -1754,6 +2808,8 @@ def spawn_all(
     owner_room_id: str = "",
     process_handle_factory=None,
     prepare_spawn=None,
+    on_log_open_factory=None,
+    on_log_open_identity_factory=None,
 ) -> tuple[list[str], list[int], dict[str, dict[str, object]]]:
     """Spawn every enabled agent in the registry.
 
@@ -1843,6 +2899,10 @@ def spawn_all(
                 on_spawned=spawned_cb,
                 owner_room_id=owner_room_id,
                 process_handle=process_handle,
+                on_log_open=(on_log_open_factory(spec["name"])
+                             if on_log_open_factory else None),
+                on_log_open_identity=(on_log_open_identity_factory(spec["name"])
+                                      if on_log_open_identity_factory else None),
             )
             continue
         try:
@@ -1852,6 +2912,10 @@ def spawn_all(
                 on_exit=on_exit_factory(spec["name"]) if on_exit_factory else None,
                 owner_room_id=owner_room_id,
                 process_handle=process_handle,
+                on_log_open=(on_log_open_factory(spec["name"])
+                             if on_log_open_factory else None),
+                on_log_open_identity=(on_log_open_identity_factory(spec["name"])
+                                      if on_log_open_identity_factory else None),
             )
             pids.append(pid)
             names.append(spec["name"])
@@ -2065,7 +3129,11 @@ def detect_rate_limit(log_path: str) -> str | None:
 def codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str,
                  last_msg_path: str | None = None, on_exit=None,
                  owner_room_id: str = "",
-                 process_handle: str | None = None) -> int:
+                 process_handle: str | None = None,
+                 model_settings: dict[str, str] | None = None,
+                 workspace_write_roots: list[str] | None = None,
+                 mcp_url: str | None = None,
+                 member_token: str | None = None) -> int:
     """Resume a Codex thread with a new prompt. Cheaper than fresh spawn —
     Codex remembers prior conversation via its rollout file.
 
@@ -2077,25 +3145,49 @@ def codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str,
     We pin danger-full-access so Codex's huddle MCP tool calls aren't auto-
     cancelled: under a restricted sandbox + `-a never`, MCP calls need approval
     that `never` denies ("user cancelled MCP tool call"). `-a` is a top-level
-    flag (before `exec`). The model is left to ~/.codex/config.toml (SoT).
+    flag (before `exec`). A room's initial model settings are retained for
+    resumed turns so a registry edit cannot switch models mid-session. A
+    supplied ``mcp_url`` likewise pins the room's original Huddle endpoint.
+    ``workspace_write_roots`` (a list, possibly empty) selects a write room's
+    bounded workspace-write sandbox instead of the process-wide default.
     """
+    if workspace_write_roots is not None and not _is_ascii(cwd or ""):
+        # The ASCII fallback cwd would silently move the writable root.
+        raise AgentSpawnError("write room cwd must be an ASCII path for Codex")
     cwd, prompt = _codex_safe_cwd_and_brief(cwd, prompt)
     # Read-only by default (matches the initial-spawn transform): pin
     # sandbox_mode=read-only and auto-approve the huddle MCP tools so the
     # resumed turn can still post without the restricted-sandbox approval that
     # `-a never` would otherwise cancel. MCP_HUDDLE_READONLY=0 → full access.
-    readonly = _readonly_enabled()
-    sandbox = "read-only" if readonly else _CODEX_SANDBOX
+    sandbox_args = _codex_resume_sandbox_args(workspace_write_roots)
+    if model_settings is None:
+        spec = get_enabled_spec("Codex")
+        settings = model_settings_for_spec(spec) if spec else {}
+    else:
+        # A room's initial selection is durable. Do not let a later registry
+        # edit silently switch the model halfway through its native session.
+        settings = _validated_model_overrides(
+            {"name": "Codex", "cmd": ["codex"], **model_settings}, "codex",
+        )
+    model = settings.get("model")
+    effort = settings.get("effort")
+
     argv = [
         _CODEX_BIN or "codex", "-a", "never",            # top-level: never auto-approve tool calls
         "exec", "resume", thread_id,                     # subcommand
         "--json",                                        # JSONL events to stdout
-        "-c", 'model_reasoning_effort="medium"',
-        "-c", f'sandbox_mode="{sandbox}"',               # resume has no -s flag; pin via -c
-        "-c", "features.guardian_approval=false",
     ]
-    if readonly:
-        argv += ["-c", 'mcp_servers.huddle.default_tools_approval_mode="approve"']
+    if model:
+        argv.extend(["-m", model])
+    if effort:
+        argv.extend(["-c", f'model_reasoning_effort="{effort}"'])
+
+    argv.extend(sandbox_args)                            # resume has no -s flag; pin via -c
+    # A member token needs the pinned HTTP route; without it the token is unused.
+    member_header = bool(member_token) and mcp_url is not None
+    if mcp_url is not None:
+        url = _codex_loopback_mcp_url(mcp_url)
+        argv.extend(["-c", _codex_huddle_server_config(url, member_header)])
     if last_msg_path:
         argv += ["-o", last_msg_path]                    # short form of --output-last-message
     argv.append(prompt)
@@ -2124,6 +3216,10 @@ def codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str,
         log_file = os.fdopen(log_fd, "ab", buffering=0)
     else:
         log_file = _open_standalone_log(Path(log_path), create_parent=False)
+    resume_env = build_sanitized_environment()
+    resume_env.pop(MEMBER_TOKEN_ENV, None)
+    if member_header:
+        resume_env[MEMBER_TOKEN_ENV] = member_token
     try:
         proc = subprocess.Popen(
             argv,
@@ -2131,7 +3227,7 @@ def codex_resume(thread_id: str, prompt: str, cwd: str, log_path: str,
             stdin=subprocess.DEVNULL,
             stdout=log_file,
             stderr=subprocess.STDOUT,
-            env=build_sanitized_environment(),
+            env=resume_env,
         )
     except BaseException:
         _close_parent_log_safely(log_file)

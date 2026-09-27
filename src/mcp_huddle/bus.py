@@ -49,6 +49,7 @@ MAX_STORED_MESSAGE_BYTES = 320 * 1024  # complete serialized JSONL entry cap
 ROOM_MESSAGE_RATE_LIMIT = 120
 ROOM_MESSAGE_RATE_WINDOW_SECS = 60
 ROOM_CLOSE_FINALIZE_ATTEMPTS = 3
+MAX_ROOM_NAME_CHARS = 160
 
 VALID_KINDS = {"request", "comment", "ack", "busy", "result", "final", "system", "close"}
 VALID_ROOM_STATUSES = {
@@ -268,8 +269,19 @@ def _agent_paths(room_id: str, agent_name: str, *, create: bool = False) -> tupl
 
 
 def create_room(name: str, owner: str, owner_pid: int, cwd: str = "",
-                session_id: str = "") -> str:
-    room_id = f"room_{uuid.uuid4().hex[:8]}"
+                session_id: str = "", *, room_id: str | None = None) -> str:
+    if room_id is None:
+        room_id = f"room_{uuid.uuid4().hex[:8]}"
+    elif (
+        not isinstance(room_id, str)
+        or len(room_id) != 13
+        or not room_id.startswith("room_")
+        or any(char not in "0123456789abcdef" for char in room_id[5:])
+    ):
+        # Validate caller-controlled IDs before creating or changing any
+        # storage directories. Explicit IDs use the same compact form as the
+        # generated IDs, which also keeps them safe as one path component.
+        raise ValueError("Invalid room_id: expected room_ followed by 8 lowercase hex digits")
     BUS_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     rdir = _room_dir(room_id)
     root_fd = os.open(
@@ -369,6 +381,35 @@ def append_agent_event(room_id: str, agent_name: str, event: dict) -> None:
 
 def get_room_info(room_id: str) -> dict:
     return _read_meta(room_id)
+
+
+def rename_room(room_id: str, name: str, owner: str) -> dict:
+    """Rename an existing room without changing its identity or history.
+
+    The room owner is checked while holding the same metadata lock used for
+    the update, so a rename cannot race a concurrent metadata change.
+    """
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("room name must be non-empty")
+    name = name.strip()
+    if len(name) > MAX_ROOM_NAME_CHARS:
+        raise ValueError(f"room name must be at most {MAX_ROOM_NAME_CHARS} characters")
+    if not isinstance(owner, str) or not owner.strip():
+        raise ValueError("room owner is required")
+    owner = owner.strip()
+
+    def _update(meta: dict) -> dict:
+        if meta.get("owner") != owner:
+            raise PermissionError("only the room owner may rename it")
+        meta["name"] = name
+        return meta
+
+    try:
+        return _update_meta_locked(room_id, _update)
+    except FileNotFoundError as e:
+        # Opening the per-room lock fails before _update_meta_locked can
+        # inspect meta.json when the directory does not exist.
+        raise ValueError(f"Room '{room_id}' not found") from e
 
 
 def mark_idle(room_id: str) -> None:
@@ -593,18 +634,16 @@ def post_message(room_id: str, agent: str, body: str, kind: str,
         if cur["status"] == "resolved" and kind not in ("system", "close"):
             raise ValueError("Room is resolved and read-only.")
 
-        # Idempotency: scan last 20 lines
-        if idempotency_key:
-            existing = _read_last_n_raw(msgs_file, 20)
-            for line in existing:
-                try:
-                    msg = json.loads(line)
-                    if msg.get("idempotency_key") == idempotency_key:
-                        return msg["id"]
-                except Exception:
-                    pass
-
+        # Load the locked history once. Idempotency keys must remain durable
+        # after arbitrarily many later messages and across process restarts.
         persisted_messages = _load_messages_unlocked(room_id)
+        if idempotency_key:
+            for msg in persisted_messages:
+                if (isinstance(msg, dict)
+                        and msg.get("idempotency_key") == idempotency_key
+                        and "id" in msg):
+                    return msg["id"]
+
         _check_room_rate_locked(persisted_messages, int(time.time()))
 
         # Check and append are one atomic decision. Previously two concurrent
@@ -670,7 +709,8 @@ def _validate_reply_to_locked(room_id: str, target_id: int, agent: str, kind: st
     the check is atomic with the append that follows.
 
     Rules:
-      * target must exist and be a `request`;
+      * target must exist; a `comment` can attach to any message (including
+        another annotation), while other kinds retain request-only replies;
       * the replying agent must have been an addressee (`to` empty / "all" /
         the agent itself) — Human/System bypass this;
       * a broadcast request (`to=all` / no `to`) expects one terminal reply
@@ -684,7 +724,9 @@ def _validate_reply_to_locked(room_id: str, target_id: int, agent: str, kind: st
     if target is None:
         raise ValueError("reply_to target not found")
     if target.get("kind") != "request":
-        raise ValueError("reply_to target must be a request")
+        if kind == "comment":
+            return
+        raise ValueError("reply_to target must be a request for this message kind")
     target_to = target.get("to")
     if (agent not in ("Human", "System")
             and target_to and target_to not in ("all", agent)):
@@ -1359,13 +1401,6 @@ def _next_id(msgs_file: Path) -> int:
         except Exception:
             pass
     return 1
-
-
-def _read_last_n_raw(msgs_file: Path, n: int) -> list[str]:
-    if not _safe_exists(msgs_file):
-        return []
-    lines = _safe_read_text(msgs_file).strip().splitlines()
-    return lines[-n:]
 
 
 class _lock:

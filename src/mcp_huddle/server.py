@@ -6,12 +6,17 @@ HTTP mode (`--http`): uvicorn + Liquid Glass dashboard on :8014.
 
 import asyncio
 import contextlib
+from functools import wraps
 import hashlib
 import hmac
 import json
 import os
+import re
+import shutil
+import signal
 import stat
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -20,13 +25,20 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, StreamingResponse
 
 from . import bus
 from . import child_processes
+from .claude_model_receipt import parse_claude_model_receipt
+from . import room_workspace
+from . import delivery
 from . import spawn
+from . import swarm_pilot
+from . import swarm_jev
+from . import swarm_replacement
+from . import swarm_planner
 
 # Shown to LLM clients in the `initialize` response. Keep tight — every agent
 # session sees this verbatim. Goal: stop one-shot misuse, enforce anti-loop.
@@ -349,6 +361,16 @@ def room_info(room_id: str) -> dict:
 
 
 @mcp.tool()
+def room_rename(room_id: str, name: str, owner: str) -> dict:
+    """Rename a room while preserving its ID, messages, status, and access.
+
+    Only the recorded room owner may rename it. Names are trimmed and limited
+    to 160 characters.
+    """
+    return bus.rename_room(room_id, name, owner)
+
+
+@mcp.tool()
 def room_reclaim(room_id: str, owner: str, owner_pid: int,
                  session_id: str = "") -> str:
     """Re-stamp the room's owner_pid after your session resumed with a new PID.
@@ -373,6 +395,2391 @@ def room_round_advance(room_id: str, owner: str, label: str = "") -> str:
     """
     n = bus.advance_round(room_id, owner, label)
     return f"round {n} opened"
+
+
+# ── Bounded four-mode swarm pilot ─────────────────────────────────────────────
+
+_SWARM_COST_CLASSES = {"free", "cheap", "paid", "unknown"}
+_SWARM_CLIENT_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_SWARM_HASH_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_SWARM_JEV_HARNESSES = {
+    "agy": "antigravity", "antigravity": "antigravity",
+    "claude": "claude", "codex": "codex", "opencode": "opencode",
+}
+
+
+def _swarm_client_request_fingerprint(
+    name: str, organizer: str, goal: str, mode: str, members: list[str],
+    cwd: str, workspace_strategy: str, start_requested: bool,
+    write_policy: str = room_workspace.READ_ONLY,
+    *, member_profiles: dict[str, str] | None = None,
+    child_agents: dict | None = None,
+) -> str:
+    payload = {
+        "name": name,
+        "organizer": organizer,
+        "goal": goal,
+        "mode": mode,
+        "members": list(members),
+        "cwd": cwd,
+        "workspace_strategy": workspace_strategy,
+        "start_requested": start_requested,
+    }
+    if write_policy != room_workspace.READ_ONLY:
+        # Omitted for read-only so existing request fingerprints stay stable.
+        payload["write_policy"] = write_policy
+    if member_profiles:
+        # Omitted when absent so existing request fingerprints stay stable.
+        payload["member_profiles"] = dict(member_profiles)
+    if child_agents:
+        # Omitted when disabled so existing request fingerprints stay stable.
+        payload["child_agents"] = dict(child_agents)
+    try:
+        encoded = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, UnicodeError):
+        raise ValueError("request fields cannot be encoded safely") from None
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _swarm_request_room_id(organizer: str, client_request_id: str) -> str:
+    digest = hashlib.sha256(
+        (organizer + "\0" + client_request_id).encode("utf-8")
+    ).hexdigest()
+    return "room_" + digest[:8]
+
+
+def _swarm_validate_expected_specs(
+    members: list[str], expected_specs: dict[str, str] | None,
+    *, check_registry: bool = True,
+    member_profiles: dict[str, str] | None = None,
+) -> dict[str, str] | None:
+    """Pin each member to the fingerprint of the profile that launches it."""
+    if expected_specs is None:
+        return None
+    if not isinstance(members, list) or not all(isinstance(item, str) for item in members):
+        raise ValueError("members must be a list of participant names")
+    if not isinstance(expected_specs, dict):
+        raise ValueError("expected_specs must map every member to a sha256 fingerprint")
+    if len(members) != len(set(members)):
+        raise ValueError("members must be unique when expected_specs is supplied")
+    if set(expected_specs) != set(members):
+        raise ValueError("expected_specs keys must exactly match members")
+    for member, fingerprint in expected_specs.items():
+        if not isinstance(member, str) or not isinstance(fingerprint, str) or not _SWARM_HASH_RE.fullmatch(fingerprint):
+            raise ValueError("expected_specs values must be sha256 fingerprints")
+
+    if check_registry:
+        registry = {item["id"]: item for item in _swarm_plan_candidates()}
+        mapped = {"member_profiles": member_profiles or {}}
+        for member in members:
+            current = registry.get(swarm_pilot.member_profile(mapped, member))
+            if current is None or not current["enabled"] or not current["static_ok"]:
+                raise ValueError(f"participant is not statically available: {member}")
+            if current["spec_fingerprint"] != expected_specs[member]:
+                raise ValueError(f"registry spec drift for participant: {member}")
+    return dict(expected_specs)
+
+
+def _swarm_mark_create_state(
+    room_id: str, state: str, expected_specs: dict[str, str] | None,
+    start_requested: bool, registry_checked: bool,
+    initial_dispatch: list[dict] | None = None,
+) -> None:
+    def update(meta: dict) -> dict:
+        pilot = meta.get("swarm_pilot")
+        if not isinstance(pilot, dict):
+            raise ValueError("partial_room: swarm pilot state is missing")
+        pilot["server_create_state"] = state
+        pilot["start_requested"] = start_requested
+        pilot["registry_availability_checked"] = registry_checked
+        if expected_specs is not None:
+            pilot["expected_specs"] = dict(expected_specs)
+        if state == "ready":
+            pilot["initial_dispatch"] = list(initial_dispatch or [])
+        return meta
+    bus._update_meta_locked(room_id, update)
+
+
+def _swarm_existing_request(
+    room_id: str, fingerprint: str, organizer: str, expected_specs: dict[str, str] | None,
+) -> dict | None:
+    try:
+        meta = bus.get_room_info(room_id)
+    except ValueError:
+        try:
+            room_path = bus._room_dir(room_id)
+        except ValueError:
+            raise ValueError("partial_room: deterministic room path is invalid") from None
+        if room_path.exists():
+            raise ValueError("partial_room: room exists without readable initialized metadata") from None
+        return None
+
+    pilot = meta.get("swarm_pilot")
+    if not isinstance(pilot, dict):
+        raise ValueError("partial_room: deterministic room ID is occupied by a non-pilot room")
+    stored_fingerprint = pilot.get("client_request_fingerprint")
+    if not isinstance(stored_fingerprint, str) or not _SWARM_HASH_RE.fullmatch(stored_fingerprint):
+        raise ValueError("partial_room: room has no valid client request fingerprint")
+    if stored_fingerprint != fingerprint:
+        raise ValueError("client_request_id conflict: the room belongs to a different request")
+    if meta.get("owner") != organizer or pilot.get("organizer") != organizer:
+        raise ValueError("client_request_id conflict: organizer does not match the stored room")
+    if not isinstance(pilot.get("start_requested"), bool):
+        raise ValueError("partial_room: original start request state is missing")
+
+    try:
+        recomputed = _swarm_client_request_fingerprint(
+            meta["name"], pilot["organizer"], pilot["goal"], pilot["mode"],
+            pilot["members"], meta.get("cwd", ""), pilot["workspace_strategy"],
+            pilot["start_requested"], room_workspace.write_policy(meta),
+            member_profiles=pilot.get("member_profiles"),
+            child_agents=pilot.get("child_agents"),
+        )
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("partial_room: stored request data is incomplete") from None
+    if recomputed != stored_fingerprint:
+        raise ValueError("partial_room: stored request fingerprint does not match room data")
+    create_state = pilot.get("server_create_state")
+    if create_state not in {"ready", "preparing"}:
+        raise ValueError("partial_room: room initialization state is missing or invalid")
+    if create_state == "ready" and not isinstance(pilot.get("initial_dispatch"), list):
+        raise ValueError("partial_room: initial dispatch result is missing")
+    members = pilot.get("members")
+    participants = meta.get("participants")
+    if (not isinstance(members, list) or not isinstance(participants, list)
+            or any(member not in participants for member in members)):
+        raise ValueError("partial_room: room roster initialization is incomplete")
+    if expected_specs is not None:
+        stored_specs = pilot.get("expected_specs")
+        if stored_specs is not None and stored_specs != expected_specs:
+            raise ValueError("client_request_id conflict: expected agent specs differ from stored request")
+        _swarm_validate_expected_specs(
+            members, expected_specs, member_profiles=pilot.get("member_profiles"),
+        )
+    result = {
+        "room_id": room_id,
+        "mode": pilot.get("mode"),
+        "dispatched": [],
+        "started": pilot["start_requested"],
+        "start_requested": pilot["start_requested"],
+        "previous_dispatch": (
+            list(pilot["initial_dispatch"])
+            if create_state == "ready" else _swarm_initial_dispatch(room_id)
+        ),
+        "reused": True,
+        "availability": {
+            "static_only": not bool(pilot.get("registry_availability_checked")),
+            "registry_availability_checked": bool(pilot.get("registry_availability_checked")),
+            "provider_response_verified": False,
+        },
+    }
+    if create_state == "preparing":
+        result["_resume_preparing"] = True
+    return result
+
+
+def _swarm_initial_dispatch(room_id: str) -> list[dict]:
+    state = swarm_pilot.status(room_id)
+    dispatched = state.get("dispatched")
+    if not isinstance(dispatched, dict):
+        return []
+    return [
+        {"member": member, "request_id": dispatched[member], "status": "dispatched"}
+        for member in state.get("members", []) if member in dispatched
+    ]
+
+
+def _serialize_swarm_create_by_request_id(function):
+    """Serialize same-process retries for one deterministic room identity."""
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        request_id = kwargs.get("client_request_id", args[8] if len(args) > 8 else "")
+        organizer = kwargs.get("organizer", args[1] if len(args) > 1 else "")
+        if (not isinstance(request_id, str) or not _SWARM_CLIENT_REQUEST_ID_RE.fullmatch(request_id)
+                or not isinstance(organizer, str)):
+            return function(*args, **kwargs)
+        room_id = _swarm_request_room_id(organizer, request_id)
+        # Reuse Huddle's weak in-process per-room lock. It is held only in
+        # memory; bus metadata locks remain sequential and are never nested.
+        with _wake_lock(room_id, "__swarm_create__"):
+            return function(*args, **kwargs)
+    return wrapped
+
+
+def _swarm_resume_preparing(
+    room_id: str, organizer: str, members: list[str], expected_specs: dict[str, str] | None,
+    start_requested: bool, registry_checked: bool,
+) -> dict:
+    """Idempotently finish invites and dispatch for a deterministic partial room."""
+    pilot = swarm_pilot.status(room_id)
+    if start_requested:
+        unavailable = [member for member in members
+                       if spawn.get_enabled_spec(swarm_pilot.member_profile(pilot, member)) is None]
+        if unavailable:
+            raise ValueError(f"unavailable registry members while resuming partial room: {unavailable}")
+    _swarm_invite_members(room_id, organizer, members)
+    _swarm_seed_council_organizer(room_id, organizer)
+    new_dispatch = swarm_pilot_pump(room_id) if start_requested else []
+    if start_requested and swarm_pilot.due_members(room_id):
+        blocked = [
+            item for item in new_dispatch
+            if item.get("status") in {"spec_drift", "unavailable"}
+        ]
+        reason = ", ".join(item.get("status", "blocked") for item in blocked) or "pending members"
+        raise ValueError(f"partial_room: swarm dispatch remains incomplete ({reason})")
+    all_dispatch = _swarm_initial_dispatch(room_id) if start_requested else []
+    _swarm_mark_create_state(
+        room_id, "ready", expected_specs, start_requested, registry_checked, all_dispatch,
+    )
+    return {
+        "room_id": room_id,
+        "mode": swarm_pilot.status(room_id).get("mode"),
+        "dispatched": new_dispatch,
+        "started": start_requested,
+        "start_requested": start_requested,
+        "previous_dispatch": all_dispatch,
+        "reused": True,
+        "availability": {
+            "static_only": not registry_checked,
+            "registry_availability_checked": registry_checked,
+            "provider_response_verified": False,
+        },
+    }
+
+
+def _swarm_invite_members(room_id: str, organizer: str, members: list[str]) -> None:
+    """Invite members; reserve a wake slot for those launched via a mapped profile.
+
+    ``room_invite`` reserves a slot only when the member name is itself an
+    enabled profile, so a mapped member needs the same reservation here.
+    """
+    pilot = swarm_pilot.status(room_id)
+    for member in members:
+        room_invite(room_id, member, by=organizer)
+        profile = swarm_pilot.member_profile(pilot, member)
+        if profile != member and spawn.get_enabled_spec(profile) is not None:
+            bus.register_external_agent(room_id, member)
+
+
+def _swarm_seed_council_organizer(room_id: str, organizer: str) -> None:
+    """Make a registry-backed council organizer wakeable for the final only."""
+    if (swarm_pilot.status(room_id)["mode"] == "council"
+            and spawn.get_enabled_spec(organizer) is not None):
+        # Invite reserves a wake slot; it does not launch a CLI turn. The
+        # organizer's PID/session is still absent from room ownership.
+        room_invite(room_id, organizer, by=organizer)
+
+
+def _swarm_cli_exists(command: str) -> bool:
+    """Check only the executable named by a registry command; never launch it."""
+    if not isinstance(command, str) or not command.strip():
+        return False
+    if os.path.isabs(command):
+        path = Path(command)
+        return path.is_file() and os.access(path, os.X_OK)
+    if os.sep in command:
+        path = Path(command)
+        return path.is_file() and os.access(path, os.X_OK)
+    return shutil.which(command) is not None
+
+
+def _swarm_display_model(value: object) -> str:
+    """Keep model IDs useful while hiding values that look like credentials."""
+    if not isinstance(value, str) or not value.strip():
+        return "harness default"
+    model = value.strip()
+    lowered = model.lower()
+    if (
+        len(model) > 160
+        or any(marker in lowered for marker in ("api_key", "token=", "secret=", "password=", "bearer "))
+        or lowered.startswith("sk-")
+        or re.fullmatch(r"[A-Za-z0-9_-]{40,}", model)
+    ):
+        return "configured model (redacted)"
+    return model
+
+
+def _swarm_readonly_enforced(spec: dict) -> bool:
+    """Delegate CLI permission truth to spawn's canonical effective check."""
+    try:
+        return spawn.readonly_enforced(spec)
+    except Exception:
+        return False
+
+
+def _swarm_plan_candidates() -> list[dict]:
+    """Build closed preview facts from the raw registry without live probes."""
+    candidates = []
+    for spec in spawn._raw_registry():
+        name = spec.get("name")
+        command = spec.get("cmd")
+        enabled = spec.get("enabled") is True
+        reasons: list[str] = []
+        cli_kind = "unsupported"
+        model = "harness default"
+        effort = variant = None
+        static_ok = True
+        settings: dict[str, str] = {}
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if not isinstance(command, list) or not command or not all(
+            isinstance(item, str) for item in command
+        ):
+            static_ok = False
+            reasons.append("invalid command template")
+            executable = ""
+        else:
+            cli_index = spawn._effective_binary_index(command)
+            executable = command[cli_index] if cli_index is not None else ""
+            binary = spawn._effective_binary(command)
+            cli_kind = binary or "unsupported"
+            if cli_index and Path(command[0]).name == "timeout" and not _swarm_cli_exists(command[0]):
+                static_ok = False
+                reasons.append("timeout wrapper executable not found")
+            if cli_index is None or not _swarm_cli_exists(executable):
+                static_ok = False
+                reasons.append("CLI executable not found")
+            try:
+                settings = spawn.model_settings_for_spec(spec)
+                if not isinstance(settings, dict) or any(
+                    key not in {"model", "effort", "variant"}
+                    or not isinstance(value, str) or not value.strip()
+                    for key, value in settings.items()
+                ):
+                    raise ValueError("invalid effective model settings")
+            except Exception:
+                settings = {}
+                static_ok = False
+                reasons.append("model settings are invalid")
+            model = settings.get("model") or spec.get("model") or model
+            effort = settings.get("effort") or spec.get("effort")
+            variant = settings.get("variant") or spec.get("variant")
+        # Special typed profiles have a different fixed runner/auth contract;
+        # the static pilot planner does not claim to preflight those yet.
+        if spec.get("profile"):
+            static_ok = False
+            reasons.append("typed runner profile is not covered by static preflight")
+        try:
+            fingerprint = spawn.spec_fingerprint(spec)
+        except Exception:
+            fingerprint = "sha256:invalid"
+            static_ok = False
+            reasons.append("registry contract could not be fingerprinted")
+        raw_cost = spec.get("cost_class")
+        cost_class = (
+            raw_cost if isinstance(raw_cost, str) and raw_cost in _SWARM_COST_CLASSES
+            else "unknown"
+        )
+        if cost_class == "unknown" and isinstance(model, str) and model.lower().endswith(":free"):
+            cost_class = "free"
+            reasons.append("configured model route is explicitly marked free")
+        if cost_class == "unknown":
+            reasons.append("cost class is not declared in registry")
+        candidates.append({
+            "id": name,
+            "name": name,
+            "cli_kind": cli_kind,
+            "model": _swarm_display_model(model),
+            "effort": effort if isinstance(effort, str) and effort.strip() else None,
+            "variant": variant if isinstance(variant, str) and variant.strip() else None,
+            "readonly_enforced": _swarm_readonly_enforced(spec),
+            "enabled": enabled,
+            "static_ok": static_ok,
+            "cost_class": cost_class,
+            "spec_fingerprint": fingerprint,
+            "reasons": reasons,
+        })
+    return candidates
+
+
+def _swarm_jev_facts(profile: dict) -> swarm_jev.ModeFacts:
+    return swarm_jev.ModeFacts(
+        task_type=profile["task_type"],
+        needs_files=profile["needs_files"],
+        parts=profile["parts"],
+        sequential_dependency=profile["sequential_dependency"],
+        diverse_opinions=profile["diverse_opinions"],
+        max_members=profile["max_members"],
+        budget=profile["budget"],
+    )
+
+
+@mcp.tool()
+def swarm_plan_preview(
+    profile: dict,
+    explicit_mode: str = "",
+    explicit_members: list[str] | None = None,
+    allow_unenforced_read: bool = False,
+) -> dict:
+    """Recommend a four-mode plan from closed task facts; creates no room/process.
+
+    This is a static advisory preview. It checks the configured CLI executable,
+    enabled flag, model settings, and enforced read-only argv. It does not test
+    provider authentication or ask a model to answer the task. Jev receives
+    only the closed profile and safe candidate capability labels. The model
+    class sent to Jev is a rough label inferred from configured reasoning
+    effort; it is not a benchmark of the model's actual capability.
+    """
+    if not isinstance(profile, dict):
+        raise ValueError("profile must be an object")
+    if explicit_mode == "":
+        explicit_mode = None
+    candidates = _swarm_plan_candidates()
+    explicit_kwargs = {
+        "explicit_mode": explicit_mode,
+        "explicit_members": explicit_members,
+        "explicit_allow_unenforced_read": allow_unenforced_read,
+    }
+    # Validate the closed input before contacting Jev. This call is pure and
+    # deliberately uses no room, process, or live registry-availability APIs.
+    base = swarm_planner.build_plan(profile, candidates, **explicit_kwargs)
+    eligible = [
+        item for item in candidates
+        if item["enabled"] and item["static_ok"]
+        and (item["readonly_enforced"] or (
+            allow_unenforced_read and profile.get("needs_files") == "read"
+        ))
+        and (
+            profile["budget"] == "any"
+            or (profile["budget"] == "cheap" and item["cost_class"] in {"free", "cheap"})
+            or (profile["budget"] == "free" and item["cost_class"] == "free")
+        )
+    ]
+    jev_facts = _swarm_jev_facts(profile)
+    jev_mode = None
+    jev_mode_confidence = None
+    mode_reason = "organizer supplied the mode" if explicit_mode else "Jev not consulted"
+    if explicit_mode is None and eligible and profile["needs_files"] != "write":
+        try:
+            result = swarm_jev.choose_mode(jev_facts)
+        except Exception:
+            result = None
+        if result is not None:
+            mode_reason = result.reason
+            if result.status == "ok" and result.choice == "none":
+                mode_reason = f"Jev chose none; deterministic profile rule used. {result.reason}"
+            if result.status == "ok" and result.choice in swarm_planner.MODES:
+                jev_mode = result.choice
+                jev_mode_confidence = result.confidence
+        else:
+            mode_reason = "Jev request failed; deterministic mode fallback"
+
+    effective_mode = explicit_mode or jev_mode or base["mode"]
+    ordered_candidates = list(candidates)
+    roster_lead = None
+    roster_reason = "organizer supplied the participant list" if explicit_members is not None else "Jev not consulted"
+    if explicit_members is None and len(eligible) >= 2 and profile["needs_files"] != "write":
+        jev_candidates = []
+        for item in eligible:
+            harness = _SWARM_JEV_HARNESSES.get(item["cli_kind"].lower())
+            if not harness:
+                continue
+            effort = (item["effort"] or "").lower()
+            model_class = "fast" if effort in {"minimal", "low", "none"} else (
+                "strong" if effort in {"high", "xhigh", "max", "ultra"} else "balanced"
+            )
+            jev_candidates.append(swarm_jev.VerifiedCandidate(
+                candidate_id=item["id"],
+                harness=harness,
+                model_class=model_class,
+                cost_class=item["cost_class"],
+                readonly_enforced=item["readonly_enforced"],
+            ))
+            if len(jev_candidates) == 9:
+                break
+        if len(jev_candidates) >= 2:
+            try:
+                result = swarm_jev.choose_candidate(jev_facts, jev_candidates)
+            except Exception:
+                result = None
+            if result is not None:
+                roster_reason = result.reason
+                if result.status == "ok" and result.choice == "none":
+                    roster_reason = (
+                        f"Jev chose none; eligible registry order used. {result.reason}"
+                    )
+                if result.status == "ok" and result.choice in {item.candidate_id for item in jev_candidates}:
+                    roster_lead = result.choice
+                    ordered_candidates.sort(key=lambda item: item["id"] != roster_lead)
+            else:
+                roster_reason = "Jev request failed; eligible registry order used"
+
+    # A single Jev pick is the lead participant; Huddle fills the rest using
+    # the verified registry order, bounded to two for a one-part council.
+    effective_profile = dict(profile)
+    roster_cap = profile["max_members"]
+    if (explicit_members is None and effective_mode == "council"
+            and profile["parts"] == "one"):
+        roster_cap = min(roster_cap, 2)
+        effective_profile["max_members"] = roster_cap
+    jev_advice = {
+        "confidence": jev_mode_confidence,
+        "mode": jev_mode,
+        "member_ids": [],
+    } if jev_mode else None
+    plan = swarm_planner.build_plan(
+        effective_profile,
+        ordered_candidates,
+        jev_advice=jev_advice,
+        **explicit_kwargs,
+    )
+    roster_note = ""
+    if roster_lead:
+        roster_note = (
+            "Jev selected the first participant; Huddle filled the remaining places "
+            "in eligible registry order."
+        )
+    if roster_cap < profile["max_members"]:
+        cap_note = f"Roster capped at {roster_cap} for a one-participant council profile."
+        roster_note = f"{roster_note} {cap_note}".strip()
+    plan["jev"] = {
+        "mode": {"choice": jev_mode, "reason": mode_reason},
+        "first_participant": {"choice": roster_lead, "reason": roster_reason},
+        "roster_note": roster_note,
+        "model_class_note": (
+            "Roughly inferred from configured reasoning effort; actual model "
+            "capability and provider route were not tested."
+        ),
+    }
+    plan["readiness"] = "static advisory only; provider authentication and response not verified"
+    plan["side_effects"] = {"room_created": False, "child_processes_started": False}
+    return plan
+
+
+@mcp.tool()
+def swarm_room_proposal(
+    name: str,
+    organizer: str,
+    goal: str,
+    requirements: dict,
+    explicit_mode: str = "",
+    explicit_members: list[str] | None = None,
+    allow_unenforced_read: bool = False,
+    cwd: str = "",
+    check_cli_login: bool = True,
+    check_exact_model: bool = False,
+) -> dict:
+    """Build a reviewable room proposal from a goal and closed requirements.
+
+    The exact goal and requirements are retained in the local response. Only
+    ``requirements`` and sanitized candidate facts reach Jev through
+    ``swarm_plan_preview``; the goal, room name, organizer, and path do not.
+    This tool never creates a room or starts a process. ``create_args`` is
+    present only when the static plan is ready and contains ``start=False``.
+    Login probing checks only native Claude/Codex login status; it does not
+    verify the selected model, provider route, quota, or model response. Login
+    probing is enabled by default and can be skipped with ``False``. The
+    opt-in ``check_exact_model`` makes one short fixed sentinel request for
+    each selected Claude/Codex model+effort route. It sends no room goal or
+    repository data and fails closed when the route is not explicitly pinned.
+    """
+    for label, value, limit in (
+        ("name", name, 200),
+        ("organizer", organizer, 120),
+        ("goal", goal, 5000),
+    ):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{label} must be a non-empty string")
+        if len(value) > limit:
+            raise ValueError(f"{label} is too long (maximum {limit} characters)")
+    if not isinstance(cwd, str) or len(cwd) > 4096:
+        raise ValueError("cwd must be a string of at most 4096 characters")
+    if not isinstance(check_cli_login, bool):
+        raise ValueError("check_cli_login must be a boolean")
+    if not isinstance(check_exact_model, bool):
+        raise ValueError("check_exact_model must be a boolean")
+
+    plan = swarm_plan_preview(
+        requirements,
+        explicit_mode=explicit_mode,
+        explicit_members=explicit_members,
+        allow_unenforced_read=allow_unenforced_read,
+    )
+    login_checks = {}
+    exact_model_checks = {}
+    if plan.get("status") == "planned":
+        selected_ids = [member["id"] for member in plan.get("members", [])]
+        if check_cli_login:
+            specs_by_name = {
+                spec.get("name"): spec for spec in spawn._raw_registry()
+                if isinstance(spec.get("name"), str)
+            }
+            probe_cwd = cwd or tempfile.gettempdir()
+            probed_routes = {}
+            for member_id in selected_ids:
+                spec = specs_by_name.get(member_id)
+                command = spec.get("cmd", []) if spec else []
+                route = spawn._effective_binary(command) if isinstance(command, list) else None
+                route_key = ("binary", route) if route else ("profile", member_id)
+                if route_key not in probed_routes:
+                    if spec is None:
+                        result = {"status": "unknown", "reason": "unsupported_harness"}
+                    else:
+                        try:
+                            probe = spawn.probe_cli_login(spec, probe_cwd)
+                        except Exception:
+                            # Never expose exceptions that may contain local account or
+                            # process details; the login probe contract is closed data.
+                            probe = None
+                        statuses = {"authenticated", "unauthenticated", "unknown"}
+                        reasons = {
+                            "cli_login_present", "cli_logged_out", "unsupported_harness",
+                            "non_native_profile", "probe_unavailable", "probe_timeout",
+                            "unrecognized_output",
+                        }
+                        if (not isinstance(probe, dict)
+                                or probe.get("status") not in statuses
+                                or probe.get("reason") not in reasons):
+                            result = {"status": "unknown", "reason": "probe_unavailable"}
+                        else:
+                            result = {
+                                "status": probe["status"], "reason": probe["reason"],
+                            }
+                    probed_routes[route_key] = result
+                login_checks[member_id] = dict(probed_routes[route_key])
+        else:
+            login_checks = {
+                member_id: {"status": "skipped", "reason": "caller_disabled"}
+                for member_id in selected_ids
+            }
+        if check_exact_model:
+            specs_by_name = {
+                spec.get("name"): spec for spec in spawn._raw_registry()
+                if isinstance(spec.get("name"), str)
+            }
+            probe_cwd = tempfile.gettempdir()
+            for member_id in selected_ids:
+                spec = specs_by_name.get(member_id)
+                command = spec.get("cmd", []) if spec else []
+                route = spawn._effective_binary(command) if isinstance(command, list) else None
+                if route not in {"claude", "codex"}:
+                    exact_model_checks[member_id] = {
+                        "status": "unsupported", "reason": "unsupported_harness",
+                    }
+                    continue
+                if spec is None:
+                    probe = {"status": "unsupported", "reason": "unsupported_harness"}
+                else:
+                    try:
+                        probe = spawn.probe_cli_model_response(spec, probe_cwd)
+                    except Exception:
+                        probe = None
+                statuses = {"passed", "failed", "unsupported", "unknown"}
+                reasons = {
+                    "sentinel_response_received", "provider_request_failed",
+                    "sentinel_response_not_received", "response_timeout",
+                    "probe_unavailable", "unsupported_harness",
+                    "invalid_model_settings", "model_effort_not_explicit",
+                }
+                if (not isinstance(probe, dict) or probe.get("status") not in statuses
+                        or probe.get("reason") not in reasons):
+                    exact_model_checks[member_id] = {
+                        "status": "unknown", "reason": "probe_unavailable",
+                    }
+                else:
+                    exact_model_checks[member_id] = {
+                        "status": probe["status"], "reason": probe["reason"],
+                    }
+    create_args = None
+    proposal_blockers = []
+    if plan.get("status") == "planned":
+        members = [member["id"] for member in plan.get("members", [])]
+        failed_exact_routes = [
+            member_id for member_id, check in exact_model_checks.items()
+            if check["status"] != "passed"
+        ]
+        if failed_exact_routes:
+            proposal_blockers.append(
+                "exact Claude/Codex model preflight did not pass for: "
+                + ", ".join(failed_exact_routes)
+                + "; choose an explicitly pinned available route or disable exact-model preflight"
+            )
+        if organizer in members:
+            proposal_blockers.append("organizer must not also be a participant")
+        if {"Human", "System"}.intersection(members):
+            proposal_blockers.append("reserved names cannot be participants")
+        if not proposal_blockers:
+            create_args = {
+                "name": name,
+                "organizer": organizer,
+                "goal": goal,
+                "mode": plan["mode"],
+                "members": members,
+                "cwd": cwd,
+                "workspace_strategy": "shared_only",
+                "start": False,
+                "expected_specs": {
+                    member["id"]: member["spec_fingerprint"]
+                    for member in plan["members"]
+                },
+                # Audit metadata only; it is not approval or authorization.
+                "plan_hash": plan["plan_hash"],
+            }
+    else:
+        proposal_blockers.append("the static plan is not ready for room creation")
+
+    return {
+        "status": "ready_for_review" if create_args is not None else "not_ready",
+        "name": name,
+        "organizer": organizer,
+        "goal": goal,
+        "requirements": requirements,
+        "plan": plan,
+        "create_args": create_args,
+        "proposal_blockers": proposal_blockers,
+        "preflight": {
+            "static_plan": plan.get("status", "unknown"),
+            "cli_login": login_checks,
+            "exact_model_provider_response": exact_model_checks or "not_checked",
+        },
+        "readiness": (
+            "static advisory; native CLI login status checked"
+            if check_cli_login else "static advisory; native CLI login status skipped"
+        ) + (
+            "; exact selected Claude/Codex model response checked with a sentinel"
+            if check_exact_model else "; exact selected model response not checked"
+        ),
+        "side_effects": {"room_created": False, "child_processes_started": False},
+    }
+
+
+@mcp.tool()
+@_serialize_swarm_create_by_request_id
+def swarm_pilot_create(
+    name: str,
+    organizer: str,
+    goal: str,
+    mode: str,
+    members: list[str],
+    cwd: str = "",
+    workspace_strategy: str = "shared_only",
+    start: bool = True,
+    client_request_id: str = "",
+    expected_specs: dict[str, str] | None = None,
+    plan_hash: str = "",
+    write_policy: str = "read_only",
+    member_profiles: dict[str, str] | None = None,
+    child_agents: dict | None = None,
+) -> dict:
+    """Create a pilot room; start exact enabled registry members when requested.
+
+    ``start=False`` prepares durable state without launching CLI workers. This
+    is useful for a dry run and never implies that model work was performed.
+    ``write_policy="read_only"`` (default) keeps members read-only discussants.
+    ``write_policy="shared_write"`` requires ``cwd`` to equal the single
+    admin-approved root in the server's ``MCP_HUDDLE_WRITE_ROOTS`` and be the
+    canonical top of an existing local Git worktree; members may then edit
+    files there (and nowhere else) with a bounded write mode derived from this
+    room. Only Codex, and Claude with a loopback ``mcp_url`` plus the user's
+    Edit/Write PreToolUse Guard hook, are accepted; anything else is rejected
+    before any room is created. With
+    ``workspace_strategy="allow_subworktrees"`` Huddle also creates one
+    detached subworktree per member (under the Huddle home) as that member's
+    cwd; the shared worktree stays writable for transferring changes.
+    Supplying ``client_request_id`` makes retries idempotent for the exact
+    request payload. ``expected_specs`` pins each selected profile to its
+    current static registry fingerprint before creating a room. ``plan_hash``
+    is stored for audit only; it does not grant permissions. For compatibility,
+    response field ``started`` mirrors the ``start`` request; it does not prove
+    that a child process launched or that a provider returned a response.
+    Optional ``member_profiles`` maps a member name to the registry profile
+    that launches it, so several uniquely named members (each with its own
+    member_id, log and wake claim) can share one profile. Unmapped members
+    launch the profile with their own name, as before; ``expected_specs``
+    then pins the mapped profile's fingerprint.
+    Participant child agents are disabled unless ``child_agents`` is
+    ``{"max_children": 1-4, "profiles": [exact registry names]}``; see
+    ``swarm_spawn_child``.
+    """
+    child_policy = _swarm_child_policy(child_agents)
+    if not isinstance(members, list) or not all(isinstance(member, str) for member in members):
+        raise ValueError("members must be a list of participant names")
+    profiles_by_member = swarm_pilot.validate_member_profiles(members, member_profiles)
+    profile_state = {"member_profiles": profiles_by_member}
+    if profiles_by_member:
+        registry = {spec.get("name"): spec for spec in spawn._raw_registry()}
+        for member, profile in profiles_by_member.items():
+            if not _swarm_mapped_profile_supported(registry.get(profile)):
+                raise ValueError(
+                    f"member_profiles: {member} -> {profile} is not a supported "
+                    "Codex or Claude CLI profile"
+                )
+    if not isinstance(client_request_id, str):
+        raise ValueError("client_request_id must be a string")
+    if client_request_id and not _SWARM_CLIENT_REQUEST_ID_RE.fullmatch(client_request_id):
+        raise ValueError("client_request_id must be 1-128 ASCII letters, digits, dot, underscore, colon or hyphen")
+    if not isinstance(plan_hash, str) or (plan_hash and not _SWARM_HASH_RE.fullmatch(plan_hash)):
+        raise ValueError("plan_hash must be empty or a sha256 fingerprint")
+    if not isinstance(start, bool):
+        raise ValueError("start must be a boolean")
+    if write_policy not in room_workspace.WRITE_POLICIES:
+        raise ValueError(f"write_policy must be one of {sorted(room_workspace.WRITE_POLICIES)}")
+
+    expected = _swarm_validate_expected_specs(
+        members, expected_specs, check_registry=not bool(client_request_id),
+        member_profiles=profiles_by_member,
+    )
+    request_fingerprint = ""
+    deterministic_room_id = None
+    if client_request_id:
+        if not all(isinstance(value, str) for value in (name, organizer, goal, cwd, workspace_strategy, mode)):
+            raise ValueError("idempotent request fields must be strings")
+        if not isinstance(members, list) or not all(isinstance(member, str) for member in members):
+            raise ValueError("members must be a list of participant names")
+        request_fingerprint = _swarm_client_request_fingerprint(
+            name, organizer, goal, mode, members, cwd, workspace_strategy, start,
+            write_policy, member_profiles=profiles_by_member,
+            child_agents=child_policy,
+        )
+        deterministic_room_id = _swarm_request_room_id(organizer, client_request_id)
+        existing = _swarm_existing_request(
+            deterministic_room_id, request_fingerprint, organizer, expected,
+        )
+        if existing is not None:
+            if existing.pop("_resume_preparing", False):
+                return _swarm_resume_preparing(
+                    deterministic_room_id, organizer, members, expected, start,
+                    bool(existing["availability"]["registry_availability_checked"]),
+                )
+            return existing
+
+    # Check expected static registry fingerprints before the old live
+    # availability probe or any persistent room creation.
+    if client_request_id:
+        expected = _swarm_validate_expected_specs(
+            members, expected_specs, member_profiles=profiles_by_member,
+        )
+    if start:
+        unavailable = [
+            name for name in members
+            if spawn.get_enabled_spec(swarm_pilot.member_profile(profile_state, name)) is None
+        ]
+        if unavailable:
+            raise ValueError(f"unavailable registry members: {unavailable}")
+    if write_policy == room_workspace.SHARED_WRITE:
+        if workspace_strategy not in swarm_pilot.WORKSPACES:
+            raise ValueError(f"workspace_strategy must be one of {sorted(swarm_pilot.WORKSPACES)}")
+        profiles = {spec.get("name"): spec for spec in spawn._raw_registry()}
+        room_workspace.check_request(
+            cwd, workspace_strategy, list(members),
+            {member: profiles.get(swarm_pilot.member_profile(profile_state, member))
+             for member in members},
+        )
+    registry_checked = bool(start or expected is not None)
+    try:
+        room_id = swarm_pilot.create(
+            name, organizer, goal, mode, members, cwd, workspace_strategy,
+            room_id=deterministic_room_id,
+            client_request_fingerprint=request_fingerprint,
+            plan_hash=plan_hash,
+            start_requested=start if client_request_id else None,
+            registry_availability_checked=(registry_checked if client_request_id else None),
+            expected_specs=(expected if client_request_id else None),
+            member_profiles=profiles_by_member,
+        )
+    except FileExistsError:
+        if deterministic_room_id:
+            existing = _swarm_existing_request(
+                deterministic_room_id, request_fingerprint, organizer, expected,
+            )
+            if existing is not None:
+                if existing.pop("_resume_preparing", False):
+                    return _swarm_resume_preparing(
+                        deterministic_room_id, organizer, members, expected, start,
+                        bool(existing["availability"]["registry_availability_checked"]),
+                    )
+                return existing
+            raise ValueError("partial_room: deterministic room directory already exists") from None
+        raise
+    if child_policy:
+        # Before any invite or dispatch. An interruption before this write
+        # leaves a room without the policy, so children stay disabled.
+        def _store_child_policy(meta: dict) -> dict:
+            meta["swarm_pilot"]["child_agents"] = dict(child_policy)
+            return meta
+        bus._update_meta_locked(room_id, _store_child_policy)
+    if write_policy == room_workspace.SHARED_WRITE:
+        # Before any invite or request: until this record exists the room is
+        # read-only, so an interruption here can only fail closed.
+        room_workspace.install(
+            room_id, cwd, workspace_strategy, swarm_pilot.status(room_id)["member_ids"],
+        )
+    if client_request_id:
+        _swarm_mark_create_state(room_id, "preparing", expected, start, registry_checked)
+    _swarm_invite_members(room_id, organizer, members)
+    _swarm_seed_council_organizer(room_id, organizer)
+    dispatch = swarm_pilot_pump(room_id) if start else []
+    if client_request_id and start and swarm_pilot.due_members(room_id):
+        blocked = [
+            item for item in dispatch
+            if item.get("status") in {"spec_drift", "unavailable"}
+        ]
+        reason = ", ".join(item.get("status", "blocked") for item in blocked) or "pending members"
+        raise ValueError(f"partial_room: swarm dispatch remains incomplete ({reason})")
+    if client_request_id:
+        dispatch = _swarm_initial_dispatch(room_id) if start else []
+        _swarm_mark_create_state(
+            room_id, "ready", expected, start, registry_checked, dispatch,
+        )
+    return {
+        "room_id": room_id,
+        "mode": mode,
+        "dispatched": dispatch,
+        "started": start,
+        "start_requested": start,
+        "reused": False,
+        "availability": {
+            "static_only": not registry_checked,
+            "registry_availability_checked": registry_checked,
+            "provider_response_verified": False,
+        },
+    }
+
+
+# ── Swarm member identity (Codex over HTTP MCP only) ─────────────────────────
+# Each wake of a Codex member with a pinned loopback ``mcp_url`` gets a fresh
+# 32-byte secret in its environment; Codex sends it as X-Huddle-Member. Only
+# its SHA-256 is stored, bound to the exact wake claim. The global
+# MCP_HUDDLE_TOKEN guard is unchanged and still decides HTTP access.
+
+
+def _issue_member_token(room_id: str, agent_name: str, wake_id: str) -> str | None:
+    """Mint a secret for this member's claimed wake; None when not applicable."""
+    secret, digest = spawn.new_member_token()
+    issued = False
+
+    def _update(meta: dict) -> dict:
+        nonlocal issued
+        pilot = meta.get("swarm_pilot")
+        info = (meta.get("agent_meta") or {}).get(agent_name)
+        if (not isinstance(pilot, dict) or agent_name not in pilot.get("members", [])
+                or not isinstance(info, dict) or info.get("wake_claim_id") != wake_id):
+            return meta
+        info["member_token_sha256"] = digest
+        info["member_token_wake_id"] = wake_id
+        issued = True
+        return meta
+
+    bus._update_meta_locked(room_id, _update)
+    return secret if issued else None
+
+
+def _request_member_secret(ctx: Context | None) -> str:
+    """Return the X-Huddle-Member header of the current HTTP MCP call, or ''."""
+    try:
+        request = ctx.request_context.request if ctx is not None else None
+    except (AttributeError, LookupError, ValueError):
+        return ""
+    headers = getattr(request, "headers", None)
+    if headers is None:
+        return ""  # stdio or another transport without HTTP headers
+    value = headers.get(spawn.MEMBER_TOKEN_HEADER, "")
+    return value if isinstance(value, str) and 0 < len(value) <= 256 else ""
+
+
+def _verified_member(ctx: Context | None, room_id: str,
+                     member: str | None = None) -> dict | None:
+    """Principal for future privileged tools, or None.
+
+    Valid only while the member's current ``wake_claim_id`` is the wake the
+    secret was minted for. ``member`` (name or member_id), when given, must
+    match the verified caller.
+    """
+    secret = _request_member_secret(ctx)
+    if not secret:
+        return None
+    digest = spawn.member_token_digest(secret)
+    try:
+        meta = bus.get_room_info(room_id)
+    except ValueError:
+        return None
+    pilot = meta.get("swarm_pilot")
+    if meta.get("status") not in ("open", "idle") or not isinstance(pilot, dict):
+        return None
+    member_ids = swarm_pilot.status(room_id)["member_ids"]
+    agent_meta = meta.get("agent_meta") or {}
+    found = None
+    for name in pilot.get("members", []):
+        info = agent_meta.get(name) or {}
+        stored = info.get("member_token_sha256")
+        claim = info.get("wake_claim_id")
+        # Compare every member so timing does not reveal which slot matched.
+        matched = isinstance(stored, str) and _constant_equal(stored, digest)
+        if (matched and claim and info.get("member_token_wake_id") == claim
+                and found is None):
+            found = {"room_id": room_id, "member": name,
+                     "member_id": member_ids[name], "wake_id": claim}
+    if found is None:
+        return None
+    if member is not None and member not in (found["member"], found["member_id"]):
+        return None
+    return found
+
+
+@mcp.tool()
+def swarm_whoami(room_id: str, ctx: Context) -> dict:
+    """Return the caller's own verified pilot identity, or a refusal.
+
+    Side-effect free. Verified only for a Codex member launched by Huddle over
+    HTTP MCP with a pinned ``mcp_url`` while its turn holds the wake claim.
+    Other callers, including stdio clients, get ``verified: false``.
+    """
+    principal = _verified_member(ctx, room_id)
+    if principal is None:
+        return {"verified": False, "room_id": room_id}
+    return {"verified": True, **principal}
+
+
+# ── Participant child agents (pilot) ────────────────────────────────────────
+# Disabled unless the room was created with ``child_agents``. A verified
+# member may start at most ``max_children`` one-shot children per room, each
+# from an exact listed profile. A child joins the same room (full history),
+# runs with Huddle's read-only transform, has its own name/log and wake claim,
+# and receives no member token, so it cannot start children itself.
+
+_SWARM_CHILD_MAX = 4
+
+
+def _swarm_child_policy(child_agents: dict | None) -> dict | None:
+    """Validate a room's child-agent policy; None means disabled."""
+    if child_agents is None:
+        return None
+    if not isinstance(child_agents, dict) or set(child_agents) != {"max_children", "profiles"}:
+        raise ValueError('child_agents must be {"max_children": int, "profiles": [names]}')
+    limit = child_agents["max_children"]
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= _SWARM_CHILD_MAX:
+        raise ValueError(f"child_agents.max_children must be 1-{_SWARM_CHILD_MAX}")
+    profiles = child_agents["profiles"]
+    if (not isinstance(profiles, list) or not profiles or len(profiles) > 8
+            or not all(isinstance(item, str) and item for item in profiles)
+            or len(set(profiles)) != len(profiles)):
+        raise ValueError("child_agents.profiles must be a non-empty list of unique profile names")
+    registry = {spec.get("name"): spec for spec in spawn._raw_registry()}
+    for profile in profiles:
+        spec = registry.get(profile)
+        if not _swarm_mapped_profile_supported(spec) or not spawn._readonly_command_enforced(spec):
+            raise ValueError(
+                f"child_agents profile {profile} is not a read-only Codex or Claude CLI profile"
+            )
+    return {"max_children": limit, "profiles": list(profiles)}
+
+
+def _swarm_reserve_child(
+    room_id: str, parent: str, parent_wake: str, parent_digest: str,
+    profile: str, child_wake: str, *, same_room: bool = True,
+) -> str:
+    """Under one meta lock: re-check the parent's claim, the policy, reserve a slot.
+
+    Returns the child name. In ``same_room`` mode the reservation is also the
+    child's wake claim in this room, so no ordinary wake can launch it
+    concurrently. A ``child_room`` child gets its claim in its own room.
+    """
+    reserved: dict[str, str] = {}
+
+    def _update(meta: dict) -> dict:
+        pilot = meta.get("swarm_pilot")
+        if meta.get("status") not in ("open", "idle") or not isinstance(pilot, dict):
+            raise ValueError("room is not an open swarm pilot")
+        if pilot.get("phase") != "working":
+            raise ValueError("swarm is no longer working")
+        policy = pilot.get("child_agents")
+        if not isinstance(policy, dict):
+            raise PermissionError("child agents are disabled for this room")
+        agent_meta = meta.setdefault("agent_meta", {})
+        info = agent_meta.get(parent) or {}
+        stored = info.get("member_token_sha256")
+        if (parent not in pilot.get("members", [])
+                or info.get("wake_claim_id") != parent_wake
+                or info.get("member_token_wake_id") != parent_wake
+                or not isinstance(stored, str)
+                or not _constant_equal(stored, parent_digest)):
+            raise PermissionError("caller identity is no longer valid")
+        if profile not in policy.get("profiles", []):
+            raise PermissionError("profile is not allowed for child agents in this room")
+        children = pilot.setdefault("children", {})
+        active = [c for c in children.values()
+                  if isinstance(c, dict) and c.get("status") != "failed"]
+        if len(active) >= int(policy.get("max_children", 0)):
+            raise PermissionError("child agent limit reached for this room")
+        taken = {str(name).lower() for name in (
+            *meta.get("participants", []), *agent_meta, *children,
+            *pilot.get("members", []), pilot.get("organizer", ""),
+        )}
+        ordinal = len(children) + 1
+        name = f"{parent}-child-{ordinal}"
+        while name.lower() in taken:
+            ordinal += 1
+            name = f"{parent}-child-{ordinal}"
+        bus._safe_path_component(name, "child agent name")
+        now = int(time.time())
+        children[name] = {
+            "parent": parent, "parent_wake_id": parent_wake, "profile": profile,
+            "wake_id": child_wake, "status": "reserved", "created_at": now,
+            "invite": "same_room" if same_room else "child_room",
+        }
+        if same_room:
+            agent_meta[name] = {
+                "wake_claim_id": child_wake, "wake_claimed_at": now,
+                "wake_id": child_wake, "last_wake_pid": None,
+                "swarm_child_of": parent,
+            }
+            if name not in meta.setdefault("participants", []):
+                meta["participants"].append(name)
+        reserved["name"] = name
+        return meta
+
+    bus._update_meta_locked(room_id, _update)
+    return reserved["name"]
+
+
+def _swarm_set_child_status(room_id: str, name: str, child_wake: str, status: str,
+                            detail: str = "") -> None:
+    """Update only this reservation's record; a newer launch is left alone."""
+    def _update(meta: dict) -> dict:
+        child = ((meta.get("swarm_pilot") or {}).get("children") or {}).get(name)
+        if isinstance(child, dict) and child.get("wake_id") == child_wake:
+            child["status"] = status
+            if detail:
+                child["detail"] = detail[:300]
+        return meta
+    bus._update_meta_locked(room_id, _update)
+
+
+_SWARM_CHILD_TERMINAL = frozenset({"failed", "exited"})
+
+
+def _swarm_child_status(room_id: str, name: str) -> str | None:
+    child = ((bus.get_room_info(room_id).get("swarm_pilot") or {})
+             .get("children") or {}).get(name)
+    return child.get("status") if isinstance(child, dict) else None
+
+
+def _swarm_child_mark_running(room_id: str, name: str, child_wake: str,
+                              claim_room: str | None = None) -> str | None:
+    """reserved -> running only while this exact wake still holds the claim.
+
+    With ``claim_room`` the claim is read from the child's own room first (two
+    rooms are never locked together). A child that exited in between is
+    already terminal, and the CAS below never regresses it.
+    """
+    result: dict[str, str] = {}
+    if claim_room is not None:
+        claim_info = (bus.get_room_info(claim_room).get("agent_meta") or {}).get(name) or {}
+        if claim_info.get("wake_claim_id") != child_wake:
+            return None
+
+    def _update(meta: dict) -> dict:
+        child = ((meta.get("swarm_pilot") or {}).get("children") or {}).get(name)
+        info = (meta.get("agent_meta") or {}).get(name) or {}
+        claim_ok = (claim_room is not None
+                    or info.get("wake_claim_id") == child_wake)
+        if (isinstance(child, dict) and child.get("wake_id") == child_wake
+                and child.get("status") == "reserved" and claim_ok):
+            child["status"] = "running"
+            result["status"] = "running"
+        return meta
+
+    bus._update_meta_locked(room_id, _update)
+    return result.get("status")
+
+
+def _swarm_child_mark_exited(room_id: str, name: str, child_wake: str,
+                             returncode) -> None:
+    """Terminal state for this exact child generation; never regresses."""
+    def _update(meta: dict) -> dict:
+        child = ((meta.get("swarm_pilot") or {}).get("children") or {}).get(name)
+        if (isinstance(child, dict) and child.get("wake_id") == child_wake
+                and child.get("status") not in _SWARM_CHILD_TERMINAL):
+            child["status"] = "exited"
+            child["returncode"] = returncode
+            child["exited_at"] = int(time.time())
+        return meta
+    bus._update_meta_locked(room_id, _update)
+
+
+def _make_child_done_callback(room_id: str, name: str, child_wake: str):
+    """Ordinary wake-exit handling, then this child's terminal record."""
+    def _callback(returncode) -> None:
+        try:
+            with _wake_lock(room_id, name):
+                _on_wake_exit(room_id, name, child_wake, returncode)
+                _swarm_child_mark_exited(room_id, name, child_wake, returncode)
+        except Exception as exc:  # never let a callback kill the reaper thread
+            print(f"[huddle] child exit callback error ({name}@{room_id}): {exc}",
+                  flush=True)
+    return _callback
+
+
+def _swarm_set_child_field(room_id: str, name: str, child_wake: str,
+                           key: str, value) -> None:
+    _swarm_set_child_fields(room_id, name, child_wake, {key: value})
+
+
+def _swarm_set_child_fields(room_id: str, name: str, child_wake: str,
+                            fields: dict) -> None:
+    def _update(meta: dict) -> dict:
+        child = ((meta.get("swarm_pilot") or {}).get("children") or {}).get(name)
+        if isinstance(child, dict) and child.get("wake_id") == child_wake:
+            child.update(fields)
+        return meta
+    bus._update_meta_locked(room_id, _update)
+
+
+_SWARM_CHILD_RECENT = 10
+_SWARM_CHILD_RELAY_CHARS = 2000
+_SWARM_CHILD_ROOM_NOTE = (
+    "Context selection only, not confidentiality or isolation: a read-only "
+    "Codex/Claude child can still read local files and reach other MCP "
+    "servers, including this Huddle."
+)
+
+
+def _swarm_child_room_result(child_room: str, name: str, request_id) -> tuple[int, str] | None:
+    """The child's own ``result`` reply to its request, validated for relay."""
+    for msg in reversed(bus._load_messages(child_room)):
+        if (msg.get("agent") == name and msg.get("kind") == "result"
+                and msg.get("reply_to") == request_id):
+            body = msg.get("body")
+            if isinstance(body, str) and body.strip():
+                return int(msg["id"]), body.strip()
+    return None
+
+
+def _swarm_deliver_child_room(room_id: str, child_room: str, name: str,
+                              child_wake: str, returncode) -> None:
+    """After a child_room child exits: record and optionally relay its result.
+
+    The exit callback closes the child's room independently of parent state.
+    """
+    child = ((bus.get_room_info(room_id).get("swarm_pilot") or {})
+             .get("children") or {}).get(name) or {}
+    if child.get("wake_id") != child_wake:
+        return
+    if child.get("delivery") and (
+        child.get("relay") != "result" or child.get("relay_status") == "sent"
+    ):
+        return
+    found = _swarm_child_room_result(child_room, name, child.get("request_id"))
+    fields = {"delivery": "result" if found else "no_result"}
+    if found:
+        fields["result_message_id"], text = found[0], found[1]
+        fields["result_chars"] = len(text)
+    if child.get("relay") == "result" and child.get("relay_status") != "sent":
+        if found:
+            clipped = text if len(text) <= _SWARM_CHILD_RELAY_CHARS else (
+                text[:_SWARM_CHILD_RELAY_CHARS] + " […truncated]")
+            body = f"Result from child {name} (room {child_room}):\n{clipped}"
+        else:
+            body = (f"Child {name} ended without a result (exit {returncode}); "
+                    f"see room {child_room}.")
+        try:
+            fields["relay_message_id"] = _post_message_checked(
+                room_id, "System", body, "comment", to=child.get("parent"),
+                idempotency_key=f"swarm-child-relay:{room_id}:{name}:{child_wake}",
+            )
+            fields["relay_status"] = "sent"
+            fields["relay_error"] = ""
+        except Exception as exc:
+            fields["delivery"] = "relay_failed"
+            fields["relay_status"] = "failed"
+            fields["relay_error"] = type(exc).__name__
+    _swarm_set_child_fields(room_id, name, child_wake, fields)
+
+
+def _swarm_close_child_room(room_id: str, child_room: str, name: str,
+                            child_wake: str) -> None:
+    """Close the child's room even if its parent was closed or deleted."""
+    try:
+        if bus.get_room_info(child_room).get("status") != "closed":
+            bus.close_room(child_room, "System")
+    except Exception as exc:
+        print(f"[huddle] child room close failed ({child_room}): "
+              f"{type(exc).__name__}", flush=True)
+        return
+    try:
+        _swarm_set_child_field(room_id, name, child_wake, "child_room_closed", True)
+    except Exception:
+        # Parent deletion must never keep a finished child room open.
+        pass
+
+
+def _make_child_room_done_callback(room_id: str, child_room: str, name: str,
+                                   child_wake: str):
+    """Exit handling in the child's room, then delivery into the parent room."""
+    def _callback(returncode) -> None:
+        with _wake_lock(child_room, name):
+            try:
+                _on_wake_exit(child_room, name, child_wake, returncode)
+                try:
+                    # Keep the parent waiting until delivery was attempted.
+                    _swarm_deliver_child_room(room_id, child_room, name, child_wake, returncode)
+                finally:
+                    _swarm_child_mark_exited(room_id, name, child_wake, returncode)
+            except Exception as exc:  # never let a callback kill the reaper thread
+                print(f"[huddle] child room exit callback error ({name}@{child_room}): "
+                      f"{type(exc).__name__}", flush=True)
+            finally:
+                _swarm_close_child_room(room_id, child_room, name, child_wake)
+    return _callback
+
+
+def _swarm_open_child_room(room_id: str, parent: str, name: str, child_wake: str,
+                           history: str) -> str:
+    """Create the child's own room with its one-shot claim and chosen context."""
+    parent_meta = bus.get_room_info(room_id)
+    child_room = bus.create_room(
+        f"{parent_meta.get('name', room_id)} / {name}", "System", 0,
+        parent_meta.get("cwd", "") or "",
+    )
+    try:
+        bus.invite_agent(child_room, name)
+
+        def _claim(meta: dict) -> dict:
+            meta.setdefault("agent_meta", {})[name] = {
+                "wake_claim_id": child_wake, "wake_claimed_at": int(time.time()),
+                "wake_id": child_wake, "last_wake_pid": None,
+                "swarm_child_of": parent, "swarm_child_parent_room": room_id,
+            }
+            return meta
+        bus._update_meta_locked(child_room, _claim)
+        if history == "recent":
+            # read_messages retains the newest `limit` messages, in order.
+            excerpt = bus.read_messages(room_id, since_id=0, limit=_SWARM_CHILD_RECENT,
+                                        max_chars=1000)
+            _post_message_checked(
+                child_room, "System",
+                f"Recent context from room {room_id} (last {_SWARM_CHILD_RECENT} "
+                f"messages, selected by Huddle):\n{excerpt}",
+                "comment", idempotency_key=f"swarm-child-context:{child_room}",
+            )
+    except Exception:
+        with contextlib.suppress(Exception):
+            bus.close_room(child_room, "System")
+        raise
+    return child_room
+
+
+@mcp.tool()
+def swarm_spawn_child(room_id: str, profile: str, task: str, ctx: Context,
+                      invite: str = "same_room", history: str = "none",
+                      relay: str = "result") -> dict:
+    """Start one read-only child agent for the calling pilot member.
+
+    The parent is the verified caller (``swarm_whoami``), never a supplied
+    name. Allowed only when the room enabled ``child_agents`` and within its
+    limit and exact profile list. It never gets more rights than read-only,
+    answers once and ends, and cannot start children itself.
+
+    ``invite="same_room"`` (default): the child joins this room and sees the
+    full history; ``history``/``relay`` do not apply.
+    ``invite="child_room"``: Huddle creates a separate room; the child is not
+    invited here. ``history="none"`` gives it only the task,
+    ``history="recent"`` also the last 10 messages of this room.
+    ``relay="result"`` posts its result (or a no-result notice) as a short
+    comment to the parent here; ``relay="none"`` only records it. The child
+    room closes when its process exits. Closing the parent does not stop an
+    already started child; it finishes independently. If its parent is gone,
+    relay cannot be delivered, but the child room still closes. A relay
+    failure is recorded as ``delivery="relay_failed"`` without automatic
+    retry. This is context selection only, NOT
+    confidentiality or isolation: the child can still read local files and
+    reach other MCP servers, including this Huddle.
+    """
+    if not isinstance(task, str) or not task.strip() or len(task) > 4000:
+        raise ValueError("task must be 1-4000 characters")
+    if invite not in ("same_room", "child_room"):
+        raise ValueError('invite must be "same_room" or "child_room"')
+    if history not in ("none", "recent") or relay not in ("result", "none"):
+        raise ValueError('history must be "none"/"recent" and relay "result"/"none"')
+    if invite == "same_room" and (history != "none" or relay != "result"):
+        raise ValueError("history and relay apply only to invite=\"child_room\"")
+    principal = _verified_member(ctx, room_id)
+    if principal is None:
+        raise PermissionError("caller is not a verified swarm member")
+    parent = principal["member"]
+    parent_digest = spawn.member_token_digest(_request_member_secret(ctx))
+    spec = spawn.get_enabled_spec(profile)
+    if (spec is None or not _swarm_mapped_profile_supported(spec)
+            or not spawn.readonly_enforced(spec)):
+        raise PermissionError("profile is not an enabled read-only child profile")
+    child_wake = uuid.uuid4().hex[:12]
+    child = _swarm_reserve_child(
+        room_id, parent, principal["wake_id"], parent_digest, profile, child_wake,
+        same_room=(invite == "same_room"),
+    )
+    if invite == "child_room":
+        return _swarm_spawn_child_room(
+            room_id, parent, child, child_wake, profile, spec, task, history, relay,
+        )
+    try:
+        bus.invite_agent(room_id, child)
+        request_id = _post_message_checked(
+            room_id, parent, task, "request", to=child,
+            idempotency_key=f"swarm-child:{room_id}:{child}:{child_wake}",
+        )
+        _merge_agent_meta_if_claim(room_id, child, child_wake, {
+            "last_wake_msg_id": request_id, "last_seen_id": request_id,
+        })
+        _swarm_set_child_field(room_id, child, child_wake, "request_id", request_id)
+        note = (
+            f"\n\n[Huddle] You are {child}, a read-only helper started by "
+            f"{parent}. Answer this one request, then end your turn. You "
+            "cannot start other agents."
+        )
+        prompt = _build_registry_agent_wakeup_prompt(
+            room_id, child, parent, task + note, child, request_id, 0,
+            bus.read_messages(room_id, since_id=0, limit=50),
+        )
+        meta = bus.get_room_info(room_id)
+        _set_agent_phase(room_id, child, "starting", task_id=request_id)
+        pid, log_path, last_msg_path = spawn.spawn_agent(
+            spawn._apply_readonly(spec), prompt, meta.get("cwd", "") or "",
+            bus._room_dir(room_id) / "agents",
+            on_exit=_make_child_done_callback(room_id, child, child_wake),
+            owner_room_id=room_id, process_handle=child_wake, log_name=child,
+        )
+    except Exception as exc:
+        # Release only this reservation; a later launch keeps its own claim.
+        _clear_wake_claim(room_id, child, child_wake, rollback=True)
+        _swarm_set_child_status(room_id, child, child_wake, "failed", str(exc))
+        _set_agent_phase(room_id, child, "unavailable", detail=str(exc)[:300])
+        raise ValueError(f"child agent launch failed: {exc}") from None
+    published = _publish_wake_started(room_id, child, child_wake, {
+        "log_path": log_path, "last_message_path": last_msg_path,
+        "last_wake_pid": pid, "last_wake_at": int(time.time()),
+    }, task_id=request_id)
+    status = _swarm_child_mark_running(room_id, child, child_wake) if published else None
+    status = status or _swarm_child_status(room_id, child)
+    return {"child": child, "parent": parent, "profile": profile,
+            "request_id": request_id, "status": status}
+
+
+def _swarm_spawn_child_room(room_id: str, parent: str, child: str, child_wake: str,
+                            profile: str, spec: dict, task: str, history: str,
+                            relay: str) -> dict:
+    """Launch a reserved child in its own room (see ``swarm_spawn_child``)."""
+    for key, value in (("invite", "child_room"), ("history", history), ("relay", relay)):
+        _swarm_set_child_field(room_id, child, child_wake, key, value)
+    child_room = None
+    try:
+        child_room = _swarm_open_child_room(room_id, parent, child, child_wake, history)
+        _swarm_set_child_field(room_id, child, child_wake, "child_room", child_room)
+        request_id = _post_message_checked(
+            child_room, parent, task, "request", to=child,
+            idempotency_key=f"swarm-child:{child_room}:{child}:{child_wake}",
+        )
+        _merge_agent_meta_if_claim(child_room, child, child_wake, {
+            "last_wake_msg_id": request_id, "last_seen_id": request_id,
+        })
+        _swarm_set_child_field(room_id, child, child_wake, "request_id", request_id)
+        note = (
+            f"\n\n[Huddle] You are {child}, a read-only helper started by "
+            f"{parent} in its own room. Answer this one request here, then end "
+            f"your turn. You cannot start other agents. {_SWARM_CHILD_ROOM_NOTE}"
+        )
+        prompt = _build_registry_agent_wakeup_prompt(
+            child_room, child, parent, task + note, child, request_id, 0,
+            bus.read_messages(child_room, since_id=0, limit=50),
+        )
+        _set_agent_phase(child_room, child, "starting", task_id=request_id)
+        pid, log_path, last_msg_path = spawn.spawn_agent(
+            spawn._apply_readonly(spec), prompt,
+            bus.get_room_info(room_id).get("cwd", "") or "",
+            bus._room_dir(child_room) / "agents",
+            on_exit=_make_child_room_done_callback(room_id, child_room, child, child_wake),
+            owner_room_id=child_room, process_handle=child_wake, log_name=child,
+        )
+    except Exception as exc:
+        # Release only this reservation; the failed child room is closed.
+        _swarm_set_child_status(room_id, child, child_wake, "failed", str(exc))
+        if child_room is not None:
+            _clear_wake_claim(child_room, child, child_wake, rollback=True)
+            _set_agent_phase(child_room, child, "unavailable", detail=str(exc)[:300])
+            with contextlib.suppress(Exception):
+                bus.close_room(child_room, "System")
+        raise ValueError(f"child agent launch failed: {exc}") from None
+    published = _publish_wake_started(child_room, child, child_wake, {
+        "log_path": log_path, "last_message_path": last_msg_path,
+        "last_wake_pid": pid, "last_wake_at": int(time.time()),
+    }, task_id=request_id)
+    status = (_swarm_child_mark_running(room_id, child, child_wake, claim_room=child_room)
+              if published else None)
+    status = status or _swarm_child_status(room_id, child)
+    return {"child": child, "parent": parent, "profile": profile,
+            "invite": "child_room", "child_room": child_room, "history": history,
+            "relay": relay, "request_id": request_id, "status": status,
+            "note": _SWARM_CHILD_ROOM_NOTE}
+
+
+@mcp.tool()
+def swarm_pilot_status(room_id: str) -> dict:
+    """Read pilot state and the current per-member runtime snapshot.
+
+    ``last_seen_id`` is the cursor Huddle places in a wake prompt, not proof
+    that a model read every message through that ID. Agent runtime fields stay
+    in room ``agent_meta``; no native session is copied into pilot state.
+    """
+    state = swarm_pilot.status(room_id)
+    agent_meta = bus.get_room_info(room_id).get("agent_meta") or {}
+    if not isinstance(agent_meta, dict):
+        agent_meta = {}
+    details = []
+    for member in state["members"]:
+        info = agent_meta.get(member) or {}
+        if not isinstance(info, dict):
+            info = {}
+        thread_id = info.get("thread_id")
+        native_session = (
+            {"kind": "codex_thread", "id": thread_id,
+             "source": "agent_meta.thread_id"}
+            if (_is_thread_resumable(member) and isinstance(thread_id, str)
+                and thread_id) else None
+        )
+        wake_id = info.get("wake_id")
+        initial_id = info.get("initial_spawn_id")
+        if isinstance(wake_id, str) and wake_id:
+            generation = {"id": wake_id, "source": "wake_id",
+                          "claim_active": info.get("wake_claim_id") == wake_id}
+        elif isinstance(initial_id, str) and initial_id:
+            generation = {"id": initial_id, "source": "initial_spawn_id",
+                          "claim_active": info.get("initial_spawn_active") is True}
+        else:
+            generation = None
+        # These are server delivery offsets. Neither one is a read receipt.
+        def cursor_value(field: str) -> int | None:
+            value = info.get(field)
+            return value if type(value) is int and value >= 0 else None
+
+        cursor = {
+            field: cursor_value(field)
+            for field in ("last_wake_msg_id", "last_seen_id")
+        }
+        cursor["read_receipt"] = False
+        raw_receipt = info.get("claude_model_receipt")
+        model_receipt = None
+        if isinstance(raw_receipt, dict):
+            reported = raw_receipt.get("reported_model")
+            receipt_generation = raw_receipt.get("generation")
+            receipt_source = raw_receipt.get("source")
+            if ((reported is None or (isinstance(reported, str)
+                                      and re.fullmatch(r"claude-[A-Za-z0-9._-]{1,121}", reported)))
+                    and receipt_source in ("assistant", "init", "mixed", "none")
+                    and isinstance(receipt_generation, str)
+                    and 0 < len(receipt_generation) <= 64):
+                model_receipt = {
+                    "reported_model": reported,
+                    "source": receipt_source,
+                    "claim_scope": "cli_reported_identifier",
+                    "generation": receipt_generation,
+                }
+        member_detail = {
+            "member_id": state["member_ids"][member],
+            "name": member,
+            "profile": (_swarm_route_profile(info)
+                        or swarm_pilot.member_profile(state, member)),
+            "native_session": native_session,
+            "process_generation": generation,
+            "delivery_cursor": cursor,
+        }
+        if model_receipt is not None:
+            member_detail["last_model_receipt"] = model_receipt
+        route = info.get("swarm_route")
+        if isinstance(route, dict):
+            member_detail["replacement"] = {
+                "attempts": len(route.get("attempts") or []),
+                "terminal": route.get("terminal"),
+                "reason": route.get("reason"),
+            }
+        details.append(member_detail)
+    return {**state, "members_detail": details}
+
+
+def _swarm_pilot_request(room_id: str, member: str) -> str:
+    state = swarm_pilot.status(room_id)
+    mode = state["mode"]
+    mode_instruction = {
+        "council": "Read the WHOLE cumulative room history before answering. "
+                   "Add a substantive view to earlier answers. The organizer speaks last.",
+        "team": "Work on a distinct part. Declare your responsibility and discuss "
+                "interfaces with peers. A member must claim reporter.",
+        "relay": "Continue the previous member's result, explicitly accept the "
+                 "handoff and your next responsibility. A member must claim reporter.",
+        "swarm": "Self-assign a useful part of the shared goal. Announce uncovered "
+                 "responsibilities to peers. A member must claim reporter.",
+    }[mode]
+    read_call = (
+        "messages_read(room_id, since_id=0, limit=10000, max_chars=0)"
+        if mode == "council" else "messages_read(room_id, since_id=0, limit=50)"
+    )
+    final_instruction = (
+        " To claim reporter, call swarm_pilot_record(room_id, member, "
+        "kind='responsibility', key='reporter', value='final reporter'). "
+        "After round_done, end this CLI turn; do not poll or wait for peers. "
+        "Huddle will wake the chosen reporter with a separate addressed final "
+        "request after everyone is done. Only then call swarm_pilot_finish."
+        if mode != "council" else
+        " After round_done, end this CLI turn. The organizer will publish the final."
+    )
+    return (
+        f"Huddle swarm pilot, mode={mode}, round={state['round']}. "
+        f"You are {member}; peers are agents, not the human user.\n"
+        f"For pilot tool arguments named member, use {member!r}; your "
+        f"stable member_id is {state['member_ids'][member]!r} and is also accepted. "
+        "For message_post(agent=...), always use your member name.\n"
+        f"Goal: {state['goal']}\n{mode_instruction}\n"
+        f"Use {read_call} to read room context; "
+        "use swarm_pilot_record for responsibility/task/decision/fact. "
+        "Discuss disagreements substantively. Post your completed answer as "
+        "message_post(kind='result', reply_to=<this request id>), then call "
+        "swarm_pilot_round_done(room_id, member, summary). "
+        "A message alone does not complete the round." + final_instruction
+        + (f" Round {state['round']} continues earlier rounds: their results, "
+           "responsibilities and decisions are in the room history and "
+           "swarm_pilot_status; build on them." if state["round"] > 1 else "")
+        + (f" If the group agrees another round is needed, record "
+           f"kind='decision', key='{swarm_pilot.NEXT_ROUND_DECISION}' before "
+           "round_done; a round never opens by itself.")
+        + room_workspace.brief_note(bus.get_room_info(room_id), member)
+    )
+
+
+_PILOT_MEMBER_EXIT_DELAY_SECONDS = 1.5
+
+
+def _stop_completed_pilot_turn(
+    room_id: str, member: str, wake_id: str, completion: str,
+) -> None:
+    """Stop only this room/member wake after its pilot completion is durable.
+
+    The child registry is the authority to signal. ``agent_meta.external`` is
+    intentionally ignored: room_invite sets it even for registry-backed agents
+    which Huddle later launches itself.
+    """
+    try:
+        state = swarm_pilot.status(room_id)
+        if completion == "round_done":
+            if member not in state["done"]:
+                return
+        elif completion == "final":
+            final = state.get("final") or {}
+            if state.get("phase") != "completed" or final.get("member") != member:
+                return
+        else:
+            return
+        info = (bus.get_room_info(room_id).get("agent_meta") or {}).get(member) or {}
+    except Exception:
+        return
+    if info.get("wake_id") != wake_id:
+        return
+    if info.get("wake_claim_id") not in (None, wake_id):
+        return
+    if child_processes.state(room_id, wake_id) != "alive":
+        return
+    _merge_agent_meta(room_id, member, {"intentional_stop_wake_id": wake_id})
+    result = child_processes.terminate(room_id, wake_id)
+    if result == "denied":
+        print(f"[huddle] could not stop completed pilot turn "
+              f"({member}@{room_id}, wake={wake_id})", flush=True)
+    if result != "sent":
+        # A vanished/unowned child was not intentionally signalled. Remove
+        # only this generation's marker so a later wake cannot inherit it.
+        def clear_marker(meta: dict) -> dict:
+            current = (meta.get("agent_meta") or {}).get(member) or {}
+            if (current.get("wake_id") == wake_id
+                    and current.get("intentional_stop_wake_id") == wake_id):
+                current.pop("intentional_stop_wake_id", None)
+            return meta
+        bus._update_meta_locked(room_id, clear_marker)
+
+
+def _schedule_completed_pilot_turn_exit(
+    room_id: str, member: str, state: dict, completion: str,
+) -> None:
+    """Defer SIGTERM until after the MCP tool has had time to return its reply.
+
+    The round state and any final request are written before this is called.
+    The exact-child reaper callback remains responsible for releasing claims.
+    """
+    if completion == "round_done" and len(state["done"]) >= len(state["members"]):
+        return
+    if completion == "final":
+        final = state.get("final") or {}
+        if state.get("phase") != "completed" or final.get("member") != member:
+            return
+    try:
+        info = (bus.get_room_info(room_id).get("agent_meta") or {}).get(member) or {}
+    except Exception:
+        return
+    wake_id = info.get("wake_id")
+    if (not wake_id or child_processes.state(room_id, wake_id) != "alive"
+            or info.get("wake_claim_id") not in (None, wake_id)):
+        return
+    try:
+        timer = threading.Timer(
+            _PILOT_MEMBER_EXIT_DELAY_SECONDS,
+            _stop_completed_pilot_turn,
+            args=(room_id, member, wake_id, completion),
+        )
+        timer.daemon = True
+        timer.start()
+    except Exception as exc:
+        print(f"[huddle] could not schedule completed pilot turn exit "
+              f"({member}@{room_id}): {exc}", flush=True)
+
+
+@mcp.tool()
+def swarm_pilot_pump(room_id: str) -> list[dict]:
+    """Dispatch the next pilot turn(s) according to the room mode.
+
+    Retries reuse the same idempotency key so a failed state write cannot
+    duplicate a request. No room metadata lock is held while posting messages.
+    """
+    state = swarm_pilot.status(room_id)
+    room_state = bus.get_room_info(room_id)
+    dispatched: list[dict] = []
+    for member in swarm_pilot.due_members(room_id):
+        spec, drift = _member_launch_spec(room_state, member)
+        if drift:
+            dispatched.append({"member": member, "status": "spec_drift"})
+            continue
+        if spec is None:
+            dispatched.append({"member": member, "status": "unavailable"})
+            continue
+        msg_id = message_post(
+            room_id, state["organizer"], _swarm_pilot_request(room_id, member),
+            "request", to=member,
+            idempotency_key=f"swarm-pilot:{room_id}:{state['round']}:{member}",
+        )
+        swarm_pilot.mark_dispatched(room_id, member, msg_id)
+        dispatched.append({"member": member, "request_id": msg_id,
+                           "status": "dispatched"})
+    return dispatched
+
+
+def _swarm_final_request_key(room_id: str, state: dict) -> str:
+    """Key of the final request for the current final owner.
+
+    Each reporter transfer gets its own key, so the new reporter receives a
+    fresh addressed request while the earlier one stays in history.
+    """
+    key = f"swarm-pilot:{room_id}:{state.get('round', 1)}:final-request"
+    if state.get("mode") != "council":
+        transfers = swarm_pilot.reporter_transfer_count(state)
+        if transfers:
+            key += f":transfer-{transfers}"
+    return key
+
+
+def _swarm_final_key(room_id: str, state: dict) -> str:
+    """Key of the round's published final; round 1 keeps its original key.
+
+    Later rounds use a separate ``swarm-pilot-round:`` namespace so no member
+    name can collide with a per-member ``swarm-pilot:<room>:<round>:<member>``
+    dispatch key.
+    """
+    round_no = state.get("round", 1)
+    if round_no == 1:
+        return f"swarm-pilot:{room_id}:final"
+    return f"swarm-pilot-round:{room_id}:{round_no}:final"
+
+
+def _swarm_advance(room_id: str) -> dict:
+    """Publish missing pilot requests after a tool turn or server restart.
+
+    A completed round is already durable in room metadata. Publishing happens
+    separately, so the watchdog must be able to repeat this step safely after
+    a process stops between those writes. Message keys are the durable journal;
+    an existing request is left to the ordinary pending-wake path.
+    """
+    room = bus.get_room_info(room_id)
+    state = room.get("swarm_pilot")
+    if (room.get("status") not in ("open", "idle")
+            or not isinstance(state, dict) or state.get("phase") != "working"
+            or state.get("server_create_state") == "preparing"):
+        return {"next_dispatch": [], "final_request": None,
+                "new_final_request": False}
+
+    next_dispatch = swarm_pilot_pump(room_id)
+    state = swarm_pilot.status(room_id)
+    if len(state["done"]) != len(state["members"]):
+        return {"next_dispatch": next_dispatch, "final_request": None,
+                "new_final_request": False}
+
+    round_no = state.get("round", 1)
+    if state["mode"] == "council":
+        recipient = state["organizer"]
+        suffix = "final-request"
+        body = (
+            "All council members have spoken. Read their results and "
+            "publish the combined result with swarm_pilot_finish(room_id, "
+            "member, result)."
+        )
+    else:
+        reporter = state["responsibilities"].get("reporter", {}).get("member")
+        if reporter:
+            recipient = reporter
+            suffix = "final-request"
+            body = (
+                "All members have completed the round. Read their results and "
+                "publish the combined result with swarm_pilot_finish(room_id, "
+                "member, result)."
+            )
+        else:
+            recipient = "all"
+            suffix = "final-request-missing-reporter"
+            body = (
+                "All members have completed the round, but no reporter is claimed. "
+                "One member must claim the reporter responsibility with "
+                "swarm_pilot_record(room_id, member, 'responsibility', 'reporter', '<description>')."
+            )
+    key = (_swarm_final_request_key(room_id, state) if suffix == "final-request"
+           else f"swarm-pilot:{room_id}:{round_no}:{suffix}")
+    existing = next(
+        (msg for msg in bus._load_messages(room_id)
+         if msg.get("idempotency_key") == key), None,
+    )
+    if existing is not None:
+        if (existing.get("agent") != "System"
+                or existing.get("kind") != "request"
+                or existing.get("to") != recipient):
+            raise ValueError("pilot final-request key belongs to another message")
+        return {"next_dispatch": next_dispatch, "final_request": existing["id"],
+                "new_final_request": False}
+    final_request = message_post(
+        room_id, "System", body, "request", to=recipient,
+        idempotency_key=key,
+    )
+    return {"next_dispatch": next_dispatch, "final_request": final_request,
+            "new_final_request": True}
+
+
+def _recover_swarm_pilots() -> list[dict]:
+    """Advance started, open pilots whose process stopped before publication."""
+    recovered: list[dict] = []
+    for room in bus.list_rooms():
+        state = room.get("swarm_pilot")
+        if (room.get("status") not in ("open", "idle")
+                or not isinstance(state, dict)
+                or state.get("server_create_state") == "preparing"):
+            continue
+        room_id = room.get("id")
+        if not isinstance(room_id, str):
+            continue
+        try:
+            if state.get("phase") == "completed" and state.get("final"):
+                final_message = _post_swarm_final_if_missing(room_id, state)
+                if final_message is not None:
+                    recovered.append({"room_id": room_id,
+                                      "final_message": final_message})
+                continue
+            if (state.get("phase") != "working"
+                    or not (state.get("start_requested") is True
+                            or state.get("dispatched") or state.get("done")
+                            or state.get("round", 1) > 1)):
+                continue
+            advanced = _swarm_advance(room_id)
+            dispatched = [item for item in advanced["next_dispatch"]
+                          if item.get("status") == "dispatched"]
+            blocked = []
+            for item in advanced["next_dispatch"]:
+                if item.get("status") not in {"unavailable", "spec_drift"}:
+                    continue
+                member, reason = item["member"], item["status"]
+                key = (f"swarm-pilot:{room_id}:{state.get('round', 1)}:"
+                       f"{member}:blocked:{reason}")
+                existing = next(
+                    (msg for msg in bus._load_messages(room_id)
+                     if msg.get("idempotency_key") == key), None,
+                )
+                if existing is not None:
+                    if (existing.get("agent") != "System"
+                            or existing.get("kind") != "system"):
+                        raise ValueError("pilot blocked key belongs to another message")
+                    continue
+                detail = (
+                    "The pinned member profile changed; dispatch is paused. "
+                    "Restore the original profile to continue."
+                    if reason == "spec_drift" else
+                    "The member profile is unavailable; dispatch is paused. "
+                    "Enable the profile to continue."
+                )
+                event_id = message_post(
+                    room_id, "System", f"Swarm member {member}: {detail}",
+                    "system", idempotency_key=key,
+                )
+                blocked.append({"member": member, "status": reason,
+                                "event_id": event_id})
+            if dispatched or advanced["new_final_request"] or blocked:
+                event = {"room_id": room_id, "next_dispatch": dispatched,
+                         "final_request": advanced["final_request"]
+                         if advanced["new_final_request"] else None}
+                if blocked:
+                    event["blocked"] = blocked
+                recovered.append(event)
+        except Exception as exc:
+            # One malformed/removed room must not prevent other rooms from
+            # recovering on this tick. The next tick can retry this room.
+            print(f"[watchdog] swarm advance failed ({room_id}): {exc}",
+                  flush=True)
+    return recovered
+
+
+def _post_swarm_final_if_missing(room_id: str, state: dict) -> int | None:
+    """Complete the final-request reply after a crash between state and post."""
+    final = state.get("final") or {}
+    member, result = final.get("member"), final.get("result")
+    if not member or not result:
+        return None
+    messages = bus._load_messages(room_id)
+    key = _swarm_final_request_key(room_id, state)
+    request = next((msg for msg in messages
+                    if msg.get("idempotency_key") == key
+                    and msg.get("kind") == "request"
+                    and msg.get("to") == member), None)
+    if request is None:
+        raise ValueError("final request has not been delivered to this member")
+    final_key = _swarm_final_key(room_id, state)
+    existing = next((msg for msg in messages
+                     if msg.get("idempotency_key") == final_key), None)
+    if existing is not None:
+        if (existing.get("agent") != member or existing.get("kind") != "final"
+                or existing.get("body") != result
+                or existing.get("reply_to") not in (None, request["id"])):
+            raise ValueError("pilot final key belongs to another message")
+        # Pilots completed before final replies carried reply_to have an
+        # append-only final message. The pending queue recognizes that legacy
+        # settlement without rewriting history or publishing a second final.
+        return None
+    return message_post(
+        room_id, member, result, "final", to=state["organizer"],
+        reply_to=request["id"], idempotency_key=final_key,
+    )
+
+
+def _swarm_spec_drift(
+    room_state: dict, member: str, spec: dict | None,
+) -> bool:
+    """Fail closed when a pinned participant no longer matches its profile."""
+    pilot = room_state.get("swarm_pilot")
+    if not isinstance(pilot, dict) and isinstance(room_state.get("expected_specs"), dict):
+        # swarm_pilot.status returns the pilot payload, while bus.get_room_info
+        # returns the enclosing room metadata object.
+        pilot = room_state
+    expected_specs = pilot.get("expected_specs") if isinstance(pilot, dict) else None
+    if expected_specs is None:
+        return False
+    expected = expected_specs.get(member) if isinstance(expected_specs, dict) else None
+    if not isinstance(expected, str) or spec is None:
+        return True
+    try:
+        return spawn.spec_fingerprint(spec) != expected
+    except Exception:
+        return True
+
+
+# ── Swarm member replacement ────────────────────────────────────────────────
+# agent_meta[member]["swarm_route"] records which registry profile currently
+# runs a pilot member. The member name stays the room identity (messages, log
+# path, receipts); only the launched profile changes.
+
+
+def _swarm_route_profile(info: dict) -> str | None:
+    route = info.get("swarm_route") if isinstance(info, dict) else None
+    profile = route.get("profile") if isinstance(route, dict) else None
+    return profile if isinstance(profile, str) and profile else None
+
+
+def _swarm_assigned_profile(meta: dict, agent_name: str) -> str:
+    """Profile chosen for a member at creation (``member_profiles``), else its name."""
+    return swarm_pilot.member_profile(meta.get("swarm_pilot") or {}, agent_name)
+
+
+def _swarm_mapped_profile_supported(spec: dict | None) -> bool:
+    """A mapped profile must be a CLI that takes its member name from the brief."""
+    if not isinstance(spec, dict) or spec.get("profile"):
+        return False  # missing, or a typed reviewer with its own fixed contract
+    cmd = spec.get("cmd")
+    if not isinstance(cmd, list) or "--agent" in cmd:
+        return False
+    return spawn._effective_binary(cmd) in swarm_pilot.MAPPED_PROFILE_BINARIES
+
+
+def _member_launch_spec(meta: dict, agent_name: str) -> tuple[dict | None, bool]:
+    """Return (enabled spec, drift) for the profile currently running a member."""
+    info = (meta.get("agent_meta") or {}).get(agent_name) or {}
+    profile = _swarm_route_profile(info)
+    if profile is None:
+        assigned = _swarm_assigned_profile(meta, agent_name)
+        spec = spawn.get_enabled_spec(assigned)
+        if assigned != agent_name and spec is not None and not _swarm_mapped_profile_supported(spec):
+            return None, True  # the registry changed after creation: fail closed
+        return spec, _swarm_spec_drift(meta, agent_name, spec)
+    spec = spawn.get_enabled_spec(profile)
+    if spec is None or spec.get("swarm_replacement") is not True:
+        return None, True
+    try:
+        drift = spawn.spec_fingerprint(spec) != info["swarm_route"].get("fingerprint")
+    except Exception:
+        drift = True
+    return spec, drift
+
+
+def _swarm_route_attempt(name: str, spec: dict | None) -> dict:
+    spec = spec or {}
+    cmd = spec.get("cmd") or [name]
+    return {"route": name, "harness": Path(str(cmd[0])).name,
+            "model": str(spec.get("model") or ""), "provider": spec.get("provider")}
+
+
+def _swarm_replacement_candidates(meta: dict, agent_name: str, writes: bool) -> list[dict]:
+    """Enabled registry profiles explicitly marked ``swarm_replacement: true``.
+
+    In a write room a candidate qualifies only when this room's workspace
+    policy validates it for the member; otherwise it is excluded.
+    """
+    candidates = []
+    for spec in spawn.load_registry():
+        name = spec.get("name")
+        if (not spec.get("enabled") or spec.get("swarm_replacement") is not True
+                or not isinstance(name, str) or name == agent_name
+                or name == _swarm_assigned_profile(meta, agent_name)):
+            continue
+        can_limit = True
+        if writes:
+            try:
+                room_workspace.launch(meta, agent_name, spec)
+            except Exception:
+                can_limit = False
+        candidates.append({
+            **_swarm_route_attempt(name, spec), "available": True,
+            "quality": spec.get("swarm_quality", 0.5),
+            "reliability": spec.get("swarm_reliability", 0.5),
+            "cost": spec.get("swarm_cost", 0.5),
+            "can_limit_writes": can_limit,
+        })
+    return candidates
+
+
+def _swarm_route_cas(room_id: str, agent_name: str, wake_id: str, apply) -> bool:
+    """Apply ``apply(info)`` only while ``wake_id`` still owns wake and claim."""
+    applied = False
+
+    def _update(meta: dict) -> dict:
+        nonlocal applied
+        info = (meta.get("agent_meta") or {}).get(agent_name)
+        if (not isinstance(info, dict) or info.get("wake_id") != wake_id
+                or info.get("wake_claim_id") != wake_id):
+            return meta
+        apply(info)
+        applied = True
+        return meta
+
+    bus._update_meta_locked(room_id, _update)
+    return applied
+
+
+def _swarm_replace_failed_member(
+    room_id: str, agent_name: str, wake_id: str, info: dict,
+    rc: int, final_phase: str, rate_limit_announced: bool,
+) -> bool:
+    """Continue a failed pilot member's request on one backup profile.
+
+    Runs inside the exact child's exit callback while ``wake_id`` still holds
+    the persisted claim. The route change and the claim hand-off to the new
+    generation are one meta-lock CAS, so no other server can claim in between.
+    Returns True when a replacement generation now owns the member.
+    """
+    meta = bus.get_room_info(room_id)
+    pilot = meta.get("swarm_pilot")
+    req = int(info.get("last_wake_msg_id", 0) or 0)
+    if (meta.get("status") not in ("open", "idle") or not isinstance(pilot, dict)
+            or pilot.get("phase") != "working"
+            or agent_name not in pilot.get("members", []) or not req):
+        return False
+    messages = bus._load_messages(room_id)
+    request = next((m for m in messages if m.get("id") == req), None)
+    if (not isinstance(request, dict) or request.get("kind") != "request"
+            or request.get("reply_to") is not None
+            or request.get("to") not in (agent_name, "all")
+            or _swarm_pilot_request_superseded(room_id, request, pilot, messages)):
+        return False
+
+    route = info.get("swarm_route") if isinstance(info.get("swarm_route"), dict) else {}
+    assigned_profile = _swarm_assigned_profile(meta, agent_name)
+    current_profile = _swarm_route_profile(info) or assigned_profile
+    attempts = list(route.get("attempts") or []) or [
+        _swarm_route_attempt(assigned_profile, spawn.get_enabled_spec(assigned_profile))]
+    try:
+        writes = room_workspace.write_policy(meta) == room_workspace.SHARED_WRITE
+    except ValueError:
+        writes = True  # invalid record: only a validated launch may proceed
+    member_id = swarm_pilot.status(room_id)["member_ids"].get(agent_name)
+    responsibility = ", ".join(
+        f"{key}: {item.get('value', '')}"
+        for key, item in (pilot.get("responsibilities") or {}).items()
+        if isinstance(item, dict) and item.get("member") == agent_name
+    )
+    failure = {"text": _log_tail(room_id, agent_name),
+               "waiting_for": info.get("waiting_for")}
+    if rate_limit_announced:
+        failure["kind"] = "quota"
+    if final_phase == "stuck":
+        failure["progress"] = False
+    candidates = _swarm_replacement_candidates(meta, agent_name, writes)
+    plan = swarm_replacement.plan_replacement(
+        failure, attempts,
+        {"member_id": member_id, "responsibility": responsibility,
+         "harness": attempts[-1].get("harness"), "write_rights": writes},
+        candidates,
+        child_stopped=child_processes.state(room_id, wake_id) == "exited",
+    )
+    now = int(time.time())
+    base = {"task_id": req, "failed_wake_id": wake_id, "updated_at": now,
+            "failure_class": plan["failure_class"], "reason": plan["reason"]}
+
+    if plan["action"] != "replace":
+        if not route and (plan["failure_class"] == "unknown" or (
+                not candidates and plan["action"] != "needs_user")):
+            # Replacement is not configured or not applicable: the ordinary
+            # noreply / rate-limit notice already explains this failure.
+            return False
+
+        def record_outcome(slot: dict) -> None:
+            slot["swarm_route"] = {**route, **base, "profile": route.get("profile"),
+                                   "attempts": attempts, "terminal": plan["action"]}
+        if _swarm_route_cas(room_id, agent_name, wake_id, record_outcome):
+            prefix = ("Ждёт решения человека" if plan["action"] == "needs_user"
+                      else "Замена не выполнена")
+            _swarm_replacement_notice(
+                room_id, agent_name, wake_id,
+                f"{agent_name} ({current_profile}): {prefix} — {plan['reason']} "
+                f"[{plan['failure_class']}].")
+        return False
+
+    profile = plan["candidate"]["route"]
+    spec = spawn.get_enabled_spec(profile)
+    if spec is None:
+        return False
+    try:
+        fingerprint = spawn.spec_fingerprint(spec)
+    except Exception:
+        return False
+    new_wake = uuid.uuid4().hex[:12]
+
+    def hand_off(slot: dict) -> None:
+        slot["swarm_route"] = {
+            **base, "profile": profile, "fingerprint": fingerprint,
+            "generation": new_wake, "terminal": None,
+            "attempts": attempts + [_swarm_route_attempt(profile, spec)],
+        }
+        # Transfer the claim directly: it is never released in between.
+        slot.update({
+            "wake_claim_id": new_wake, "wake_claim_msg_id": req,
+            "wake_claimed_at": now, "wake_id": new_wake,
+            "last_wake_msg_id": req, "last_wake_pid": None,
+            "rate_limited_until": 0,
+        })
+        # The previous profile's native session and settings do not transfer.
+        for field in ("thread_id", "model_settings"):
+            slot.pop(field, None)
+
+    note = (f"\n\n[Huddle] You continue as member {agent_name} (member_id "
+            f"{member_id}) on profile {profile} because the previous route "
+            f"{current_profile} failed ({plan['failure_class']}). Keep the same "
+            f"responsibility{': ' + responsibility if responsibility else ''}. "
+            f"For swarm_pilot_* member arguments use {agent_name!r}; the "
+            "member_id is also accepted. For message_post agent use the name. "
+            "Read the room history before answering this same request.")
+    prompt = _build_registry_agent_wakeup_prompt(
+        room_id, agent_name, request.get("agent", ""),
+        request.get("body", "") + note, request.get("to"), req,
+        int(info.get("last_seen_id", 0) or 0),
+        bus.read_messages(room_id, since_id=0, limit=50),
+    )
+    # Finish every fallible prompt read before transferring the persisted
+    # claim; once transferred, only the exact new generation may release it.
+    if not _swarm_route_cas(room_id, agent_name, wake_id, hand_off):
+        return False  # a newer generation already owns this member
+    try:
+        _spawn_fresh_room_agent(room_id, agent_name, prompt,
+                                bus.get_room_info(room_id), msg_id=req,
+                                wake_id=new_wake)
+    except Exception as exc:
+        _clear_wake_claim(room_id, agent_name, new_wake, rollback=True)
+
+        def mark_failed(meta: dict) -> dict:
+            slot = (meta.get("agent_meta") or {}).get(agent_name)
+            current = slot.get("swarm_route") if isinstance(slot, dict) else None
+            if isinstance(current, dict) and current.get("generation") == new_wake:
+                current.update({"terminal": "terminal",
+                                "reason": f"replacement launch failed: {exc}"[:300]})
+            return meta
+        bus._update_meta_locked(room_id, mark_failed)
+        _announce_spawn_failure(room_id, agent_name, exc, f"swarm-replace:{new_wake}")
+        return False
+    _swarm_replacement_notice(
+        room_id, agent_name, new_wake,
+        f"{agent_name} продолжает через {profile}: маршрут {current_profile} "
+        f"завершился сбоем [{plan['failure_class']}]. Тот же участник "
+        f"{member_id}, тот же запрос #{req}.")
+    return True
+
+
+def _swarm_replacement_notice(room_id: str, agent_name: str, generation: str,
+                              body: str) -> None:
+    try:
+        _post_message_checked(
+            room_id, "System", body, kind="system",
+            idempotency_key=f"swarm-replace:{room_id}:{agent_name}:{generation}",
+        )
+    except Exception as exc:
+        print(f"[huddle] swarm replacement notice failed "
+              f"({agent_name}@{room_id}): {exc}", flush=True)
+
+
+@mcp.tool()
+def swarm_pilot_record(
+    room_id: str, member: str, kind: str, key: str, value: str,
+) -> dict:
+    """Record a responsibility, task, decision or fact in the pilot room."""
+    member = swarm_pilot.resolve_member(room_id, member)
+    updated = swarm_pilot.record(room_id, member, kind, key, value)
+
+    advanced = _swarm_advance(room_id) if (
+        kind == "responsibility" and key == "reporter"
+        and updated["mode"] != "council"
+        and len(updated["done"]) == len(updated["members"])
+    ) else None
+    return {**updated, "final_request": advanced["final_request"] if advanced else None}
+
+
+@mcp.tool()
+def swarm_pilot_transfer(
+    room_id: str, member: str, key: str, to_member: str, reason: str,
+) -> dict:
+    """Transfer a claimed responsibility (e.g. reporter) to another member.
+
+    The owner may hand it off; another member may take it over only after the
+    round is complete and the owner is not running a turn. The move is kept in
+    ``transfers``. A reporter transfer sends the new reporter a fresh final
+    request. Council keeps the organizer's final word and refuses reporter.
+    """
+    member = swarm_pilot.resolve_member(room_id, member)
+    to_member = swarm_pilot.resolve_member(room_id, to_member)
+    updated = swarm_pilot.transfer_responsibility(room_id, member, key, to_member, reason)
+    transfer = updated["transfers"][-1]
+    try:
+        _post_message_checked(
+            room_id, "System",
+            f"Responsibility '{key}' moved from {transfer['from']} to {to_member} "
+            f"(by {member}): {reason}",
+            kind="system",
+            idempotency_key=(f"swarm-pilot:{room_id}:transfer:{key}:"
+                             f"{transfer['version']}"),
+        )
+    except Exception as exc:
+        print(f"[huddle] swarm transfer notice failed ({room_id}): {exc}",
+              flush=True)
+    advanced = _swarm_advance(room_id) if (
+        key == "reporter" and len(updated["done"]) == len(updated["members"])
+    ) else None
+    return {**updated, "final_request": advanced["final_request"] if advanced else None}
+
+
+@mcp.tool()
+def swarm_pilot_round_done(room_id: str, member: str, summary: str) -> dict:
+    """Consciously finish this member's turn, then wake the next if sequential."""
+    member = swarm_pilot.resolve_member(room_id, member)
+    state = swarm_pilot.status(room_id)
+    request_id = state["dispatched"].get(member)
+    if request_id is None:
+        raise ValueError("member has no dispatched request")
+    messages = bus._load_messages(room_id)
+    valid_request_ids = {request_id}
+    # An organizer may issue a direct recovery request after a provider error
+    # (for example, retrying a wake that failed before the member could use
+    # Huddle tools). The member's result belongs to that retry request, not the
+    # original dispatch. Only organizer-authored requests explicitly addressed
+    # to this member qualify; peer chatter cannot complete another task.
+    valid_request_ids.update(
+        int(msg["id"])
+        for msg in messages
+        if int(msg.get("id", 0) or 0) > int(request_id)
+        and msg.get("kind") == "request"
+        and msg.get("reply_to") is None
+        and msg.get("agent") == state["organizer"]
+        and msg.get("to") == member
+    )
+    delivered = any(
+        msg.get("agent") == member and msg.get("kind") == "result"
+        and msg.get("reply_to") in valid_request_ids
+        for msg in messages
+    )
+    if not delivered:
+        raise ValueError(
+            "member must post a result for the pilot request or an organizer's "
+            "direct recovery request first"
+        )
+    updated = swarm_pilot.round_done(room_id, member, summary)
+    advanced = _swarm_advance(room_id)
+    _schedule_completed_pilot_turn_exit(room_id, member, updated, "round_done")
+    return {"state": updated, "next_dispatch": advanced["next_dispatch"],
+            "final_request": advanced["final_request"]}
+
+
+@mcp.tool()
+def swarm_pilot_finish(room_id: str, member: str, result: str) -> dict:
+    """Record the council organizer's last word or the swarm reporter's final."""
+    member = swarm_pilot.resolve_member(room_id, member, allow_organizer=True)
+    state = swarm_pilot.status(room_id)
+    final_request_key = _swarm_final_request_key(room_id, state)
+    if not any(
+        msg.get("idempotency_key") == final_request_key
+        and msg.get("to") == member
+        for msg in bus._load_messages(room_id)
+    ):
+        raise ValueError("final request has not been delivered to this member")
+    updated = swarm_pilot.finish(room_id, member, result)
+    _post_swarm_final_if_missing(room_id, updated)
+    _schedule_completed_pilot_turn_exit(room_id, member, updated, "final")
+    return updated
+
+
+@mcp.tool()
+def swarm_pilot_open_round(
+    room_id: str, by: str, reason: str, from_round: int,
+) -> dict:
+    """Deliberately open the next pilot round after the current round's final.
+
+    ``by`` is the organizer, or a member (name or member_id) once the room
+    recorded decision ``next_round`` in the round being closed. ``from_round``
+    must equal the current round, so a retry cannot skip a round. Earlier
+    per-round progress moves to ``round_history``; responsibilities, tasks,
+    decisions, facts and messages stay. The next round is dispatched by the
+    same path as the first. Council stays sequential with the organizer's
+    final word. Rounds never open automatically and are capped.
+    """
+    by = swarm_pilot.resolve_member(room_id, by, allow_organizer=True)
+    state = swarm_pilot.status(room_id)
+    if state.get("phase") == "completed" and state.get("final"):
+        # A crash between finish and its post must not lose the round final.
+        _post_swarm_final_if_missing(room_id, state)
+    updated = swarm_pilot.open_round(room_id, by, reason, from_round)
+    round_no = updated["round"]
+    try:
+        _post_message_checked(
+            room_id, "System",
+            f"━━━ Swarm round {round_no} opened by {by}: {reason} ━━━",
+            kind="system",
+            idempotency_key=f"swarm-pilot-round:{room_id}:{round_no}:open",
+        )
+    except Exception as exc:
+        print(f"[huddle] swarm round notice failed ({room_id}): {exc}", flush=True)
+    advanced = _swarm_advance(room_id)
+    return {"state": swarm_pilot.status(room_id), "round": round_no,
+            "next_dispatch": advanced["next_dispatch"]}
 
 
 @mcp.tool()
@@ -507,11 +2914,25 @@ def respond_via_agent(
             raise ValueError(f"Agent {agent_name} already has an active process claim")
         _set_agent_phase(room_id, agent_name, "starting")
         try:
+            resume_settings = info.get("model_settings")
+            resume_kwargs = (
+                {"model_settings": resume_settings}
+                if isinstance(resume_settings, dict) else {}
+            )
+            if "mcp_url" in info:
+                resume_kwargs["mcp_url"] = info["mcp_url"]
+                member_token = _issue_member_token(room_id, agent_name, wake_id)
+                if member_token:
+                    resume_kwargs["member_token"] = member_token
+            cwd, write_roots = room_workspace.resume(meta, agent_name)
+            if write_roots is not None:
+                resume_kwargs["workspace_write_roots"] = write_roots
             pid = spawn.codex_resume(
                 thread_id, prompt, cwd, log_path, last_msg_path,
                 on_exit=_make_wake_done_callback(
                     room_id, agent_name, wake_id),
                 owner_room_id=room_id, process_handle=wake_id,
+                **resume_kwargs,
             )
         except Exception:
             _set_agent_phase(room_id, agent_name, "unavailable")
@@ -644,19 +3065,74 @@ def _server_terminal_failure_task_ids(status_info: dict, wake_info: dict) -> set
         and status_info.get("task_id", "") != ""
     ):
         task_ids.add(str(status_info["task_id"]))
+    # A live Swarm replacement generation reopened exactly one failed request.
+    # The old receipt stays as diagnostics; it settles again only if the
+    # replacement route itself ends terminally.
+    route = wake_info.get("swarm_route") if isinstance(wake_info, dict) else None
+    if isinstance(route, dict) and not route.get("terminal") and route.get("task_id"):
+        task_ids.discard(str(route["task_id"]))
     return task_ids
+
+
+def _swarm_pilot_request_superseded(
+    room_id: str, message: dict, pilot: dict | None,
+    messages: list[dict] | None = None,
+) -> bool:
+    """Whether durable pilot state has replaced this request's work."""
+    if not isinstance(pilot, dict) or message.get("kind") != "request":
+        return False
+    key = message.get("idempotency_key")
+    room_prefix = f"swarm-pilot:{room_id}:"
+    if isinstance(key, str) and key.startswith(room_prefix):
+        # An earlier round only opens after its final, so its pilot requests
+        # are settled history, not work for the current round.
+        round_part = key[len(room_prefix):].split(":", 1)[0]
+        if round_part.isdigit() and int(round_part) < pilot.get("round", 1):
+            return True
+    prefix = f"swarm-pilot:{room_id}:{pilot.get('round', 1)}:"
+    if not isinstance(key, str) or not key.startswith(prefix):
+        return False
+    suffix = key[len(prefix):]
+    if suffix == "final-request-missing-reporter":
+        return bool(pilot.get("responsibilities", {}).get("reporter", {}).get("member"))
+    if suffix.startswith("final-request") and key != _swarm_final_request_key(room_id, pilot):
+        # An earlier reporter's final request, replaced by a transfer.
+        return True
+    if suffix.startswith("final-request") and pilot.get("phase") == "completed":
+        final_member = (pilot.get("final") or {}).get("member")
+        return any(
+            msg.get("idempotency_key") == _swarm_final_key(room_id, pilot)
+            and msg.get("agent") == final_member and msg.get("kind") == "final"
+            for msg in (messages or [])
+        )
+    return suffix in pilot.get("members", []) and suffix in pilot.get("done", {})
+
+
+def _swarm_child_expected(children: dict, name: str, request_id: int) -> bool:
+    """A one-shot child owes a reply only to its own request, and only while live.
+
+    Non-child participants are always expected. A child is never relaunched,
+    so later direct or broadcast requests cannot make it waiting.
+    """
+    child = children.get(name) if isinstance(children, dict) else None
+    if not isinstance(child, dict):
+        return True
+    return (child.get("request_id") == request_id
+            and child.get("status") not in _SWARM_CHILD_TERMINAL)
 
 
 def _pending_requests(
     room_id: str,
     participants: list[str],
     terminal_tasks: dict[str, set[str]] | None = None,
+    pilot: dict | None = None,
 ) -> list[dict]:
     """Return unanswered request work, including agents still expected.
 
     A terminal lifecycle phase only settles the request recorded in its
     ``task_id``. Progress messages (ack/busy/comment) are not a receipt;
-    only a stored result/final reply settles a request.
+    a stored result/final reply settles ordinary work. Durable pilot completion
+    also supersedes its initial dispatch and the reporter-claim broadcast.
     """
     terminal_tasks = terminal_tasks or {}
     messages = bus._load_messages(room_id)
@@ -666,9 +3142,12 @@ def _pending_requests(
         if reply_to is not None and message.get("kind") in {"result", "final"}:
             replies_by_request.setdefault(int(reply_to), set()).add(message.get("agent", ""))
 
+    children = (pilot.get("children") if isinstance(pilot, dict) else None) or {}
     pending: list[dict] = []
     for message in messages:
         if message.get("kind") != "request" or message.get("reply_to") is not None:
+            continue
+        if _swarm_pilot_request_superseded(room_id, message, pilot, messages):
             continue
         to = message.get("to")
         if to and to != "all":
@@ -677,7 +3156,8 @@ def _pending_requests(
             targets = [name for name in participants if name != message.get("agent")]
         waiting_for = [name for name in targets
                        if str(message["id"]) not in terminal_tasks.get(name, set())
-                       and name not in replies_by_request.get(int(message["id"]), set())]
+                       and name not in replies_by_request.get(int(message["id"]), set())
+                       and _swarm_child_expected(children, name, int(message["id"]))]
         if not waiting_for:
             continue
         pending.append({
@@ -695,9 +3175,10 @@ def _pending_requests(
 def room_status(room_id: str) -> dict:
     """Return an actionable lifecycle snapshot for orchestrators.
 
-    ``wait_recommended`` is true while an agent is starting/working/responding
-    or while a request still has one or more expected replies. A live process
-    is never treated as completed merely because its output log is quiet.
+    ``wait_recommended`` is true while an agent is starting/working/responding,
+    a request still expects replies, or a separate child room has an active
+    reservation. A live process is never treated as completed merely because
+    its output log is quiet.
     """
     meta = bus.get_room_info(room_id)
     participants = list(meta.get("participants", []))
@@ -710,7 +3191,9 @@ def room_status(room_id: str) -> dict:
         )
         if task_ids:
             terminal_tasks[name] = task_ids
-    pending = _pending_requests(room_id, participants, terminal_tasks)
+    pending = _pending_requests(
+        room_id, participants, terminal_tasks, meta.get("swarm_pilot"),
+    )
     pending_by_agent = {
         name: [item["id"] for item in pending if name in item["waiting_for"]]
         for name in set(participants) | set(agent_meta) | set(status_details)
@@ -740,13 +3223,25 @@ def room_status(room_id: str) -> dict:
         or (agent.get("health") or {}).get("claim_active")
         for agent in agents.values()
     )
-    waiting = bool(pending) or active
+    pilot = meta.get("swarm_pilot") or {}
+    children = pilot.get("children") if isinstance(pilot, dict) else None
+    if not isinstance(children, dict):
+        children = {}
+    pending_child_rooms = [
+        {"child": name, "room_id": child.get("child_room"),
+         "status": child.get("status")}
+        for name, child in children.items()
+        if isinstance(child, dict) and child.get("invite") == "child_room"
+        and child.get("status") in {"reserved", "running"}
+    ]
+    waiting = bool(pending) or active or bool(pending_child_rooms)
     return {
         "room_id": room_id,
         "room_status": meta.get("status", "unknown"),
         "participants": participants,
         "agents": agents,
         "pending_requests": pending,
+        "pending_child_rooms": pending_child_rooms,
         "wait_recommended": waiting,
         "all_terminal": not waiting,
     }
@@ -763,6 +3258,21 @@ def _post_message_checked(
     meta: Optional[dict] = None,
 ) -> int:
     info = bus.get_room_info(room_id)
+    pilot = info.get("swarm_pilot")
+    if (kind == "result" and isinstance(pilot, dict)
+            and pilot.get("phase") == "completed" and reply_to is not None):
+        # Final requests can wake a member just as another member publishes
+        # the room final. Discard only a late answer to one of those automatic
+        # pilot-final requests; ordinary follow-up requests in a completed
+        # room remain usable.
+        final_request = next((msg for msg in bus._load_messages(room_id)
+                              if msg.get("id") == reply_to), None)
+        if (isinstance(final_request, dict)
+                and ":final-request" in str(
+                    final_request.get("idempotency_key") or "")):
+            raise ValueError(
+                "pilot is already completed; late final-request result discarded"
+            )
     if info.get("status") == "idle" and kind == "request":
         bus.revive(room_id)
     # reply_to is validated inside bus.post_message under the messages lock —
@@ -811,6 +3321,39 @@ def notify_register(room_id: str, agent: str, notify_file_path: str) -> str:
     return "ok"
 
 
+# ── Native cross-harness message delivery ──────────────────────────────────────
+
+@mcp.tool()
+def message_send(to: str, text: str, mode: str = "auto", from_name: str = "",
+                  reply_to: str = "", idempotency_key: str = "") -> str:
+    """Deliver `text` to another agent session outside this room, picking a
+    deterministic "postman" per harness (no LLM) and trying methods in order.
+    `text` is sent unchanged inside a small envelope.
+
+    `to`: 'claude:<name|sessionId>', 'codex:<threadId|thread_name>',
+    'codex://threads/<id>', 'hermes:<peer[/agent]|session>',
+    'opencode:<sessionId>', 'agy:<conversationId>', or a bare name.
+    `mode`: 'auto' (default) or a forced method id, e.g. 'claude.native'.
+
+    Returns JSON: {msg_id, delivered, method, attempts, note}. `delivered`
+    for a resume/spool method means the attempt started/was queued, not that
+    it was read. See docs/delivery.md.
+    """
+    return delivery.message_send(
+        to, text, mode=mode, from_name=from_name, reply_to=reply_to,
+        idempotency_key=idempotency_key,
+    )
+
+
+@mcp.tool()
+def message_targets(harness: str = "") -> list:
+    """List resolvable cross-harness targets (Claude/Codex session registries),
+    optionally filtered by harness ('claude', 'codex', ...). Never returns
+    tokens or file contents -- see docs/delivery.md.
+    """
+    return delivery.message_targets(harness)
+
+
 # ── Background tasks ──────────────────────────────────────────────────────────
 
 async def _background_watchdog():
@@ -857,6 +3400,14 @@ async def _background_watchdog():
                 print(f"[watchdog] Deadlock-notified rooms: {notified}", flush=True)
         except Exception as e:
             print(f"[watchdog] deadlock check error: {e}", flush=True)
+
+        try:
+            advanced = _recover_swarm_pilots()
+            if advanced:
+                print(f"[watchdog] Recovered swarm requests: {advanced}",
+                      flush=True)
+        except Exception as e:
+            print(f"[watchdog] swarm recovery error: {e}", flush=True)
 
         try:
             wakes = _wake_pending_agents()
@@ -1281,6 +3832,50 @@ async def api_rooms(request: Request) -> JSONResponse:
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@mcp.custom_route("/api/rooms_search", methods=["GET"])
+async def api_rooms_search(request: Request) -> JSONResponse:
+    query = request.query_params.get("q", "").strip()
+    if not query or len(query) > 120:
+        return JSONResponse({"error": "q must contain 1–120 characters"}, status_code=400)
+
+    def search() -> list[dict]:
+        needle = query.casefold()
+        found = []
+        for room in bus.list_rooms():
+            name = str(room.get("name") or room.get("id") or "")
+            title_match = needle in name.casefold()
+            matching_message = None
+            for msg in bus._load_messages(room["id"]):
+                body = msg.get("body")
+                if isinstance(body, str) and needle in body.casefold():
+                    matching_message = msg
+                    break
+            if not title_match and matching_message is None:
+                continue
+            snippet = ""
+            message_id = None
+            if matching_message is not None:
+                body = " ".join(matching_message["body"].split())
+                at = body.casefold().find(needle)
+                start = max(0, at - 72)
+                snippet = ("…" if start else "") + body[start:start + 190]
+                if start + 190 < len(body):
+                    snippet += "…"
+                message_id = matching_message.get("id")
+            found.append({"id": room["id"], "name": name,
+                          "owner": room.get("owner"), "status": room.get("status"),
+                          "snippet": snippet, "message_id": message_id,
+                          "title_match": title_match,
+                          "last_activity": room.get("last_activity") or room.get("created_at")})
+        found.sort(key=lambda item: (not item["title_match"], -(item["last_activity"] or 0)))
+        return found[:100]
+
+    try:
+        return JSONResponse({"results": await asyncio.to_thread(search)})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @mcp.custom_route("/api/messages_json", methods=["GET"])
 async def api_messages_json(request: Request) -> JSONResponse:
     room_id = request.query_params.get("room_id", "")
@@ -1290,8 +3885,12 @@ async def api_messages_json(request: Request) -> JSONResponse:
         if since > 0:
             msgs = [m for m in msgs if m["id"] > since]
         room_meta = bus._read_meta(room_id)
-        statuses = bus.get_status(room_id)
-        return JSONResponse({"messages": msgs, "room": room_meta, "statuses": statuses})
+        status_details = bus.get_status_details(room_id)
+        statuses = {name: info["status"] for name, info in status_details.items()}
+        phases = {name: info.get("phase", "online")
+                  for name, info in status_details.items()}
+        return JSONResponse({"messages": msgs, "room": room_meta,
+                             "statuses": statuses, "phases": phases})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
@@ -1695,6 +4294,100 @@ def _room_open_for_spawn(room_id: str) -> bool:
 _SPAWNED_PID_HISTORY_MAX = 64
 
 
+def _claude_receipt_log_open(
+    room_id: str, agent_name: str, generation: str, source: str, spec: dict,
+):
+    """Bind one subscription Claude stream segment to its owned generation."""
+    if spec.get("profile") != spawn._SUBSCRIPTION_OPUS_REVIEW_PROFILE:
+        return None
+
+    def _opened(start_offset: int, log_path: str, device: int, inode: int) -> None:
+        try:
+            canonical, _ = bus._agent_paths(room_id, agent_name, create=True)
+        except (OSError, ValueError) as exc:
+            raise spawn.AgentSpawnError("Claude room log unavailable") from exc
+        if log_path != str(canonical):
+            raise spawn.AgentSpawnError("Claude log path does not match room agent path")
+        claimed = False
+
+        def _update(meta: dict) -> dict:
+            nonlocal claimed
+            info = (meta.get("agent_meta") or {}).get(agent_name)
+            if not isinstance(info, dict):
+                return meta
+            if source == "initial_spawn_id":
+                claimed = (info.get(source) == generation
+                           and info.get("initial_spawn_active") is True)
+            else:
+                claimed = (info.get(source) == generation
+                           and info.get("wake_claim_id") == generation)
+            if claimed:
+                info["claude_log_segment"] = {
+                    "generation": generation, "source": source,
+                    "start_offset": start_offset,
+                    "device": device, "inode": inode,
+                }
+            return meta
+
+        bus._update_meta_locked(room_id, _update)
+        if not claimed:
+            raise spawn.AgentSpawnError("Claude process generation no longer owns room slot")
+
+    return _opened
+
+
+def _record_claude_model_receipt(
+    room_id: str, agent_name: str, generation: str, source: str,
+) -> None:
+    """Observe only this exited CLI process and publish under the same claim."""
+    meta = bus.get_room_info(room_id)
+    info = (meta.get("agent_meta") or {}).get(agent_name) or {}
+    segment = info.get("claude_log_segment") or {}
+    if (segment.get("generation") != generation
+            or segment.get("source") != source
+            or info.get(source) != generation):
+        return
+    start = segment.get("start_offset")
+    if type(start) is not int:
+        return
+    canonical, _ = bus._agent_paths(room_id, agent_name, create=False)
+    try:
+        fd = bus._safe_open_fd(canonical, os.O_RDONLY)
+        with os.fdopen(fd, "rb") as stream:
+            current_stat = os.fstat(stream.fileno())
+            if (current_stat.st_dev != segment.get("device")
+                    or current_stat.st_ino != segment.get("inode")
+                    or current_stat.st_size < start):
+                return
+            receipt = parse_claude_model_receipt(
+                stream, start_offset=start, end_offset=current_stat.st_size,
+                expected_device=segment.get("device"),
+                expected_inode=segment.get("inode"),
+            )
+    except (OSError, ValueError):
+        receipt = {"reported_model": None, "source": "none"}
+
+    def _update(current: dict) -> dict:
+        slot = (current.get("agent_meta") or {}).get(agent_name)
+        if not isinstance(slot, dict):
+            return current
+        owned_segment = slot.get("claude_log_segment") or {}
+        if (slot.get(source) != generation
+                or owned_segment.get("generation") != generation
+                or owned_segment.get("source") != source
+                or owned_segment.get("start_offset") != start):
+            return current
+        slot["claude_model_receipt"] = {
+            "reported_model": receipt["reported_model"],
+            "source": receipt["source"],
+            "claim_scope": "cli_reported_identifier",
+            "generation": generation,
+        }
+        return current
+
+    bus._update_meta_locked(room_id, _update)
+
+
 def _bounded_spawned_pids(pids: list, *new_pids: int) -> list[int]:
     values = [int(pid) for pid in pids if isinstance(pid, int) and pid > 0]
     for pid in new_pids:
@@ -1944,6 +4637,10 @@ def _spawn_agents(
                         ))(spec["name"], initial_spawn_id),
                     owner_room_id=room_id,
                     process_handle=initial_spawn_id,
+                    on_log_open_identity=_claude_receipt_log_open(
+                        room_id, spec["name"], initial_spawn_id,
+                        "initial_spawn_id", spec,
+                    ),
                 )
                 continue
             try:
@@ -1954,6 +4651,10 @@ def _spawn_agents(
                         room_id, spec["name"], initial_spawn_id),
                     owner_room_id=room_id,
                     process_handle=initial_spawn_id,
+                    on_log_open_identity=_claude_receipt_log_open(
+                        room_id, spec["name"], initial_spawn_id,
+                        "initial_spawn_id", spec,
+                    ),
                 )
                 pids.append(pid)
                 names.append(spec["name"])
@@ -2011,6 +4712,10 @@ def _spawn_agents(
             owner_room_id=room_id,
             process_handle_factory=lambda n: initial_generations[n],
             prepare_spawn=_prepare_initial_spawn,
+            on_log_open_identity_factory=lambda n: _claude_receipt_log_open(
+                room_id, n, initial_generations[n], "initial_spawn_id",
+                spawn.get_enabled_spec(n) or {},
+            ),
         )
         for agent_name, info in agent_meta.items():
             info["initial_spawn_id"] = initial_generations[agent_name]
@@ -2132,6 +4837,23 @@ def _merge_agent_meta(room_id: str, agent_name: str, fields: dict) -> None:
     bus._update_meta_locked(room_id, _update)
 
 
+def _merge_agent_meta_if_claim(room_id: str, agent_name: str, wake_id: str,
+                               fields: dict) -> bool:
+    """Merge fields only while ``wake_id`` still holds this agent's claim."""
+    merged = False
+
+    def _update(meta: dict) -> dict:
+        nonlocal merged
+        info = (meta.get("agent_meta") or {}).get(agent_name)
+        if isinstance(info, dict) and info.get("wake_claim_id") == wake_id:
+            info.update(fields)
+            merged = True
+        return meta
+
+    bus._update_meta_locked(room_id, _update)
+    return merged
+
+
 def _claim_wake(
     room_id: str, agent_name: str, msg_id: int, wake_id: str,
 ) -> bool:
@@ -2154,6 +4876,8 @@ def _claim_wake(
             info = {}
         if info.get("wake_claim_id") or info.get("initial_spawn_active"):
             return meta
+        if info.get("swarm_child_of"):
+            return meta  # one-shot participant child: never relaunched
         if int(info.get("last_wake_msg_id", 0) or 0) >= msg_id:
             return meta
         info.update({
@@ -2189,6 +4913,8 @@ def _claim_explicit_wake(
             info = {}
         if info.get("wake_claim_id") or info.get("initial_spawn_active"):
             return meta
+        if info.get("swarm_child_of"):
+            return meta  # one-shot participant child: never relaunched
         info.update({
             "wake_claim_id": wake_id,
             "wake_claim_msg_id": None,
@@ -2215,7 +4941,10 @@ def _clear_wake_claim(
         info = (meta.get("agent_meta") or {}).get(agent_name)
         if not isinstance(info, dict) or info.get("wake_claim_id") != wake_id:
             return meta
-        for field in ("wake_claim_id", "wake_claim_msg_id", "wake_claimed_at"):
+        for field in (
+            "wake_claim_id", "wake_claim_msg_id", "wake_claimed_at",
+            "member_token_sha256", "member_token_wake_id",
+        ):
             info.pop(field, None)
         if rollback and info.get("wake_id") == wake_id:
             info.pop("wake_id", None)
@@ -2300,6 +5029,11 @@ def _agent_wake_health(
     process_state = _owned_process_state(room_id, info) if pid else "unknown"
     pid_alive = process_state == "alive"
     rc = info.get("last_wake_rc")
+    intentional_pilot_stop = (
+        info.get("intentional_stop_wake_id") == info.get("wake_id")
+        and rc == -int(signal.SIGTERM)
+    )
+    fail_count = int(info.get("wake_fail_count", 0) or 0)
     return {
         "status": status or "offline",
         "wake_id": info.get("wake_id"),
@@ -2314,8 +5048,13 @@ def _agent_wake_health(
         "last_wake_msg_id": info.get("last_wake_msg_id"),
         "last_wake_at": info.get("last_wake_at"),
         "last_wake_rc": rc,
-        "last_wake_failed": rc is not None and rc != 0,
-        "wake_fail_count": int(info.get("wake_fail_count", 0) or 0),
+        # A completed Swarm turn may be intentionally SIGTERM'd after posting
+        # its result. Match the same exact-generation marker used by the exit
+        # handler; other nonzero exits remain failures.
+        "last_wake_failed": (
+            rc is not None and rc != 0 and not intentional_pilot_stop
+        ),
+        "wake_fail_count": fail_count,
         "rate_limited": _agent_in_rate_limit_cooldown(info),
         "rate_limited_until": int(info.get("rate_limited_until", 0) or 0),
         "rate_limit_reason": info.get("rate_limit_reason"),
@@ -2576,6 +5315,13 @@ def _on_initial_spawn_exit(
     # A stale callback must not overwrite a newer wake's phase or metadata.
     if not _begin_initial_spawn_exit(room_id, agent_name, initial_spawn_id):
         return
+    try:
+        _record_claude_model_receipt(
+            room_id, agent_name, initial_spawn_id, "initial_spawn_id",
+        )
+    except Exception as exc:
+        print(f"[huddle] Claude model receipt failed (init) "
+              f"({agent_name}@{room_id}): {exc}", flush=True)
     rc = -999 if returncode is None else int(returncode)
     rate_limit_announced = False
     if rc != 0:
@@ -2636,6 +5382,11 @@ def _on_wake_exit(room_id: str, agent_name: str, wake_id: str,
     # superseded us (then it owns the busy state and the drain).
     if info.get("wake_id") != wake_id:
         return
+    try:
+        _record_claude_model_receipt(room_id, agent_name, wake_id, "wake_id")
+    except Exception as exc:
+        print(f"[huddle] Claude model receipt failed (wake) "
+              f"({agent_name}@{room_id}): {exc}", flush=True)
     if (not already_announced and (
         info.get("stuck_announced_wake_id") == wake_id
         or info.get("stuck_killed_wake_id") == wake_id
@@ -2645,19 +5396,26 @@ def _on_wake_exit(room_id: str, agent_name: str, wake_id: str,
         # notice when the exact child eventually exits.
         already_announced = True
     rc = -999 if returncode is None else int(returncode)
+    intentional_pilot_stop = (
+        info.get("intentional_stop_wake_id") == wake_id
+        and rc == -int(signal.SIGTERM)
+    )
     fail_count = int(info.get("wake_fail_count", 0) or 0)
     updates = {
         "last_wake_rc": rc,
         "last_wake_exit_at": int(time.time()),
-        "wake_fail_count": (fail_count + 1) if rc != 0 else 0,
+        "wake_fail_count": (
+            fail_count if intentional_pilot_stop
+            else (fail_count + 1) if rc != 0 else 0
+        ),
     }
-    if rc == 0:
+    if rc == 0 and not intentional_pilot_stop:
         # A clean turn clears any prior rate-limit cooldown so the agent can be
         # woken again immediately.
         updates["rate_limited_until"] = 0
     _merge_agent_meta(room_id, agent_name, updates)
     rate_limit_announced = False
-    if not already_announced and rc != 0:
+    if not already_announced and rc != 0 and not intentional_pilot_stop:
         try:
             rate_limit_announced = _handle_rate_limit_on_exit(room_id, agent_name)
         except Exception as exc:
@@ -2675,7 +5433,8 @@ def _on_wake_exit(room_id: str, agent_name: str, wake_id: str,
     else:
         final_phase = "unavailable"
     _set_agent_phase(room_id, agent_name, final_phase)
-    if not already_announced and not rate_limit_announced:
+    if (not already_announced and not rate_limit_announced
+            and not intentional_pilot_stop):
         try:
             _announce_noreply_on_exit(
                 room_id, agent_name,
@@ -2683,6 +5442,18 @@ def _on_wake_exit(room_id: str, agent_name: str, wake_id: str,
                 rc, info.get("log_path"))
         except Exception as exc:
             print(f"[huddle] noreply check error "
+                  f"({agent_name}@{room_id}): {exc}", flush=True)
+    if not posted_result and not intentional_pilot_stop:
+        try:
+            # Still holding this generation's claim: a replacement takes it
+            # over atomically, making the release below a no-op.
+            if _swarm_replace_failed_member(
+                room_id, agent_name, wake_id, info, rc, final_phase,
+                rate_limit_announced,
+            ):
+                return
+        except Exception as exc:
+            print(f"[huddle] swarm replacement error "
                   f"({agent_name}@{room_id}): {exc}", flush=True)
     try:
         # Operational status is terminal now. Release only this exact
@@ -2703,10 +5474,14 @@ def _next_pending_request(room_id: str, agent_name: str,
     """Oldest request addressed to agent_name it has not been woken for yet.
     The message log itself is the per-agent wake queue."""
     last_wake = int(info.get("last_wake_msg_id", 0) or 0)
-    for msg in bus._load_messages(room_id):
+    pilot = bus.get_room_info(room_id).get("swarm_pilot")
+    messages = bus._load_messages(room_id)
+    for msg in messages:
         if msg.get("id", 0) <= last_wake:
             continue
         if msg.get("kind") != "request" or msg.get("reply_to") is not None:
+            continue
+        if _swarm_pilot_request_superseded(room_id, msg, pilot, messages):
             continue
         if msg.get("agent") == agent_name:
             continue
@@ -2763,6 +5538,8 @@ def _wake_agents_for_request(
             continue
         if to and to not in (agent_name, "all"):
             continue
+        if (agent_meta.get(agent_name) or {}).get("swarm_child_of"):
+            continue  # one-shot child; _claim_wake refuses it as well
 
         with _wake_lock(room_id, agent_name):
             # Re-read under the lock — another thread may have just woken it.
@@ -2790,11 +5567,40 @@ def _wake_agents_for_request(
                 })
                 continue
 
+            pilot_state = fresh.get("swarm_pilot")
+            pinned_specs = (
+                pilot_state.get("expected_specs")
+                if isinstance(pilot_state, dict) else None
+            )
+            if isinstance(pinned_specs, dict) and _member_launch_spec(fresh, agent_name)[1]:
+                wakes.append({"agent": agent_name, "status": "spec_drift"})
+                continue
+
             log_path = info.get("log_path")
             last_seen = int(info.get("last_seen_id", 0) or 0)
             wake_id = uuid.uuid4().hex[:12]
 
-            if _is_thread_resumable(agent_name):
+            # A replaced member always launches its route profile fresh.
+            # So does a member mapped to another profile: resume reads the
+            # default Codex profile, not the member's assigned one.
+            resumable = (_is_thread_resumable(agent_name)
+                         and _swarm_route_profile(info) is None
+                         and _swarm_assigned_profile(fresh, agent_name) == agent_name)
+            # A newly invited Codex has no native thread yet. The first pilot
+            # turn must start a registry-backed process; later turns resume
+            # the captured thread just like an ordinary room.
+            if (resumable and fresh.get("swarm_pilot")
+                    and not info.get("thread_id")):
+                initial_thread = _parse_owned_codex_thread_id(
+                    room_id, agent_name, timeout=1.0,
+                )
+                if initial_thread:
+                    _merge_agent_meta(room_id, agent_name,
+                                      {"thread_id": initial_thread})
+                    info["thread_id"] = initial_thread
+                else:
+                    resumable = False
+            if resumable:
                 try:
                     canonical_log, canonical_last = bus._agent_paths(
                         room_id, agent_name, create=False,
@@ -2818,12 +5624,42 @@ def _wake_agents_for_request(
                     continue
                 _set_agent_phase(room_id, agent_name, "starting", task_id=msg_id)
                 try:
+                    if isinstance(pinned_specs, dict):
+                        latest_spec = spawn.get_enabled_spec(agent_name)
+                        if _swarm_spec_drift(
+                            bus.get_room_info(room_id), agent_name, latest_spec,
+                        ):
+                            _clear_wake_claim(
+                                room_id, agent_name, wake_id, rollback=True,
+                            )
+                            _set_agent_phase(
+                                room_id, agent_name, "unavailable", msg_id,
+                                "spec_drift",
+                            )
+                            wakes.append({"agent": agent_name, "status": "spec_drift"})
+                            continue
+                    resume_settings = info.get("model_settings")
+                    resume_kwargs = (
+                        {"model_settings": resume_settings}
+                        if isinstance(resume_settings, dict) else {}
+                    )
+                    if "mcp_url" in info:
+                        resume_kwargs["mcp_url"] = info["mcp_url"]
+                        member_token = _issue_member_token(room_id, agent_name, wake_id)
+                        if member_token:
+                            resume_kwargs["member_token"] = member_token
+                    resume_cwd, write_roots = room_workspace.resume(
+                        bus.get_room_info(room_id), agent_name,
+                    )
+                    if write_roots is not None:
+                        resume_kwargs["workspace_write_roots"] = write_roots
                     pid = spawn.codex_resume(
-                        thread_id, prompt, cwd, log_path,
+                        thread_id, prompt, resume_cwd, log_path,
                         str(canonical_last),
                         on_exit=_make_wake_done_callback(room_id, agent_name, wake_id),
                         owner_room_id=room_id,
                         process_handle=wake_id,
+                        **resume_kwargs,
                     )
                 except Exception as exc:
                     _set_agent_phase(room_id, agent_name, "unavailable", msg_id, str(exc))
@@ -2885,7 +5721,8 @@ def _agent_replied_to_request(room_id: str, agent_name: str, msg_id: int) -> boo
     A failure settlement remains a failure lifecycle state; this predicate only
     prevents a duplicate wake when wake metadata is missing.
     """
-    for msg in bus._load_messages(room_id):
+    messages = bus._load_messages(room_id)
+    for msg in messages:
         if (
             msg.get("agent") == agent_name
             and msg.get("reply_to") == msg_id
@@ -2897,6 +5734,11 @@ def _agent_replied_to_request(room_id: str, agent_name: str, msg_id: int) -> boo
         meta = bus.get_room_info(room_id)
     except Exception:
         return False
+    request = next((msg for msg in messages if msg.get("id") == msg_id), None)
+    if request and _swarm_pilot_request_superseded(
+        room_id, request, meta.get("swarm_pilot"), messages,
+    ):
+        return True
     wake_info = (meta.get("agent_meta") or {}).get(agent_name) or {}
     return str(msg_id) in _server_terminal_failure_task_ids(status_info, wake_info)
 
@@ -3155,10 +5997,21 @@ def _spawn_fresh_room_agent(
 
     Records a wake lease (wake_id + last_wake_pid) and wires a reaper callback
     so the busy lease is released — and the next request drained — when the
-    process exits."""
-    spec = spawn.get_enabled_spec(agent_name)
+    process exits. A replaced Swarm member launches its route profile under
+    the member's own room/log identity."""
+    current_meta = bus.get_room_info(room_id)
+    if ((current_meta.get("agent_meta") or {}).get(agent_name) or {}).get("swarm_child_of"):
+        raise ValueError(f"{agent_name} is a one-shot child agent and is not relaunched")
+    spec, drift = _member_launch_spec(current_meta, agent_name)
     if not spec:
         raise ValueError(f"Agent {agent_name} has no enabled spawn registry entry")
+    if drift:
+        raise ValueError(
+            f"spec_drift: refusing to launch {agent_name} with a changed swarm profile"
+        )
+    # Permissions come from this room's persisted policy, re-validated per
+    # launch; a write room refuses unsupported profiles before Popen.
+    launch_spec, launch_cwd = room_workspace.launch(current_meta, agent_name, spec)
 
     if agent_name not in meta.get("participants", []):
         bus.invite_agent(room_id, agent_name)
@@ -3167,15 +6020,24 @@ def _spawn_fresh_room_agent(
         wake_id = uuid.uuid4().hex[:12]
     session_id = meta.get("session_id", "")
     _set_agent_phase(room_id, agent_name, "starting", task_id=msg_id or "")
+    identity = {"log_name": agent_name} if spec.get("name") != agent_name else {}
+    if spawn.member_identity_supported(launch_spec):
+        member_token = _issue_member_token(room_id, agent_name, wake_id)
+        if member_token:
+            identity["member_token"] = member_token
     try:
         pid, log_path, last_msg_path = spawn.spawn_agent(
-            spec,
+            launch_spec,
             prompt,
-            meta.get("cwd", "") or "",
+            launch_cwd,
             bus._room_dir(room_id) / "agents",
             on_exit=_make_wake_done_callback(room_id, agent_name, wake_id),
             owner_room_id=room_id,
             process_handle=wake_id,
+            on_log_open_identity=_claude_receipt_log_open(
+                room_id, agent_name, wake_id, "wake_id", spec,
+            ),
+            **identity,
         )
     except Exception as exc:
         _set_agent_phase(room_id, agent_name, "unavailable", detail=str(exc))
@@ -3188,6 +6050,12 @@ def _spawn_fresh_room_agent(
         "last_wake_at": int(time.time()),
         "wake_id": wake_id,
     }
+    model_settings = spawn.model_settings_for_spec(spec)
+    if model_settings:
+        fields["model_settings"] = model_settings
+    if ("mcp_url" in launch_spec
+            and spawn._effective_binary(launch_spec.get("cmd") or []) == "codex"):
+        fields["mcp_url"] = spawn._codex_loopback_mcp_url(launch_spec["mcp_url"])
     if msg_id is not None:
         fields["last_wake_msg_id"] = msg_id
         fields["last_seen_id"] = msg_id

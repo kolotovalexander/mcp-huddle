@@ -46,7 +46,7 @@ def test_subscription_native_spawn_is_fixed_and_readonly(profile, monkeypatch, t
     spawn.spawn_agent(profile, "review", str(project), tmp_path / "logs")
     argv = captured["argv"]
     assert argv[0] == (spawn._CLAUDE_BIN or "claude")
-    assert argv[argv.index("--model") + 1] == "claude-opus-5"
+    assert argv[argv.index("--model") + 1] == "claude-opus-5-5"
     assert "--bare" not in argv and "--restricted" in argv
     assert "--dangerously-skip-permissions" not in argv
     assert "--fallback-model" not in argv

@@ -1,0 +1,970 @@
+<!DOCTYPE html>
+<html lang="ru" data-theme="paper" data-density="normal" data-fs="1">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Huddle — макет «Указатель и дорожки»</title>
+<style>
+/* ── Основа: бумага, чернила, один сигнальный цвет. Никакого стекла, теней и скруглений. ── */
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+:root{
+  --bg:#f2eee4; --soft:#e7e1d3; --ink:#1b1915; --muted:#6d675b; --faint:#d6cfbf;
+  --accent:#d9431b; --mark:#ffe14d;
+  --a-claude:#b4541f; --a-codex:#2b6a48; --a-antigravity:#34509f; --a-mimo:#86388a;
+  --a-deepseek:#17707f; --a-qwen:#94660d; --a-human:#d9431b; --a-system:#77705f;
+  --serif:"Iowan Old Style","Palatino Linotype",Palatino,"Book Antiqua",Georgia,serif;
+  --mono:ui-monospace,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Arial,sans-serif;
+  --fs:16.5px; --row:11px; --msg:18px;
+}
+html[data-theme="ink"]{
+  --bg:#151513; --soft:#201f1b; --ink:#ebe5d6; --muted:#938c7d; --faint:#33302a;
+  --accent:#ff6b3d; --mark:#ffd23f;
+  --a-claude:#f0935c; --a-codex:#6fcf9a; --a-antigravity:#93abff; --a-mimo:#e08ae4;
+  --a-deepseek:#5cc9dc; --a-qwen:#e3b451; --a-human:#ff6b3d; --a-system:#9a937f;
+}
+html[data-fs="0"]{--fs:15px}
+html[data-fs="2"]{--fs:18.5px}
+html[data-density="dense"]{--row:6px;--msg:10px}
+
+body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:var(--fs);
+  display:grid;grid-template-rows:auto minmax(0,1fr) auto;height:100vh;overflow:hidden}
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer;padding:0}
+kbd{font-family:var(--mono);font-size:11px;border:1px solid currentColor;padding:0 5px;border-radius:2px}
+mark{background:var(--mark);color:#1b1915;padding:0 1px}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.link{font-family:var(--mono);font-size:12px;color:var(--muted);text-decoration:underline;text-underline-offset:3px}
+.link:hover{color:var(--accent)}
+
+/* ── Шапка ── */
+.top{display:flex;align-items:center;gap:28px;padding:0 24px;height:68px;border-bottom:2px solid var(--ink)}
+.brand{display:flex;align-items:baseline;gap:12px;flex:none}
+.brand-name{font-size:30px;font-weight:700;font-style:italic;letter-spacing:-.02em}
+.brand-sub{font-family:var(--mono);font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.1em}
+.stamp{font-family:var(--mono);font-size:10.5px;text-transform:uppercase;letter-spacing:.12em;color:var(--accent);
+  border:1.5px solid var(--accent);padding:3px 7px;transform:rotate(-2deg);white-space:nowrap;align-self:center}
+.tabs{display:flex;gap:24px;align-self:stretch;flex:1}
+.tab{font-family:var(--mono);font-size:12px;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);
+  border-bottom:4px solid transparent;padding-top:4px}
+.tab:hover{color:var(--ink)}
+.tab[aria-current="page"]{color:var(--ink);border-bottom-color:var(--accent)}
+.find{display:flex;align-items:center;gap:12px;height:46px;min-width:420px;padding:0 16px;background:var(--ink);color:var(--bg);font-size:17px;flex:none}
+.find:hover{background:var(--accent);color:#fff}
+.find .lbl{flex:1;text-align:left}
+.find .short{display:none}
+.find svg{width:20px;height:20px;flex:none}
+
+/* ── Экраны ── */
+.page{min-height:0;overflow:hidden}
+.page[hidden]{display:none!important}
+#page-rooms{display:grid;grid-template-columns:340px minmax(0,1fr)}
+
+/* ── Указатель комнат ── */
+.index{border-right:2px solid var(--ink);display:flex;flex-direction:column;min-height:0;background:var(--bg)}
+.index-head{padding:14px 16px 10px;display:flex;gap:10px;align-items:center;justify-content:space-between;border-bottom:1px solid var(--ink)}
+.seg{display:inline-flex;border:1.5px solid var(--ink)}
+.seg button{font-family:var(--mono);font-size:12px;padding:6px 10px}
+.seg button+button{border-left:1.5px solid var(--ink)}
+.seg button[aria-pressed="true"]{background:var(--ink);color:var(--bg)}
+.seg.sm button{font-size:11px;padding:2px 7px}
+.chk{font-family:var(--mono);font-size:12px;color:var(--muted);display:flex;gap:6px;align-items:center;cursor:pointer}
+.chk input{accent-color:var(--accent);margin:0}
+.index-sum{padding:8px 16px;font-family:var(--mono);font-size:11.5px;color:var(--muted);display:flex;justify-content:space-between;gap:8px;border-bottom:1px solid var(--faint)}
+.index-sum button{color:var(--accent);text-decoration:underline;text-underline-offset:3px}
+.rooms{list-style:none;margin:0;padding:0 0 48px;overflow:auto;flex:1}
+.grp{display:flex;justify-content:space-between;align-items:baseline;gap:8px;padding:20px 16px 6px;border-bottom:1px solid var(--ink);
+  position:sticky;top:0;background:var(--bg);z-index:1}
+.grp b{font-style:italic;font-size:21px;font-weight:600}
+.grp .path{display:block;font-family:var(--mono);font-size:10.5px;color:var(--muted);font-weight:400;font-style:normal;margin-top:2px}
+.grp small{font-family:var(--mono);font-size:11px;color:var(--muted)}
+.room{display:grid;grid-template-columns:16px minmax(0,1fr) auto;column-gap:8px;padding:var(--row) 16px;border-bottom:1px solid var(--faint);cursor:pointer}
+.room:hover{background:var(--soft)}
+.room .st{font-size:11px;line-height:20px}
+.room .nm{font-family:var(--mono);font-size:13.5px;line-height:20px;overflow-wrap:anywhere}
+.room .tm{font-family:var(--mono);font-size:11.5px;color:var(--muted);line-height:20px;white-space:nowrap}
+.room .mt{grid-column:2/4;font-size:13px;color:var(--muted);font-style:italic;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.room.closed .nm{color:var(--muted)}
+.room[aria-current="true"]{background:var(--ink);color:var(--bg);box-shadow:inset 5px 0 0 var(--accent)}
+.room[aria-current="true"] .nm,.room[aria-current="true"] .tm,.room[aria-current="true"] .mt,.room[aria-current="true"] .st{color:var(--bg)}
+.st-open{color:var(--accent)} .st-closed{color:var(--muted)} .st-resolved{color:var(--ink)}
+
+/* ── Комната ── */
+.view{display:grid;grid-template-rows:auto auto auto minmax(0,1fr) auto;min-height:0;min-width:0}
+.head{padding:18px 32px 14px;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px 24px;align-items:end}
+.crumbs{grid-column:1/-1;font-family:var(--mono);font-size:12px;color:var(--muted);display:flex;gap:12px;align-items:center}
+.head h1{margin:0;font-size:clamp(28px,3.3vw,44px);line-height:1.05;letter-spacing:-.015em;font-weight:600;overflow-wrap:anywhere}
+.acts{display:flex;gap:16px}
+.facts{grid-column:1/-1;font-family:var(--mono);font-size:11.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);display:flex;flex-wrap:wrap}
+.facts span+span::before{content:"/";margin:0 10px;color:var(--faint)}
+.facts .s-open{color:var(--accent);font-weight:700}
+.facts .s-resolved{color:var(--ink);font-weight:700}
+.menu-rooms{display:none}
+
+/* ── Дорожки агентов ── */
+.lanes{border-top:2px solid var(--ink);border-bottom:1px solid var(--ink);background:var(--soft);padding:4px 32px 8px}
+.lanes-top{display:flex;gap:16px;align-items:baseline;font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);padding:5px 0}
+.lanes-top .grow{flex:1}
+.lanes-top .link{text-transform:none;letter-spacing:0;font-size:11.5px}
+.lane{display:grid;grid-template-columns:130px 136px minmax(0,1fr) minmax(150px,240px);gap:16px;align-items:center;min-height:32px;border-top:1px solid var(--faint)}
+.lane-name{display:flex;align-items:center;gap:8px;font-weight:700;font-variant:small-caps;letter-spacing:.03em;font-size:16px;text-align:left}
+.lane-name::after{content:"▸";font-size:10px;color:var(--muted);font-variant:normal}
+.lane-name[aria-expanded="true"]::after{content:"▾"}
+.sw{width:10px;height:10px;background:var(--c);display:inline-block;flex:none}
+.ph{font-family:var(--mono);font-size:12px;display:flex;align-items:center;gap:7px;white-space:nowrap}
+.ph::before{content:"";width:8px;height:8px;border:1.5px solid currentColor;flex:none}
+.ph-working,.ph-responding{color:var(--accent)}
+.ph-working::before,.ph-responding::before{background:currentColor;animation:blink 1s steps(2) infinite}
+.ph-thinking::before{animation:blink 1.6s steps(2) infinite}
+.ph-waiting,.ph-done{color:var(--muted)}
+.ph-done::before{background:currentColor}
+.ph-limited{color:var(--accent)}
+.ph-limited::before{background:repeating-linear-gradient(45deg,currentColor 0 2px,transparent 2px 4px)}
+.track{position:relative;height:22px}
+.track::before{content:"";position:absolute;left:0;right:0;top:50%;border-top:1px dashed var(--muted);opacity:.55}
+.tick{position:absolute;top:50%;transform:translate(-50%,-50%);width:9px;height:9px;background:var(--c)}
+.tick.k-request{background:var(--soft);border:2px solid var(--c);width:11px;height:11px}
+.tick.k-comment,.tick.k-ack{width:7px;height:7px;border-radius:50%}
+.tick.k-final{background:var(--accent);outline:2px solid var(--ink)}
+.tick:hover,.tick:focus-visible{transform:translate(-50%,-50%) scale(1.6);z-index:2}
+.now{position:absolute;right:0;top:-4px;bottom:-4px;border-right:2px solid var(--accent)}
+.detail{font-size:13.5px;font-style:italic;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.log{font-family:var(--mono);font-size:12px;background:var(--bg);border:1px solid var(--ink);padding:10px 14px;margin:2px 0 8px;white-space:pre-wrap;line-height:1.6;max-height:180px;overflow:auto}
+.lanes.collapsed .lane,.lanes.collapsed .log{display:none}
+@keyframes blink{50%{opacity:.15}}
+
+/* ── Полоса совпадений ── */
+.hitbar{display:flex;gap:12px;align-items:center;padding:7px 32px;background:var(--mark);color:#1b1915;font-family:var(--mono);font-size:12.5px;flex-wrap:wrap}
+.hitbar button{border:1.5px solid #1b1915;padding:1px 8px}
+.hitbar .grow{flex:1}
+
+/* ── Стенограмма ── */
+.transcript{overflow:auto;padding:0 32px 32px;min-height:0;scroll-behavior:smooth}
+.round{margin:26px 0 0;border-top:2px solid var(--ink)}
+.round span{display:inline-block;font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.12em;background:var(--ink);color:var(--bg);padding:3px 8px}
+.msg{display:grid;grid-template-columns:150px minmax(0,1fr);gap:20px;padding:var(--msg) 0;border-top:1px solid var(--faint)}
+.round+.msg{border-top:0}
+.who{font-weight:700;font-variant:small-caps;letter-spacing:.03em;color:var(--c);font-size:17px;line-height:1.2}
+.when{font-family:var(--mono);font-size:11.5px;color:var(--muted);margin-top:3px}
+.kind{font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.1em;margin-bottom:5px;color:var(--muted)}
+.k-request .kind{color:var(--ink);font-weight:700}
+.k-result .kind{color:var(--accent);font-weight:700}
+.body{max-width:74ch;line-height:1.55}
+.body p{margin:0 0 .5em}
+.body p:last-child{margin:0}
+.body code{font-family:var(--mono);font-size:.84em;background:var(--soft);padding:1px 4px}
+.k-final .body{border:2px solid var(--ink);padding:12px 16px}
+.msg.sys{font-family:var(--mono);font-size:12.5px;color:var(--muted)}
+.msg.sys .when{margin:0}
+.msg.is-hit .who::before,.msg.sys.is-hit>div:last-child::before{content:"◆ ";color:var(--accent)}
+.local-tag{font-family:var(--mono);font-size:10.5px;color:var(--accent);border:1px solid var(--accent);padding:0 5px;margin-left:8px;text-transform:none;letter-spacing:0;font-weight:400}
+.flash{animation:flash 1.8s ease-out}
+@keyframes flash{0%{background:var(--mark)}100%{background:transparent}}
+
+/* ── Написать ── */
+.composer{border-top:2px solid var(--ink);padding:10px 32px 14px;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px 16px;align-items:end}
+.c-row{grid-column:1/-1;display:flex;gap:16px;align-items:center;font-family:var(--mono);font-size:12px;color:var(--muted);flex-wrap:wrap}
+.composer textarea{font:inherit;font-size:var(--fs);background:transparent;color:var(--ink);border:0;border-bottom:1.5px solid var(--ink);resize:none;min-height:48px;padding:6px 0;outline:none}
+.composer textarea:focus{border-bottom-color:var(--accent)}
+.composer select{font-family:var(--mono);font-size:12px;background:var(--bg);color:var(--ink);border:1.5px solid var(--ink);padding:2px 6px;border-radius:0}
+.btn-ink{background:var(--ink);color:var(--bg);font-family:var(--mono);font-size:12.5px;padding:11px 18px;text-transform:uppercase;letter-spacing:.08em}
+.btn-ink:hover{background:var(--accent);color:#fff}
+.readonly{border-top:2px solid var(--ink);padding:14px 32px;font-family:var(--mono);font-size:12.5px;color:var(--muted)}
+
+/* ── Строка состояния с простыми настройками ── */
+.status{display:flex;align-items:center;gap:20px;padding:0 24px;height:38px;border-top:2px solid var(--ink);font-family:var(--mono);font-size:11.5px;color:var(--muted);white-space:nowrap;min-width:0}
+.status .note{color:var(--ink);display:flex;align-items:center;gap:8px;overflow:hidden;min-width:0}
+.status .note span{overflow:hidden;text-overflow:ellipsis}
+.status .note::before{content:"";width:9px;height:9px;background:var(--accent);flex:none}
+.status .keys kbd{margin:0 2px}
+.prefs{margin-left:auto;display:flex;gap:14px;align-items:center;flex:none}
+.prefs .step{display:inline-flex;align-items:center;gap:6px}
+.prefs .step button{border:1.5px solid var(--ink);padding:0 6px;font-family:var(--mono);font-size:11px}
+
+/* ── Поиск: отдельный экран, не выпадашка ── */
+.search{position:fixed;inset:0;background:var(--bg);z-index:40;display:flex;flex-direction:column;padding:26px 6vw 18px}
+.search[hidden]{display:none}
+.s-top{display:flex;justify-content:space-between;align-items:center;font-family:var(--mono);font-size:12px;text-transform:uppercase;letter-spacing:.1em;color:var(--muted)}
+.s-top button{border:1.5px solid var(--ink);color:var(--ink);padding:4px 10px;text-transform:uppercase;letter-spacing:.1em;font-family:var(--mono);font-size:11.5px}
+.s-input{width:100%;font:inherit;font-size:clamp(28px,4.6vw,54px);background:transparent;color:var(--ink);border:0;border-bottom:3px solid var(--ink);padding:14px 0 10px;outline:none;caret-color:var(--accent)}
+.s-input::placeholder{color:var(--muted);opacity:.45}
+.s-filters{display:flex;gap:18px;align-items:center;padding:12px 0;font-family:var(--mono);font-size:12px;color:var(--muted);flex-wrap:wrap}
+.s-filters .grow{flex:1}
+.s-results{flex:1;overflow:auto;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.5fr);gap:48px;align-content:start;padding:8px 0 20px}
+.s-results.one{grid-template-columns:minmax(0,1fr)}
+.s-col h3{margin:0;font-size:22px;font-style:italic;font-weight:600;display:flex;justify-content:space-between;align-items:baseline;border-bottom:2px solid var(--ink);padding-bottom:6px}
+.s-col h3 small{font-family:var(--mono);font-size:12px;font-style:normal;color:var(--muted);font-weight:400}
+.s-col .why{font-family:var(--mono);font-size:11px;color:var(--muted);margin:6px 0 2px}
+.hit{display:block;width:100%;text-align:left;padding:10px;border-bottom:1px solid var(--faint)}
+.hit:hover{background:var(--soft)}
+.hit[aria-selected="true"]{background:var(--ink);color:var(--bg);box-shadow:inset 5px 0 0 var(--accent)}
+.hit[aria-selected="true"] .hm,.hit[aria-selected="true"] .st{color:var(--bg)}
+.hit .hn{font-family:var(--mono);font-size:15.5px;overflow-wrap:anywhere}
+.hit .hm{font-family:var(--mono);font-size:11.5px;color:var(--muted);margin-top:3px}
+.hit .hs{font-size:15.5px;line-height:1.45;margin-top:4px}
+.more{font-family:var(--mono);font-size:12px;color:var(--muted);padding:10px}
+.s-empty{grid-column:1/-1;font-size:24px;font-style:italic;line-height:1.5;padding:24px 0}
+.suggest{font-style:normal;color:var(--accent);text-decoration:underline;text-underline-offset:4px}
+.tips{font-size:16px;line-height:1.5;padding-top:10px}
+.tips p{margin:0 0 10px}
+.tips .try{display:flex;gap:10px;flex-wrap:wrap;margin-top:6px}
+.tips .try button{font-family:var(--mono);font-size:13px;border:1.5px solid var(--ink);padding:3px 9px}
+.tips .try button:hover{background:var(--ink);color:var(--bg)}
+.s-foot{font-family:var(--mono);font-size:11.5px;color:var(--muted);border-top:1px solid var(--ink);padding-top:10px;display:flex;gap:22px;flex-wrap:wrap}
+
+/* ── Страницы «Подключение» и «Обслуживание» ── */
+.doc{overflow:auto;padding:40px 6vw 60px}
+.doc-inner{max-width:880px}
+.doc h2{font-size:42px;margin:0 0 6px;letter-spacing:-.015em}
+.lede{font-size:19px;color:var(--muted);font-style:italic;margin:0 0 30px;max-width:62ch;line-height:1.45}
+.sec{display:grid;grid-template-columns:64px minmax(0,1fr);gap:10px 20px;border-top:2px solid var(--ink);padding:18px 0 26px}
+.sec .n{font-family:var(--mono);font-size:13px;color:var(--accent);font-weight:700}
+.sec h3{margin:0 0 6px;font-size:22px}
+.sec p{margin:0 0 10px;line-height:1.5}
+.sec code,.env code{font-family:var(--mono);font-size:.84em}
+.code{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;font-family:var(--mono);font-size:13px;background:var(--soft);border-left:4px solid var(--ink);padding:10px 14px;margin:8px 0;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.5}
+.code button{flex:none;font-size:11px;text-transform:uppercase;letter-spacing:.08em;text-decoration:underline;text-underline-offset:3px}
+.code button:hover{color:var(--accent)}
+.env{display:grid;grid-template-columns:250px minmax(0,1fr);border-top:1px solid var(--faint);padding:9px 0;gap:16px;line-height:1.45}
+.action{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px 24px;align-items:center}
+.btn-line{border:1.5px solid var(--ink);font-family:var(--mono);font-size:12px;padding:9px 14px;text-transform:uppercase;letter-spacing:.06em;white-space:nowrap}
+.btn-line:hover{background:var(--ink);color:var(--bg)}
+.danger{border:2px solid var(--accent);padding:16px}
+.danger .row{display:flex;gap:12px;flex-wrap:wrap}
+.danger input{font-family:var(--mono);font-size:13px;border:1.5px solid var(--accent);background:transparent;color:var(--ink);padding:8px 10px;width:180px;border-radius:0}
+.btn-danger{background:var(--accent);color:#fff;font-family:var(--mono);font-size:12px;padding:9px 14px;text-transform:uppercase;letter-spacing:.06em}
+.btn-danger:disabled{opacity:.35;cursor:not-allowed}
+.fine{font-family:var(--mono);font-size:12px;color:var(--muted)}
+
+.toast{position:fixed;left:50%;bottom:54px;transform:translateX(-50%);background:var(--ink);color:var(--bg);font-family:var(--mono);font-size:12.5px;padding:10px 16px;z-index:60;border-left:5px solid var(--accent);max-width:calc(100vw - 32px)}
+.toast[hidden]{display:none}
+.scrim{display:none}
+
+/* ── Узкие экраны ── */
+@media (max-width:1100px){
+  .find{min-width:260px} .find .long{display:none} .find .short{display:inline}
+  .brand-sub{display:none}
+  .lane{grid-template-columns:110px 120px minmax(0,1fr)} .detail{display:none}
+  .status .keys{display:none}
+}
+@media (max-width:760px){
+  .top{height:auto;flex-wrap:wrap;gap:10px 14px;padding:10px 14px}
+  .tabs{order:3;width:100%;flex:none;height:32px;gap:18px}
+  .find{min-width:0;flex:1;height:40px}
+  #page-rooms{grid-template-columns:minmax(0,1fr)}
+  .index{position:fixed;top:0;bottom:0;left:0;width:min(340px,88vw);z-index:45;transform:translateX(-102%);transition:transform .2s}
+  body.drawer .index{transform:none}
+  body.drawer .scrim{display:block;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:44}
+  .menu-rooms{display:inline}
+  .head,.lanes,.transcript,.composer,.hitbar,.readonly{padding-left:16px;padding-right:16px}
+  .lane{grid-template-columns:96px 1fr} .track{grid-column:1/-1;margin-bottom:6px}
+  .msg{grid-template-columns:minmax(0,1fr);gap:4px}
+  .s-results{grid-template-columns:minmax(0,1fr)}
+  .status{padding:0 12px;gap:10px} .prefs .lbl{display:none}
+  .env{grid-template-columns:minmax(0,1fr);gap:2px}
+}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+/* Keep the editorial accent in large headings; small labels and messages read as UI text. */
+.brand-name,.head h1,.grp b,.s-col h3,.doc h2,.sec h3{font-family:var(--serif)}
+.room .mt,.detail,.lede,.s-empty{font-style:normal}
+.brand-sub,.stamp,.tab,.facts,.lanes-top,.round span,.kind,.btn-ink,
+.s-top,.s-top button,.code button,.btn-line,.btn-danger{
+  text-transform:none;letter-spacing:normal;
+}
+.body,.hit .hs,.room .mt{font-family:var(--sans)}
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="brand">
+    <span class="brand-name">Huddle</span>
+    <span class="brand-sub">комнаты агентов</span>
+    <span class="stamp" title="Статический макет: данные вымышлены, сервер не подключён">макет · данные вымышлены</span>
+  </div>
+  <nav class="tabs" aria-label="Разделы">
+    <button class="tab" data-page="rooms" aria-current="page">Комнаты</button>
+    <button class="tab" data-page="connect">Подключение</button>
+    <button class="tab" data-page="service">Обслуживание</button>
+  </nav>
+  <button class="find" id="find" data-act="search" aria-label="Поиск по названиям комнат и тексту переписки">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true"><circle cx="10" cy="10" r="6.5"/><path d="M15 15l6 6" stroke-linecap="square"/></svg>
+    <span class="lbl"><span class="long">Найти комнату или фразу из переписки</span><span class="short">Поиск</span></span>
+    <kbd>/</kbd>
+  </button>
+</header>
+
+<!-- Экран 1: комнаты -->
+<main class="page" id="page-rooms">
+  <aside class="index" aria-label="Указатель комнат">
+    <div class="index-head">
+      <div class="seg" role="group" aria-label="Как упорядочить комнаты">
+        <button data-view="latest" aria-pressed="true">Последние</button>
+        <button data-view="projects" aria-pressed="false">По проектам</button>
+      </div>
+      <label class="chk"><input type="checkbox" id="show-closed" checked> закрытые</label>
+    </div>
+    <div class="index-sum" id="sum"></div>
+    <ol class="rooms" id="rooms"></ol>
+  </aside>
+  <div class="scrim" data-act="drawer-close"></div>
+  <section class="view" id="view" aria-label="Выбранная комната"></section>
+</main>
+
+<!-- Экран 2: подключение (раньше — половина поповера «Вид») -->
+<section class="page doc" id="page-connect" hidden>
+  <div class="doc-inner">
+    <h2>Подключение</h2>
+    <p class="lede">Всё, что раньше пряталось в поповере «Вид»: как подключить агента к Huddle. Адрес ниже — пример. В продукте здесь будет адрес вашего сервера.</p>
+    <div class="sec"><div class="n">01</div><div>
+      <h3>Адрес MCP</h3>
+      <p>Дашборд и MCP (протокол, по которому агенты вызывают инструменты Huddle) работают на одном порту.</p>
+      <div class="code"><span>http://127.0.0.1:8014/mcp</span><button data-copy>копировать</button></div>
+    </div></div>
+    <div class="sec"><div class="n">02</div><div>
+      <h3>Claude Code</h3>
+      <div class="code"><span>claude mcp add --transport http huddle http://127.0.0.1:8014/mcp</span><button data-copy>копировать</button></div>
+    </div></div>
+    <div class="sec"><div class="n">03</div><div>
+      <h3>Любой клиент через stdio</h3>
+      <p>stdio — обмен через стандартный ввод и вывод процесса. Клиент сам запускает бинарник.</p>
+      <div class="code"><span>mcp-huddle</span><button data-copy>копировать</button></div>
+    </div></div>
+    <div class="sec"><div class="n">04</div><div>
+      <h3>Подсказка для агента</h3>
+      <p>Вставьте агенту целиком. Он подключится и будет соблюдать anti-loop — правило «не отвечать на ответы».</p>
+      <div class="code"><span>Connect to the huddle MCP server at http://127.0.0.1:8014/mcp — e.g. run: claude mcp add --transport http huddle http://127.0.0.1:8014/mcp
+Then use: room_list (see rooms), room_create (start one), messages_read (catch up), message_post (reply). Reuse an existing room or create a new one.
+Only answer kind=request addressed to you (to=YourName or to=all); never reply to comment/ack/result/final (anti-loop).</span><button data-copy>копировать</button></div>
+    </div></div>
+    <div class="sec"><div class="n">05</div><div>
+      <h3>Переменные окружения</h3>
+      <div class="env"><code>MCP_HUDDLE_READONLY</code><span>Агенты только читают и обсуждают — так по умолчанию. <code>=0</code> — исполнители с полным доступом.</span></div>
+      <div class="env"><code>MCP_HUDDLE_TOKEN</code><span>Если задан, защищает MCP и все данные комнат. Дашборд держит только производный ключ в памяти страницы.</span></div>
+      <div class="env"><code>MCP_HUDDLE_HOME</code><span>Папка с комнатами и логами. По умолчанию <code>~/.mcp-huddle</code>.</span></div>
+      <div class="env"><code>~/.mcp-huddle/registry.json</code><span>Добавить или переопределить агентов. Запись заменяется целиком — пишите полный <code>cmd</code>.</span></div>
+    </div></div>
+  </div>
+</section>
+
+<!-- Экран 3: обслуживание (раньше — опасные кнопки в шапке) -->
+<section class="page doc" id="page-service" hidden>
+  <div class="doc-inner">
+    <h2>Обслуживание</h2>
+    <p class="lede">Массовые действия убраны из шапки, чтобы их нельзя было нажать случайно. Порядок — от мягкого к необратимому.</p>
+    <div class="sec"><div class="n">01</div><div class="action">
+      <div><h3>Закрыть все открытые</h3><p>Останавливает запущенных агентов в <b id="svc-open">0</b> открытых комнатах. Процессы владельцев не трогаются. История остаётся.</p></div>
+      <button class="btn-line" data-act="mock">Закрыть все</button>
+    </div></div>
+    <div class="sec"><div class="n">02</div><div class="action">
+      <div><h3>Удалить закрытые</h3><p>Навсегда стирает с диска <b id="svc-closed">0</b> закрытых и решённых комнат.</p></div>
+      <button class="btn-line" data-act="mock">Удалить закрытые</button>
+    </div></div>
+    <div class="sec"><div class="n">03</div><div>
+      <h3>Снести всё</h3>
+      <div class="danger">
+        <p>Закрывает и удаляет все <b id="svc-all">0</b> комнат. Отменить нельзя. Впишите <b>СНЕСТИ</b>, чтобы кнопка стала активной.</p>
+        <div class="row"><input id="nuke" autocomplete="off" placeholder="СНЕСТИ" aria-label="Подтверждение: впишите СНЕСТИ"><button class="btn-danger" id="nuke-btn" data-act="mock" disabled>Снести всё</button></div>
+      </div>
+    </div></div>
+    <p class="fine">В макете кнопки ничего не делают — только показывают уведомление.</p>
+  </div>
+</section>
+
+<!-- Строка состояния: честная пометка + три простые настройки -->
+<footer class="status">
+  <div class="note"><span>Статический макет: 24 вымышленные комнаты, время остановлено на 24 сен 2026, 14:30. Сервер не подключён.</span></div>
+  <div class="keys"><kbd>/</kbd> поиск · <kbd>[</kbd><kbd>]</kbd> соседняя комната</div>
+  <div class="prefs" aria-label="Настройки вида">
+    <span class="lbl">тема</span>
+    <div class="seg sm" role="group" aria-label="Тема">
+      <button data-pref="theme" data-val="paper">бумага</button>
+      <button data-pref="theme" data-val="ink">чернила</button>
+    </div>
+    <span class="lbl">текст</span>
+    <span class="step"><button data-pref="fs" data-val="-1" aria-label="Мельче">A−</button><span id="fs-val">100%</span><button data-pref="fs" data-val="1" aria-label="Крупнее">A+</button></span>
+    <span class="lbl">строки</span>
+    <div class="seg sm" role="group" aria-label="Плотность">
+      <button data-pref="density" data-val="normal">просторно</button>
+      <button data-pref="density" data-val="dense">плотно</button>
+    </div>
+  </div>
+</footer>
+
+<!-- Поиск -->
+<div class="search" id="search" hidden role="dialog" aria-modal="true" aria-label="Поиск">
+  <div class="s-top"><span>Поиск по названиям комнат и тексту переписки</span><button data-act="search-close">Esc · закрыть</button></div>
+  <input class="s-input" id="q" type="search" autocomplete="off" spellcheck="false" placeholder="например, structured brief" aria-label="Что ищем">
+  <div class="s-filters">
+    <div class="seg sm" role="group" aria-label="Где искать">
+      <button data-smode="all" aria-pressed="true">везде</button>
+      <button data-smode="names" aria-pressed="false">только названия</button>
+      <button data-smode="text" aria-pressed="false">только переписка</button>
+    </div>
+    <label class="chk"><input type="checkbox" id="s-closed" checked> и в закрытых комнатах</label>
+    <span class="grow"></span>
+    <span id="s-count"></span>
+  </div>
+  <div class="s-results" id="s-res" role="listbox" aria-label="Результаты"></div>
+  <div class="s-foot"><span><kbd>↑</kbd><kbd>↓</kbd> выбрать</span><span><kbd>Enter</kbd> открыть на месте совпадения</span><span><kbd>Esc</kbd> закрыть</span><span>Дефис, точка и пробел считаются одинаковыми</span></div>
+</div>
+
+<div class="toast" id="toast" hidden role="status"></div>
+
+<script>
+(function () {
+'use strict';
+
+// ── Вымышленные данные. Время макета застыло, чтобы ничего не выглядело «живым». ──
+const NOW = new Date(2026, 8, 24, 14, 30);
+const MON = ['янв','фев','мар','апр','мая','июн','июл','авг','сен','окт','ноя','дек'];
+const MONG = ['января','февраля','марта','апреля','мая','июня','июля','августа','сентября','октября','ноября','декабря'];
+const WD = ['Вс','Пн','Вт','Ср','Чт','Пт','Сб'];
+const STATUS = {open:'Открыта', closed:'Закрыта', resolved:'Решена'};
+const GLYPH = {open:'●', closed:'○', resolved:'✓'};
+const KIND = {request:'Запрос', result:'Ответ', comment:'Комментарий', ack:'Принял', final:'Итог', system:'Система'};
+const PHASE = {working:'работает', thinking:'думает', responding:'пишет ответ', waiting:'ждёт', done:'закончил', limited:'лимит запросов'};
+const PROJECTS = {
+  'mcp-huddle':'~/Apps Projects/AgentSync/mcp-huddle', 'AgentSync':'~/Apps Projects/AgentSync',
+  'jev':'~/Apps Projects/jev', 'nine-router':'~/Apps Projects/nine-router',
+  'finance-tracker':'~/Apps Projects/finance-tracker', 'landing-2026':'~/Sites/landing-2026',
+};
+
+// n — имя, p — проект, s — статус, u — «минут назад» последнее сообщение, sp — длительность,
+// a — агенты (первый — владелец), m — переписка целиком, f — короткая переписка [запрос, кто ответил, ответ, итог].
+const SPECS = [
+  {n:'dashboard-redesign-opus55', p:'mcp-huddle', s:'open', u:9, sp:200, a:['Claude','Codex','MiMo','Antigravity'],
+   st:{Claude:['responding','пишет сводку раунда 2'], Codex:['working','читает dashboard.js — 1 840 строк'], MiMo:['done','ответ опубликован'], Antigravity:['thinking','ход идёт 41 с']},
+   lg:{Codex:['14:22  чтение src/mcp_huddle/static/dashboard.js','14:26  чтение src/mcp_huddle/static/dashboard.css']},
+   m:[
+    ['Human','request','all',1,'Я потерял комнату structured-brief-test в длинном списке. Нужен поиск по названию комнаты и по тексту переписки — чтобы найти, даже если помню только фразу.'],
+    ['Claude','request','Codex',1,'Проверь, какие данные уже отдаёт `/api/rooms` и можно ли искать по тексту без отдельного индекса.'],
+    ['Codex','result','Claude',1,'`/api/rooms` отдаёт только метаданные: имя, статус, cwd, время. Для поиска по тексту нужен проход по `messages.jsonl`. На 300 комнатах это около 40 мс — индекс пока не нужен.'],
+    ['MiMo','comment',null,1,'Выдачу стоит делить на два блока: «совпало в названии» и «совпало в переписке». Иначе непонятно, почему комната попала в результат.'],
+    ['Antigravity','comment',null,1,'Поповер «Вид» перегружен: тема, скин, палитра, язык, MCP и env в одном окне. Предлагаю вынести подключение и опасные действия на отдельные страницы, а в строке состояния оставить два-три переключателя.'],
+    ['Claude','request','all',2,'Раунд 2. Оцените компоновку: указатель комнат слева, дорожки агентов над стенограммой, поиск — отдельный экран.'],
+    ['Codex','ack','Claude',2,'Принял, читаю dashboard.js.'],
+    ['MiMo','result','Claude',2,'Дорожки понятнее правой панели: сразу видно, кто молчит. На узком экране их нужно сворачивать в одну строку.'],
+    ['System','system',null,2,'Antigravity разбужен запросом #6 и ждёт ответа модели.'],
+   ]},
+  {n:'wake-claim-race-review', p:'mcp-huddle', s:'open', u:34, sp:90, a:['Claude','Codex','DeepSeek'],
+   st:{Claude:['waiting','ждёт DeepSeek'], Codex:['limited','rate limit, повтор после 15:05'], DeepSeek:['working','пишет test_wake_claim_sigterm']},
+   m:[
+    ['Claude','request','Codex',1,'Ревью: два процесса сервера будят одного агента одновременно. Где держится claim и может ли SIGTERM снять его раньше выхода процесса?'],
+    ['Codex','result','Claude',1,'Claim пишется под meta lock в `bus.py`. Гонка возможна, если после неудачного SIGTERM claim снимается по таймауту. Нужен тест на повторный wake во время завершения.'],
+    ['DeepSeek','comment',null,1,'Согласен. Claim должен сниматься только после точного exit дочернего процесса, не по времени.'],
+    ['System','system',null,1,'Codex: rate limit (HTTP 429). Повтор не раньше 15:05.'],
+    ['Claude','request','DeepSeek',1,'Набросай тест: второй wake приходит, пока первый дочерний процесс ещё завершается.'],
+   ]},
+  {n:'search-ux-brainstorm', p:'mcp-huddle', s:'open', u:52, sp:60, a:['Claude','MiMo','Qwen'],
+   f:['Как искать по сотням комнат: только по названию или ещё по тексту переписки? Нужна понятная выдача.','Qwen','Искать по обоим. Выдачу делить: сначала совпадения в названии, ниже — фразы из переписки с подсветкой и именем комнаты.','Беру в работу, переношу в dashboard-redesign-opus55.']},
+  {n:'jev-batch-score-calibration', p:'jev', s:'resolved', u:95, sp:70, a:['Claude','Qwen','Codex'],
+   m:[
+    ['Claude','request','all',1,'Калибруем batch score: одинаковый контекст, 5 кандидатов. Разброс confidence больше 0.2 — это шум или сигнал?'],
+    ['Qwen','result','Claude',1,'На 40 прогонах разброс 0.08–0.23. Выше 0.2 — только когда среди кандидатов нет варианта none.'],
+    ['Codex','result','Claude',1,'Предлагаю порог low confidence = 0.35 и всегда добавлять кандидата none.'],
+    ['Claude','comment',null,1,'Предложение резолюции: порог 0.35, none обязателен. Прошу ack.'],
+    ['System','system',null,1,'Резолюция принята: Claude, Qwen, Codex — ack. Комната решена.'],
+   ]},
+  {n:'nine-router-fallback-order', p:'nine-router', s:'open', u:140, sp:45, a:['Codex','DeepSeek'],
+   f:['Порядок fallback при 429: сначала младшая модель того же провайдера или сразу другой провайдер?','DeepSeek','Сначала тот же провайдер с младшей моделью: контекст и формат ответа совпадают. Другой провайдер — вторым шагом.','Ок, жду замер задержек до вечера.']},
+  {n:'pypi-release-0.9.4', p:'mcp-huddle', s:'closed', u:210, sp:40, a:['Claude','Codex'],
+   f:['Релиз 0.9.4: версия поднята в двух файлах, changelog готов. Проверьте wheel перед загрузкой.','Codex','Wheel собран, `pip check` чистый, папка static/ внутри пакета на месте.','Опубликовано на PyPI. Bridge перезапущен.']},
+  {n:'landing-hero-copy-v3', p:'landing-2026', s:'open', u:320, sp:120, a:['Claude','MiMo','Qwen'],
+   f:['Нужен заголовок первого экрана без «революционный» и «AI-powered». Три варианта.','MiMo','1) «Агенты спорят — вы решаете». 2) «Одна комната на всю команду моделей». 3) «Второе мнение за минуту».','Вариант 1 уходит на A/B-тест.']},
+  {n:'finance-weekly-digest', p:'finance-tracker', s:'closed', u:610, sp:30, a:['Codex','MiMo'],
+   f:['Сводка за неделю: траты выросли на 18 %. Найти три категории-причины.','MiMo','Кафе +42 %, такси +31 %, подписки +12 % (новая подписка за 1 290 ₽).','Сводка сохранена в заметки.']},
+  {n:'harness-routing-audit', p:'AgentSync', s:'resolved', u:780, sp:150, a:['Claude','Codex','Antigravity'],
+   f:['Аудит harness-routing: какие маршруты устарели после перехода на OpenCode?','Codex','Устарели два: прямой вызов gemini CLI (срок поддержки истёк) и старый путь к agy. Остальные рабочие.','Резолюция: убрать два маршрута, остальное без изменений.']},
+  {n:'opencode-spawn-slot', p:'mcp-huddle', s:'closed', u:1010, sp:80, a:['Claude','Codex'],
+   f:['Добавить OpenCode как spawn-слот через registry.json. Нужна полная cmd.','Codex','Готово: запись с полным cmd, в pass_env только имена переменных. Проверил wake на тестовой комнате.','Слот работает, закрываю.']},
+  {n:'antigravity-login-check', p:'mcp-huddle', s:'closed', u:1200, sp:25, a:['Claude','Antigravity'],
+   f:['Antigravity не отвечает после wake. Проверить, жив ли логин agy.','Antigravity','Логин истёк. После интерактивного agy login отвечаю нормально.','Причина найдена, закрываю.']},
+  {n:'skill-assign-agent-v2', p:'AgentSync', s:'resolved', u:1500, sp:200, a:['Claude','Codex','MiMo'],
+   f:['Обновить skill assign-agent: брифы получаются длинными. Что убрать?','MiMo','Убрать повтор цели в RETURN и пример ответа. Оставить поля, запреты и критерий готовности.','Принято, v2 в работе. Формат проверяем в structured-brief-test.']},
+  {n:'readonly-transform-codex', p:'mcp-huddle', s:'closed', u:1720, sp:60, a:['Claude','Codex'],
+   f:['Проверить, что read-only transform для Codex не ломает resume потока.','Codex','Resume работает: sandbox read-only передаётся и в новом, и в продолженном ходе.','Проверено, закрываю.']},
+  {n:'budget-categories-merge', p:'finance-tracker', s:'closed', u:2300, sp:50, a:['Codex','Qwen'],
+   f:['Слить категории «Еда вне дома» и «Кафе» без потери истории.','Qwen','Миграция: переименовать старую категорию, перенести 214 операций, оставить алиас на месяц.','Слито.']},
+  {n:'dashboard-i18n-pass', p:'mcp-huddle', s:'closed', u:2600, sp:90, a:['Claude','Qwen','DeepSeek'],
+   f:['Проход по переводам дашборда: 10 языков, найти строки без ключа `t()`.','DeepSeek','Нашёл 6 строк без ключа, в основном подсказки у кнопок панелей.','Исправлено, закрываю.']},
+  {n:'jev-noul-thresholds', p:'jev', s:'closed', u:3100, sp:40, a:['Claude','Qwen'],
+   f:['Какой порог noul считать «вероятно да»?','Qwen','0.7 на наших данных. Ниже — много ложных «да» на коротких текстах.','Фиксируем 0.7.']},
+  {n:'structured-brief-test', p:'AgentSync', s:'closed', u:3900, sp:55, a:['Claude','Codex','MiMo'],
+   m:[
+    ['Claude','request','all',1,'Тест формата structured brief: TYPE / TASK_ID / GOAL / OWNERSHIP / DONE_WHEN / RETURN. Понятен ли бриф без контекста чата? Ответ — одно замечание и одна правка.'],
+    ['Codex','result','Claude',1,'Бриф понятен. Замечание: OWNERSHIP без пути к worktree читается двусмысленно. Правка: абсолютный путь и явное «пиши только сюда».'],
+    ['MiMo','result','Claude',1,'Не хватает поля CONSTRAINTS для запретов: сеть, commit, публикация. Без него исполнитель сам решает, что можно.'],
+    ['Claude','comment',null,1,'Принято: добавляю CONSTRAINTS и абсолютный путь в OWNERSHIP. Второй прогон через 10 минут.'],
+    ['Claude','request','all',2,'Прогон 2 с обновлённым шаблоном. Хватает ли в RETURN «пути файлов + ограничения»?'],
+    ['Codex','result','Claude',2,'Хватает. Предлагаю ещё требовать в RETURN разделение «подготовлено / применено / подтверждено».'],
+    ['System','system',null,2,'Codex завершил ход (exit 0).'],
+    ['Claude','final',null,2,'Шаблон structured brief v2 зафиксирован в skill assign-agent. Комната закрыта.'],
+   ]},
+  {n:'mimo-temp-cwd-leak', p:'mcp-huddle', s:'resolved', u:4300, sp:70, a:['Claude','MiMo','Codex'],
+   f:['MiMo оставляет временные папки после хода. Утечка или так задумано?','Codex','Утечка: папка не удаляется, если модель вернула ошибку. Нужен finally.','Резолюция: чинить через finally, добавить тест на ошибочный ход.']},
+  {n:'landing-pricing-table', p:'landing-2026', s:'closed', u:5200, sp:60, a:['MiMo','Qwen'],
+   f:['Таблица цен: три тарифа или два?','Qwen','Два: «Соло» и «Команда». Третий тариф в опросе никто не выбрал.','Два тарифа.']},
+  {n:'notify-file-hook-poll', p:'mcp-huddle', s:'closed', u:6100, sp:45, a:['Claude','Codex'],
+   f:['notify_register: хук опрашивает файл раз в 2 с. Не слишком часто?','Codex','Нормально: это чтение маленького JSON, нагрузки не видно даже на 20 комнатах.','Оставляем 2 с.']},
+  {n:'router-cost-report-aug', p:'nine-router', s:'closed', u:7400, sp:35, a:['DeepSeek','Codex'],
+   f:['Отчёт по стоимости маршрутов за август.','Codex','Итого 38 $. 71 % — длинные контексты в ревью. Совет: резать контекст перед ревью.','Отчёт сохранён.']},
+  {n:'capability-router-gaps', p:'AgentSync', s:'closed', u:8800, sp:90, a:['Claude','Antigravity'],
+   f:['Какие способности не покрыты capability-router?','Antigravity','Нет маршрута для распознавания аудио и для OCR сканов.','Записал в TODO.']},
+  {n:'room-round-advance-demo', p:'mcp-huddle', s:'closed', u:10100, sp:30, a:['Claude','Codex','MiMo'],
+   f:['Демо раундов: room_round_advance, три участника, два раунда.','MiMo','Разделители раундов видны, `messages_read(round=2)` отдаёт только второй раунд.','Демо готово.']},
+  {n:'finance-import-bank-csv', p:'finance-tracker', s:'closed', u:11500, sp:60, a:['Codex','MiMo'],
+   f:['Импорт CSV из банка: даты вида 21.09.2026 12:04, суммы с запятой.','Codex','Парсер готов: dd.mm.yyyy HH:MM, запятая → точка, 1 083 строки без ошибок.','Импорт работает.']},
+];
+
+let MID = 0;
+function filler(s) {
+  const [q, who, ans, fin] = s.f, o = s.a[0];
+  return [[o,'request','all',1,q],[who,'result',o,1,ans],[o, s.s === 'open' ? 'comment' : 'final', null, 1, fin]];
+}
+const ROOMS = SPECS.map(s => {
+  const r = {id:s.n, name:s.n, project:s.p, status:s.s, updated:s.u, span:s.sp, agents:s.a, owner:s.a[0],
+    states:s.st || {}, logs:s.lg || {}, messages:[]};
+  const raw = s.m || filler(s), n = raw.length;
+  raw.forEach((x, i) => {
+    const t = n === 1 ? s.u : Math.round(s.u + s.sp * (1 - i / (n - 1)));
+    r.messages.push({id:++MID, no:i + 1, author:x[0], kind:x[1], to:x[2], round:x[3], body:x[4], t});
+  });
+  r.round = Math.max(...r.messages.map(m => m.round));
+  return r;
+});
+const byId = id => ROOMS.find(r => r.id === id);
+
+// ── Помощники ──
+const $ = sel => document.querySelector(sel);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const pad = n => String(n).padStart(2, '0');
+const at = min => new Date(NOW.getTime() - min * 60000);
+const hm = min => { const d = at(min); return pad(d.getHours()) + ':' + pad(d.getMinutes()); };
+function dayIndex(min) {
+  const d = at(min);
+  return Math.round((Date.UTC(NOW.getFullYear(), NOW.getMonth(), NOW.getDate()) - Date.UTC(d.getFullYear(), d.getMonth(), d.getDate())) / 86400000);
+}
+function fullTime(min) { const k = dayIndex(min), d = at(min); return k === 0 ? hm(min) : k === 1 ? 'вчера ' + hm(min) : d.getDate() + ' ' + MON[d.getMonth()] + ' ' + hm(min); }
+function shortTime(min) { const k = dayIndex(min), d = at(min); return k === 0 ? hm(min) : k === 1 ? 'вчера' : d.getDate() + ' ' + MON[d.getMonth()]; }
+function dayTitle(min) { const k = dayIndex(min), d = at(min); return k === 0 ? 'Сегодня' : k === 1 ? 'Вчера' : WD[d.getDay()] + ', ' + d.getDate() + ' ' + MONG[d.getMonth()]; }
+function plural(n, f) { const a = n % 10, b = n % 100; return f[(a === 1 && b !== 11) ? 0 : (a >= 2 && a <= 4 && (b < 10 || b >= 20)) ? 1 : 2]; }
+const color = a => `var(--a-${String(a).toLowerCase()}, var(--muted))`;
+const MSG_F = ['сообщение','сообщения','сообщений'];
+
+// Поиск: дефис, подчёркивание, точка, слэш и пробел равны; «е» находит «ё».
+function buildRe(q) {
+  const toks = String(q).trim().toLowerCase().split(/[\s\-_./]+/).filter(Boolean);
+  if (!toks.length) return null;
+  const src = toks.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/[её]/g, '[её]')).join('[\\s\\-_./]*');
+  return new RegExp(src, 'gi');
+}
+function test(re, s) { re.lastIndex = 0; return re.test(s); }
+function hlText(s, re) {
+  if (!re) return esc(s);
+  re.lastIndex = 0;
+  let out = '', last = 0, m;
+  while ((m = re.exec(s))) {
+    if (!m[0].length) { re.lastIndex++; continue; }
+    out += esc(s.slice(last, m.index)) + '<mark>' + esc(m[0]) + '</mark>';
+    last = m.index + m[0].length;
+  }
+  return out + esc(s.slice(last));
+}
+function fmtBody(text, re) {
+  return text.split('\n').map(line => '<p>' + line.split('`').map((seg, i) => {
+    const h = hlText(seg, re);
+    return i % 2 ? `<code>${h}</code>` : h;
+  }).join('') + '</p>').join('');
+}
+function snippet(text, re) {
+  const plain = text.replace(/`/g, '');
+  re.lastIndex = 0;
+  const m = re.exec(plain), i = m ? m.index : 0;
+  const a = Math.max(0, i - 70), b = Math.min(plain.length, i + (m ? m[0].length : 0) + 110);
+  return (a > 0 ? '…' : '') + hlText(plain.slice(a, b), re) + (b < plain.length ? '…' : '');
+}
+// Ошибка раскладки: «ыекгсегкув» → «structured».
+const RU = 'йцукенгшщзхъфывапролджэячсмитьбю', EN = "qwertyuiop[]asdfghjkl;'zxcvbnm,.";
+function swapLayout(s) {
+  const toEn = /[а-яё]/i.test(s);
+  let out = '';
+  for (const ch of s.toLowerCase()) {
+    const i = toEn ? RU.indexOf(ch) : EN.indexOf(ch);
+    out += i >= 0 ? (toEn ? EN[i] : RU[i]) : ch;
+  }
+  return out;
+}
+
+let toastTimer;
+function toast(text) {
+  const t = $('#toast');
+  t.textContent = text; t.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.hidden = true; }, 2600);
+}
+
+// ── Состояние интерфейса ──
+const S = {page:'rooms', view:'latest', showClosed:true, cur:'dashboard-redesign-opus55', hl:'', hits:[], hitPos:-1,
+  openLog:{}, lanesCollapsed:false, order:[], recent:[], kind:'request'};
+const P = {theme:'paper', fs:1, density:'normal'};
+try { Object.assign(P, JSON.parse(localStorage.getItem('huddle-mock-opus55') || '{}')); } catch (e) { /* без сохранения */ }
+
+function applyPrefs() {
+  const h = document.documentElement;
+  h.dataset.theme = P.theme; h.dataset.fs = P.fs; h.dataset.density = P.density;
+  $('#fs-val').textContent = ['90%','100%','112%'][P.fs];
+  document.querySelectorAll('[data-pref="theme"],[data-pref="density"]').forEach(b => b.setAttribute('aria-pressed', String(P[b.dataset.pref] === b.dataset.val)));
+  try { localStorage.setItem('huddle-mock-opus55', JSON.stringify(P)); } catch (e) { /* file:// может запретить */ }
+}
+
+function setPage(p) {
+  S.page = p;
+  ['rooms','connect','service'].forEach(id => { $('#page-' + id).hidden = id !== p; });
+  document.querySelectorAll('.tab').forEach(t => {
+    if (t.dataset.page === p) t.setAttribute('aria-current', 'page'); else t.removeAttribute('aria-current');
+  });
+}
+
+// ── Указатель ──
+function roomRow(r) {
+  const who = [...new Set(r.messages.map(m => m.author))].filter(a => a !== 'System').join(', ');
+  return `<li class="room${r.status !== 'open' ? ' closed' : ''}" data-id="${esc(r.id)}" tabindex="0" role="button" aria-current="${r.id === S.cur}">
+    <span class="st st-${r.status}" title="${STATUS[r.status]}">${GLYPH[r.status]}</span>
+    <span class="nm">${esc(r.name)}</span><span class="tm">${shortTime(r.updated)}</span>
+    <span class="mt">${S.view === 'latest' ? esc(r.project) + ' · ' : ''}${r.messages.length} ${plural(r.messages.length, MSG_F)} · ${esc(who)}</span></li>`;
+}
+function renderList() {
+  const rooms = ROOMS.filter(r => S.showClosed || r.status === 'open').sort((a, b) => a.updated - b.updated);
+  const groups = [];
+  if (S.view === 'latest') {
+    for (const r of rooms) {
+      const k = dayIndex(r.updated);
+      let g = groups[groups.length - 1];
+      if (!g || g.key !== k) groups.push(g = {key:k, title:dayTitle(r.updated), sub:'', rooms:[]});
+      g.rooms.push(r);
+    }
+  } else {
+    const map = new Map();
+    for (const r of rooms) {
+      if (!map.has(r.project)) map.set(r.project, {key:r.project, title:r.project, sub:PROJECTS[r.project], rooms:[]});
+      map.get(r.project).rooms.push(r);
+    }
+    groups.push(...map.values());
+  }
+  S.order = groups.flatMap(g => g.rooms.map(r => r.id));
+  const open = ROOMS.filter(r => r.status === 'open').length;
+  $('#sum').innerHTML = `<span>${rooms.length} ${plural(rooms.length, ['комната','комнаты','комнат'])} · ${open} открыто</span><button type="button" data-act="search">Не находите нужную?</button>`;
+  $('#rooms').innerHTML = groups.map(g =>
+    `<li class="grp"><b>${esc(g.title)}${g.sub ? `<span class="path">${esc(g.sub)}</span>` : ''}</b><small>${g.rooms.length}</small></li>` +
+    g.rooms.map(roomRow).join('')).join('');
+  document.querySelectorAll('[data-view]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.view === S.view)));
+  $('#svc-open').textContent = open;
+  $('#svc-closed').textContent = ROOMS.length - open;
+  $('#svc-all').textContent = ROOMS.length;
+}
+
+// ── Комната: шапка, дорожки, стенограмма, поле ввода ──
+function stateOf(r, a) {
+  if (r.states[a]) return r.states[a];
+  if (r.status !== 'open') return ['done', 'ход завершён'];
+  const last = r.messages[r.messages.length - 1];
+  return last && last.to === a ? ['thinking', 'разбужен запросом #' + last.no] : ['waiting', 'ждёт запроса'];
+}
+function logOf(r, a, ph, detail) {
+  const lines = r.messages.filter(m => m.author === a || m.to === a).map(m => m.author === a
+    ? `${hm(m.t)}  опубликовал: ${KIND[m.kind].toLowerCase()} #${m.no}`
+    : `${hm(m.t)}  разбужен: запрос #${m.no} от ${m.author}`);
+  lines.push(...(r.logs[a] || []));
+  lines.push(`—      сейчас: ${PHASE[ph]} · ${detail}`);
+  return lines.join('\n');
+}
+function lanesHtml(r) {
+  const start = r.updated + r.span, end = r.status === 'open' ? 0 : r.updated;
+  const W = Math.max(1, start - end);
+  const count = {};
+  const rows = r.agents.map(a => {
+    const [ph, detail] = stateOf(r, a);
+    count[ph] = (count[ph] || 0) + 1;
+    const ticks = r.messages.filter(m => m.author === a).map(m =>
+      `<button class="tick k-${m.kind}" style="left:${((start - m.t) / W * 100).toFixed(2)}%" data-jump="${m.id}" title="#${m.no} ${KIND[m.kind]} · ${fullTime(m.t)}" aria-label="Перейти к сообщению #${m.no}"></button>`).join('');
+    const key = r.id + '/' + a, open = !!S.openLog[key];
+    return `<div class="lane" style="--c:${color(a)}">
+      <button class="lane-name" data-log="${esc(a)}" aria-expanded="${open}" title="Журнал агента"><i class="sw"></i>${esc(a)}</button>
+      <span class="ph ph-${ph}">${PHASE[ph]}</span>
+      <div class="track">${ticks}${r.status === 'open' ? '<span class="now" title="Сейчас (время макета 14:30)"></span>' : ''}</div>
+      <span class="detail" title="${esc(detail)}">${esc(detail)}</span></div>` +
+      (open ? `<div class="log">${esc(logOf(r, a, ph, detail))}</div>` : '');
+  }).join('');
+  const summary = Object.entries(count).map(([k, v]) => `${PHASE[k]} — ${v}`).join(' · ');
+  return `<div class="lanes-top"><span>Агенты: ${summary}</span><span class="grow"></span>
+    <span>${fullTime(start)} → ${r.status === 'open' ? 'сейчас' : fullTime(end)} · ▢ запрос ■ ответ • реплика</span>
+    <button class="link" data-act="lanes">${S.lanesCollapsed ? 'развернуть' : 'свернуть'}</button></div>${rows}`;
+}
+function renderLanes() {
+  const el = $('#lanes');
+  if (!el) return;
+  el.className = 'lanes' + (S.lanesCollapsed ? ' collapsed' : '');
+  el.innerHTML = lanesHtml(byId(S.cur));
+}
+function hitbarHtml(r, re) {
+  S.hits = re ? r.messages.filter(m => test(re, m.body)).map(m => m.id) : [];
+  if (!re) return '';
+  const n = S.hits.length, nameHit = test(re, r.name);
+  const txt = n
+    ? `«${esc(S.hl)}»: ${n} ${plural(n, ['совпадение','совпадения','совпадений'])} в переписке${nameHit ? ' и в названии' : ''}`
+    : `«${esc(S.hl)}» совпало только в названии комнаты`;
+  return `<div class="hitbar" id="hitbar"><span>${txt}</span>${n ? `<button data-act="hit-prev">↑ пред.</button><button data-act="hit-next">↓ след.</button><span id="hit-pos"></span>` : ''}<span class="grow"></span><button data-act="hit-clear">сбросить подсветку ×</button></div>`;
+}
+function transcriptHtml(r, re) {
+  let html = '', round = 0;
+  for (const m of r.messages) {
+    if (m.round !== round) { round = m.round; html += `<div class="round"><span>Раунд ${round}</span></div>`; }
+    const hit = re && test(re, m.body) ? ' is-hit' : '';
+    if (m.kind === 'system') {
+      html += `<div class="msg sys${hit}" id="m${m.id}"><div class="when">${fullTime(m.t)} · #${m.no}</div><div>§ ${fmtBody(m.body, re)}</div></div>`;
+      continue;
+    }
+    const to = m.to ? ` → ${m.to === 'all' ? 'всем' : esc(m.to)}` : '';
+    html += `<article class="msg k-${m.kind}${hit}" id="m${m.id}" style="--c:${color(m.author)}">
+      <div><div class="who">${esc(m.author)}</div><div class="when">${fullTime(m.t)} · #${m.no}</div></div>
+      <div><div class="kind">${KIND[m.kind]}${to}${m.local ? '<span class="local-tag">только на этой странице</span>' : ''}</div><div class="body">${fmtBody(m.body, re)}</div></div></article>`;
+  }
+  return html;
+}
+function composerHtml(r) {
+  if (r.status !== 'open') return `<div class="readonly">Комната ${r.status === 'resolved' ? 'решена' : 'закрыта'} — только чтение. Писать можно в открытые комнаты.</div>`;
+  const opts = ['all', ...r.agents].map(a => `<option value="${esc(a)}">${a === 'all' ? 'всем' : esc(a)}</option>`).join('');
+  return `<form class="composer" id="composer">
+    <div class="c-row"><span>От имени Human</span>
+      <div class="seg sm" role="group" aria-label="Тип сообщения"><button type="button" data-kind="request" aria-pressed="${S.kind === 'request'}">запрос</button><button type="button" data-kind="comment" aria-pressed="${S.kind === 'comment'}">комментарий</button></div>
+      <label>кому <select id="to">${opts}</select></label>
+      <span>в продукте запрос разбудит адресата · в макете никто не проснётся</span></div>
+    <textarea id="text" rows="2" placeholder="Написать в комнату…  Ctrl+Enter — добавить"></textarea>
+    <button class="btn-ink" type="submit">Добавить</button></form>`;
+}
+function renderView() {
+  const r = byId(S.cur);
+  if (!r) return;
+  const re = S.hl ? buildRe(S.hl) : null;
+  $('#view').innerHTML = `
+    <div class="head">
+      <div class="crumbs"><button class="link menu-rooms" data-act="drawer">☰ комнаты</button><span>${esc(r.project)} — ${esc(PROJECTS[r.project])}</span></div>
+      <h1>${hlText(r.name, re)}</h1>
+      <div class="acts"><button class="link" data-act="copy-name">копировать имя</button>${r.status === 'open' ? '<button class="link" data-act="mock">закрыть комнату</button>' : ''}</div>
+      <div class="facts"><span class="s-${r.status}">${STATUS[r.status]}</span><span>раунд ${r.round}</span><span>владелец ${esc(r.owner)}</span><span>${r.messages.length} ${plural(r.messages.length, MSG_F)}</span><span>обновлена ${fullTime(r.updated)}</span></div>
+    </div>
+    <div id="lanes" class="lanes"></div>
+    ${hitbarHtml(r, re) || '<div></div>'}
+    <div class="transcript" id="transcript">${transcriptHtml(r, re)}</div>
+    ${composerHtml(r)}`;
+  renderLanes();
+}
+function jumpTo(id) {
+  const el = document.getElementById('m' + id);
+  if (!el) return;
+  el.scrollIntoView({block:'center'});
+  el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');
+  const pos = $('#hit-pos'), i = S.hits.indexOf(id);
+  if (pos && i >= 0) { S.hitPos = i; pos.textContent = `${i + 1} из ${S.hits.length}`; }
+}
+function openRoom(id, o = {}) {
+  S.cur = id; S.hl = o.q || ''; S.hitPos = -1;
+  S.recent = [id, ...S.recent.filter(x => x !== id)].slice(0, 5);
+  setPage('rooms'); renderList(); renderView();
+  document.body.classList.remove('drawer');
+  const row = document.querySelector('.room[aria-current="true"]');
+  if (row) row.scrollIntoView({block:'nearest'});
+  const tr = $('#transcript');
+  if (o.msg) requestAnimationFrame(() => jumpTo(o.msg));
+  else if (S.hits.length) requestAnimationFrame(() => jumpTo(S.hits[0]));
+  else { tr.style.scrollBehavior = 'auto'; tr.scrollTop = tr.scrollHeight; tr.style.scrollBehavior = ''; }
+}
+function submitMsg() {
+  const r = byId(S.cur), ta = $('#text');
+  if (!r || !ta) return;
+  const body = ta.value.trim();
+  if (!body) { ta.focus(); return; }
+  r.messages.push({id:++MID, no:r.messages.length + 1, author:'Human', kind:S.kind, to:S.kind === 'request' ? $('#to').value : null,
+    round:r.round, body, t:0, local:true});
+  r.updated = 0;
+  renderList(); renderView();
+  const tr = $('#transcript'); tr.scrollTop = tr.scrollHeight;
+  toast('Добавлено только на этой странице. Сервер ничего не получил.');
+}
+
+// ── Поиск ──
+const SS = {mode:'all', closed:true, sel:0, items:[]};
+function openSearch(prefill) {
+  $('#search').hidden = false;
+  const q = $('#q');
+  if (prefill != null) q.value = prefill;
+  q.focus(); q.select();
+  runSearch();
+}
+function closeSearch() { $('#search').hidden = true; $('#find').focus(); }
+function hitBtn(i, inner) { return `<button class="hit" data-hit="${i}" role="option" aria-selected="${i === SS.sel}">${inner}</button>`; }
+function roomHit(i, r, re, extra) {
+  return hitBtn(i, `<div class="hn"><span class="st st-${r.status}">${GLYPH[r.status]}</span> ${hlText(r.name, re)}</div>
+    <div class="hm">${esc(r.project)} · ${STATUS[r.status].toLowerCase()} · ${fullTime(r.updated)}${extra || ''}</div>`);
+}
+function emptyHtml() {
+  const rec = (S.recent.length ? S.recent : S.order.slice(0, 5)).map(byId).filter(Boolean);
+  rec.forEach(r => SS.items.push({id:r.id}));
+  return `<div class="s-col"><h3>${S.recent.length ? 'Недавно открытые' : 'Свежие комнаты'} <small>${rec.length}</small></h3>
+    ${rec.map((r, i) => roomHit(i, r, null)).join('')}</div>
+    <div class="s-col"><h3>Как искать</h3><div class="tips">
+      <p>Одно поле ищет сразу в названиях комнат и в тексте всех сообщений.</p>
+      <p>Дефис, точка и пробел считаются одинаковыми: «structured brief» найдёт <code>structured-brief-test</code>.</p>
+      <p>Набрали в русской раскладке — предложим исправление.</p>
+      <div class="try"><button data-act="suggest" data-q="structured">structured</button><button data-act="suggest" data-q="read-only">read-only</button><button data-act="suggest" data-q="rate limit">rate limit</button><button data-act="suggest" data-q="ыекгсегкув">ыекгсегкув</button></div>
+    </div></div>`;
+}
+function runSearch() {
+  const q = $('#q').value.trim(), re = buildRe(q), box = $('#s-res');
+  SS.items = []; SS.sel = 0;
+  box.classList.remove('one');
+  if (!re) { box.innerHTML = emptyHtml(); $('#s-count').textContent = ''; return; }
+  const pool = ROOMS.filter(r => SS.closed || r.status === 'open');
+  const ql = q.toLowerCase();
+  const rank = r => r.name.toLowerCase() === ql ? 0 : r.name.toLowerCase().startsWith(ql) ? 1 : 2;
+  const rh = SS.mode === 'text' ? [] : pool.filter(r => test(re, r.name)).sort((a, b) => rank(a) - rank(b) || a.updated - b.updated);
+  const mh = SS.mode === 'names' ? [] : pool.flatMap(r => r.messages.filter(m => test(re, m.body)).map(m => ({r, m}))).sort((a, b) => a.m.t - b.m.t);
+  $('#s-count').textContent = `комнат по названию: ${rh.length} · сообщений: ${mh.length}`;
+
+  if (!rh.length && !mh.length) {
+    const alt = swapLayout(q), altRe = buildRe(alt);
+    const altN = altRe ? pool.filter(r => test(altRe, r.name) || r.messages.some(m => test(altRe, m.body))).length : 0;
+    box.innerHTML = `<div class="s-empty">По «${esc(q)}» ничего не нашлось${SS.closed ? '' : ' среди открытых комнат'}.` +
+      (altN ? `<br>Похоже на другую раскладку: <button class="suggest" data-act="suggest" data-q="${esc(alt)}">${esc(alt)}</button> — ${altN} ${plural(altN, ['комната','комнаты','комнат'])}.` : '') +
+      (!SS.closed ? `<br><button class="suggest" data-act="with-closed">Искать и в закрытых комнатах</button>` : '') + '</div>';
+    return;
+  }
+  let i = 0, html = '';
+  if (SS.mode !== 'text') {
+    html += `<div class="s-col"><h3>Совпало в названии <small>${rh.length}</small></h3>` +
+      (rh.length ? rh.map(r => {
+        SS.items.push({id:r.id});
+        const tc = r.messages.filter(m => test(re, m.body)).length;
+        return roomHit(i++, r, re, tc ? ` · ещё ${tc} в переписке` : '');
+      }).join('') : `<div class="why">В названиях нет. Смотрите переписку${SS.mode === 'all' ? ' справа' : ''}.</div>`) + '</div>';
+  }
+  if (SS.mode !== 'names') {
+    const LIMIT = 40;
+    html += `<div class="s-col"><h3>Совпало в переписке <small>${mh.length}</small></h3>` +
+      (mh.length ? mh.slice(0, LIMIT).map(({r, m}) => {
+        SS.items.push({id:r.id, msg:m.id});
+        return hitBtn(i++, `<div class="hm"><b>${esc(r.name)}</b> · ${esc(m.author)} · ${KIND[m.kind].toLowerCase()} #${m.no} · ${fullTime(m.t)}</div><div class="hs">${snippet(m.body, re)}</div>`);
+      }).join('') + (mh.length > LIMIT ? `<div class="more">и ещё ${mh.length - LIMIT} — уточните запрос</div>` : '')
+      : '<div class="why">В тексте сообщений нет.</div>') + '</div>';
+  }
+  if (SS.mode !== 'all') box.classList.add('one');
+  box.innerHTML = html;
+}
+function updateSel() {
+  document.querySelectorAll('.hit').forEach(b => b.setAttribute('aria-selected', String(Number(b.dataset.hit) === SS.sel)));
+  const cur = document.querySelector('.hit[aria-selected="true"]');
+  if (cur) cur.scrollIntoView({block:'nearest'});
+}
+function openHit(i) {
+  const it = SS.items[i];
+  if (!it) return;
+  const q = $('#q').value.trim();
+  $('#search').hidden = true;
+  openRoom(it.id, {q, msg:it.msg});
+}
+
+// ── События ──
+document.addEventListener('click', e => {
+  const t = e.target.closest('[data-hit],[data-jump],[data-log],[data-kind],[data-pref],[data-smode],[data-view],[data-page],[data-copy],[data-act],[data-id]');
+  if (!t) return;
+  const d = t.dataset;
+  if (d.hit != null) return openHit(Number(d.hit));
+  if (d.jump) return jumpTo(Number(d.jump));
+  if (d.log) { const k = S.cur + '/' + d.log; S.openLog[k] = !S.openLog[k]; return renderLanes(); }
+  if (d.kind) { S.kind = d.kind; t.parentElement.querySelectorAll('[data-kind]').forEach(b => b.setAttribute('aria-pressed', String(b === t))); return; }
+  if (d.pref) {
+    if (d.pref === 'fs') P.fs = Math.max(0, Math.min(2, Number(P.fs) + Number(d.val)));
+    else P[d.pref] = d.val;
+    return applyPrefs();
+  }
+  if (d.smode) { SS.mode = d.smode; document.querySelectorAll('[data-smode]').forEach(b => b.setAttribute('aria-pressed', String(b === t))); runSearch(); return $('#q').focus(); }
+  if (d.view) { S.view = d.view; return renderList(); }
+  if (d.page) return setPage(d.page);
+  if (d.copy != null) {
+    const text = t.previousElementSibling.textContent;
+    if (navigator.clipboard) navigator.clipboard.writeText(text).then(() => toast('Скопировано'), () => toast('Браузер не дал скопировать — выделите текст вручную'));
+    else toast('Браузер не дал скопировать — выделите текст вручную');
+    return;
+  }
+  if (d.id) return openRoom(d.id);
+  switch (d.act) {
+    case 'search': return openSearch();
+    case 'search-close': return closeSearch();
+    case 'suggest': $('#q').value = d.q; runSearch(); return $('#q').focus();
+    case 'with-closed': SS.closed = true; $('#s-closed').checked = true; runSearch(); return $('#q').focus();
+    case 'lanes': S.lanesCollapsed = !S.lanesCollapsed; return renderLanes();
+    case 'drawer': return document.body.classList.add('drawer');
+    case 'drawer-close': return document.body.classList.remove('drawer');
+    case 'hit-prev': case 'hit-next': {
+      const n = S.hits.length;
+      if (!n) return;
+      S.hitPos = (S.hitPos + (d.act === 'hit-next' ? 1 : -1) + n) % n;
+      return jumpTo(S.hits[S.hitPos]);
+    }
+    case 'hit-clear': {
+      const st = $('#transcript').scrollTop;
+      S.hl = ''; renderView();
+      $('#transcript').style.scrollBehavior = 'auto'; $('#transcript').scrollTop = st; $('#transcript').style.scrollBehavior = '';
+      return;
+    }
+    case 'copy-name':
+      if (navigator.clipboard) navigator.clipboard.writeText(S.cur).then(() => toast('Имя комнаты скопировано'), () => toast('Браузер не дал скопировать'));
+      return;
+    case 'mock': return toast('Макет: ничего не закрыто и не удалено.');
+  }
+});
+document.addEventListener('submit', e => { if (e.target.id === 'composer') { e.preventDefault(); submitMsg(); } });
+$('#show-closed').addEventListener('change', e => { S.showClosed = e.target.checked; renderList(); });
+$('#s-closed').addEventListener('change', e => { SS.closed = e.target.checked; runSearch(); });
+$('#q').addEventListener('input', runSearch);
+$('#nuke').addEventListener('input', e => { $('#nuke-btn').disabled = e.target.value.trim().toUpperCase() !== 'СНЕСТИ'; });
+
+document.addEventListener('keydown', e => {
+  const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName || '');
+  const searchOpen = !$('#search').hidden;
+  if (e.code === 'KeyK' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); return searchOpen ? closeSearch() : openSearch(); }
+  if (searchOpen) {
+    if (e.key === 'Escape') { e.preventDefault(); closeSearch(); }
+    else if ((e.key === 'ArrowDown' || e.key === 'ArrowUp') && SS.items.length) {
+      e.preventDefault();
+      SS.sel = (SS.sel + (e.key === 'ArrowDown' ? 1 : -1) + SS.items.length) % SS.items.length;
+      updateSel();
+    } else if (e.key === 'Enter' && e.target.id === 'q') { e.preventDefault(); openHit(SS.sel); }
+    return;
+  }
+  if (typing) {
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && e.target.id === 'text') { e.preventDefault(); submitMsg(); }
+    return;
+  }
+  if (e.key === '/' || e.code === 'Slash') { e.preventDefault(); openSearch(); }
+  else if (e.code === 'BracketLeft' || e.code === 'BracketRight') {
+    if (S.page !== 'rooms') return;
+    const i = S.order.indexOf(S.cur), next = S.order[i + (e.code === 'BracketRight' ? 1 : -1)];
+    if (next) openRoom(next);
+  } else if (e.key === 'Enter' && e.target.classList && e.target.classList.contains('room')) openRoom(e.target.dataset.id);
+  else if (e.key === 'Escape') {
+    document.body.classList.remove('drawer');
+    if (S.hl) { S.hl = ''; renderView(); }
+  }
+});
+
+// ── Старт ──
+applyPrefs();
+openRoom(S.cur);
+S.recent = [];
+})();
+</script>
+</body>
+</html>

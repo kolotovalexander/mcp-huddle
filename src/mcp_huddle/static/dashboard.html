@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>🤖 Agent Bus</title>
+  <title>Huddle — agent workspace</title>
   <meta name="color-scheme" content="dark light">
   <link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🤖</text></svg>">
   <link rel="stylesheet" href="/static/dashboard.css">
@@ -17,7 +17,7 @@
           mode = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
         }
         var skin = localStorage.getItem('agentbus-skin');
-        skin = (skin === 'web' || skin === 'code' || skin === 'glass') ? skin : 'glass';
+        skin = (skin === 'opus' || skin === 'web' || skin === 'code' || skin === 'glass') ? skin : 'opus';
         document.documentElement.setAttribute('data-skin', skin);
         var PALETTES = ['default','dracula','nord','tokyonight','catppuccin','gruvbox'];
         var pal = localStorage.getItem('agentbus-palette');
@@ -27,7 +27,7 @@
         document.documentElement.setAttribute('data-theme', pal !== 'default' ? 'dark' : mode);
       } catch (e) {
         document.documentElement.setAttribute('data-theme', 'dark');
-        document.documentElement.setAttribute('data-skin', 'glass');
+        document.documentElement.setAttribute('data-skin', 'opus');
         document.documentElement.setAttribute('data-palette', 'default');
       }
     })();
@@ -39,13 +39,14 @@
 <div class="app">
   <header class="topbar lq-panel">
     <div class="brand">
-      <div class="logo"><span>AB</span></div>
+      <div class="logo"><span>H</span></div>
       <div class="brand-text">
-        <div class="title">Agent Bus</div>
+        <div class="title">Huddle</div>
         <div class="subtitle"><span id="room-count">0</span> <span data-i18n="app.subtitle">rooms &middot; multi-agent discussion</span></div>
       </div>
     </div>
     <div class="topbar-actions">
+      <button class="lq-btn" id="search-toggle" type="button" aria-label="Search rooms and messages" title="Search rooms and messages">⌕ <span data-i18n="btn.search">Search</span></button>
       <button class="lq-btn" id="sidebar-collapse" title="Свернуть/развернуть список комнат">◧</button>
       <button class="lq-btn" id="activity-collapse" title="Свернуть/развернуть панель активности">◨</button>
       <button class="lq-btn" id="bulk-close-all" data-i18n="btn.closeAll" data-i18n-title="tip.closeAll">Close all</button>
@@ -60,6 +61,10 @@
     <aside class="sidebar lq-panel">
       <div class="panel-head pc-left">
         <button class="panel-collapse-btn" data-side="sidebar" data-i18n-title="tip.collapse" aria-label="collapse">◧</button>
+      </div>
+      <div class="room-search" id="room-search" hidden>
+        <input id="room-search-input" type="search" autocomplete="off" placeholder="Search room titles and messages" aria-label="Search room titles and messages">
+        <button id="room-search-close" type="button" aria-label="Close search">×</button>
       </div>
       <div class="sidebar-scroll" id="room-list"></div>
     </aside>
@@ -83,6 +88,18 @@
       </div>
     </aside>
   </div>
+  <footer class="dashboard-status" aria-label="Dashboard status">
+    <span class="status-live" id="footer-room-status">Выберите комнату</span>
+    <span class="status-keys"><kbd>/</kbd> <span data-i18n="footer.search">поиск</span></span>
+    <div class="status-prefs">
+      <span data-i18n="footer.theme">Тема</span>
+      <button type="button" id="footer-theme-light" data-i18n="footer.paper">бумага</button><button type="button" id="footer-theme-dark" data-i18n="footer.ink">чернила</button>
+      <span data-i18n="footer.text">Текст</span>
+      <button type="button" id="footer-font-down" aria-label="Уменьшить текст">A−</button><span id="footer-font-value">100%</span><button type="button" id="footer-font-up" aria-label="Увеличить текст">A+</button>
+      <span data-i18n="footer.rows">Строки</span>
+      <button type="button" id="footer-density-normal" data-i18n="footer.spacious">Просторно</button><button type="button" id="footer-density-dense" data-i18n="footer.dense">Плотно</button>
+    </div>
+  </footer>
   <div class="drawer-backdrop" id="drawer-backdrop" hidden></div>
 </div>
 <div class="settings-popover" id="settings-popover" hidden></div>

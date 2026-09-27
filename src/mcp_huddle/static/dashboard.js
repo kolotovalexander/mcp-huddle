@@ -18,6 +18,16 @@ const AGENT_LETTER = {Claude:'C', Codex:'X', Antigravity:'A', Qwen:'Q', MiMo:'M'
 
 function agentCls(a)  { return AGENT_CLS[a]  || 'agent-other'; }
 function avatarCls(a) { return AVATAR_CLS[a] || 'avatar-other'; }
+// Identity colour as a CSS value: the skin's --c-<agent> for known agents, a
+// stable hashed --c-dyn-N slot for dynamic names (e.g. OpenCode-nvidia).
+const AGENT_DYN_SLOTS = 6;
+function agentColor(a) {
+  const cls = AGENT_CLS[a];
+  if (cls) return `var(--c-${cls.slice('agent-'.length)})`;
+  let h = 0;
+  for (const ch of String(a || '')) h = (h * 31 + ch.codePointAt(0)) >>> 0;
+  return `var(--c-dyn-${h % AGENT_DYN_SLOTS}, var(--text-muted))`;
+}
 function agentLetter(a) { return AGENT_LETTER[a] || (String(a||'?')[0] || '?').toUpperCase(); }
 
 function el(tag, attrs, children) {
@@ -199,6 +209,53 @@ const I18N = {
     'app.subtitle': 'rooms · multi-agent discussion',
     'btn.closeAll': 'Close all', 'btn.deleteClosed': 'Delete closed', 'btn.nukeAll': 'Nuke all',
     'btn.view': 'View', 'btn.live': 'live', 'btn.copy': 'Copy', 'btn.send': 'Send',
+    'btn.search': 'Search',
+    'room.owner': 'Owner', 'room.round': 'Round', 'room.noRound': 'No recorded round', 'room.messages': 'messages',
+    'room.created': 'Created', 'room.updated': 'Updated',
+    'room.copyName': 'Copy name', 'room.copyId': 'Copy room ID',
+    'room.copied': 'Copied', 'room.copyFailed': 'Copy failed',
+    'swarm.title': 'Team brief', 'swarm.goal': 'Goal', 'swarm.mode': 'Mode',
+    'swarm.phase': 'Phase', 'swarm.round': 'Round', 'swarm.responsibilities': 'Responsibilities',
+    'swarm.tasks': 'Tasks', 'swarm.decisions': 'Decisions', 'swarm.facts': 'Facts',
+    'swarm.final': 'Final result', 'swarm.working': 'In progress', 'swarm.completed': 'Completed',
+    'swarm.empty': 'Nothing recorded yet', 'swarm.owner': 'Owner', 'swarm.reporter': 'Reporter',
+    'swarm.members': 'Members', 'swarm.memberDone': 'done', 'swarm.memberActive': 'working',
+    'swarm.memberWaiting': 'waiting', 'swarm.noRole': 'no role yet',
+    'swarm.childAgents': 'Child agents', 'swarm.childQuota': 'Limit',
+    'swarm.childProfiles': 'Allowed profiles', 'swarm.childParent': 'parent',
+    'swarm.childRunning': 'running', 'swarm.childStarting': 'starting',
+    'swarm.childExited': 'finished', 'swarm.childFailed': 'failed', 'swarm.childUnknown': 'status unavailable',
+    'swarm.childOpenRoom': 'Open child room', 'swarm.childHistoryNone': 'Context: task only',
+    'swarm.childHistoryRecent': 'Context: last 10 room messages',
+    'swarm.childContextNote': 'Context selection does not restrict file or tool access.',
+    'swarm.childRelaySent': 'Result sent to parent room', 'swarm.childRelayFailed': 'Result could not be sent',
+    'swarm.childRelayOff': 'Result forwarding is off', 'swarm.childRelayPending': 'Result forwarding pending',
+    'lanes.title': 'Agents', 'lanes.collapse': 'Collapse', 'lanes.expand': 'Expand',
+    'lanes.waiting': 'Waiting', 'lanes.working': 'Working', 'lanes.done': 'Finished',
+    'lanes.offline': 'Offline', 'lanes.online': 'Online', 'lanes.unknown': 'No status',
+    'lanes.thinking': 'Thinking', 'lanes.responding': 'Writing an answer',
+    'lanes.starting': 'Starting', 'lanes.queued': 'Queued',
+    'lanes.limited': 'Rate limited', 'lanes.stuck': 'Stalled',
+    'lanes.messages': 'messages', 'round.discussion': 'Discussion', 'round.label': 'Round',
+    'lanes.legend': '□ request  ■ answer  • comment',
+    'lanes.now': 'now', 'lanes.nowFar': 'now — no messages since', 'lanes.noPosts': 'has not posted yet',
+    'lanes.pending': 'request', 'lanes.unanswered': 'no reply to', 'lanes.from': 'from',
+    'lanes.last': 'last', 'lanes.until': 'until', 'lanes.active': 'active',
+    'kind.request': 'request', 'kind.comment': 'comment', 'kind.ack': 'acknowledged',
+    'kind.busy': 'busy', 'kind.result': 'answer', 'kind.final': 'final',
+    'kind.system': 'system', 'kind.close': 'closed', 'kind.other': 'message',
+    'compose.as': 'From Human', 'compose.request': 'Request', 'compose.comment': 'Comment',
+    'compose.system': 'Important', 'compose.to': 'To', 'compose.all': 'Everyone',
+    'compose.hint': 'A request wakes its recipients. A comment does not.',
+    'compose.reply': 'Reply', 'compose.replyTo': 'Replying to {agent} · #{id}', 'compose.cancelReply': 'Cancel reply',
+    'compose.placeholder': 'Write to the room… Ctrl+Enter to send',
+    'footer.noRoom': 'Choose a room to view the discussion', 'footer.search': 'search',
+    'footer.theme': 'Theme', 'footer.text': 'Text', 'footer.rows': 'Rows',
+    'footer.paper': 'paper', 'footer.ink': 'ink',
+    'footer.spacious': 'Spacious', 'footer.dense': 'Compact',
+    'search.placeholder': 'Search room titles and messages',
+    'search.hint': 'Type a room name or words from a conversation',
+    'search.pending': 'Searching…', 'search.empty': 'No matching rooms or messages',
     'chat.selectRoom': 'Select a room',
     'chat.selectHint': 'Use room_create() from an agent to start a discussion',
     'chat.closed': 'Room closed — read-only',
@@ -208,9 +265,44 @@ const I18N = {
     'chat.pickAnother': 'Pick another room from the sidebar',
     'activity.title': 'Agent activity',
     'activity.hint': 'Opens when you select a room with spawned agents',
+    'activity.liveTitle': 'Agent activity · live',
+    'activity.noStream': 'no live stream',
+    'activity.pending': 'waiting for events',
+    'activity.detail': 'Technical details',
+    'activity.started': 'Started', 'activity.completed': 'Completed',
+    'activity.failed': 'Failed', 'activity.error': 'Error',
+    'activity.cancelled': 'Stopped', 'activity.retrying': 'Retrying',
+    'activity.liveStatus': 'Live', 'activity.resetStatus': 'Stream reset',
+    'activity.errorStatus': 'Stream error', 'activity.authStatus': 'Authentication required',
+    'activity.answer': 'Answer', 'activity.fragment': 'Answer fragment',
+    'activity.step': 'Step completed', 'activity.tool': 'Tool call',
+    'activity.output': 'Process output', 'activity.generic': 'Agent event',
+    'activity.transcript': 'Room conversation', 'activity.noParticipants': 'No participants in this room',
+    'activity.loadAgentsFailed': 'Could not load participants',
+    'activity.ownerHint': 'Room organizer. Their messages appear in the room conversation.',
+    'activity.staticHint': 'Participant has no live event stream.',
+    'activity.emptyLog': 'Empty log entry',
+    'activity.agentStarted': 'Agent started', 'activity.roomWork': 'Working with room',
+    'activity.limitReached': 'Provider limit reached',
+    'activity.setupIssue': 'Agent setup needs attention',
+    'activity.unownedLease': 'Agent state is unclear',
+    'activity.staleLease': 'Agent stopped responding',
+    'activity.wakeFailed': 'Agent could not resume',
+    'activity.wakeFailures': 'Resume failures',
+    'status.open': 'Open', 'status.idle': 'Idle',
+    'status.busy': 'Working', 'status.online': 'Online',
+    'status.offline': 'Offline', 'status.closed': 'Closed',
+    'status.resolved': 'Resolved', 'status.closing': 'Closing',
+    'status.closing_requested': 'Closing requested',
+    'activity.internal': 'Internal step',
+    'roomMode.council': 'Council', 'roomMode.relay': 'Relay',
+    'roomMode.team': 'Team', 'roomMode.swarm': 'Swarm',
+    'roomMode.ordinary': 'Ordinary room',
+    'roomMode.title': 'Room mode',
     'sidebar.empty': 'No rooms yet. Call room_create() from an agent.',
     'set.appearance': 'Appearance', 'set.theme': 'Theme', 'set.skin': 'Design',
     'set.palette': 'Palette', 'set.lang': 'Language', 'set.mcp': 'MCP connection',
+    'set.roomView': 'Room list', 'roomView.latest': 'Latest activity', 'roomView.projects': 'By project',
     'theme.auto': 'Auto', 'theme.dark': 'Dark', 'theme.light': 'Light',
     'mcp.endpoint': 'HTTP endpoint', 'mcp.claude': 'Claude Code', 'mcp.codex': 'Codex (config.toml)',
     'mcp.stdio': 'stdio (any client)',
@@ -243,6 +335,52 @@ const I18N = {
     'app.subtitle': 'комнат · мультиагентное обсуждение',
     'btn.closeAll': 'Закрыть все', 'btn.deleteClosed': 'Удалить закрытые', 'btn.nukeAll': 'Снести всё',
     'btn.view': 'Вид', 'btn.live': 'онлайн', 'btn.copy': 'Копировать', 'btn.send': 'Отправить',
+    'btn.search': 'Поиск', 'search.placeholder': 'Название комнаты или слова из переписки',
+    'room.owner': 'Владелец', 'room.round': 'Раунд', 'room.noRound': 'Раунд не задан', 'room.messages': 'сообщений',
+    'room.created': 'Создана', 'room.updated': 'Обновлена',
+    'room.copyName': 'Копировать имя', 'room.copyId': 'Копировать ID комнаты',
+    'room.copied': 'Скопировано', 'room.copyFailed': 'Не удалось скопировать',
+    'swarm.title': 'План команды', 'swarm.goal': 'Цель', 'swarm.mode': 'Режим',
+    'swarm.phase': 'Этап', 'swarm.round': 'Раунд', 'swarm.responsibilities': 'Обязанности',
+    'swarm.tasks': 'Задачи', 'swarm.decisions': 'Решения', 'swarm.facts': 'Факты',
+    'swarm.final': 'Итог', 'swarm.working': 'В работе', 'swarm.completed': 'Завершён',
+    'swarm.empty': 'Пока ничего не записано', 'swarm.owner': 'Ответственный', 'swarm.reporter': 'Сводит результат',
+    'swarm.members': 'Участники', 'swarm.memberDone': 'готово', 'swarm.memberActive': 'в работе',
+    'swarm.memberWaiting': 'ждёт', 'swarm.noRole': 'роли нет',
+    'swarm.childAgents': 'Дочерние агенты', 'swarm.childQuota': 'Лимит',
+    'swarm.childProfiles': 'Разрешённые профили', 'swarm.childParent': 'родитель',
+    'swarm.childRunning': 'работает', 'swarm.childStarting': 'запускается',
+    'swarm.childExited': 'завершил', 'swarm.childFailed': 'ошибка', 'swarm.childUnknown': 'статус неизвестен',
+    'swarm.childOpenRoom': 'Открыть дочернюю комнату', 'swarm.childHistoryNone': 'Контекст: только задание',
+    'swarm.childHistoryRecent': 'Контекст: последние 10 сообщений комнаты',
+    'swarm.childContextNote': 'Выбор контекста не ограничивает доступ к файлам и инструментам.',
+    'swarm.childRelaySent': 'Результат передан в родительскую комнату', 'swarm.childRelayFailed': 'Не удалось передать результат',
+    'swarm.childRelayOff': 'Передача результата выключена', 'swarm.childRelayPending': 'Передача результата ожидает завершения',
+    'lanes.title': 'Агенты', 'lanes.collapse': 'Свернуть', 'lanes.expand': 'Развернуть',
+    'lanes.waiting': 'Ждёт', 'lanes.working': 'Работает', 'lanes.done': 'Закончил',
+    'lanes.offline': 'Не в сети', 'lanes.online': 'На связи', 'lanes.unknown': 'Нет статуса',
+    'lanes.thinking': 'Думает', 'lanes.responding': 'Пишет ответ',
+    'lanes.starting': 'Запускается', 'lanes.queued': 'В очереди',
+    'lanes.limited': 'Уперся в лимит', 'lanes.stuck': 'Завис',
+    'lanes.messages': 'сообщений', 'round.discussion': 'Обсуждение', 'round.label': 'Раунд',
+    'lanes.legend': '□ запрос  ■ ответ  • реплика',
+    'lanes.now': 'сейчас', 'lanes.nowFar': 'сейчас — сообщений не было с', 'lanes.noPosts': 'ещё не писал',
+    'lanes.pending': 'запрос', 'lanes.unanswered': 'без ответа на', 'lanes.from': 'от',
+    'lanes.last': 'последнее', 'lanes.until': 'до', 'lanes.active': 'в работе',
+    'kind.request': 'запрос', 'kind.comment': 'комментарий', 'kind.ack': 'принял',
+    'kind.busy': 'занят', 'kind.result': 'ответ', 'kind.final': 'итог',
+    'kind.system': 'системное', 'kind.close': 'закрытие', 'kind.other': 'сообщение',
+    'compose.as': 'От имени Human', 'compose.request': 'Запрос', 'compose.comment': 'Комментарий',
+    'compose.system': 'Важное', 'compose.to': 'Кому', 'compose.all': 'Всем',
+    'compose.hint': 'Запрос разбудит адресатов. Комментарий — нет.',
+    'compose.reply': 'Ответить', 'compose.replyTo': 'Ответ на сообщение {agent} · №{id}', 'compose.cancelReply': 'Отменить ответ',
+    'compose.placeholder': 'Написать в комнату… Ctrl+Enter — отправить',
+    'footer.noRoom': 'Выберите комнату, чтобы читать обсуждение', 'footer.search': 'поиск',
+    'footer.theme': 'Тема', 'footer.text': 'Текст', 'footer.rows': 'Строки',
+    'footer.paper': 'бумага', 'footer.ink': 'чернила',
+    'footer.spacious': 'Просторно', 'footer.dense': 'Плотно',
+    'search.hint': 'Введите название комнаты или слова из переписки',
+    'search.pending': 'Ищу…', 'search.empty': 'Совпадений нет',
     'chat.selectRoom': 'Выберите комнату',
     'chat.selectHint': 'Вызовите room_create() из агента, чтобы начать обсуждение',
     'chat.closed': 'Комната закрыта — только чтение',
@@ -252,9 +390,44 @@ const I18N = {
     'chat.pickAnother': 'Выберите другую комнату слева',
     'activity.title': 'Активность агентов',
     'activity.hint': 'Откроется при выборе комнаты со spawned-агентами',
+    'activity.liveTitle': 'Активность агентов · онлайн',
+    'activity.noStream': 'нет live-потока',
+    'activity.pending': 'ждём события',
+    'activity.detail': 'Технические подробности',
+    'activity.started': 'Запущено', 'activity.completed': 'Завершено',
+    'activity.failed': 'Не выполнено', 'activity.error': 'Ошибка',
+    'activity.cancelled': 'Остановлено', 'activity.retrying': 'Повторная попытка',
+    'activity.liveStatus': 'Онлайн', 'activity.resetStatus': 'Поток сброшен',
+    'activity.errorStatus': 'Ошибка потока', 'activity.authStatus': 'Нужна авторизация',
+    'activity.answer': 'Ответ', 'activity.fragment': 'Фрагмент ответа',
+    'activity.step': 'Шаг завершён', 'activity.tool': 'Вызов инструмента',
+    'activity.output': 'Вывод процесса', 'activity.generic': 'Событие агента',
+    'activity.transcript': 'Переписка комнаты', 'activity.noParticipants': 'В комнате нет участников',
+    'activity.loadAgentsFailed': 'Не удалось загрузить участников',
+    'activity.ownerHint': 'Организатор комнаты. Его сообщения видны в переписке комнаты.',
+    'activity.staticHint': 'У участника нет live-потока событий.',
+    'activity.emptyLog': 'Пустая запись лога',
+    'activity.agentStarted': 'Агент запущен', 'activity.roomWork': 'Работа с комнатой',
+    'activity.limitReached': 'Достигнут лимит провайдера',
+    'activity.setupIssue': 'Проблема с настройкой агента',
+    'activity.unownedLease': 'Состояние агента неясно',
+    'activity.staleLease': 'Агент перестал отвечать',
+    'activity.wakeFailed': 'Не удалось возобновить агента',
+    'activity.wakeFailures': 'Ошибок возобновления',
+    'status.open': 'Открыта', 'status.idle': 'Без активности',
+    'status.busy': 'Работает', 'status.online': 'Онлайн',
+    'status.offline': 'Не в сети', 'status.closed': 'Закрыта',
+    'status.resolved': 'Решена', 'status.closing': 'Закрывается',
+    'status.closing_requested': 'Запрошено закрытие',
+    'activity.internal': 'Внутренний шаг',
+    'roomMode.council': 'Совет', 'roomMode.relay': 'Эстафета',
+    'roomMode.team': 'Команда', 'roomMode.swarm': 'Рой',
+    'roomMode.ordinary': 'Обычная комната',
+    'roomMode.title': 'Режим комнаты',
     'sidebar.empty': 'Пока нет комнат. Вызовите room_create() из агента.',
     'set.appearance': 'Оформление', 'set.theme': 'Тема', 'set.skin': 'Дизайн',
     'set.palette': 'Палитра', 'set.lang': 'Язык', 'set.mcp': 'MCP-подключение',
+    'set.roomView': 'Список комнат', 'roomView.latest': 'По последней активности', 'roomView.projects': 'По проектам',
     'theme.auto': 'Авто', 'theme.dark': 'Тёмная', 'theme.light': 'Светлая',
     'mcp.endpoint': 'HTTP endpoint', 'mcp.claude': 'Claude Code', 'mcp.codex': 'Codex (config.toml)',
     'mcp.stdio': 'stdio (любой клиент)',
@@ -404,11 +577,42 @@ function fmtTime(ts) {
   return new Date((ts || 0) * 1000).toLocaleTimeString('ru', {hour:'2-digit', minute:'2-digit'});
 }
 
+function fmtDateTime(ts) {
+  return new Date(ts * 1000).toLocaleString(LANG || 'en', {
+    day: '2-digit', month: '2-digit', year: 'numeric',
+    hour: '2-digit', minute: '2-digit',
+  });
+}
+
+function messageCount(n) {
+  if (LANG === 'ru') {
+    const word = n % 10 === 1 && n % 100 !== 11 ? 'сообщение'
+      : n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 12 || n % 100 > 14)
+        ? 'сообщения' : 'сообщений';
+    return `${n} ${word}`;
+  }
+  return `${n} ${n === 1 ? 'message' : t('room.messages')}`;
+}
+
+function messageKindLabel(kind) {
+  return t(`kind.${kind}`) === `kind.${kind}` ? t('kind.other') : t(`kind.${kind}`);
+}
+
+function messageRecipientLabel(to) {
+  return to === 'all' ? t('compose.all').toLowerCase() : to;
+}
+
 // ── State ─────────────────────────────────────────────────
 let currentRoom = null, currentOwner = null, lastId = 0;
 let rooms = [], msgMap = {};
+let searchResults = null, searchPending = false, searchTimer = null, searchSequence = 0;
 let agentMetaTotals = {}; // {agentName: {tokens_total, tokens_in, tokens_out, msgs, models:Set, last_reasoning}}
 let lastStatuses = {};    // {agentName: 'online'|'busy'|...} — latest room status snapshot
+let lastPhases = {};      // lifecycle phase explicitly reported by agent/server
+let lastHealth = {};      // wake-health from /api/room_agents (rate-limit window, last wake)
+let roomMessages = [], laneCollapsed = false, composerKind = 'request', lastRenderedRound = null;
+let selectedReplyTarget = null;
+let roomData = null;
 
 function metaBadge(meta) {
   if (!meta) return null;
@@ -464,6 +668,7 @@ const THEME_OPTS = [
   {v: 'auto', label: '🌓 Auto'}, {v: 'dark', label: '🌙 Dark'}, {v: 'light', label: '☀️ Light'},
 ];
 const SKIN_OPTS = [
+  {v: 'opus', label: '✦ Editorial'},
   {v: 'glass', label: '🪟 Glass'}, {v: 'web', label: '💬 Web'}, {v: 'code', label: '⌨️ Code'},
 ];
 const PALETTE_OPTS = [
@@ -487,7 +692,7 @@ function applyTheme(mode) {
   document.documentElement.setAttribute('data-theme-mode', mode);
 }
 function applySkin(skin) {
-  if (!SKIN_OPTS.some(o => o.v === skin)) skin = 'glass';
+  if (!SKIN_OPTS.some(o => o.v === skin)) skin = 'opus';
   document.documentElement.setAttribute('data-skin', skin);
 }
 function applyPalette(pal) {
@@ -558,6 +763,38 @@ function buildPromptRow(value) {
   return el('div', {class: 'set-prompt-wrap'}, [ta, btn]);
 }
 
+// Keep the everyday view controls visible and put connection/spawn reference
+// material behind explicit disclosures. This keeps the popover useful on a
+// laptop without removing any existing configuration or copy actions.
+function buildSettingsSection(title, children, open = false) {
+  const section = el('details', {class: 'set-section'});
+  if (open) section.open = true;
+  section.appendChild(el('summary', {class: 'set-section-summary'}, [
+    el('span', {text: title}),
+    el('span', {class: 'set-section-chevron', text: '›', 'aria-hidden': 'true'}),
+  ]));
+  section.appendChild(el('div', {class: 'set-section-body'}, children));
+  return section;
+}
+
+function buildServiceAction(label, action, danger = false) {
+  const button = el('button', {type: 'button', class: `set-service-action${danger ? ' danger' : ''}`, text: label});
+  button.addEventListener('click', () => {
+    document.getElementById('settings-popover').hidden = true;
+    action();
+  });
+  return button;
+}
+
+function getRoomView() {
+  return localStorage.getItem('agentbus-room-view') === 'projects' ? 'projects' : 'latest';
+}
+
+function applyRoomView(view) {
+  if (view !== 'projects') view = 'latest';
+  renderRooms();
+}
+
 // Theme labels are localised (emoji + word); skin/palette/lang labels are proper nouns.
 function themeOpts() {
   return [
@@ -571,38 +808,53 @@ function buildSettingsPopover(pop) {
   pop.innerHTML = '';
   const origin = location.origin;
   pop.appendChild(el('div', {class: 'set-title'}, [el('span', {text: t('set.appearance')}), helpIcon('tip.view')]));
-  pop.appendChild(buildSettingsRow('set.lang', I18N_LANGS, 'agentbus-lang', () => LANG, setLang, 'tip.lang'));
   pop.appendChild(buildSettingsRow('set.theme', themeOpts(), 'agentbus-theme',
     () => localStorage.getItem('agentbus-theme') || 'auto', applyTheme, 'tip.theme'));
-  pop.appendChild(buildSettingsRow('set.skin', SKIN_OPTS, 'agentbus-skin',
-    () => localStorage.getItem('agentbus-skin') || 'glass', applySkin, 'tip.skin'));
-  pop.appendChild(buildSettingsRow('set.palette', PALETTE_OPTS, 'agentbus-palette',
-    () => localStorage.getItem('agentbus-palette') || 'default', applyPalette, 'tip.palette'));
+  pop.appendChild(buildSettingsRow('set.roomView', [
+    {v: 'latest', label: t('roomView.latest')},
+    {v: 'projects', label: t('roomView.projects')},
+  ], 'agentbus-room-view', getRoomView, applyRoomView));
+  pop.appendChild(buildSettingsSection(`${t('set.skin')} · ${t('set.palette')} · ${t('set.lang')}`, [
+    buildSettingsRow('set.lang', I18N_LANGS, 'agentbus-lang', () => LANG, setLang, 'tip.lang'),
+    buildSettingsRow('set.skin', SKIN_OPTS, 'agentbus-skin',
+      () => localStorage.getItem('agentbus-skin') || 'opus', applySkin, 'tip.skin'),
+    buildSettingsRow('set.palette', PALETTE_OPTS, 'agentbus-palette',
+      () => localStorage.getItem('agentbus-palette') || 'default', applyPalette, 'tip.palette'),
+  ]));
   pop.appendChild(el('div', {class: 'set-sep'}));
-  pop.appendChild(el('div', {class: 'set-title'}, [el('span', {text: t('set.mcp')})]));
-  pop.appendChild(buildCopyRow(t('mcp.endpoint'), origin + '/mcp'));
-  pop.appendChild(buildCopyRow(t('mcp.claude'), `claude mcp add --transport http huddle ${origin}/mcp`));
-  pop.appendChild(buildCopyRow(t('mcp.codex'), `[mcp_servers.huddle]\nurl = "${origin}/mcp"`));
-  pop.appendChild(buildCopyRow(t('mcp.stdio'), 'mcp-huddle'));
-  pop.appendChild(el('div', {class: 'set-hint', text: t('mcp.hint')}));
+  pop.appendChild(buildSettingsSection(t('set.mcp'), [
+    buildCopyRow(t('mcp.endpoint'), origin + '/mcp'),
+    buildCopyRow(t('mcp.claude'), `claude mcp add --transport http huddle ${origin}/mcp`),
+    buildCopyRow(t('mcp.codex'), `[mcp_servers.huddle]\nurl = "${origin}/mcp"`),
+    buildCopyRow(t('mcp.stdio'), 'mcp-huddle'),
+    el('div', {class: 'set-hint', text: t('mcp.hint')}),
+  ]));
 
   // ── Environment variables / spawn rules (reference; click a name to copy) ──
   pop.appendChild(el('div', {class: 'set-sep'}));
-  pop.appendChild(el('div', {class: 'set-title'}, [el('span', {text: t('set.spawn')}), helpIcon('tip.spawn')]));
-  pop.appendChild(buildVarRow('MCP_HUDDLE_READONLY=0', t('var.readonly')));
-  pop.appendChild(buildVarRow('~/.mcp-huddle/registry.json', t('var.registryFile')));
-  pop.appendChild(buildVarRow('MCP_HUDDLE_SPAWN_REGISTRY', t('var.registryEnv')));
-  pop.appendChild(buildVarRow('MCP_HUDDLE_CLAUDE_ENABLED=1', t('var.claude')));
-  pop.appendChild(buildVarRow('MCP_HUDDLE_ANTIGRAVITY_ENABLED=1', t('var.antigravity')));
-  pop.appendChild(buildVarRow('MCP_HUDDLE_MIMO_ENABLED=0', t('var.mimo')));
-  pop.appendChild(buildVarRow('MCP_HUDDLE_TOKEN', t('var.token')));
-  pop.appendChild(buildVarRow('MCP_HUDDLE_HOME', t('var.home')));
-  pop.appendChild(buildVarRow('PORT', t('var.port')));
+  pop.appendChild(buildSettingsSection(t('set.spawn'), [
+    buildVarRow('MCP_HUDDLE_READONLY=0', t('var.readonly')),
+    buildVarRow('~/.mcp-huddle/registry.json', t('var.registryFile')),
+    buildVarRow('MCP_HUDDLE_SPAWN_REGISTRY', t('var.registryEnv')),
+    buildVarRow('MCP_HUDDLE_CLAUDE_ENABLED=1', t('var.claude')),
+    buildVarRow('MCP_HUDDLE_ANTIGRAVITY_ENABLED=1', t('var.antigravity')),
+    buildVarRow('MCP_HUDDLE_MIMO_ENABLED=0', t('var.mimo')),
+    buildVarRow('MCP_HUDDLE_TOKEN', t('var.token')),
+    buildVarRow('MCP_HUDDLE_HOME', t('var.home')),
+    buildVarRow('PORT', t('var.port')),
+  ]));
 
   // ── Copy-paste prompt to onboard an agent into huddle ──
   pop.appendChild(el('div', {class: 'set-sep'}));
-  pop.appendChild(el('div', {class: 'set-title'}, [el('span', {text: t('set.agentPrompt')}), helpIcon('tip.agentPrompt')]));
-  pop.appendChild(buildPromptRow(t('agentPrompt.text').split('{origin}').join(location.origin)));
+  pop.appendChild(buildSettingsSection(t('set.agentPrompt'), [
+    helpIcon('tip.agentPrompt'),
+    buildPromptRow(t('agentPrompt.text').split('{origin}').join(location.origin)),
+  ]));
+  pop.appendChild(buildSettingsSection(LANG === 'ru' ? 'Обслуживание' : 'Maintenance', [
+    buildServiceAction(t('btn.closeAll'), bulkCloseAll),
+    buildServiceAction(t('btn.deleteClosed'), bulkDeleteClosed, true),
+    buildServiceAction(t('btn.nukeAll'), bulkNuke, true),
+  ]));
 }
 
 function setLang(lang) {
@@ -610,6 +862,13 @@ function setLang(lang) {
   LANG = lang;
   try { localStorage.setItem('agentbus-lang', lang); } catch (_) {}
   applyI18n();
+  if (roomData) renderSwarmPilot(roomData);
+  updateActivityStatuses(lastStatuses);
+  document.querySelectorAll('.agent-transcript').forEach(transcript => {
+    const content = transcript.querySelector('.agent-transcript-scroll');
+    const summary = transcript.querySelector('summary');
+    if (content && summary) summary.textContent = `${t('activity.transcript')} · ${content.querySelectorAll('.agent-transcript-message').length}`;
+  });
   const pop = document.getElementById('settings-popover');
   if (pop) buildSettingsPopover(pop);  // rebuild so the popover's own labels update
 }
@@ -617,7 +876,7 @@ function setLang(lang) {
 function initSettings() {
   // Apply saved values (head script already set them pre-paint; re-assert).
   applyTheme(localStorage.getItem('agentbus-theme') || 'auto');
-  applySkin(localStorage.getItem('agentbus-skin') || 'glass');
+  applySkin(localStorage.getItem('agentbus-skin') || 'opus');
   applyPalette(localStorage.getItem('agentbus-palette') || 'default');
   applyI18n();
 
@@ -650,6 +909,11 @@ async function loadRooms() {
     rooms = loaded;
     document.getElementById('room-count').textContent = rooms.length;
     renderRooms();
+    const roomFromLink = new URLSearchParams(location.hash.slice(1)).get('room');
+    if (!currentRoom && roomFromLink) {
+      const target = rooms.find(room => room.id === roomFromLink);
+      if (target) openRoom(target.id, target.owner);
+    }
     hideAuthRequired();
   } catch(e) {
     // Preserve the last successfully rendered room list during auth/network errors.
@@ -669,11 +933,75 @@ function toggleTree(key) {
   renderRooms();
 }
 
+const ROOM_MODES = new Set(['council', 'relay', 'team', 'swarm']);
+function roomModeBadge(room, showOrdinary = false) {
+  const mode = room && room.swarm_pilot && room.swarm_pilot.mode;
+  if (!ROOM_MODES.has(mode)) {
+    return showOrdinary ? el('span', {
+      class: 'room-mode room-mode-ordinary',
+      text: t('roomMode.ordinary'),
+      title: t('roomMode.title'),
+    }) : null;
+  }
+  return el('span', {
+    class: `room-mode room-mode-${mode}`,
+    text: t(`roomMode.${mode}`),
+    title: t('roomMode.title'),
+  });
+}
+
+function roomItem(r, label, indent = 46) {
+  const active = r.id === currentRoom;
+  // Search results are intentionally compact and may omit swarm_pilot. Reuse
+  // the full /api/rooms record when it is already loaded in memory.
+  const fullRoom = rooms.find(room => room.id === r.id) || r;
+  const modeBadge = roomModeBadge(fullRoom, true);
+  return el('div', {
+    class: 'room-item' + (active ? ' active' : ''),
+    dataset: {id: r.id, owner: r.owner},
+    style: `padding-left:${indent}px`,
+    title: r.created_at ? `${t('room.created')} ${fmtDateTime(r.created_at)}` : '',
+  }, [
+    el('div', {class: 'room-name'}, [
+      el('span', {class: `dot dot-${r.status}` + (r.status === 'open' ? ' pulse' : '')}),
+      el('span', {text: label}),
+      modeBadge,
+    ]),
+    el('div', {class: 'room-meta', text: `${(r.participants || []).length}·${fmtTime(r.last_activity || r.created_at)}`}),
+  ]);
+}
+
 function renderRooms() {
   const sidebar = document.getElementById('room-list');
   sidebar.innerHTML = '';
+  if (!document.getElementById('room-search').hidden) {
+    if (searchPending) {
+      sidebar.appendChild(el('div', {class: 'empty-sidebar', text: t('search.pending')}));
+    } else if (searchResults) {
+      if (!searchResults.length) sidebar.appendChild(el('div', {class: 'empty-sidebar', text: t('search.empty')}));
+      for (const hit of searchResults) {
+        const item = roomItem(hit, hit.name, 18);
+        item.classList.add('search-hit');
+        if (hit.snippet) item.appendChild(el('div', {class: 'search-snippet', text: hit.snippet}));
+        if (hit.message_id != null) item.dataset.messageId = String(hit.message_id);
+        sidebar.appendChild(item);
+      }
+    } else {
+      sidebar.appendChild(el('div', {class: 'empty-sidebar', text: t('search.hint')}));
+    }
+    return;
+  }
   if (!rooms.length) {
     sidebar.appendChild(el('div', {class: 'empty-sidebar', text: t('sidebar.empty')}));
+    return;
+  }
+
+  if (getRoomView() === 'latest') {
+    const sorted = rooms.slice().sort((a, b) => {
+      const activity = (b.last_activity || b.created_at || 0) - (a.last_activity || a.created_at || 0);
+      return activity || String(a.name || a.id).localeCompare(String(b.name || b.id));
+    });
+    sorted.forEach(r => sidebar.appendChild(roomItem(r, r.name || r.id, 18)));
     return;
   }
 
@@ -736,19 +1064,8 @@ function renderRooms() {
         db.appendChild(og);
 
         rs.forEach((r, i) => {
-          const active = r.id === currentRoom;
           const label = rs.length > 1 ? `${i + 1}. ${r.name}` : r.name;
-          ob.appendChild(el('div', {
-            class: 'room-item' + (active ? ' active' : ''),
-            dataset: {id: r.id, owner: r.owner},
-            style: 'padding-left:46px',
-          }, [
-            el('div', {class: 'room-name'}, [
-              el('span', {class: `dot dot-${r.status}` + (r.status === 'open' ? ' pulse' : '')}),
-              el('span', {text: label}),
-            ]),
-            el('div', {class: 'room-meta', text: `${(r.participants || []).length}·${fmtTime(r.last_activity || r.created_at)}`}),
-          ]));
+          ob.appendChild(roomItem(r, label));
         });
       }
     }
@@ -756,6 +1073,59 @@ function renderRooms() {
 }
 
 // ── Chat ──────────────────────────────────────────────────
+async function copyRoomValue(btn, text, defaultLabelKey) {
+  if (!btn) return;
+  const originalText = t(defaultLabelKey);
+  clearTimeout(btn._copyTimer);
+  btn.classList.remove('is-copied', 'is-failed');
+
+  let ok = false;
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+    try {
+      await navigator.clipboard.writeText(text);
+      ok = true;
+    } catch (_) {}
+  }
+  if (!ok) {
+    let ta;
+    try {
+      ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.top = '-9999px';
+      ta.style.left = '-9999px';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      ok = Boolean(document.execCommand && document.execCommand('copy'));
+    } catch (_) {
+      ok = false;
+    } finally {
+      if (ta && ta.parentNode) ta.parentNode.removeChild(ta);
+    }
+  }
+
+  if (ok) {
+    btn.textContent = t('room.copied');
+    btn.classList.add('is-copied');
+    btn.title = '';
+    btn._copyTimer = setTimeout(() => {
+      btn.textContent = originalText;
+      btn.classList.remove('is-copied');
+    }, 1500);
+  } else {
+    btn.textContent = t('room.copyFailed');
+    btn.classList.add('is-failed');
+    btn.title = text;
+    btn._copyTimer = setTimeout(() => {
+      btn.textContent = originalText;
+      btn.classList.remove('is-failed');
+    }, 2500);
+  }
+}
+
 function buildChatShell(room) {
   const chat = document.getElementById('chat-area');
   chat.innerHTML = '';
@@ -767,6 +1137,8 @@ function buildChatShell(room) {
     el('span', {class: 'hash', text: '#'}),
     el('span', {text: room.name || room.id || ''}),
   ];
+  const modeBadge = roomModeBadge(room, true);
+  if (modeBadge) titleChildren.push(modeBadge);
   if (isClosed) {
     titleChildren.push(el('span', {class: 'kind kind-close', text: 'closed'}));
   } else if (room.status === 'resolved') {
@@ -782,21 +1154,24 @@ function buildChatShell(room) {
     : el('button', {class: 'lq-btn danger', id: 'btn-close', text: 'Close'});
 
   const header = el('div', {class: 'chat-header'}, [
-    el('div', {}, [
+    el('div', {class: 'room-heading'}, [
+      el('div', {class: 'room-crumb', id: 'room-crumb', text: room.cwd || room.project || ''}),
       el('div', {class: 'chat-title'}, titleChildren),
       el('div', {class: 'chat-meta', id: 'chat-meta', text: 'Loading…'}),
     ]),
-    el('div', {class: 'topbar-actions'}, [
-      el('div', {class: 'avatar-stack', id: 'avatar-stack'}),
+    el('div', {class: 'room-actions'}, [
+      el('button', {class: 'room-text-action', id: 'copy-room-name', text: t('room.copyName')}),
+      el('button', {class: 'room-text-action', id: 'copy-room-id', text: t('room.copyId')}),
       actionBtn,
     ]),
   ]);
 
+  const lanes = el('section', {class: 'room-lanes', id: 'room-lanes', 'aria-label': t('lanes.title')});
+  const swarmPanel = el('section', {class: 'swarm-pilot', id: 'swarm-pilot', hidden: '', 'aria-label': t('swarm.title')});
   const messages = el('div', {class: 'messages', id: 'messages'});
 
   const inputAttrs = {
     id: 'human-inp',
-    type: 'text',
     // A bare <input type="text"> with no name makes Safari/Chrome offer
     // contact autofill (phone number etc.). Opt out explicitly: it is a
     // free-text chat field, not a contact form.
@@ -807,25 +1182,52 @@ function buildChatShell(room) {
     spellcheck: 'false',
     'data-1p-ignore': '',
     'data-lpignore': 'true',
-    placeholder: isReadOnly
-      ? (isClosed ? t('chat.closed') : t('chat.resolved'))
-      : t('chat.placeholder'),
+    placeholder: isReadOnly ? (isClosed ? t('chat.closed') : t('chat.resolved')) : t('compose.placeholder'),
   };
   if (isReadOnly) inputAttrs.disabled = '';
-  const input = el('input', inputAttrs);
+  const input = el('textarea', inputAttrs);
 
-  const sendAttrs = {class: 'send-btn', id: 'btn-send', text: t('btn.send') + ' ↵'};
+  const sendAttrs = {class: 'send-btn', id: 'btn-send', text: t('btn.send')};
   if (isReadOnly) sendAttrs.disabled = '';
   const send = el('button', sendAttrs);
 
-  const inputWrap = el('div', {class: 'input-wrap'}, [
+  const participants = (room.participants || []).filter(p => p !== 'Human' && p !== 'System');
+  const recipient = el('select', {id: 'human-to', 'aria-label': t('compose.to')}, [
+    el('option', {value: 'all', text: t('compose.all')}),
+    ...participants.map(p => el('option', {value: p, text: p})),
+  ]);
+  const kindButtons = ['request', 'comment', 'system'].map(kind => {
+    const b = el('button', {type: 'button', class: 'composer-kind', dataset: {kind},
+      'aria-pressed': String(composerKind === kind), text: t(`compose.${kind}`)});
+    b.onclick = () => {
+      composerKind = kind;
+      if (kind !== 'comment' && selectedReplyTarget) {
+        selectedReplyTarget = null;
+        renderComposerReplyTarget();
+      }
+      document.querySelectorAll('.composer-kind').forEach(x => x.setAttribute('aria-pressed', String(x.dataset.kind === kind)));
+      const hint = document.getElementById('composer-hint');
+      if (hint) hint.textContent = kind === 'request' ? t('compose.hint') : '';
+    };
+    return b;
+  });
+  const inputWrap = el('div', {class: 'input-wrap room-composer'}, [
+    el('div', {class: 'composer-controls'}, [
+      el('span', {text: t('compose.as')}),
+      el('span', {class: 'composer-kinds'}, kindButtons),
+      el('label', {}, [t('compose.to') + ' ', recipient]),
+      el('span', {class: 'composer-hint', id: 'composer-hint', text: composerKind === 'request' ? t('compose.hint') : ''}),
+    ]),
+    el('div', {id: 'composer-reply-slot', class: 'composer-reply-slot'}),
     el('div', {class: 'input-row'}, [
-      avatar('Human', 'avatar-sm'),
       input, send,
     ]),
   ]);
+  renderComposerReplyTarget();
 
   chat.appendChild(header);
+  chat.appendChild(lanes);
+  chat.appendChild(swarmPanel);
   chat.appendChild(messages);
   chat.appendChild(inputWrap);
 
@@ -836,24 +1238,302 @@ function buildChatShell(room) {
   }
   if (!isReadOnly) {
     send.onclick = sendMsg;
-    input.onkeydown = e => { if (e.key === 'Enter') sendMsg(); };
+    input.onkeydown = e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendMsg(); } };
   }
+  const btnCopyName = document.getElementById('copy-room-name');
+  if (btnCopyName) {
+    btnCopyName.onclick = () => copyRoomValue(btnCopyName, room.name || room.id || '', 'room.copyName');
+  }
+  const btnCopyId = document.getElementById('copy-room-id');
+  if (btnCopyId) {
+    btnCopyId.onclick = () => copyRoomValue(btnCopyId, room.id, 'room.copyId');
+  }
+  renderSwarmPilot(room);
+}
+
+const SWARM_BUCKETS = [
+  ['responsibilities', 'swarm.responsibilities'], ['tasks', 'swarm.tasks'],
+  ['decisions', 'swarm.decisions'], ['facts', 'swarm.facts'],
+];
+function swarmEntryText(entry) {
+  if (typeof entry === 'string') return entry;
+  return entry && typeof entry.value === 'string' ? entry.value : '';
+}
+// Pure: one row per member with their claimed roles and this round's state.
+function swarmMemberRows(state) {
+  const members = Array.isArray(state && state.members) ? state.members.filter(m => typeof m === 'string') : [];
+  const asObj = v => (v && typeof v === 'object' ? v : {});
+  const done = asObj(state.done), dispatched = asObj(state.dispatched), resp = asObj(state.responsibilities);
+  return members.map(name => ({
+    name,
+    roles: Object.keys(resp).filter(k => asObj(resp[k]).member === name),
+    status: name in done ? 'done' : name in dispatched ? 'active' : 'waiting',
+  }));
+}
+function renderSwarmPilot(room) {
+  const panel = document.getElementById('swarm-pilot');
+  const state = room && room.swarm_pilot;
+  if (!panel) return;
+  if (!state || typeof state !== 'object') { panel.hidden = true; panel.replaceChildren(); return; }
+  panel.hidden = false;
+  const wasOpen = panel.querySelector('details')?.open;
+  const storageKey = `agentbus-swarm-panel:${room.id || currentRoom}`;
+  let savedOpen = null;
+  try { savedOpen = localStorage.getItem(storageKey); } catch (_) {}
+  const open = savedOpen === null ? (wasOpen ?? true) : savedOpen === '1';
+  panel.replaceChildren();
+
+  const mode = ROOM_MODES.has(state.mode) ? t(`roomMode.${state.mode}`) : String(state.mode || '—');
+  const phase = state.phase === 'completed' ? t('swarm.completed')
+    : state.phase === 'working' ? t('swarm.working') : String(state.phase || '—');
+  const memberRows = swarmMemberRows(state);
+  const doneCount = memberRows.filter(m => m.status === 'done').length;
+  const progress = memberRows.length ? ` · ${doneCount}/${memberRows.length}` : '';
+  const head = el('summary', {class: 'swarm-summary'}, [
+    el('span', {class: 'swarm-marker', 'aria-hidden': 'true'}),
+    el('span', {class: 'swarm-title', text: t('swarm.title')}),
+    el('span', {class: 'swarm-meta', text: `${t('swarm.mode')}: ${mode} · ${t('swarm.phase')}: ${phase} · ${t('swarm.round')} ${state.round || 1}${progress}`}),
+  ]);
+  const details = el('details', {class: 'swarm-details'});
+  details.open = open;
+  details.addEventListener('toggle', () => {
+    try { localStorage.setItem(storageKey, details.open ? '1' : '0'); } catch (_) {}
+  });
+  details.appendChild(head);
+  const body = el('div', {class: 'swarm-body'});
+  if (state.goal) body.appendChild(el('div', {class: 'swarm-goal'}, [
+    el('span', {class: 'swarm-label', text: `${t('swarm.goal')} · `}),
+    el('span', {text: String(state.goal)}),
+  ]));
+
+  if (memberRows.length) {
+    const strip = el('ul', {class: 'swarm-members', 'aria-label': t('swarm.members')});
+    for (const m of memberRows) {
+      const statusKey = {done: 'swarm.memberDone', active: 'swarm.memberActive', waiting: 'swarm.memberWaiting'}[m.status];
+      strip.appendChild(el('li', {class: `swarm-member swarm-member-${m.status}`}, [
+        el('span', {class: 'swarm-member-name', text: m.name}),
+        el('span', {class: 'swarm-member-role', text: m.roles.length ? m.roles.join(', ') : t('swarm.noRole')}),
+        el('span', {class: 'swarm-member-status', text: t(statusKey)}),
+      ]));
+    }
+    body.appendChild(strip);
+  }
+
+  const childPolicy = state.child_agents && typeof state.child_agents === 'object' ? state.child_agents : null;
+  const childRecords = state.children && typeof state.children === 'object' ? Object.entries(state.children)
+    .filter(([, child]) => child && typeof child === 'object') : [];
+  // Keep the child section out of ordinary pilots; once children exist, show
+  // both the room's configured allowance and the readable child roster.
+  if (childRecords.length) {
+    const childSection = el('section', {class: 'swarm-children'});
+    childSection.appendChild(el('h3', {text: t('swarm.childAgents')}));
+    if (childPolicy) {
+      const policyParts = [];
+      if (Number.isInteger(childPolicy.max_children)) {
+        policyParts.push(`${t('swarm.childQuota')}: ${childPolicy.max_children}`);
+      }
+      if (Array.isArray(childPolicy.profiles) && childPolicy.profiles.length) {
+        policyParts.push(`${t('swarm.childProfiles')}: ${childPolicy.profiles.filter(x => typeof x === 'string').join(', ')}`);
+      }
+      if (policyParts.length) childSection.appendChild(el('p', {class: 'swarm-child-policy', text: policyParts.join(' · ')}));
+    }
+    const childList = el('ul', {class: 'swarm-child-list'});
+    for (const [name, child] of childRecords) {
+      const statusKey = child.status === 'failed' ? 'swarm.childFailed'
+        : child.status === 'exited' ? 'swarm.childExited'
+          : child.status === 'reserved' ? 'swarm.childStarting'
+            : child.status === 'running' ? 'swarm.childRunning' : 'swarm.childUnknown';
+      const statusClass = child.status === 'failed' ? 'failed'
+        : child.status === 'exited' ? 'exited'
+          : child.status === 'reserved' ? 'starting'
+            : child.status === 'running' ? 'running' : 'unknown';
+      const identity = [child.parent ? `${t('swarm.childParent')}: ${child.parent}` : '',
+        typeof child.profile === 'string' ? child.profile : ''].filter(Boolean).join(' · ');
+      const childItem = el('li', {class: `swarm-child swarm-child-${statusClass}`}, [
+        el('span', {class: 'swarm-child-name', text: name}),
+        identity ? el('span', {class: 'swarm-child-meta', text: identity}) : null,
+        el('span', {class: 'swarm-child-status', text: t(statusKey)}),
+      ]);
+      if (child.invite === 'child_room') {
+        const childRoom = typeof child.child_room === 'string' ? child.child_room : '';
+        if (childRoom) {
+          const roomLink = el('button', {type: 'button', class: 'swarm-child-room-link',
+            text: `${t('swarm.childOpenRoom')} · ${childRoom}`});
+          roomLink.addEventListener('click', () => {
+            const linkedRoom = rooms.find(r => r.id === childRoom);
+            openRoom(childRoom, linkedRoom ? linkedRoom.owner : 'System');
+          });
+          childItem.appendChild(roomLink);
+        }
+        const historyLabel = child.history === 'recent' ? 'swarm.childHistoryRecent' : 'swarm.childHistoryNone';
+        childItem.appendChild(el('span', {class: 'swarm-child-meta', text: t(historyLabel)}));
+        childItem.appendChild(el('span', {class: 'swarm-child-context-note', text: t('swarm.childContextNote')}));
+        const relayLabel = child.relay === 'none' ? 'swarm.childRelayOff'
+          : child.relay_status === 'sent' ? 'swarm.childRelaySent'
+            : child.relay_status === 'failed' || child.delivery === 'relay_failed' ? 'swarm.childRelayFailed'
+              : 'swarm.childRelayPending';
+        childItem.appendChild(el('span', {class: `swarm-child-relay${relayLabel === 'swarm.childRelayFailed' ? ' failed' : ''}`,
+          text: t(relayLabel)}));
+      }
+      childList.appendChild(childItem);
+    }
+    childSection.appendChild(childList);
+    body.appendChild(childSection);
+  }
+
+  const grid = el('div', {class: 'swarm-grid'});
+  for (const [bucketName, labelKey] of SWARM_BUCKETS) {
+    const bucket = state[bucketName] && typeof state[bucketName] === 'object' ? state[bucketName] : {};
+    const entries = Object.entries(bucket);
+    const group = el('section', {class: `swarm-group swarm-${bucketName}`});
+    group.appendChild(el('h3', {text: `${t(labelKey)} · ${entries.length}`}));
+    if (!entries.length) {
+      group.appendChild(el('p', {class: 'swarm-empty', text: t('swarm.empty')}));
+    } else {
+      const list = el('ul', {class: 'swarm-list'});
+      for (const [key, entry] of entries) {
+        const value = swarmEntryText(entry);
+        const member = entry && typeof entry === 'object' ? entry.member : '';
+        const item = el('li', {}, [
+          el('span', {class: 'swarm-key', text: key}),
+          el('span', {class: 'swarm-value', text: value || '—'}),
+        ]);
+        if (member) item.appendChild(el('span', {class: 'swarm-owner', text: `${t(bucketName === 'responsibilities' && key === 'reporter' ? 'swarm.reporter' : 'swarm.owner')}: ${member}`}));
+        list.appendChild(item);
+      }
+      group.appendChild(list);
+    }
+    grid.appendChild(group);
+  }
+  body.appendChild(grid);
+  if (state.final && typeof state.final === 'object' && state.final.result) {
+    body.appendChild(el('section', {class: 'swarm-final'}, [
+      el('h3', {text: t('swarm.final')}),
+      el('p', {text: String(state.final.result)}),
+      state.final.member ? el('span', {class: 'swarm-owner', text: `${t('swarm.owner')}: ${state.final.member}`}) : null,
+    ]));
+  }
+  details.appendChild(body);
+  panel.appendChild(details);
 }
 
 async function openRoom(id, owner) {
   currentRoom = id;
   currentOwner = owner;
+  selectedReplyTarget = null;
+  history.replaceState(null, '', `${location.pathname}${location.search}#room=${encodeURIComponent(id)}`);
   lastId = 0;
   msgMap = {};
+  roomMessages = [];
+  roomData = null;
+  lastPhases = {};
+  lastHealth = {};
+  lastRenderedRound = null;
   agentMetaTotals = {};
   closeAgentStreams();  // abort authenticated fetch streams from previous room
   renderRooms();
   buildChatShell(rooms.find(x => x.id === id) || {id});
   await fetchMessages(true);
   await attachAgentPanels(id);  // Phase 1: live agent event stream (Codex / runner agents)
+  if (roomData && currentRoom === id) { renderRoomLanes(roomData, lastStatuses); updateFooterStatus(); }
   // Re-paint totals badges after panels rebuilt
   Object.keys(agentMetaTotals).forEach(renderAgentTotalsBadge);
   relayout();  // reveal the activity panel now that a room is open
+}
+
+function initRoomSearch() {
+  const panel = document.getElementById('room-search');
+  const input = document.getElementById('room-search-input');
+  const button = document.getElementById('search-toggle');
+  input.placeholder = t('search.placeholder');
+  input.setAttribute('aria-label', t('search.placeholder'));
+  const close = () => {
+    panel.hidden = true;
+    input.value = '';
+    searchResults = null;
+    searchPending = false;
+    clearTimeout(searchTimer);
+    searchSequence++;
+    button.setAttribute('aria-expanded', 'false');
+    renderRooms();
+  };
+  button.onclick = () => {
+    if (!panel.hidden) return close();
+    panel.hidden = false;
+    button.setAttribute('aria-expanded', 'true');
+    if (isOverlay()) { layout.drawer = 'sidebar'; relayout(); }
+    else if (layout.sidebarCollapsed) { layout.sidebarCollapsed = false; persistLayout(); relayout(); }
+    input.focus();
+    renderRooms();
+  };
+  document.getElementById('room-search-close').onclick = close;
+  input.oninput = () => {
+    clearTimeout(searchTimer);
+    const query = input.value.trim();
+    const sequence = ++searchSequence;
+    if (!query) { searchResults = null; searchPending = false; renderRooms(); return; }
+    searchPending = true;
+    renderRooms();
+    searchTimer = setTimeout(async () => {
+      try {
+        let results;
+        try {
+          const response = await apiFetch(`/api/rooms_search?q=${encodeURIComponent(query)}`);
+          results = (await response.json()).results;
+        } catch (error) {
+          // An older running server may still serve the fresh dashboard files.
+          // Keep search usable until its Python process is restarted.
+          if (error.status !== 404) throw error;
+          results = await searchOnOlderServer(query, sequence);
+        }
+        if (sequence !== searchSequence) return;
+        searchResults = results;
+        searchPending = false;
+        renderRooms();
+      } catch (error) {
+        if (sequence !== searchSequence) return;
+        searchPending = false;
+        searchResults = [];
+        renderRooms();
+        showDashboardNotice(`Search failed: ${error.message}`, 'Retry', () => input.dispatchEvent(new Event('input')));
+      }
+    }, 250);
+  };
+  input.onkeydown = event => { if (event.key === 'Escape') close(); };
+}
+
+async function searchOnOlderServer(query, sequence) {
+  const needle = query.toLocaleLowerCase();
+  const snapshot = rooms.slice();
+  const found = [];
+  let next = 0;
+  async function worker() {
+    while (next < snapshot.length && sequence === searchSequence) {
+      const room = snapshot[next++];
+      const name = String(room.name || room.id);
+      const titleMatch = name.toLocaleLowerCase().includes(needle);
+      let match = null;
+      try {
+        const response = await apiFetch(`/api/messages_json?room_id=${encodeURIComponent(room.id)}`);
+        const data = await response.json();
+        match = (data.messages || []).find(msg =>
+          typeof msg.body === 'string' && msg.body.toLocaleLowerCase().includes(needle));
+      } catch (_) { /* A title hit still remains searchable if its log is unavailable. */ }
+      if (!titleMatch && !match) continue;
+      const body = match ? match.body.replace(/\s+/g, ' ') : '';
+      const at = body.toLocaleLowerCase().indexOf(needle);
+      const start = Math.max(0, at - 72);
+      found.push({id: room.id, name, owner: room.owner, status: room.status,
+        title_match: titleMatch, last_activity: room.last_activity || room.created_at,
+        message_id: match ? match.id : null,
+        snippet: body ? (start ? '…' : '') + body.slice(start, start + 190) +
+          (start + 190 < body.length ? '…' : '') : ''});
+    }
+  }
+  await Promise.all(Array.from({length: Math.min(4, snapshot.length)}, worker));
+  found.sort((a, b) => Number(b.title_match) - Number(a.title_match) ||
+    (b.last_activity || 0) - (a.last_activity || 0));
+  return found.slice(0, 100);
 }
 
 // ── Phase 1: agent live event panels ─────────────────────────────────────────
@@ -871,7 +1551,7 @@ function closeAgentStreams() {
     if (stream.retryResolve) stream.retryResolve();
   }
   agentStreams = {};
-  resetActivityPanel('Откроется при выборе комнаты со spawned-агентами');
+  resetActivityPanel(t('activity.hint'));
 }
 
 function parseSSEText(state, text, finish = false) {
@@ -990,10 +1670,22 @@ async function streamAgentEvents(baseUrl, name, stream) {
               }
               if (Number.isSafeInteger(parsedOffset)) stream.offset = parsedOffset;
               const node = status();
-              if (node) node.textContent = event.event === 'open' ? '● live' : '↻ stream reset';
+              if (node) {
+                const outcome = swarmAgentOutcome(roomData, name);
+                if (outcome) {
+                  node.textContent = swarmOutcomeText(outcome);
+                } else {
+                  node.textContent = event.event === 'open'
+                    ? `● ${t('activity.liveStatus')}`
+                    : `↻ ${t('activity.resetStatus')}`;
+                }
+              }
             } else if (event.event === 'error') {
               const node = status();
-              if (node) node.textContent = `× ${event.data || 'stream error'}`;
+              if (node) node.textContent = `× ${t('activity.errorStatus')}`;
+              if (event.data) {
+                appendAgentEvent(name, JSON.stringify({type: 'error', error: event.data}));
+              }
             } else {
               if (Number.isSafeInteger(parsedOffset)) {
                 if (parsedOffset <= stream.offset) continue;
@@ -1013,7 +1705,7 @@ async function streamAgentEvents(baseUrl, name, stream) {
             || (e && e.name === 'AbortError')) return;
         if (e && e.status === 401) {
           const node = status();
-          if (node) node.textContent = '× authentication required';
+          if (node) node.textContent = `× ${t('activity.authStatus')}`;
           showAuthRequired('Authentication expired. Enter the token to reconnect.');
           return;
         }
@@ -1022,7 +1714,14 @@ async function streamAgentEvents(baseUrl, name, stream) {
       stream.attempt = Math.min((stream.attempt || 0) + 1, 5);
       const delayMs = Math.min(1000 * (2 ** (stream.attempt - 1)), 10000);
       const node = status();
-      if (node) node.textContent = `↻ reconnecting in ${delayMs / 1000}s`;
+      if (node) {
+        const outcome = swarmAgentOutcome(roomData, name);
+        if (outcome) {
+          node.textContent = swarmOutcomeText(outcome);
+        } else {
+          node.textContent = `↻ ${t('activity.retrying')} · ${delayMs / 1000}s`;
+        }
+      }
       await reconnectDelay(stream, delayMs);
     }
   } finally {
@@ -1036,7 +1735,7 @@ function resetActivityPanel(emptyHint) {
   panel.innerHTML = '';
   if (emptyHint) {
     panel.appendChild(el('div', {class: 'activity-empty'}, [
-      el('div', {class: 'activity-empty-title', text: 'Agent activity'}),
+      el('div', {class: 'activity-empty-title', text: t('activity.title')}),
       el('div', {class: 'activity-empty-hint', text: emptyHint}),
     ]));
   }
@@ -1044,63 +1743,71 @@ function resetActivityPanel(emptyHint) {
 }
 
 async function attachAgentPanels(roomId) {
+  const attachGeneration = activityStreamGeneration;
   let resp;
   try {
     resp = await apiFetch('/api/room_agents?room_id=' + encodeURIComponent(roomId));
   } catch(e) {
-    resetActivityPanel('Не удалось загрузить агентов');
+    if (roomId === currentRoom && attachGeneration === activityStreamGeneration) {
+      resetActivityPanel(t('activity.loadAgentsFailed'));
+    }
     return;
   }
+  if (roomId !== currentRoom || attachGeneration !== activityStreamGeneration) return;
   const {agents, health} = await resp.json();
+  if (roomId !== currentRoom || attachGeneration !== activityStreamGeneration) return;
   const spawned = agents || {};
   const healthMap = health || {};
+  if (roomId === currentRoom) lastHealth = healthMap;
   const panel = resetActivityPanel(null);
   if (!panel) return;
 
   // Show EVERY participant — not just huddle-spawned ones. The room owner
   // (Claude) has no spawned process / event log, but the user still wants to
   // see that it is in the room and its online/busy status.
-  const room = rooms.find(x => x.id === roomId) || {};
+  const room = (roomData && roomData.id === roomId) ? roomData : (rooms.find(x => x.id === roomId) || roomData || {});
   const seen = new Set();
   const participants = [];
   for (const p of (room.participants || [])) { if (!seen.has(p)) { seen.add(p); participants.push(p); } }
   for (const p of Object.keys(spawned)) { if (!seen.has(p)) { seen.add(p); participants.push(p); } }
 
   if (!participants.length) {
-    resetActivityPanel('В этой комнате нет участников');
+    resetActivityPanel(t('activity.noParticipants'));
     return;
   }
 
   const wrap = el('div', {class: 'agent-panels', id: 'agent-panels'});
-  wrap.appendChild(el('div', {class: 'agent-panels-header', text: 'Agent activity (live)'}));
+  wrap.appendChild(el('div', {class: 'agent-panels-header', text: t('activity.liveTitle')}));
   const scroll = el('div', {class: 'agent-panels-scroll'});
   wrap.appendChild(scroll);
 
   for (const name of participants) {
     const isSpawned = !!spawned[name];
+    const outcome = swarmAgentOutcome(room, name);
+    const isFailed = outcome === 'failed';
     const healthSpan = el('span', {class: 'agent-panel-health', id: `agent-health-${name}`});
 
     const summary = el('summary', {class: 'agent-panel-summary'}, [
       avatar(name, 'avatar-sm'),
       el('span', {class: 'agent-panel-name', text: name}),
-      el('span', {class: 'agent-status-dot offline', id: `agent-sdot-${name}`,
-                  title: `${name}: offline`}),
+      el('span', {class: `agent-status-dot ${isFailed ? 'failed' : 'offline'}`, id: `agent-sdot-${name}`,
+                  title: outcome ? `${name}: ${swarmOutcomeText(outcome)}` : `${name}: offline`}),
       el('span', {class: 'agent-panel-totals', id: `agent-totals-${name}`, text: ''}),
-      el('span', {class: 'agent-panel-status', id: `agent-status-${name}`,
-                  text: isSpawned ? '·' : 'no live stream'}),
+      el('span', {class: `agent-panel-status${isFailed ? ' failed' : ''}`, id: `agent-status-${name}`,
+                  text: outcome ? swarmOutcomeText(outcome) : (isSpawned ? t('activity.pending') : t('activity.noStream'))}),
       healthSpan,
     ]);
 
+    const transcript = buildAgentTranscript(name, roomMessages);
     const body = isSpawned
       ? el('div', {class: 'agent-events', id: `agent-events-${name}`})
       : el('div', {class: 'agent-panel-hint', text: name === room.owner
-          ? 'Оркестратор комнаты. Его реплики видны в чате слева — huddle не spawn-ит owner-а, поэтому отдельного live-лога событий у него нет.'
-          : 'Участник без spawned-процесса: live-потока событий нет, только статус.'});
+          ? t('activity.ownerHint') : t('activity.staticHint')});
 
     const detailsEl = el('details', {
       class: 'agent-panel' + (isSpawned ? '' : ' static'),
-      dataset: {agent: name}, open: '',
-    }, [summary, body]);
+      dataset: {agent: name}, open: '', style: `--agent-c:${agentColor(name)}`,
+    }, [summary, transcript, body]);
     scroll.appendChild(detailsEl);
 
     if (isSpawned) {
@@ -1122,13 +1829,64 @@ async function attachAgentPanels(roomId) {
   updateActivityStatuses(lastStatuses);
 }
 
+// Check whether an agent has finished their part in a Swarm room.
+function isSwarmMemberDone(room, name) {
+  const current = room || roomData || (currentRoom ? rooms.find(x => x.id === currentRoom) : null);
+  const pilot = current && current.swarm_pilot;
+  if (!pilot || typeof pilot !== 'object') return false;
+  // A child has its own lifecycle; it is not a pilot member and must not be
+  // inferred complete from the team's final phase.
+  const children = pilot.children && typeof pilot.children === 'object' ? pilot.children : {};
+  if (Object.prototype.hasOwnProperty.call(children, name)) {
+    const child = children[name];
+    return !!child && child.status === 'exited' && child.returncode === 0;
+  }
+  const done = pilot.done && typeof pilot.done === 'object' ? pilot.done : {};
+  if (name in done) return true;
+  if (pilot.phase === 'completed') {
+    const members = Array.isArray(pilot.members) ? pilot.members : [];
+    if (!members.length || members.includes(name)) return true;
+  }
+  return false;
+}
+
+function isSwarmChildFailed(room, name) {
+  const current = room || roomData || (currentRoom ? rooms.find(x => x.id === currentRoom) : null);
+  const pilot = current && current.swarm_pilot;
+  const children = pilot && pilot.children && typeof pilot.children === 'object' ? pilot.children : {};
+  if (!Object.prototype.hasOwnProperty.call(children, name)) return false;
+  const child = children[name];
+  return !!child && (child.status === 'failed'
+    || (child.status === 'exited' && child.returncode !== undefined
+      && child.returncode !== null && Number(child.returncode) !== 0));
+}
+
+function swarmAgentOutcome(room, name) {
+  if (isSwarmChildFailed(room, name)) return 'failed';
+  if (isSwarmMemberDone(room, name)) return 'done';
+  const current = room || roomData || {};
+  if (current.status === 'closed' || current.status === 'resolved') {
+    const health = lastHealth[name];
+    // A closed room alone is not proof the agent finished. Require the server's
+    // process check; retain an explicit failed-exit signal as an error.
+    if (health && health.process_state === 'exited') {
+      return health.last_wake_failed ? 'failed' : 'done';
+    }
+  }
+  return '';
+}
+
+function swarmOutcomeText(outcome) {
+  return outcome === 'failed' ? `✗ ${t('activity.failed')}` : t('lanes.done');
+}
+
 // Wake-health label for an agent panel (from /api/room_agents `health`).
 function activityHealthLabel(h) {
   if (!h) return '';
-  if (h.unowned_lease) return '⚠ unowned/unknown lease';
-  if (h.stale_lease) return '⚠ stale lease';
-  if (h.last_wake_failed) return `✗ wake failed (rc ${h.last_wake_rc})`;
-  if (h.wake_fail_count > 0) return `⚠ ${h.wake_fail_count} wake fail(s)`;
+  if (h.unowned_lease) return `⚠ ${t('activity.unownedLease')}`;
+  if (h.stale_lease) return `⚠ ${t('activity.staleLease')}`;
+  if (h.last_wake_failed) return `✗ ${t('activity.wakeFailed')}`;
+  if (h.wake_fail_count > 0) return `⚠ ${t('activity.wakeFailures')}: ${h.wake_fail_count}`;
   return '';
 }
 
@@ -1137,59 +1895,244 @@ function updateActivityStatuses(statuses) {
   statuses = statuses || {};
   document.querySelectorAll('[id^="agent-sdot-"]').forEach(dot => {
     const name = dot.id.slice('agent-sdot-'.length);
+    const outcome = swarmAgentOutcome(roomData, name);
+    const isDone = outcome === 'done';
+    const isFailed = outcome === 'failed';
     const st = statuses[name] || 'offline';
-    const cls = st === 'busy' ? 'busy' : st === 'online' ? 'online' : 'offline';
+    const cls = isDone ? 'offline' : isFailed ? 'failed'
+      : (st === 'busy' ? 'busy' : st === 'online' ? 'online' : 'offline');
     dot.className = 'agent-status-dot ' + cls;
-    dot.title = `${name}: ${st}`;
+    dot.title = `${name}: ${outcome ? swarmOutcomeText(outcome) : t(`status.${st}`)}`;
+
+    const statusNode = document.getElementById(`agent-status-${name}`);
+    if (statusNode) {
+      statusNode.classList.toggle('failed', isFailed);
+      if (outcome) {
+        statusNode.textContent = swarmOutcomeText(outcome);
+      } else if (statusNode.textContent === t('lanes.done')
+          || statusNode.textContent === `✗ ${t('activity.failed')}`) {
+        statusNode.textContent = agentStreams[name] ? `● ${t('activity.liveStatus')}` : t('activity.pending');
+      }
+    }
   });
+}
+
+// Terminal runners emit a mixture of JSONL, plain stderr and ANSI control
+// sequences. Keep the raw record behind an explicit disclosure, while the
+// everyday panel shows a short human-readable status or result.
+function stripAnsi(value) {
+  return String(value == null ? '' : value)
+    .replace(/\x1B\][^\x07]*(?:\x07|\x1B\\)/g, '')
+    .replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '')
+    .replace(/\x9B[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, ' ');
+}
+
+function printableDiagnostic(value) {
+  return String(value == null ? '' : value)
+    .replace(/\x1B/g, '\\x1b')
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, c => `\\x${c.charCodeAt(0).toString(16).padStart(2, '0')}`);
+}
+
+function activityTypeLabel(type, object) {
+  const key = String(type || '').toLowerCase().replace(/\s+/g, '_');
+  if (object && object.agent_message != null) return t('activity.answer');
+  if (object && object.item && object.item.type === 'agent_message') return t('activity.answer');
+  if (object && object.item && object.item.type === 'mcp_tool_call') return t('activity.tool');
+  if (object && object.item && object.item.type === 'command_execution') return t('activity.internal');
+  if (/agent[_ .-]?message|message/.test(key)) return t('activity.answer');
+  if (/delta|chunk|stream/.test(key)) return t('activity.fragment');
+  if (/tool[_ .-]?call|tool|function[_ .-]?call/.test(key)) return t('activity.tool');
+  if (/huddle[_ .-]|room[_ .-]|messages?[_ .-]?read|message[_ .-]?post/.test(key)) return t('activity.roomWork');
+  if (/thread[._-]?started|turn[._-]?started|spawn|^start|^started/.test(key)) return t('activity.started');
+  if (/thread[._-]?completed|turn[._-]?completed|^complete|^completed|finished|success/.test(key)) return t('activity.completed');
+  if (/failed|failure/.test(key)) return t('activity.failed');
+  if (/error|exception/.test(key)) return t('activity.error');
+  if (/rate.?limit|quota/.test(key)) return t('activity.limitReached');
+  if (/cancel|abort|stopped/.test(key)) return t('activity.cancelled');
+  if (/churn|retry|reconnect/.test(key)) return t('activity.retrying');
+  if (/output|stdout|stderr/.test(key)) return t('activity.output');
+  if (/item[._-]?completed|step[._-]?completed/.test(key)) return t('activity.step');
+  return t('activity.generic');
+}
+
+function activityPayload(object) {
+  if (!object || typeof object !== 'object') return '';
+  const item = object.item && typeof object.item === 'object' ? object.item : null;
+  const value = object.agent_message ?? object.message ?? object.delta ?? object.content
+    ?? object.text ?? object.error ?? object.reason ?? (item && (item.text || item.message));
+  if (value == null || typeof value === 'object') return '';
+  return stripAnsi(value).replace(/\s+/g, ' ').trim();
+}
+
+function visibleActivityPayload(payload, type, object) {
+  if (!payload) return '';
+  if (/usage limit|rate.?limit|quota exceeded/i.test(payload)) return t('activity.limitReached');
+  if (/failed to parse hooks config|unknown field.*expected/i.test(payload)) return t('activity.setupIssue');
+  if (/^(?:item[._-]?completed|step[._-]?completed|thread[._-]?started|turn[._-]?started)$/i.test(type)) return '';
+  const answer = (object && (object.agent_message != null
+    || (object.item && object.item.type === 'agent_message')))
+    || /agent[_ .-]?message|^answer$/i.test(String(type || ''));
+  if (!answer) return '';
+  if (/^\s*(?:\{|\[|\/Users\/|\/private\/)/.test(payload)) return '';
+  return payload.slice(0, 220);
+}
+
+function plainActivityLabel(clean) {
+  // OpenCode and shell bridges often print a startup banner or a tool call as
+  // plain text. Do not leak their command/JSON arguments into the default UI.
+  if (/reading additional input from stdin|waiting for (?:additional )?input from stdin/i.test(clean)) {
+    return t('activity.agentStarted');
+  }
+  if (/^>\s*(build|run|start|model)\b/i.test(clean)
+      || /\b(model|reasoning)\s*[·:]/i.test(clean)) {
+    return t('activity.agentStarted');
+  }
+  if (/\b(?:huddle|room)_(?:messages?_read|message_post|room_(?:list|create|status))\b/i.test(clean)
+      || /\b(?:messages?_read|message_post|room_list|room_create)\b/i.test(clean)) {
+    return t('activity.roomWork');
+  }
+  if (/^\s*(?:tool|function|calling)\b/i.test(clean)) return t('activity.tool');
+  if (/^\s*(?:error|failed|failure|exception)\b/i.test(clean)) return t('activity.error');
+  // Antigravity/CLI bridges may emit a path or bare room identifier as a
+  // transport line. A prose line that mentions a path remains visible.
+  if (/^(?:file:\/\/\/|\/(?:Users|private|tmp|var)\/)[^\n]+$/i.test(clean)
+      || /^room_[a-z0-9_-]+$/i.test(clean)
+      || /^(?:room_id|session_id|request_id)\s*[:=]\s*\S+$/i.test(clean)) {
+    return t('activity.internal');
+  }
+  return '';
+}
+
+function activityPresentation(raw) {
+  const clean = stripAnsi(raw).trim();
+  if (!clean) return null;
+  let object = null;
+  try { object = JSON.parse(clean); } catch (_) {}
+  if (object && typeof object === 'object') {
+    const type = object.type || object.event || object.status || '';
+    const label = activityTypeLabel(type, object);
+    const payload = visibleActivityPayload(activityPayload(object), type, object);
+    if (payload === t('activity.limitReached') || payload === t('activity.setupIssue')) {
+      return {summary: payload, raw: JSON.stringify(object, null, 2)};
+    }
+    const suffix = payload ? `: ${payload}` : '';
+    return {
+      summary: label === t('activity.generic') && !payload ? '' : `${label}${suffix}`,
+      raw: JSON.stringify(object, null, 2),
+    };
+  }
+  // Keep unclassified process output out of the readable stream. It remains
+  // available in the disclosure below for diagnosis.
+  if (/^[\[{]/.test(clean)) {
+    return {summary: '', raw};
+  }
+  const label = plainActivityLabel(clean);
+  if (label) return {summary: label, raw};
+  return {summary: '', raw};
+}
+
+function appendAgentDiagnostic(list, raw) {
+  let details = list.querySelector('.agent-diagnostics');
+  if (!details) {
+    details = el('details', {class: 'agent-diagnostics'}, [
+      el('summary', {text: t('activity.detail')}),
+      el('pre'),
+    ]);
+    details._records = [];
+    list.appendChild(details);
+  }
+  details._records.push(printableDiagnostic(raw));
+  while (details._records.length > 200) details._records.shift();
+  details.querySelector('summary').textContent = `${t('activity.detail')} · ${details._records.length}`;
+  details.querySelector('pre').textContent = details._records.join('\n\n');
 }
 
 function appendAgentEvent(agentName, raw) {
   const list = document.getElementById(`agent-events-${agentName}`);
   if (!list) return;
-  let summary = raw;
-  let detail = null;
-  try {
-    const obj = JSON.parse(raw);
-    // Codex --json events: {type, agent_message?, delta?, ...}
-    // Runner events (MiMo / DeepSeek / Qwen via *_runner): {type, error?,
-    //   reason?, model?, message_id?, ...}. Antigravity (agy -p) is plain text.
-    if (obj.type) {
-      summary = obj.type;
-      // Lines word-wrap in the panel now, so we can afford a fuller preview.
-      if (obj.agent_message) summary += ': ' + String(obj.agent_message).slice(0, 400);
-      else if (obj.delta) summary += ': ' + String(obj.delta).slice(0, 400);
-      else if (obj.content) summary += ': ' + String(obj.content).slice(0, 400);
-      else if (obj.error) summary += ': ' + String(obj.error).slice(0, 400);
-      else if (obj.reason) summary += ': ' + String(obj.reason).slice(0, 400);
-      else if (obj.model) summary += ': ' + String(obj.model).slice(0, 120);
-      detail = JSON.stringify(obj, null, 2);
-    }
-  } catch(e) {
-    // Not JSON — show as plain text (e.g. stderr lines).
+  const view = activityPresentation(raw);
+  if (!view) return;
+  const keepAtEnd = list.scrollHeight - list.scrollTop - list.clientHeight < 32;
+  if (view.summary) {
+    const line = el('div', {class: 'agent-event'}, [
+      el('span', {class: 'agent-event-summary', text: view.summary}),
+    ]);
+    const diagnostics = list.querySelector('.agent-diagnostics');
+    if (diagnostics) list.insertBefore(line, diagnostics);
+    else list.appendChild(line);
   }
-  const line = el('div', {class: 'agent-event'}, [
-    el('span', {class: 'agent-event-summary', text: summary}),
+  appendAgentDiagnostic(list, raw);
+  if (keepAtEnd) list.scrollTop = list.scrollHeight;
+}
+
+function transcriptMessagesFor(name, messages) {
+  return messages.filter(m => m.agent === name || m.to === name || m.to === 'all');
+}
+
+function buildAgentTranscript(name, messages) {
+  const relevant = transcriptMessagesFor(name, messages || []);
+  const content = el('div', {class: 'agent-transcript-scroll'});
+  for (const message of relevant) content.appendChild(agentTranscriptMessage(message));
+  content.dataset.lastId = String((messages || []).reduce((max, m) => Math.max(max, Number(m.id) || 0), 0));
+  return el('details', {class: 'agent-transcript', dataset: {agent: name}}, [
+    el('summary', {text: `${t('activity.transcript')} · ${relevant.length}`}),
+    content,
   ]);
-  if (detail) {
-    line.title = detail;
-  }
-  list.appendChild(line);
-  // Auto-scroll: keep last 200 events to avoid runaway DOM.
-  while (list.children.length > 200) list.removeChild(list.firstChild);
-  list.scrollTop = list.scrollHeight;
+}
+
+function agentTranscriptMessage(message) {
+  return el('article', {class: 'agent-transcript-message'}, [
+    el('div', {class: 'agent-transcript-meta', text: `${message.agent || '—'} · ${messageKindLabel(message.kind)} · ${fmtTime(message.timestamp)}`}),
+    el('div', {class: 'agent-transcript-body', text: message.body || ''}),
+  ]);
+}
+
+function updateAgentTranscripts(messages) {
+  const additions = (messages || []).slice();
+  if (!additions.length) return;
+  document.querySelectorAll('.agent-transcript').forEach(transcript => {
+    const name = transcript.dataset.agent;
+    const content = transcript.querySelector('.agent-transcript-scroll');
+    if (!content) return;
+    let lastId = Number(content.dataset.lastId) || 0;
+    const keepAtEnd = content.scrollHeight - content.scrollTop - content.clientHeight < 32;
+    for (const message of additions) {
+      const id = Number(message.id) || 0;
+      if (id <= lastId) continue;
+      if (message.agent === name || message.to === name || message.to === 'all') {
+        content.appendChild(agentTranscriptMessage(message));
+        const summary = transcript.querySelector('summary');
+        if (summary) {
+          const count = content.querySelectorAll('.agent-transcript-message').length;
+          summary.textContent = `${t('activity.transcript')} · ${count}`;
+        }
+      }
+      lastId = Math.max(lastId, id);
+    }
+    content.dataset.lastId = String(lastId);
+    if (keepAtEnd) content.scrollTop = content.scrollHeight;
+  });
 }
 
 function renderOne(m) {
   const list = document.getElementById('messages');
   if (!list) return;
-  msgMap[m.id] = {body: m.body, agent: m.agent};
+  msgMap[m.id] = {id: Number(m.id), body: m.body, agent: m.agent};
+  const round = Number(m.round) > 0 ? Number(m.round) : 0;
+  if (round !== lastRenderedRound) {
+    const label = round ? `${t('round.label')} ${round}` : t('round.discussion');
+    list.appendChild(el('div', {class: 'round-divider'}, [el('span', {text: label})]));
+    lastRenderedRound = round;
+  }
 
   const isSystem = (m.agent === 'System' || m.kind === 'system' || m.kind === 'close');
 
   if (isSystem) {
     const div = el('div', {class: 'msg is-system', dataset: {id: String(m.id)}}, [
+      el('div', {class: 'msg-system-when', text: `${fmtTime(m.timestamp)} · #${m.id}`}),
       el('div', {class: 'msg-body', text: m.body}),
+      replyButton(m),
     ]);
     list.appendChild(div);
     list.scrollTop = list.scrollHeight;
@@ -1202,18 +2145,21 @@ function renderOne(m) {
     renderAgentTotalsBadge(m.agent);
   }
   const line = el('div', {class: 'msg-line'}, [
-    el('span', {class: 'msg-name', text: m.agent}),
-    m.to ? el('span', {class: 'msg-to', text: '→ ' + m.to}) : null,
-    el('span', {class: `kind kind-${m.kind}`, text: m.kind}),
-    el('span', {class: 'msg-time', text: fmtTime(m.timestamp)}),
+    el('span', {class: 'msg-agent-ident'}, [avatar(m.agent, 'avatar-inline'), el('span', {class: 'msg-name', text: m.agent})]),
+    el('span', {class: 'msg-time', text: `${fmtTime(m.timestamp)} · #${m.id}`}),
+  ]);
+  const kindLine = el('div', {class: 'msg-kind-line'}, [
+    el('span', {class: `kind kind-${m.kind}`, text: messageKindLabel(m.kind)}),
+    m.to ? el('span', {class: 'msg-to', text: '→ ' + messageRecipientLabel(m.to)}) : null,
     badge,
+    replyButton(m),
   ]);
 
   const bubble = el('div', {class: 'msg-bubble'});
   if (m.reply_to != null) {
     const q = msgMap[m.reply_to];
     const replyName = q ? q.agent : `#${m.reply_to}`;
-    const replyAgentColor = q ? `var(--c-${(q.agent||'').toLowerCase()}, var(--text-muted))` : 'var(--text-muted)';
+    const replyAgentColor = q ? agentColor(q.agent) : 'var(--text-muted)';
     const preview = q
       ? (q.body.length > 90 ? q.body.slice(0,90) + '…' : q.body)
       : `(message #${m.reply_to})`;
@@ -1229,20 +2175,214 @@ function renderOne(m) {
     replyEl.querySelector('.reply-name').style.color = replyAgentColor;
     bubble.appendChild(replyEl);
   }
+  // Opus skin: book-style head (large initial, name, tiny caption) floated
+  // right before the text, below any reply quote, so the text wraps beside it.
+  // The skin hides `line` instead; every other skin hides this head, so the
+  // author is never exposed twice. "Name (note)" splits into name and caption.
+  const nameParts = /^(.+?)\s+\(([^()]+)\)$/.exec(m.agent);
+  const drophead = el('div', {class: 'msg-drophead'}, [
+    el('span', {class: 'msg-dropcap', 'aria-hidden': 'true', text: agentLetter(m.agent)}),
+    el('span', {class: 'msg-drophead-text'}, [
+      el('span', {class: 'msg-name', text: nameParts ? nameParts[1] : m.agent}),
+      nameParts ? el('span', {class: 'msg-model-note', text: nameParts[2]}) : null,
+      el('span', {class: 'msg-time', text: `${fmtTime(m.timestamp)} · #${m.id}`}),
+    ]),
+  ]);
   const bodyEl = el('div', {class: 'msg-body md'});
   bodyEl.innerHTML = renderMarkdown(m.body);
+  bubble.appendChild(drophead);
   bubble.appendChild(bodyEl);
 
   const div = el('div', {
     class: `msg ${agentCls(m.agent)} kind-${m.kind}`,
-    dataset: {id: String(m.id)},
+    dataset: {id: String(m.id)}, style: `--agent-c:${agentColor(m.agent)}`,
   }, [
-    avatar(m.agent),
-    el('div', {class: 'msg-content'}, [line, bubble]),
+    el('div', {class: 'msg-content'}, [line, el('div', {class: 'msg-main'}, [kindLine, bubble])]),
   ]);
 
   list.appendChild(div);
   list.scrollTop = list.scrollHeight;
+}
+
+// Lane state comes only from the live snapshot: explicit phase first, then the
+// legacy lease status (servers without `phases`). Idle agents never blink.
+const LANE_PHASES = {
+  thinking: ['thinking', 'lanes.thinking'], responding: ['responding', 'lanes.responding'],
+  working: ['working', 'lanes.working'], starting: ['starting', 'lanes.starting'],
+  queued: ['queued', 'lanes.queued'], completed: ['done', 'lanes.done'],
+  rate_limited: ['limited', 'lanes.limited'], stuck: ['stuck', 'lanes.stuck'],
+  unavailable: ['offline', 'lanes.offline'], online: ['online', 'lanes.online'],
+};
+const LANE_ACTIVE = new Set(['thinking', 'responding', 'working', 'starting', 'queued']);
+
+function laneState(room, name) {
+  if (room.status === 'closed' || room.status === 'resolved') return ['done', t('lanes.done')];
+  const st = lastStatuses && lastStatuses[name];
+  const known = LANE_PHASES[lastPhases[name]];
+  const h = lastHealth[name];
+  // Health is fetched once per room open, so honour its end time locally.
+  const limited = h && h.rate_limited && (!h.rate_limited_until || h.rate_limited_until > Date.now() / 1000);
+  if (limited && (!known || !LANE_ACTIVE.has(known[0]))) return ['limited', t('lanes.limited')];
+  if (known) return [known[0], t(known[1])];
+  if (st === 'busy') return ['working', t('lanes.working')];
+  if (st === 'online') return ['online', t('lanes.online')];
+  if (st === 'offline') return ['offline', t('lanes.offline')];
+  return ['unknown', t('lanes.unknown')];
+}
+
+// One short, verifiable line about what the agent is on: derived from the
+// transcript (addressed requests, own posts) and wake-health, never invented.
+function laneDetail(room, name, phase, authored) {
+  const last = authored[authored.length - 1];
+  const open = room.status !== 'closed' && room.status !== 'resolved';
+  let pending = null;
+  for (let i = roomMessages.length - 1; i >= 0; i--) {
+    const m = roomMessages[i];
+    if (last && m.id <= last.id) break;
+    if (m.kind === 'request' && m.agent !== name && (m.to === name || m.to === 'all')) { pending = m; break; }
+  }
+  const h = lastHealth[name] || {};
+  if (phase === 'limited' && h.rate_limited_until > Date.now() / 1000) {
+    return `${t('lanes.until')} ${fmtTime(h.rate_limited_until)}${h.rate_limit_reason ? ' · ' + h.rate_limit_reason : ''}`;
+  }
+  if (LANE_ACTIVE.has(phase) && pending) return `${t('lanes.pending')} #${pending.id} ${t('lanes.from')} ${pending.agent} · ${fmtTime(pending.timestamp)}`;
+  if (open && pending) return `${t('lanes.unanswered')} #${pending.id} ${t('lanes.from')} ${pending.agent}`;
+  if (last) return `${t('lanes.last')}: ${messageKindLabel(last.kind)} #${last.id} · ${fmtTime(last.timestamp)}`;
+  return t('lanes.noPosts');
+}
+
+function roomLanePeople(room) {
+  return [...new Set((room.participants || []).filter(p => p !== 'Human' && p !== 'System'))];
+}
+
+function renderRoomLanes(room, statuses) {
+  const root = document.getElementById('room-lanes');
+  if (!root || !room) return;
+  const isOpen = room.status !== 'closed' && room.status !== 'resolved';
+  const nowSec = Date.now() / 1000;
+  // Open rooms re-render once a minute so the "now" edge keeps moving.
+  const signature = JSON.stringify([room.id, room.status, roomMessages.length,
+    roomMessages.length && roomMessages[roomMessages.length - 1].id, statuses, lastPhases,
+    lastHealth, laneCollapsed, LANG, isOpen && Math.floor(nowSec / 60)]);
+  if (root.dataset.signature === signature) return;
+  root.dataset.signature = signature;
+  const expanded = new Set([...root.querySelectorAll('.lane-log[open]')].map(x => x.dataset.agent));
+  const people = roomLanePeople(room);
+  const states = Object.fromEntries(people.map(name => [name, laneState(room, name)]));
+  const tally = {};
+  for (const name of people) { const key = states[name][1]; tally[key] = (tally[key] || 0) + 1; }
+
+  // Time axis: first message → now (open) or → last message (closed). A long
+  // idle gap is compressed and the now edge is drawn dashed with its real time.
+  let first = nowSec, lastTs = nowSec, stampCount = 0;
+  for (const m of roomMessages) {
+    const stamp = Number(m.timestamp);
+    if (!Number.isFinite(stamp) || stamp <= 0) continue;
+    if (!stampCount) first = lastTs = stamp;
+    else { first = Math.min(first, stamp); lastTs = Math.max(lastTs, stamp); }
+    stampCount++;
+  }
+  const span = Math.max(60, lastTs - first);
+  const far = isOpen && nowSec - lastTs > span;
+  const axisEnd = isOpen ? (far ? lastTs + span * 0.12 : Math.max(nowSec, lastTs)) : lastTs;
+  const pos = ts => `${Math.max(1.5, Math.min(98.5, ((Number(ts) || first) - first) / Math.max(1, axisEnd - first) * 97 + 1.5))}%`;
+
+  root.innerHTML = '';
+  const summary = Object.entries(tally).map(([key, n]) => `${key} — ${n}`).join(' · ');
+  const toggle = el('button', {class: 'lane-toggle', type: 'button', text: t(laneCollapsed ? 'lanes.expand' : 'lanes.collapse')});
+  toggle.onclick = () => { laneCollapsed = !laneCollapsed; renderRoomLanes(roomData, lastStatuses); };
+  const range = stampCount ? `${fmtTime(first)} → ${isOpen ? t('lanes.now') : fmtTime(lastTs)}` : '';
+  root.appendChild(el('div', {class: 'lanes-head'}, [
+    el('span', {text: `${t('lanes.title')}: ${summary || '—'}`}),
+    range ? el('span', {class: 'lanes-range', text: range}) : null,
+    el('span', {class: 'lanes-legend', text: t('lanes.legend')}),
+    toggle,
+  ]));
+  if (laneCollapsed) return;
+  for (const name of people) {
+    const authored = roomMessages.filter(m => m.agent === name);
+    const relevant = roomMessages.filter(m => m.agent === name || m.to === name || (m.kind === 'request' && m.to === 'all'));
+    const [phase, phaseLabel] = states[name];
+    const track = el('div', {class: 'lane-track'});
+    for (const m of authored) {
+      const tick = el('button', {class: `lane-tick kind-${m.kind}`, type: 'button',
+        title: `#${m.id} · ${messageKindLabel(m.kind)} · ${fmtTime(m.timestamp)}`,
+        'aria-label': `${name}: ${messageKindLabel(m.kind)} #${m.id}`});
+      tick.style.left = pos(m.timestamp);
+      tick.onclick = () => {
+        const target = document.querySelector(`#messages .msg[data-id="${m.id}"]`);
+        if (target) { target.scrollIntoView({block: 'center'}); target.classList.add('lane-flash');
+          setTimeout(() => target.classList.remove('lane-flash'), 1500); }
+      };
+      track.appendChild(tick);
+    }
+    if (isOpen) {
+      track.appendChild(el('span', {class: 'lane-now' + (far ? ' is-far' : ''), 'aria-hidden': 'true',
+        title: far ? `${t('lanes.nowFar')} ${fmtTime(lastTs)}` : `${t('lanes.now')} ${fmtTime(nowSec)}`}));
+    }
+    const log = el('details', {class: 'lane-log', dataset: {agent: name}}, [
+      el('summary', {text: name}),
+      el('div', {class: 'lane-log-body'}, relevant.length
+        ? relevant.map(m => el('button', {type: 'button'}, [
+          el('span', {class: 'lane-log-meta', text: `${fmtTime(m.timestamp)} · #${m.id} · ${m.agent} · ${messageKindLabel(m.kind)}`}),
+          el('span', {class: 'lane-log-message', text: m.body || ''}),
+        ]))
+        : [el('span', {text: '—'})]),
+    ]);
+    if (expanded.has(name)) log.open = true;
+    log.querySelectorAll('.lane-log-body button').forEach((b, i) => {
+      b.onclick = () => { const m = relevant[i]; const target = document.querySelector(`#messages .msg[data-id="${m.id}"]`);
+        if (target) target.scrollIntoView({block: 'center'}); };
+    });
+    const detail = laneDetail(room, name, phase, authored);
+    root.appendChild(el('div', {class: 'lane-row' + (LANE_ACTIVE.has(phase) ? ' is-active' : ''),
+      style: `--agent-c:${agentColor(name)}`, dataset: {phase}}, [
+      log,
+      el('span', {class: `lane-phase phase-${phase}`, text: phaseLabel}),
+      track,
+      el('span', {class: 'lane-detail', text: detail, title: `${detail} · ${messageCount(authored.length)}`}),
+    ]));
+  }
+}
+
+function updateFooterStatus() {
+  const target = document.getElementById('footer-room-status');
+  if (!target) return;
+  if (!roomData) { target.textContent = t('footer.noRoom'); target.classList.remove('is-active'); return; }
+  const active = roomLanePeople(roomData).filter(p => LANE_ACTIVE.has(laneState(roomData, p)[0])).length;
+  const parts = [roomData.name || roomData.id, t(`status.${roomData.status}`), messageCount(roomMessages.length)];
+  if (active) parts.push(`${t('lanes.active')}: ${active}`);
+  target.textContent = parts.join(' · ');
+  target.classList.toggle('is-active', active > 0);
+}
+
+function initStatusBar() {
+  const bind = (id, fn) => { const b = document.getElementById(id); if (b) b.onclick = fn; };
+  const setFooterTheme = mode => {
+    localStorage.setItem('agentbus-theme', mode);
+    localStorage.setItem('agentbus-palette', 'default');
+    applyPalette('default');
+  };
+  bind('footer-theme-light', () => setFooterTheme('light'));
+  bind('footer-theme-dark', () => setFooterTheme('dark'));
+  const saved = Number(localStorage.getItem('agentbus-reading-size') || 100);
+  let size = Number.isFinite(saved) ? Math.max(85, Math.min(125, saved)) : 100;
+  const applySize = () => {
+    document.documentElement.style.setProperty('--reading-scale', String(size / 100));
+    document.getElementById('footer-font-value').textContent = `${size}%`;
+    localStorage.setItem('agentbus-reading-size', String(size));
+  };
+  bind('footer-font-down', () => { size = Math.max(85, size - 5); applySize(); });
+  bind('footer-font-up', () => { size = Math.min(125, size + 5); applySize(); });
+  applySize();
+  const applyDensity = dense => {
+    document.documentElement.classList.toggle('dense-rows', dense);
+    localStorage.setItem('agentbus-density', dense ? 'dense' : 'normal');
+  };
+  bind('footer-density-normal', () => applyDensity(false));
+  bind('footer-density-dense', () => applyDensity(true));
+  applyDensity(localStorage.getItem('agentbus-density') === 'dense');
+  updateFooterStatus();
 }
 
 function renderAvatarStack(participants) {
@@ -1258,44 +2398,104 @@ function renderChatMeta(room, statuses) {
   const meta = document.getElementById('chat-meta');
   if (!meta) return;
   meta.innerHTML = '';
-  const parts = (room.participants || []);
-  meta.appendChild(document.createTextNode(parts.join(' · ') + ' · '));
-  meta.appendChild(el('span', {class: 'msg-time', text: room.status}));
-  if (room.session_id) {
-    meta.appendChild(document.createTextNode(' · '));
-    meta.appendChild(el('span', {class: 'msg-meta', text: 'sid: ' + room.session_id, title: 'session_id'}));
-  }
-  for (const [agent, st] of Object.entries(statuses || {})) {
-    if (!st || st === 'online') continue;
-    meta.appendChild(document.createTextNode(' '));
-    meta.appendChild(el('span', {class: `kind kind-${st === 'busy' ? 'busy' : 'comment'}`, text: `${agent}: ${st}`}));
-  }
+  const activeRound = room.swarm_pilot && room.swarm_pilot.round || room.current_round;
+  const details = [t(`status.${room.status}`)];
+  details.push(activeRound ? `${t('room.round')} ${activeRound}` : t('room.noRound'));
+  if (room.owner) details.push(`${t('room.owner')} ${room.owner}`);
+  details.push(messageCount(roomMessages.length));
+  if (room.created_at) details.push(`${t('room.created')} ${fmtDateTime(room.created_at)}`);
+  if (room.last_activity) details.push(`${t('room.updated')} ${fmtDateTime(room.last_activity)}`);
+  meta.textContent = details.join('  /  ');
+  const crumb = document.getElementById('room-crumb');
+  if (crumb) crumb.textContent = room.cwd || room.project || '';
+  renderSwarmPilot(room);
 }
 
 async function fetchMessages(initial) {
   if (!currentRoom) return;
+  const requestedRoom = currentRoom;
   try {
-    const url = `/api/messages_json?room_id=${encodeURIComponent(currentRoom)}&since_id=${lastId}`;
+    const url = `/api/messages_json?room_id=${encodeURIComponent(requestedRoom)}&since_id=${lastId}`;
     const resp = await apiFetch(url);
     const data = await resp.json();
+    // A fetch from the previous room can finish after close/delete or a room
+    // switch. It must not resurrect stale room state or move the footer back.
+    if (requestedRoom !== currentRoom) return;
 
-    if (data.room) {
-      renderChatMeta(data.room, data.statuses);
-      renderAvatarStack(data.room.participants);
-    }
+    if (data.room) roomData = data.room;
     lastStatuses = data.statuses || {};
+    lastPhases = data.phases || {};
     updateActivityStatuses(lastStatuses);
 
     if (initial) {
       const list = document.getElementById('messages');
       if (list) list.innerHTML = '';
       msgMap = {};
+      roomMessages = [];
+      lastRenderedRound = null;
     }
 
     const msgs = data.messages || [];
     for (const m of msgs) renderOne(m);
+    roomMessages.push(...msgs);
+    updateAgentTranscripts(msgs);
     if (msgs.length) lastId = msgs[msgs.length-1].id;
+    if (roomData) {
+      renderChatMeta(roomData, lastStatuses);
+      renderRoomLanes(roomData, lastStatuses);
+      updateFooterStatus();
+    }
   } catch(e) {}
+}
+
+function replyButton(message) {
+  const button = el('button', {
+    type: 'button', class: 'message-reply-action', text: t('compose.reply'),
+    title: t('compose.reply'), 'aria-label': `${t('compose.reply')} · ${message.agent} · #${message.id}`,
+  });
+  button.onclick = event => {
+    event.preventDefault();
+    event.stopPropagation();
+    const id = Number(message.id);
+    if (!Number.isSafeInteger(id) || id <= 0) return;
+    selectedReplyTarget = {id, agent: String(message.agent || '—'), body: String(message.body || '')};
+    composerKind = 'comment';
+    document.querySelectorAll('.composer-kind').forEach(x => x.setAttribute('aria-pressed', String(x.dataset.kind === 'comment')));
+    const hint = document.getElementById('composer-hint');
+    if (hint) hint.textContent = '';
+    renderComposerReplyTarget();
+    const input = document.getElementById('human-inp');
+    if (input) input.focus();
+  };
+  return button;
+}
+
+function renderComposerReplyTarget() {
+  const slot = document.getElementById('composer-reply-slot');
+  if (!slot) return;
+  slot.replaceChildren();
+  if (!selectedReplyTarget) { slot.hidden = true; return; }
+  const target = selectedReplyTarget;
+  const title = t('compose.replyTo').replace('{agent}', target.agent).replace('{id}', String(target.id));
+  const preview = target.body.length > 120 ? target.body.slice(0, 120) + '…' : target.body;
+  const clear = el('button', {
+    type: 'button', class: 'composer-reply-cancel', text: t('compose.cancelReply'),
+    'aria-label': t('compose.cancelReply'),
+  });
+  clear.onclick = () => {
+    selectedReplyTarget = null;
+    renderComposerReplyTarget();
+    document.getElementById('human-inp')?.focus();
+  };
+  slot.hidden = false;
+  slot.appendChild(el('div', {class: 'composer-reply-target'}, [
+    el('span', {class: 'composer-reply-bar', 'aria-hidden': 'true'}),
+    el('span', {class: 'composer-reply-copy'}, [
+      el('span', {class: 'composer-reply-title', text: title}),
+      el('span', {class: 'composer-reply-preview', text: preview}),
+    ]),
+    clear,
+  ]));
 }
 
 async function sendMsg() {
@@ -1304,14 +2504,19 @@ async function sendMsg() {
   const btn = document.getElementById('btn-send');
   const body = inp && inp.value ? inp.value.trim() : '';
   if (!body) return;
+  const recipient = document.getElementById('human-to');
+  const to = recipient ? recipient.value : 'all';
   inp.disabled = true; btn.disabled = true;
   try {
     await apiFetch('/api/message_post', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({room_id: currentRoom, agent: 'Human', body, kind: 'system', to: 'all'}),
+      body: JSON.stringify({room_id: currentRoom, agent: 'Human', body, kind: composerKind, to,
+        ...(selectedReplyTarget ? {reply_to: Number(selectedReplyTarget.id)} : {})}),
     });
     inp.value = '';
+    selectedReplyTarget = null;
+    renderComposerReplyTarget();
     await fetchMessages(false);
   } catch(e) {
     showRequestError('Failed to send message', e);
@@ -1319,6 +2524,22 @@ async function sendMsg() {
     inp.disabled = false; btn.disabled = false;
     inp.focus();
   }
+}
+
+function clearSelectedRoom() {
+  closeAgentStreams();
+  currentRoom = null;
+  selectedReplyTarget = null;
+  currentOwner = null;
+  roomData = null;
+  roomMessages = [];
+  lastStatuses = {};
+  lastPhases = {};
+  lastHealth = {};
+  lastId = 0;
+  agentMetaTotals = {};
+  history.replaceState(null, '', `${location.pathname}${location.search}`);
+  updateFooterStatus();
 }
 
 async function closeRoom() {
@@ -1333,7 +2554,7 @@ async function closeRoom() {
     showRequestError('Failed to close room', e);
     return;
   }
-  currentRoom = null;
+  clearSelectedRoom();
   const chat = document.getElementById('chat-area');
   chat.innerHTML = '';
   chat.appendChild(el('div', {class: 'empty'}, [
@@ -1357,14 +2578,14 @@ async function deleteRoom() {
     showRequestError('Failed to delete room', e);
     return;
   }
-  closeAgentStreams();
-  currentRoom = null;
+  clearSelectedRoom();
   const chat = document.getElementById('chat-area');
   chat.innerHTML = '';
   chat.appendChild(el('div', {class: 'empty'}, [
     el('div', {class: 'empty-title', text: 'Room deleted'}),
     el('div', {class: 'empty-hint', text: 'Pick another room from the sidebar'}),
   ]));
+  relayout();
   await loadRooms();
 }
 
@@ -1392,15 +2613,15 @@ async function bulkAction(endpoint, confirmMsg, label) {
     showRequestError(`${label} failed`, e);
     return;
   }
-  closeAgentStreams();
   if (currentRoom) {
-    currentRoom = null;
+    clearSelectedRoom();
     const chat = document.getElementById('chat-area');
     chat.innerHTML = '';
     chat.appendChild(el('div', {class: 'empty'}, [
       el('div', {class: 'empty-title', text: label}),
       el('div', {class: 'empty-hint', text: 'Pick another room from the sidebar'}),
     ]));
+    relayout();
   }
   await loadRooms();
   alert(fmtBulkSummary(label, data));
@@ -1433,7 +2654,20 @@ async function bulkNuke() {
 // ── Event delegation ──────────────────────────────────────
 document.addEventListener('click', e => {
   const item = e.target.closest('.room-item');
-  if (item) { openRoom(item.dataset.id, item.dataset.owner); return; }
+  if (item) {
+    openRoom(item.dataset.id, item.dataset.owner).then(() => {
+      if (item.dataset.messageId) {
+        const match = document.querySelector(`#messages .msg[data-id="${item.dataset.messageId}"]`);
+        if (match) {
+          document.querySelectorAll('#messages .msg.is-search-hit').forEach(x => x.classList.remove('is-search-hit'));
+          match.classList.add('is-search-hit', 'lane-flash');
+          match.scrollIntoView({block: 'center'});
+          setTimeout(() => match.classList.remove('lane-flash'), 1500);
+        }
+      }
+    });
+    return;
+  }
   if (e.target.closest('#bulk-close-all'))      { bulkCloseAll(); return; }
   if (e.target.closest('#bulk-delete-closed'))  { bulkDeleteClosed(); return; }
   if (e.target.closest('#bulk-nuke'))           { bulkNuke(); return; }
@@ -1684,6 +2918,8 @@ function initLayout() {
 
 initSettings();
 initLayout();
+initRoomSearch();
+initStatusBar();
 authenticateDashboard(true)
   .then(loadRooms)
   .catch(e => showAuthRequired(e && e.message ? e.message : 'Authentication failed.'));

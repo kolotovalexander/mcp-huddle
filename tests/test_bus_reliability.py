@@ -35,6 +35,47 @@ def test_storage_root_uses_mcp_huddle_home(isolated_bus, tmp_path: Path) -> None
     assert not (Path.home() / ".mcp-huddle" / "rooms" / room_id).exists()
 
 
+def test_create_room_accepts_explicit_safe_id(isolated_bus, tmp_path: Path) -> None:
+    room_id = isolated_bus.create_room(
+        "Explicit", "Codex", 0, "/tmp", "session", room_id="room_0123abcd",
+    )
+
+    assert room_id == "room_0123abcd"
+    assert isolated_bus.get_room_info(room_id)["id"] == room_id
+    assert (tmp_path / "rooms" / room_id / "status.json").exists()
+
+
+def test_create_room_explicit_id_collision_preserves_existing_room(isolated_bus, tmp_path: Path) -> None:
+    room_id = isolated_bus.create_room(
+        "Original", "Codex", 0, "/tmp", "session", room_id="room_0123abcd",
+    )
+    meta_path = tmp_path / "rooms" / room_id / "meta.json"
+    original_meta = meta_path.read_bytes()
+
+    with pytest.raises(FileExistsError):
+        isolated_bus.create_room(
+            "Replacement", "Claude", 0, "/different", "other", room_id=room_id,
+        )
+
+    assert meta_path.read_bytes() == original_meta
+    assert isolated_bus.get_room_info(room_id)["name"] == "Original"
+
+
+@pytest.mark.parametrize(
+    "room_id",
+    ["../outside", "room_0123ABCD", "room_0123abc", "room_0123abcd/child", "room_0123abcd\\child"],
+)
+def test_create_room_rejects_invalid_explicit_id_before_creating_storage(
+    isolated_bus, tmp_path: Path, room_id: str,
+) -> None:
+    with pytest.raises(ValueError, match="room_id"):
+        isolated_bus.create_room(
+            "Invalid", "Codex", 0, "/tmp", "session", room_id=room_id,
+        )
+
+    assert not (tmp_path / "rooms").exists()
+
+
 def test_concurrent_appends_have_unique_sequential_ids(isolated_bus) -> None:
     room_id = _create_room(isolated_bus)
     count = 10
@@ -809,6 +850,63 @@ def test_idempotency_key_reuses_message_id(isolated_bus) -> None:
 
     assert first == second
     assert len(isolated_bus._load_messages(room_id)) == 1
+
+
+def test_idempotency_key_survives_many_messages_and_bus_reopen(isolated_bus) -> None:
+    room_id = _create_room(isolated_bus)
+    original_id = isolated_bus.post_message(
+        room_id, "Swarm", "start work", "request", idempotency_key="swarm-start-1",
+    )
+
+    for index in range(25):
+        isolated_bus.post_message(room_id, f"Worker-{index}", f"progress {index}", "comment")
+
+    # Simulate a process restart: the in-memory parsed-message cache is reset,
+    # while the durable JSONL history remains.
+    reopened_bus = importlib.reload(isolated_bus)
+    retried_id = reopened_bus.post_message(
+        room_id, "Swarm", "start work", "request", idempotency_key="swarm-start-1",
+    )
+
+    assert retried_id == original_id
+    messages = reopened_bus._load_messages(room_id)
+    assert len(messages) == 26
+    assert sum(message.get("idempotency_key") == "swarm-start-1" for message in messages) == 1
+
+
+def test_concurrent_posts_with_same_idempotency_key_append_once(isolated_bus) -> None:
+    room_id = _create_room(isolated_bus)
+    count = 8
+    barrier = threading.Barrier(count)
+    results: list[int] = []
+    errors: list[BaseException] = []
+    result_lock = threading.Lock()
+
+    def post() -> None:
+        try:
+            barrier.wait(timeout=5)
+            msg_id = isolated_bus.post_message(
+                room_id, "Swarm", "start work", "request", idempotency_key="swarm-start-concurrent",
+            )
+            with result_lock:
+                results.append(msg_id)
+        except BaseException as exc:
+            with result_lock:
+                errors.append(exc)
+
+    workers = [threading.Thread(target=post) for _ in range(count)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=10)
+
+    assert not errors
+    assert all(not worker.is_alive() for worker in workers)
+    assert len(results) == count
+    assert len(set(results)) == 1
+    messages = isolated_bus._load_messages(room_id)
+    assert len(messages) == 1
+    assert messages[0]["idempotency_key"] == "swarm-start-concurrent"
 
 
 def test_http_message_post_honors_idempotency_key(isolated_bus) -> None:
