@@ -1619,10 +1619,34 @@ def _swarm_set_child_field(room_id: str, name: str, child_wake: str,
 
 def _swarm_set_child_fields(room_id: str, name: str, child_wake: str,
                             fields: dict) -> None:
+    """Read-modify-write child fields in one locked critical section (no
+    separate read then write, so no window for a concurrent writer to
+    interleave between them).
+
+    Relay-specific CAS guards apply only when ``fields`` touches relay state
+    (``relay_status`` present): two watchdog sweeps can both read a child at
+    ``relay_status="failed"`` and race to call ``_swarm_deliver_child_room``;
+    the bus dedupes the relay message itself, but without this guard a
+    reordered/stale write here could still clobber an already-recorded
+    success. ``sent`` is therefore sticky (never downgraded back to
+    ``failed``/``gave_up`` for the same wake), and ``relay_attempts`` never
+    decreases (max of old/new).
+    """
     def _update(meta: dict) -> dict:
         child = ((meta.get("swarm_pilot") or {}).get("children") or {}).get(name)
-        if isinstance(child, dict) and child.get("wake_id") == child_wake:
-            child.update(fields)
+        if not isinstance(child, dict) or child.get("wake_id") != child_wake:
+            return meta
+        patch = dict(fields)
+        if "relay_status" in patch:
+            if (child.get("relay_status") == "sent"
+                    and patch.get("relay_status") in ("failed", "gave_up")):
+                for key in ("relay_status", "relay_error", "relay_next_at", "delivery"):
+                    patch.pop(key, None)
+            if "relay_attempts" in patch:
+                patch["relay_attempts"] = max(
+                    int(patch["relay_attempts"]), int(child.get("relay_attempts") or 0)
+                )
+        child.update(patch)
         return meta
     bus._update_meta_locked(room_id, _update)
 
@@ -3325,6 +3349,18 @@ def room_status(room_id: str) -> dict:
         if isinstance(child, dict) and child.get("invite") == "child_room"
         and child.get("status") in {"reserved", "running"}
     ]
+    # A child whose room already closed but whose relay is still
+    # ``failed`` has a retry sweep pending (_swarm_retry_failed_relays): the
+    # child's own process/room lifecycle looks terminal, but the answer has
+    # not reached the parent room yet. Surface it as still-pending so an
+    # organizer doesn't finish the room before the relay lands.
+    relay_retry_pending = [
+        {"child": name, "room_id": child.get("child_room"), "status": "relay_retry"}
+        for name, child in children.items()
+        if isinstance(child, dict) and child.get("relay") == "result"
+        and child.get("relay_status") == "failed"
+    ]
+    pending_child_rooms = pending_child_rooms + relay_retry_pending
     # A relay that has given up or lost its parent is a terminal outcome, not
     # something an orchestrator should keep waiting on — surface it here so
     # "wait forever" isn't the only visible state after a relay failure.

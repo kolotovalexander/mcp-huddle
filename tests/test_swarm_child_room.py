@@ -262,3 +262,93 @@ def test_parent_waits_for_child_room_and_deleted_parent_does_not_orphan_it(launc
                                  "result", reply_to=child["request_id"])
     launches[-1]["on_exit"](0)
     assert bus.get_room_info(child["child_room"])["status"] == "closed"
+
+
+def test_room_status_waits_on_relay_retry_pending_then_clears_after_sweep(
+    launches, monkeypatch,
+):
+    """A child whose room already closed but whose relay is stuck at
+    relay_status="failed" still has a retry sweep pending: room_status must
+    keep recommending wait (not declare all_terminal) until the sweep either
+    lands the relay or gives up, otherwise an organizer could finish the
+    room before the answer is relayed.
+    """
+    room, ctx = _setup()
+    child = server.swarm_spawn_child(room, CHILD["name"], "find risks", ctx,
+                                     invite="child_room")
+    name = child["child"]
+    server._post_message_checked(child["child_room"], name, "answer 42", "result",
+                                 reply_to=child["request_id"])
+    server._clear_wake_claim(room, "A", "wakeA")
+    real_post = server._post_message_checked
+
+    def flaky_post(room_id, *args, **kwargs):
+        if room_id == room and kwargs.get("idempotency_key", "").startswith(
+            "swarm-child-relay:"
+        ):
+            raise OSError("temporary relay failure")
+        return real_post(room_id, *args, **kwargs)
+
+    monkeypatch.setattr(server, "_post_message_checked", flaky_post)
+    launches[-1]["on_exit"](0)
+    record = _child(room, name)
+    assert record["relay_status"] == "failed"
+    assert record["child_room_closed"] is True
+
+    snapshot = server.room_status(room)
+    assert snapshot["wait_recommended"] is True
+    assert snapshot["all_terminal"] is False
+    retry_entries = [c for c in snapshot["pending_child_rooms"] if c["child"] == name]
+    assert retry_entries == [{
+        "child": name, "room_id": child["child_room"], "status": "relay_retry",
+    }]
+
+    # Once the sweep lands the relay, room_status must go terminal.
+    monkeypatch.setattr(server, "_post_message_checked", real_post)
+    future = time.time() + 3600
+    monkeypatch.setattr(server.time, "time", lambda: future)
+    assert server._swarm_retry_failed_relays() == [f"{room}:{name}"]
+    assert _child(room, name)["relay_status"] == "sent"
+
+    snapshot = server.room_status(room)
+    assert snapshot["wait_recommended"] is False
+    assert snapshot["all_terminal"] is True
+    assert snapshot["pending_child_rooms"] == []
+
+
+def test_reordered_relay_completion_keeps_sent_sticky(launches, monkeypatch):
+    """Two watchdogs can both see relay_status="failed" and race to call
+    _swarm_deliver_child_room; the bus dedupes the relay message itself, but
+    a stale writer finishing after a successful one must never resurrect a
+    failure over an already-recorded success.
+    """
+    room, ctx = _setup()
+    child = server.swarm_spawn_child(room, CHILD["name"], "find risks", ctx,
+                                     invite="child_room")
+    name = child["child"]
+    server._post_message_checked(child["child_room"], name, "answer 42", "result",
+                                 reply_to=child["request_id"])
+    server._clear_wake_claim(room, "A", "wakeA")
+
+    # Attempt A: the real, successful relay post — sets relay_status="sent".
+    launches[-1]["on_exit"](0)
+    record = _child(room, name)
+    assert record["relay_status"] == "sent"
+    assert record["delivery"] == "result"
+    child_wake = record["wake_id"]
+    assert len(_relays(room)) == 1
+
+    # Attempt B: a stale/reordered watchdog write for the same wake, computed
+    # from a pre-success snapshot, landing after A already wrote "sent".
+    server._swarm_set_child_fields(room, name, child_wake, {
+        "delivery": "relay_failed",
+        "relay_status": "failed",
+        "relay_attempts": 1,
+        "relay_error": "OSError",
+        "relay_next_at": int(time.time()) + 5,
+    })
+
+    record = _child(room, name)
+    assert record["relay_status"] == "sent"
+    assert record["delivery"] == "result"
+    assert len(_relays(room)) == 1
