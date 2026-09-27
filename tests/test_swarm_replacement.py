@@ -1,4 +1,4 @@
-from mcp_huddle.swarm_replacement import plan_replacement
+from mcp_huddle.swarm_replacement import classify_failure, plan_replacement
 
 MEMBER = {"member_id": "m1", "responsibility": "api", "harness": "claude",
           "write_rights": {"paths": ["src/api"]}}
@@ -46,6 +46,7 @@ def test_unknown_failure_and_quiet_child_do_not_trigger_model_replacement():
                             candidates, child_stopped=True)["action"] == "terminal"
     assert plan_replacement({"progress": False}, [A1], MEMBER,
                             candidates, child_stopped=True)["action"] == "check_progress"
+    assert classify_failure({"text": "HTTP 400 Bad Request"}) == "unknown"
     readonly = dict(MEMBER, write_rights=None)
     assert plan_replacement({"text": "timeout"}, [A1], readonly,
                             candidates)["action"] == "wait_child_stop"

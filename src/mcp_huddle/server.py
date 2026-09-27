@@ -12,6 +12,7 @@ import hmac
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import stat
@@ -1293,6 +1294,13 @@ def swarm_pilot_create(
                 return existing
             raise ValueError("partial_room: deterministic room directory already exists") from None
         raise
+    recovery_secret = secrets.token_urlsafe(32)
+    def _store_recovery_secret(meta: dict) -> dict:
+        meta["swarm_pilot"]["organizer_recovery_sha256"] = hashlib.sha256(
+            recovery_secret.encode("ascii")
+        ).hexdigest()
+        return meta
+    bus._update_meta_locked(room_id, _store_recovery_secret)
     if child_policy:
         # Before any invite or dispatch. An interruption before this write
         # leaves a room without the policy, so children stay disabled.
@@ -1325,6 +1333,7 @@ def swarm_pilot_create(
         )
     return {
         "room_id": room_id,
+        "organizer_recovery_secret": recovery_secret,
         "mode": mode,
         "dispatched": dispatch,
         "started": start,
@@ -2100,6 +2109,14 @@ def swarm_pilot_status(room_id: str) -> dict:
         }
         if model_receipt is not None:
             member_detail["last_model_receipt"] = model_receipt
+        recovery = info.get("swarm_pilot_recovery")
+        if isinstance(recovery, dict):
+            member_detail["recovery"] = {
+                key: recovery[key]
+                for key in ("round", "request_id", "attempts", "status",
+                            "recovery_request_id", "reason")
+                if key in recovery
+            }
         route = info.get("swarm_route")
         if isinstance(route, dict):
             member_detail["replacement"] = {
@@ -2109,6 +2126,247 @@ def swarm_pilot_status(room_id: str) -> dict:
             }
         details.append(member_detail)
     return {**state, "members_detail": details}
+
+
+@mcp.tool()
+def swarm_pilot_recover_member(
+    room_id: str, by: str, member: str, organizer_recovery_secret: str,
+    ctx: Context,
+) -> dict:
+    """Let the organizer retry one terminally failed member exactly once.
+
+    Requires a server-owned failure receipt for the current dispatch and no
+    active wake claim. The new organizer request does not mark the member done;
+    the member still has to post its result and call swarm_pilot_round_done.
+    """
+    state = swarm_pilot.status(room_id)
+    if _verified_member(ctx, room_id) is not None:
+        raise PermissionError("a verified swarm member cannot trigger organizer recovery")
+    stored_secret_hash = (bus.get_room_info(room_id).get("swarm_pilot") or {}).get(
+        "organizer_recovery_sha256"
+    )
+    supplied_secret_hash = hashlib.sha256(
+        organizer_recovery_secret.encode("utf-8")
+    ).hexdigest() if isinstance(organizer_recovery_secret, str) else ""
+    if (not isinstance(stored_secret_hash, str)
+            or not hmac.compare_digest(stored_secret_hash, supplied_secret_hash)):
+        raise PermissionError("organizer recovery requires the room's private secret")
+    organizer = swarm_pilot.resolve_member(room_id, by, allow_organizer=True)
+    if organizer != state["organizer"]:
+        raise PermissionError("only the pilot organizer can recover a member")
+    member = swarm_pilot.resolve_member(room_id, member)
+    if state.get("phase") != "working":
+        raise ValueError("swarm is not working")
+    if member in state.get("done", {}):
+        done_info = (bus.get_room_info(room_id).get("agent_meta") or {}).get(member) or {}
+        done_recovery = done_info.get("swarm_pilot_recovery")
+        if (isinstance(done_recovery, dict)
+                and done_recovery.get("round") == state.get("round", 1)
+                and str(done_recovery.get("request_id"))
+                == str(state.get("dispatched", {}).get(member))):
+            _swarm_store_manual_recovery(room_id, member, {
+                **done_recovery, "status": "superseded",
+            })
+            return {"status": "superseded", "member": member,
+                    "recovery_request_id": done_recovery.get("recovery_request_id")}
+        return {"status": "already_done", "member": member}
+    request_id = state.get("dispatched", {}).get(member)
+    if request_id is None:
+        raise ValueError("member has no dispatched request")
+
+    key = (f"swarm-pilot:{room_id}:{state.get('round', 1)}:{member}"
+           f":manual-recovery:1")
+    meta = bus.get_room_info(room_id)
+    info = (meta.get("agent_meta") or {}).get(member) or {}
+    if info.get("wake_claim_id") or info.get("initial_spawn_active") is True:
+        return {"status": "active_wake", "member": member,
+                "request_id": request_id}
+
+    recovery = info.get("swarm_pilot_recovery")
+    matches_recovery = (
+        isinstance(recovery, dict)
+        and recovery.get("round") == state.get("round", 1)
+        and str(recovery.get("request_id")) == str(request_id)
+    )
+    messages = bus._load_messages(room_id)
+    retry_message = next((msg for msg in messages
+                          if msg.get("idempotency_key") == key), None)
+    if retry_message is not None:
+        retry_id = retry_message["id"]
+        if (not matches_recovery
+                or recovery.get("recovery_request_id") not in (None, retry_id)):
+            return {"status": "conflict", "member": member,
+                    "request_id": request_id}
+        status_info = bus.get_status_details(room_id).get(member) or {}
+        latest_meta = bus.get_room_info(room_id)
+        latest_info = (latest_meta.get("agent_meta") or {}).get(member) or {}
+        if latest_info.get("wake_claim_id") or latest_info.get("initial_spawn_active") is True:
+            return {"status": "active_wake", "member": member,
+                    "request_id": request_id, "recovery_request_id": retry_id}
+        failed_ids = _server_terminal_failure_task_ids(status_info, latest_info)
+        if str(retry_id) in failed_ids:
+            try:
+                writes = room_workspace.write_policy(latest_meta) == room_workspace.SHARED_WRITE
+            except ValueError:
+                writes = True
+            candidates = _swarm_replacement_candidates(latest_meta, member, writes)
+            needs_profile = not any(
+                candidate.get("can_limit_writes") is True
+                for candidate in candidates
+            )
+            result_status = "needs_profile" if needs_profile else "terminal"
+            reason = ("retry failed; no enabled swarm_replacement profile"
+                      if needs_profile else "retry failed; inspect replacement route")
+            _swarm_store_manual_recovery(room_id, member, {
+                **(recovery if matches_recovery else {}),
+                "round": state.get("round", 1), "request_id": request_id,
+                "attempts": _SWARM_MANUAL_RECOVERY_LIMIT,
+                "status": result_status, "recovery_request_id": retry_id,
+                "reason": reason,
+            })
+            return {"status": result_status, "member": member,
+                    "request_id": request_id, "recovery_request_id": retry_id,
+                    "reason": reason}
+        if matches_recovery and recovery.get("status") == "dispatching":
+            _swarm_store_manual_recovery(room_id, member, {
+                **recovery, "status": "retry_dispatched",
+                "recovery_request_id": retry_id,
+            })
+            recovery = {**recovery, "status": "retry_dispatched",
+                        "recovery_request_id": retry_id}
+            _wake_agents_for_request(
+                room_id, retry_message.get("agent", ""), retry_message.get("body", ""),
+                retry_message.get("to"), retry_message.get("reply_to"), retry_id,
+            )
+            latest_state = swarm_pilot.status(room_id)
+            if (latest_state.get("round", 1) != state.get("round", 1)
+                    or member in latest_state.get("done", {})):
+                _swarm_stop_superseded_recovery(room_id, member, retry_id)
+                _swarm_store_manual_recovery(room_id, member, {
+                    **recovery, "status": "superseded",
+                    "recovery_request_id": retry_id,
+                })
+                return {"status": "superseded", "member": member,
+                        "request_id": request_id, "recovery_request_id": retry_id}
+        status_value = recovery.get("status") if matches_recovery else "retry_dispatched"
+        return {"status": status_value or "retry_dispatched", "member": member,
+                "request_id": request_id, "recovery_request_id": retry_id}
+
+    status_info = bus.get_status_details(room_id).get(member) or {}
+    failed_ids = _server_terminal_failure_task_ids(status_info, info)
+    if str(request_id) not in failed_ids:
+        return {"status": "awaiting_terminal_failure", "member": member,
+                "request_id": request_id}
+    if any(msg.get("agent") == member and msg.get("kind") in {"result", "final"}
+           and msg.get("reply_to") == request_id for msg in messages):
+        return {"status": "result_needs_round_done", "member": member,
+                "request_id": request_id}
+
+    spec, drift = _member_launch_spec(meta, member)
+    if spec is None or drift:
+        outcome = {"round": state.get("round", 1), "request_id": request_id,
+                   "attempts": 0, "status": "needs_profile",
+                   "reason": "assigned member profile is unavailable or changed"}
+        _swarm_store_manual_recovery(room_id, member, outcome)
+        return {"status": "needs_profile", "member": member,
+                "request_id": request_id, "reason": outcome["reason"]}
+
+    reservation = {}
+
+    def reserve(meta_update: dict) -> dict:
+        pilot = meta_update.get("swarm_pilot")
+        slot = (meta_update.get("agent_meta") or {}).get(member)
+        if (not isinstance(pilot, dict) or pilot.get("phase") != "working"
+                or pilot.get("round", 1) != state.get("round", 1)
+                or member in pilot.get("done", {})
+                or pilot.get("dispatched", {}).get(member) != request_id
+                or not isinstance(slot, dict)):
+            reservation["status"] = "stale"
+            return meta_update
+        if slot.get("wake_claim_id") or slot.get("initial_spawn_active") is True:
+            reservation["status"] = "active_wake"
+            return meta_update
+        current = slot.get("swarm_pilot_recovery")
+        if (isinstance(current, dict)
+                and current.get("round") == state.get("round", 1)
+                and str(current.get("request_id")) == str(request_id)
+                and int(current.get("attempts", 0) or 0) >= _SWARM_MANUAL_RECOVERY_LIMIT):
+            if current.get("status") == "dispatching":
+                # Resume the deterministic idempotent post after a crash
+                # between reservation and message creation.
+                reservation["status"] = "reserved"
+            else:
+                reservation["status"] = current.get("status", "terminal")
+                return meta_update
+        else:
+            slot["swarm_pilot_recovery"] = {
+                "round": state.get("round", 1), "request_id": request_id,
+                "attempts": 1, "status": "dispatching",
+            }
+            reservation["status"] = "reserved"
+        return meta_update
+
+    bus._update_meta_locked(room_id, reserve)
+    if reservation.get("status") != "reserved":
+        return {"status": reservation.get("status", "stale"), "member": member,
+                "request_id": request_id}
+
+    # A delayed result can arrive after the receipt check. Preserve it for the
+    # organizer; only round_done may settle the pilot member.
+    messages = bus._load_messages(room_id)
+    if any(msg.get("agent") == member and msg.get("kind") in {"result", "final"}
+           and msg.get("reply_to") == request_id for msg in messages):
+        outcome = {"round": state.get("round", 1), "request_id": request_id,
+                   "attempts": 1, "status": "result_needs_round_done"}
+        _swarm_store_manual_recovery(room_id, member, outcome)
+        return {"status": outcome["status"], "member": member,
+                "request_id": request_id}
+
+    retry_body = (
+        f"One-time organizer recovery for your pilot request #{request_id}. "
+        "Your previous turn ended with a server-recorded failure and no result. "
+        "Continue the same responsibility. Post a result replying to this recovery "
+        "request, then call swarm_pilot_round_done. If this route fails again, stop; "
+        "the organizer will inspect the profile."
+    )
+    retry_id = _post_message_checked(
+        room_id, organizer, retry_body, "request", to=member,
+        idempotency_key=key,
+    )
+    outcome = {"round": state.get("round", 1), "request_id": request_id,
+               "attempts": 1, "status": "retry_dispatched",
+               "recovery_request_id": retry_id}
+    _swarm_store_manual_recovery(room_id, member, outcome)
+    _wake_agents_for_request(room_id, organizer, retry_body, member, None, retry_id)
+    latest_state = swarm_pilot.status(room_id)
+    if (latest_state.get("round", 1) != state.get("round", 1)
+            or member in latest_state.get("done", {})):
+        _swarm_stop_superseded_recovery(room_id, member, retry_id)
+        outcome["status"] = "superseded"
+        _swarm_store_manual_recovery(room_id, member, outcome)
+        return {"status": "superseded", "member": member,
+                "request_id": request_id, "recovery_request_id": retry_id}
+    return {"status": "retry_dispatched", "member": member,
+            "request_id": request_id, "recovery_request_id": retry_id}
+
+
+def _swarm_store_manual_recovery(room_id: str, member: str, recovery: dict) -> None:
+    def update(meta: dict) -> dict:
+        slot = (meta.get("agent_meta") or {}).get(member)
+        if isinstance(slot, dict):
+            slot["swarm_pilot_recovery"] = dict(recovery)
+        return meta
+    bus._update_meta_locked(room_id, update)
+
+
+def _swarm_stop_superseded_recovery(room_id: str, member: str, retry_id: int) -> None:
+    """Stop only an owned recovery wake after a late original result wins."""
+    info = (bus.get_room_info(room_id).get("agent_meta") or {}).get(member) or {}
+    if info.get("wake_claim_msg_id") != retry_id:
+        return
+    wake_id = info.get("wake_claim_id")
+    if isinstance(wake_id, str) and wake_id:
+        _stop_completed_pilot_turn(room_id, member, wake_id, "round_done")
 
 
 def _swarm_pilot_request(room_id: str, member: str) -> str:
@@ -2161,6 +2419,7 @@ def _swarm_pilot_request(room_id: str, member: str) -> str:
 
 
 _PILOT_MEMBER_EXIT_DELAY_SECONDS = 1.5
+_SWARM_MANUAL_RECOVERY_LIMIT = 1
 
 
 def _stop_completed_pilot_turn(
@@ -2655,21 +2914,29 @@ def _swarm_replace_failed_member(
             "failure_class": plan["failure_class"], "reason": plan["reason"]}
 
     if plan["action"] != "replace":
-        if not route and (plan["failure_class"] == "unknown" or (
-                not candidates and plan["action"] != "needs_user")):
+        if not route and plan["failure_class"] == "unknown":
             # Replacement is not configured or not applicable: the ordinary
             # noreply / rate-limit notice already explains this failure.
             return False
 
+        terminal = ("needs_profile" if not candidates
+                    and plan["action"] not in {"needs_user", "wait_child_stop"}
+                    else plan["action"])
+        outcome_reason = ("no enabled swarm_replacement profile"
+                          if terminal == "needs_profile" else plan["reason"])
         def record_outcome(slot: dict) -> None:
-            slot["swarm_route"] = {**route, **base, "profile": route.get("profile"),
-                                   "attempts": attempts, "terminal": plan["action"]}
+            slot["swarm_route"] = {**route, **base, "reason": outcome_reason,
+                                   "profile": route.get("profile"),
+                                   "attempts": attempts, "terminal": terminal}
         if _swarm_route_cas(room_id, agent_name, wake_id, record_outcome):
-            prefix = ("Ждёт решения человека" if plan["action"] == "needs_user"
+            prefix = ("Ждёт решения человека" if terminal == "needs_user"
+                      else "Нужен резервный профиль" if terminal == "needs_profile"
                       else "Замена не выполнена")
+            detail = ("В registry нет включённого профиля с swarm_replacement=true."
+                      if terminal == "needs_profile" else plan["reason"])
             _swarm_replacement_notice(
                 room_id, agent_name, wake_id,
-                f"{agent_name} ({current_profile}): {prefix} — {plan['reason']} "
+                f"{agent_name} ({current_profile}): {prefix} — {detail} "
                 f"[{plan['failure_class']}].")
         return False
 
@@ -2813,17 +3080,24 @@ def swarm_pilot_round_done(room_id: str, member: str, summary: str) -> dict:
         raise ValueError("member has no dispatched request")
     messages = bus._load_messages(room_id)
     valid_request_ids = {request_id}
-    # An organizer may issue a direct recovery request after a provider error
-    # (for example, retrying a wake that failed before the member could use
-    # Huddle tools). The member's result belongs to that retry request, not the
-    # original dispatch. Only organizer-authored requests explicitly addressed
-    # to this member qualify; peer chatter cannot complete another task.
+    recovery_key = (f"swarm-pilot:{room_id}:{state.get('round', 1)}:{member}"
+                    ":manual-recovery:1")
+    member_info = (bus.get_room_info(room_id).get("agent_meta") or {}).get(member)
+    recovery_state = (member_info.get("swarm_pilot_recovery") or {}
+                      if isinstance(member_info, dict) else {})
+    authorized_recovery_id = recovery_state.get("recovery_request_id")
+    # Only the one bounded request created by swarm_pilot_recover_member may
+    # substitute for the original pilot dispatch. Other organizer requests
+    # or a caller-supplied idempotency key must never count as completion.
     valid_request_ids.update(
         int(msg["id"])
         for msg in messages
-        if int(msg.get("id", 0) or 0) > int(request_id)
+        if isinstance(authorized_recovery_id, int)
+        and msg.get("id") == authorized_recovery_id
+        and int(msg.get("id", 0) or 0) > int(request_id)
         and msg.get("kind") == "request"
         and msg.get("reply_to") is None
+        and msg.get("idempotency_key") == recovery_key
         and msg.get("agent") == state["organizer"]
         and msg.get("to") == member
     )
@@ -2933,6 +3207,18 @@ def message_post(
       kind=request with reply_to!=null is someone's answer — NOT a new request to you.
       For all other kinds: read silently, do not reply.
     """
+    if idempotency_key:
+        pilot = bus.get_room_info(room_id).get("swarm_pilot")
+        if isinstance(pilot, dict):
+            reserved_keys = {
+                f"swarm-pilot:{room_id}:{pilot.get('round', 1)}:{member}"
+                ":manual-recovery:1"
+                for member in pilot.get("members", [])
+            }
+            if idempotency_key in reserved_keys:
+                raise PermissionError(
+                    "manual-recovery idempotency keys are reserved for the recovery tool"
+                )
     msg_id = _post_message_checked(room_id, agent, body, kind, to, reply_to, idempotency_key, meta)
     if kind == "request":
         _wake_agents_for_request(room_id, agent, body, to, reply_to, msg_id)
@@ -3208,6 +3494,10 @@ def _swarm_pilot_request_superseded(
     if not isinstance(key, str) or not key.startswith(prefix):
         return False
     suffix = key[len(prefix):]
+    for member in pilot.get("members", []):
+        if key == f"{prefix}{member}:manual-recovery:1":
+            return (pilot.get("phase") != "working"
+                    or member in pilot.get("done", {}))
     if suffix == "final-request-missing-reporter":
         return bool(pilot.get("responsibilities", {}).get("reporter", {}).get("member"))
     if suffix.startswith("final-request") and key != _swarm_final_request_key(room_id, pilot):
@@ -5032,6 +5322,14 @@ def _claim_wake(
         if not isinstance(info, dict):
             info = {}
         if info.get("wake_claim_id") or info.get("initial_spawn_active"):
+            return meta
+        pilot = meta.get("swarm_pilot")
+        recovery = info.get("swarm_pilot_recovery")
+        if (isinstance(pilot, dict) and isinstance(recovery, dict)
+                and recovery.get("recovery_request_id") == msg_id
+                and (pilot.get("phase") != "working"
+                     or pilot.get("round", 1) != recovery.get("round")
+                     or agent_name in pilot.get("done", {}))):
             return meta
         if info.get("swarm_child_of"):
             return meta  # one-shot participant child: never relaunched

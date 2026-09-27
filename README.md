@@ -88,7 +88,7 @@ Dashboard: <http://127.0.0.1:8014/dashboard>. The dashboard reads the same files
 
 ## Features
 
-- **20 MCP tools** for room creation, messaging, rounds, lifecycle status, consensus, and a bounded four-mode swarm pilot
+- **MCP tools** for room creation, messaging, rounds, lifecycle status, consensus, and a bounded four-mode swarm pilot
 - **JSONL storage** at `~/.mcp-huddle/rooms/` — grep-able, no DB
 - **Bounded writes and anti-loop guards**: `kind` enum, per-message dedup,
   a server-side circuit breaker, a persisted 120-messages/minute room limit,
@@ -134,6 +134,7 @@ These are the tools exposed over MCP (decorated with `@mcp.tool()` in
 | `swarm_pilot_round_done` | Mark a member's turn done only after its addressed `result` was saved; dispatch the next sequential member. |
 | `swarm_pilot_status` | Read the compact pilot state, including responsibilities and final result. |
 | `swarm_pilot_finish` | Save the organizer's council conclusion or a reporter's team/relay/swarm conclusion. |
+| `swarm_pilot_recover_member` | Organizer requests one bounded retry after a server-recorded member failure; reports when a replacement profile is needed. |
 
 The pilot tools are documented in [docs/SWARM_PILOT.md](docs/SWARM_PILOT.md).
 | `message_send` / `message_targets` | Native cross-harness delivery to another agent session outside a room (Claude/Codex/Hermes/OpenCode/agy) — see [`docs/delivery.md`](docs/delivery.md). |

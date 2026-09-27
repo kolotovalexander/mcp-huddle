@@ -81,6 +81,139 @@ def test_member_brief_exits_after_round_done_instead_of_polling(isolated_home):
     assert "separate addressed final request" in brief
 
 
+def test_organizer_can_recover_terminal_member_once(isolated_home, monkeypatch):
+    monkeypatch.setattr(server.spawn, "get_enabled_spec", lambda name: {"name": name})
+    wakes = []
+    monkeypatch.setattr(server, "_wake_agents_for_request",
+                        lambda *args: wakes.append(args) or [])
+    created = server.swarm_pilot_create(
+        "pilot", "Organizer", "Decide", "team", ["A"], start=True,
+    )
+    room = created["room_id"]
+    secret = created["organizer_recovery_secret"]
+    original = swarm_pilot.status(room)["dispatched"]["A"]
+    wakes.clear()
+    server._set_agent_phase(room, "A", "unavailable", original)
+
+    verified_member = server._verified_member
+    monkeypatch.setattr(server, "_verified_member",
+                        lambda *_: {"member": "A", "room_id": room})
+    with pytest.raises(PermissionError, match="verified swarm member"):
+        server.swarm_pilot_recover_member(room, "Organizer", "A", secret, object())
+    monkeypatch.setattr(server, "_verified_member", verified_member)
+
+    with pytest.raises(PermissionError, match="private secret"):
+        server.swarm_pilot_recover_member(room, "Organizer", "A", "wrong", None)
+    recovered = server.swarm_pilot_recover_member(room, "Organizer", "A", secret, None)
+    repeated = server.swarm_pilot_recover_member(room, "Organizer", "A", secret, None)
+
+    assert recovered["status"] == "retry_dispatched"
+    assert repeated == recovered
+    assert len(wakes) == 1
+    assert recovered["recovery_request_id"] != original
+    assert swarm_pilot.status(room)["done"] == {}
+    request = next(m for m in bus._load_messages(room)
+                   if m["id"] == recovered["recovery_request_id"])
+    assert (request["agent"], request["to"], request["kind"]) == (
+        "Organizer", "A", "request",
+    )
+    assert server.swarm_pilot_status(room)["members_detail"][0]["recovery"]["status"] == "retry_dispatched"
+
+
+def test_recovery_requires_terminal_failure_and_stops_without_backup(
+    isolated_home, monkeypatch,
+):
+    monkeypatch.setattr(server.spawn, "get_enabled_spec", lambda name: {"name": name})
+    wakes = []
+    monkeypatch.setattr(server, "_wake_agents_for_request",
+                        lambda *args: wakes.append(args) or [])
+    created = server.swarm_pilot_create(
+        "pilot", "Organizer", "Decide", "team", ["A"], start=True,
+    )
+    room = created["room_id"]
+    secret = created["organizer_recovery_secret"]
+    original = swarm_pilot.status(room)["dispatched"]["A"]
+    wakes.clear()
+
+    waiting = server.swarm_pilot_recover_member(room, "Organizer", "A", secret, None)
+    server._set_agent_phase(room, "A", "unavailable", original)
+    server._merge_agent_meta(room, "A", {"wake_claim_id": "still-owned"})
+    active = server.swarm_pilot_recover_member(room, "Organizer", "A", secret, None)
+    server._merge_agent_meta(room, "A", {"wake_claim_id": None})
+    retry = server.swarm_pilot_recover_member(room, "Organizer", "A", secret, None)
+    server._set_agent_phase(room, "A", "unavailable", retry["recovery_request_id"])
+    terminal = server.swarm_pilot_recover_member(room, "Organizer", "A", secret, None)
+
+    assert waiting["status"] == "awaiting_terminal_failure"
+    assert active["status"] == "active_wake"
+    assert retry["status"] == "retry_dispatched"
+    assert terminal["status"] == "needs_profile"
+    assert len(wakes) == 1
+    assert swarm_pilot.status(room)["done"] == {}
+
+
+def test_recovery_wake_is_superseded_if_round_done_races_dispatch(
+    isolated_home, monkeypatch,
+):
+    monkeypatch.setattr(server.spawn, "get_enabled_spec", lambda name: {"name": name})
+    monkeypatch.setattr(server, "_wake_agents_for_request", lambda *args: [])
+    created = server.swarm_pilot_create(
+        "late result", "Organizer", "Decide", "team", ["A"], start=True,
+    )
+    room = created["room_id"]
+    original = swarm_pilot.status(room)["dispatched"]["A"]
+    server._set_agent_phase(room, "A", "unavailable", original)
+    claims = []
+
+    def race_after_post(room_id, sender, body, to, reply_to, msg_id):
+        # Simulate the original result completing after recovery's pre-post
+        # check but before its wake claim is acquired.
+        swarm_pilot.round_done(room_id, "A", "late result won")
+        claims.append(server._claim_wake(room_id, "A", msg_id, "race-wake"))
+        return []
+
+    monkeypatch.setattr(server, "_wake_agents_for_request", race_after_post)
+    recovered = server.swarm_pilot_recover_member(
+        room, "Organizer", "A", created["organizer_recovery_secret"], None,
+    )
+
+    assert recovered["status"] == "superseded"
+    assert claims == [False]
+    assert swarm_pilot.status(room)["done"]["A"]["summary"] == "late result won"
+    assert server.swarm_pilot_status(room)["members_detail"][0]["recovery"]["status"] == "superseded"
+
+
+def test_recovery_stops_exact_owned_wake_when_original_finishes_after_claim(
+    isolated_home, monkeypatch,
+):
+    monkeypatch.setattr(server.spawn, "get_enabled_spec", lambda name: {"name": name})
+    monkeypatch.setattr(server, "_wake_agents_for_request", lambda *args: [])
+    created = server.swarm_pilot_create(
+        "late result after claim", "Organizer", "Decide", "team", ["A"],
+        start=True,
+    )
+    room = created["room_id"]
+    original = swarm_pilot.status(room)["dispatched"]["A"]
+    server._set_agent_phase(room, "A", "unavailable", original)
+    terminated = []
+    monkeypatch.setattr(server.child_processes, "state", lambda *args: "alive")
+    monkeypatch.setattr(server.child_processes, "terminate",
+                        lambda *args: terminated.append(args) or "sent")
+
+    def finish_after_claim(room_id, sender, body, to, reply_to, msg_id):
+        assert server._claim_wake(room_id, "A", msg_id, "owned-retry")
+        server._merge_agent_meta(room_id, "A", {"wake_id": "owned-retry"})
+        swarm_pilot.round_done(room_id, "A", "original finished")
+        return []
+
+    monkeypatch.setattr(server, "_wake_agents_for_request", finish_after_claim)
+    recovered = server.swarm_pilot_recover_member(
+        room, "Organizer", "A", created["organizer_recovery_secret"], None,
+    )
+    assert recovered["status"] == "superseded"
+    assert terminated == [(room, "owned-retry")]
+
+
 def test_round_done_stops_only_exact_local_generation_after_reply(
     isolated_home, monkeypatch,
 ):
@@ -441,10 +574,11 @@ def test_round_done_accepts_result_to_organizer_recovery_request(
     )
     room = created["room_id"]
     original_id = swarm_pilot.status(room)["dispatched"]["A"]
-    retry_id = server.message_post(
-        room, "Organizer", "Retry A after its CLI failed before replying.",
-        "request", to="A",
+    server._set_agent_phase(room, "A", "unavailable", original_id)
+    retry = server.swarm_pilot_recover_member(
+        room, "Organizer", "A", created["organizer_recovery_secret"], None,
     )
+    retry_id = retry["recovery_request_id"]
 
     with pytest.raises(ValueError, match="organizer's direct recovery request"):
         server.swarm_pilot_round_done(room, "A", "done")
@@ -461,6 +595,38 @@ def test_round_done_accepts_result_to_organizer_recovery_request(
         item["id"] for item in server.room_status(room)["pending_requests"]
     }
     assert server._agent_replied_to_request(room, "A", original_id)
+
+
+def test_round_done_rejects_unrelated_organizer_request(
+    isolated_home, monkeypatch,
+):
+    monkeypatch.setattr(server.spawn, "get_enabled_spec", lambda name: {"name": name})
+    monkeypatch.setattr(server, "_wake_agents_for_request", lambda *args: [])
+    room = server.swarm_pilot_create(
+        "unrelated request", "Organizer", "Decide", "team", ["A"],
+        start=True,
+    )["room_id"]
+    forged_key = f"swarm-pilot:{room}:1:A:manual-recovery:1"
+    with pytest.raises(PermissionError, match="reserved for the recovery tool"):
+        server.message_post(
+            room, "Organizer", "Forged recovery request.", "request", to="A",
+            idempotency_key=forged_key,
+        )
+    # Defend at round_done too, even if an old or lower-level caller persisted
+    # the reserved key without the recovery tool's server-side authorization.
+    unrelated_id = bus.post_message(
+        room, "Organizer", "A separate follow-up.", "request", to="A",
+        idempotency_key=forged_key,
+    )
+    server.message_post(
+        room, "A", "Unrelated answer", "result", to="Organizer",
+        reply_to=unrelated_id,
+    )
+
+    with pytest.raises(ValueError, match="direct recovery request"):
+        server.swarm_pilot_round_done(room, "A", "must not complete")
+
+    assert "A" not in swarm_pilot.status(room)["done"]
 
 
 def test_pilot_room_survives_organizer_session_close(isolated_home):

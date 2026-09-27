@@ -40,8 +40,8 @@ _PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
                    "timed out", "timeout", "network", "502", "503", "504",
                    "broken pipe", "stream disconnected", "overloaded")),
 )
-_KINDS = {"quota", "model_unavailable", "transport", "permission_wait",
-          "user_input_wait", "no_progress"}
+_KINDS = {"quota", "provider_error", "model_unavailable", "transport",
+          "permission_wait", "user_input_wait", "no_progress"}
 
 
 def classify_failure(failure: dict[str, Any]) -> str:
@@ -55,6 +55,12 @@ def classify_failure(failure: dict[str, Any]) -> str:
     if kind in _KINDS:
         return kind
     text = str(failure.get("text") or "").lower()
+    if ("minimax" in text and "410" in text
+            and any(word in text for word in ("retired", "deprecated", "gone"))):
+        return "provider_error"
+    if ("cohere" in text and "400" in text
+            and "tool_results.outputs" in text):
+        return "provider_error"
     for cls, needles in _PATTERNS:
         if any(n in text for n in needles):
             return cls
