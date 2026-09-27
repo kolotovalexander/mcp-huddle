@@ -13,10 +13,12 @@ import time
 import uuid
 from typing import Optional
 
+from . import caller as caller_mod
 from . import config as delivery_config
 from . import envelope as envelope_mod
 from . import idempotency
 from . import methods
+from . import ownership
 from . import targets as targets_mod
 
 # "native"/"resume" tokens in a harness's configured order map to one
@@ -105,14 +107,21 @@ def _log_attempt(msg_id: str, to: str, harness: str, method: str, ok: bool,
         fh.write(json.dumps(entry) + "\n")
 
 
-def _refusal(msg_id: str, note: str) -> str:
-    return json.dumps({
+def _refusal(msg_id: str, note: str, reason: Optional[str] = None) -> str:
+    out = {
         "msg_id": msg_id, "delivered": False, "method": None, "attempts": [], "note": note,
-    })
+    }
+    if reason is not None:
+        # Only the two policy guards below (readonly-caller /
+        # huddle-owned-session) set this; every pre-existing refusal path
+        # keeps its old shape (no "reason" key) for backward compatibility.
+        out["reason"] = reason
+    return json.dumps(out)
 
 
 def message_send(to: str, text: str, mode: str = "auto", from_name: str = "",
-                  reply_to: str = "", idempotency_key: str = "") -> str:
+                  reply_to: str = "", idempotency_key: str = "",
+                  caller: "caller_mod.Caller | None" = None) -> str:
     """Send `text` to `to`, trying delivery methods per the configured order
     (or a single forced method). Returns a JSON string:
     ``{msg_id, delivered, method, attempts, note}``.
@@ -128,6 +137,14 @@ def message_send(to: str, text: str, mode: str = "auto", from_name: str = "",
     in-flight call's msg_id>}`` instead of the usual result shape -- there is
     no result yet to hand back. A repeat after the first call finished
     returns that finished call's result JSON verbatim.
+
+    ``caller``: policy input built by the server.py tool wrapper (see
+    ``delivery/caller.py`` and docs/delivery.md) describing whether this
+    call came from a Huddle-spawned read-only discussant. ``None`` (the
+    default) means "not a Huddle-spawned agent" -- unchanged behavior. When
+    set, a read-only (or unknown-readonly) caller is refused with reason
+    ``"readonly_caller"`` before anything else is attempted -- no spool, no
+    subprocess, no idempotency side effect beyond the refusal itself.
     """
     msg_id = uuid.uuid4().hex[:16]
     cfg = delivery_config.load()
@@ -170,8 +187,30 @@ def message_send(to: str, text: str, mode: str = "auto", from_name: str = "",
     except targets_mod.TargetNotFound as exc:
         return _finish(_refusal(msg_id, f"target not found: {exc}"))
 
+    readonly_reason = caller_mod.check_readonly_caller(caller, to, cfg, target)
+    if readonly_reason:
+        _log_attempt(msg_id, to, target.harness, f"refused:{readonly_reason}", False,
+                     "readonly caller refused before any delivery attempt", text)
+        return _finish(_refusal(
+            msg_id,
+            "refused: caller is a read-only Huddle discussant (or its read-only "
+            "status is unknown) -- message_send would launder that restriction",
+            reason=readonly_reason,
+        ))
+
     if not cfg.harness_enabled(target.harness):
         return _finish(_refusal(msg_id, f"refused: harness {target.harness!r} is disabled by config"))
+
+    owned_reason = ownership.check_not_huddle_owned(target)
+    if owned_reason:
+        _log_attempt(msg_id, to, target.harness, f"refused:{owned_reason}", False,
+                     "huddle-owned session refused before any delivery attempt", text)
+        return _finish(_refusal(
+            msg_id,
+            "refused: this target is a session/thread Huddle itself currently owns "
+            "via an active wake claim -- delivering now would run two turns in one history",
+            reason=owned_reason,
+        ))
 
     if mode == "auto":
         order_tokens = cfg.order(target.harness)

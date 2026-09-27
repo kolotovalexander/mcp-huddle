@@ -152,6 +152,15 @@ class DeliveryConfig:
     def opencode_server_url(self) -> str:
         return str(self._raw.get("opencode", {}).get("server_url", "") or "")
 
+    def readonly_allowed_targets(self) -> frozenset:
+        """``to`` strings (or resolved ``harness:id``) a read-only Huddle
+        caller may still reach. Empty by default -- see
+        ``delivery/caller.py`` and docs/delivery.md."""
+        raw = self._raw.get("readonly_allowed_targets")
+        if not isinstance(raw, list):
+            return frozenset()
+        return frozenset(item for item in raw if isinstance(item, str) and item)
+
 
 def load() -> DeliveryConfig:
     return DeliveryConfig()

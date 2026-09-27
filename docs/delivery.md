@@ -9,7 +9,12 @@ text through unchanged. Implementation: `src/mcp_huddle/delivery/`.
 
 ## Tools
 
-### `message_send(to, text, mode="auto", from_name="", reply_to="", idempotency_key="")`
+### `message_send(to, text, mode="auto", from_name="", reply_to="", idempotency_key="", room_id="")`
+
+`room_id` (planned, server.py side -- see "Swarm-pilot guards" below) lets
+Huddle verify the caller's own identity when it's a swarm pilot member, so
+the two guards below can decide whether to refuse. It is not otherwise used
+for resolving `to`.
 
 Resolves `to`, wraps `text` in the envelope (below), and tries methods in
 order until one succeeds or the order is exhausted. Returns a JSON string:
@@ -254,6 +259,68 @@ Every attempt appends one JSON line to
 `$MCP_HUDDLE_HOME/delivery/log.jsonl`: `ts`, `msg_id`, `to`, `harness`,
 `method`, `ok`, `detail`, `text_sha256`, `text_len`. The raw text is never
 logged — only its hash and length.
+
+## Swarm-pilot guards
+
+Two policy checks close off `message_send` as a way to work around the
+swarm pilot's own constraints (`src/mcp_huddle/delivery/caller.py` and
+`ownership.py`). Both refuse before anything is attempted: `attempts: []`,
+no spool write, no subprocess. The refusal JSON gains a `"reason"` key for
+these two cases only (every pre-existing refusal keeps its old shape).
+
+### Readonly-caller guard
+
+`core.message_send(..., caller=None)` takes an optional `Caller` (a small
+frozen dataclass: `verified_member: bool`, `readonly: bool | None`,
+`room_id`, `agent`, `wake_id`). It is **fail-closed**:
+
+- `caller is None` -- no Huddle member-token header was ever seen on this
+  call, i.e. not an agent Huddle spawned (a human, or an external client).
+  Allowed, unchanged from before this guard existed.
+- `caller.readonly is False` -- Huddle positively knows this profile's
+  read-only transform is not in effect. Allowed.
+- `caller.readonly is True`, **or** `caller.readonly is None` (unknown --
+  Huddle knows it spawned this caller because it carried the member-token
+  header, but couldn't establish its read-only status, e.g. no `room_id`
+  was given or the wake claim didn't resolve) -- refused with
+  `reason: "readonly_caller"`, unless the target is in `delivery.json`'s
+  `readonly_allowed_targets` (a list of `to` strings or resolved
+  `harness:id`, default empty).
+
+Building the `Caller` is the server.py tool wrapper's job, not this
+module's -- see the hunk below. The wrapper's contract: any call that
+carries Huddle's `X-Huddle-Member` header is *always* turned into a
+`Caller` object, even when room/wake verification fails -- never silently
+downgraded to `caller=None`, which would let a caller that omits or lies
+about `room_id` launder itself into the allowed path.
+
+### Huddle-owned-session guard
+
+Independent of the caller check, `message_send` refuses (`reason:
+"huddle_owned_session"`) when the resolved target is a **Codex thread**
+Huddle itself currently owns: some room's `agent_meta[member]` carries both
+a live `wake_claim_id` and a `thread_id` equal to the target id. This is
+unconditional -- it applies even for `caller=None` -- because the risk
+(two turns racing into one Codex thread history) doesn't depend on who's
+asking.
+
+**Limitation**: only Codex is checked. There is no persisted field mapping
+a Huddle wake claim to the *Claude* session id it might correspond to (a
+spawned/woken Claude member's `agent_meta` has no equivalent of
+`thread_id`), so a `claude:...` target relies only on delivery's existing
+liveness tri-state (`claude.native` vs `claude.resume`, above) -- guessing
+an ownership mapping that isn't actually recorded would be worse than not
+checking at all.
+
+### server.py wrapper (not applied here)
+
+`message_send`'s MCP tool wrapper lives in `server.py`, owned by another
+worker in parallel. The exact hunk this module's guards depend on --
+`ctx`/`room_id` handling, reusing `_verified_member` and
+`spawn.readonly_enforced` to build the `Caller` -- is at
+`/tmp/huddle-delivery-swarm-guard-server-hunk.diff` for that worker (or the
+lead) to apply; it is **not applied in this worktree**, per this task's
+ownership boundary (`server.py` is off limits here).
 
 ## Honesty
 
