@@ -511,3 +511,14 @@ def test_value_flags_are_not_followed_by_double_dash():
         argv = DEFAULT_ARGV[key]
         flag = "-q" if key == "hermes.resume" else "-p"
         assert argv[argv.index(flag) + 1] == "{text}", key
+
+
+def test_resume_that_fails_immediately_is_not_reported_started(fake_bin, cfg):
+    """Live false positive: agy exits 1 ("trajectory not found") right away,
+    so the turn never started and delivery must not claim success."""
+    agy = fake_bin["dir"] / "agy"
+    agy.write_text("#!/bin/sh\necho 'Error: trajectory not found: conv-x'\nexit 1\n")
+    result = methods.agy_resume(Target(harness="agy", id="conv-x"), ENVELOPE, cfg)
+    assert result.ok is False
+    assert "exited 1 immediately" in result.detail
+    assert "trajectory not found" in result.detail
