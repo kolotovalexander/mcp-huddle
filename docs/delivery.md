@@ -11,7 +11,7 @@ text through unchanged. Implementation: `src/mcp_huddle/delivery/`.
 
 ### `message_send(to, text, mode="auto", from_name="", reply_to="", idempotency_key="", room_id="")`
 
-`room_id` (planned, server.py side -- see "Swarm-pilot guards" below) lets
+`room_id` lets
 Huddle verify the caller's own identity when it's a swarm pilot member, so
 the two guards below can decide whether to refuse. It is not otherwise used
 for resolving `to`.
@@ -317,15 +317,15 @@ liveness tri-state (`claude.native` vs `claude.resume`, above) -- guessing
 an ownership mapping that isn't actually recorded would be worse than not
 checking at all.
 
-### server.py wrapper (not applied here)
+### server.py wrapper
 
-`message_send`'s MCP tool wrapper lives in `server.py`, owned by another
-worker in parallel. The exact hunk this module's guards depend on --
-`ctx`/`room_id` handling, reusing `_verified_member` and
-`spawn.readonly_enforced` to build the `Caller` -- is at
-`/tmp/huddle-delivery-swarm-guard-server-hunk.diff` for that worker (or the
-lead) to apply; it is **not applied in this worktree**, per this task's
-ownership boundary (`server.py` is off limits here).
+The MCP tool wrapper accepts optional `room_id` and receives the request
+`Context`. When the call carries `X-Huddle-Member`, it builds a `Caller` from
+the verified room member and effective read-only policy. A missing or false
+`room_id` stays `readonly=None`, which is refused by default. Calls without
+that header keep the external-client behavior. This guard protects the
+Huddle-issued member-token route; it does not authenticate arbitrary clients
+that omit the header or use another server connection.
 
 ## Honesty
 

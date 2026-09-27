@@ -35,6 +35,7 @@ from . import child_processes
 from .claude_model_receipt import parse_claude_model_receipt
 from . import room_workspace
 from . import delivery
+from .delivery.caller import Caller as DeliveryCaller
 from . import spawn
 from . import swarm_pilot
 from . import swarm_jev
@@ -415,6 +416,7 @@ def _swarm_client_request_fingerprint(
     write_policy: str = room_workspace.READ_ONLY,
     *, member_profiles: dict[str, str] | None = None,
     child_agents: dict | None = None,
+    organizer_recovery_sha256: str = "",
 ) -> str:
     payload = {
         "name": name,
@@ -435,6 +437,8 @@ def _swarm_client_request_fingerprint(
     if child_agents:
         # Omitted when disabled so existing request fingerprints stay stable.
         payload["child_agents"] = dict(child_agents)
+    if organizer_recovery_sha256:
+        payload["organizer_recovery_sha256"] = organizer_recovery_sha256
     try:
         encoded = json.dumps(
             payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
@@ -537,6 +541,7 @@ def _swarm_existing_request(
             pilot["start_requested"], room_workspace.write_policy(meta),
             member_profiles=pilot.get("member_profiles"),
             child_agents=pilot.get("child_agents"),
+            organizer_recovery_sha256=pilot.get("organizer_recovery_sha256", ""),
         )
     except (KeyError, TypeError, ValueError):
         raise ValueError("partial_room: stored request data is incomplete") from None
@@ -1163,6 +1168,7 @@ def swarm_pilot_create(
     write_policy: str = "read_only",
     member_profiles: dict[str, str] | None = None,
     child_agents: dict | None = None,
+    organizer_recovery_secret: str = "",
 ) -> dict:
     """Create a pilot room; start exact enabled registry members when requested.
 
@@ -1213,6 +1219,10 @@ def swarm_pilot_create(
         raise ValueError("client_request_id must be 1-128 ASCII letters, digits, dot, underscore, colon or hyphen")
     if not isinstance(plan_hash, str) or (plan_hash and not _SWARM_HASH_RE.fullmatch(plan_hash)):
         raise ValueError("plan_hash must be empty or a sha256 fingerprint")
+    if not isinstance(organizer_recovery_secret, str):
+        raise ValueError("organizer_recovery_secret must be a string")
+    if organizer_recovery_secret and not 32 <= len(organizer_recovery_secret) <= 256:
+        raise ValueError("organizer_recovery_secret must contain 32-256 characters")
     if not isinstance(start, bool):
         raise ValueError("start must be a boolean")
     if write_policy not in room_workspace.WRITE_POLICIES:
@@ -1224,6 +1234,12 @@ def swarm_pilot_create(
     )
     request_fingerprint = ""
     deterministic_room_id = None
+    # An idempotent create must get the same secret again from its caller.
+    # Otherwise a partial-room retry could strand an unrecoverable capability.
+    recovery_secret = (organizer_recovery_secret or
+                       (secrets.token_urlsafe(32) if not client_request_id else ""))
+    recovery_sha256 = (hashlib.sha256(recovery_secret.encode("utf-8")).hexdigest()
+                       if recovery_secret else "")
     if client_request_id:
         if not all(isinstance(value, str) for value in (name, organizer, goal, cwd, workspace_strategy, mode)):
             raise ValueError("idempotent request fields must be strings")
@@ -1233,6 +1249,7 @@ def swarm_pilot_create(
             name, organizer, goal, mode, members, cwd, workspace_strategy, start,
             write_policy, member_profiles=profiles_by_member,
             child_agents=child_policy,
+            organizer_recovery_sha256=recovery_sha256,
         )
         deterministic_room_id = _swarm_request_room_id(organizer, client_request_id)
         existing = _swarm_existing_request(
@@ -1279,6 +1296,7 @@ def swarm_pilot_create(
             registry_availability_checked=(registry_checked if client_request_id else None),
             expected_specs=(expected if client_request_id else None),
             member_profiles=profiles_by_member,
+            organizer_recovery_sha256=recovery_sha256,
         )
     except FileExistsError:
         if deterministic_room_id:
@@ -1294,13 +1312,6 @@ def swarm_pilot_create(
                 return existing
             raise ValueError("partial_room: deterministic room directory already exists") from None
         raise
-    recovery_secret = secrets.token_urlsafe(32)
-    def _store_recovery_secret(meta: dict) -> dict:
-        meta["swarm_pilot"]["organizer_recovery_sha256"] = hashlib.sha256(
-            recovery_secret.encode("ascii")
-        ).hexdigest()
-        return meta
-    bus._update_meta_locked(room_id, _store_recovery_secret)
     if child_policy:
         # Before any invite or dispatch. An interruption before this write
         # leaves a room without the policy, so children stay disabled.
@@ -2361,12 +2372,32 @@ def _swarm_store_manual_recovery(room_id: str, member: str, recovery: dict) -> N
 
 def _swarm_stop_superseded_recovery(room_id: str, member: str, retry_id: int) -> None:
     """Stop only an owned recovery wake after a late original result wins."""
-    info = (bus.get_room_info(room_id).get("agent_meta") or {}).get(member) or {}
+    meta = bus.get_room_info(room_id)
+    info = (meta.get("agent_meta") or {}).get(member) or {}
     if info.get("wake_claim_msg_id") != retry_id:
         return
     wake_id = info.get("wake_claim_id")
-    if isinstance(wake_id, str) and wake_id:
+    if not isinstance(wake_id, str) or not wake_id:
+        return
+    recovery = info.get("swarm_pilot_recovery") or {}
+    if recovery.get("recovery_request_id") != retry_id:
+        return
+    pilot = meta.get("swarm_pilot") or {}
+    if pilot.get("round", 1) == recovery.get("round"):
         _stop_completed_pilot_turn(room_id, member, wake_id, "round_done")
+        return
+    # The next round cleared `done`; its old wake is nevertheless still the
+    # exact locally owned generation for the superseded recovery request.
+    if child_processes.state(room_id, wake_id) != "alive":
+        return
+    _merge_agent_meta(room_id, member, {"intentional_stop_wake_id": wake_id})
+    if child_processes.terminate(room_id, wake_id) != "sent":
+        def clear_marker(current_meta: dict) -> dict:
+            slot = (current_meta.get("agent_meta") or {}).get(member) or {}
+            if slot.get("wake_id") == wake_id:
+                slot.pop("intentional_stop_wake_id", None)
+            return current_meta
+        bus._update_meta_locked(room_id, clear_marker)
 
 
 def _swarm_pilot_request(room_id: str, member: str) -> str:
@@ -3754,8 +3785,9 @@ def notify_register(room_id: str, agent: str, notify_file_path: str) -> str:
 # ── Native cross-harness message delivery ──────────────────────────────────────
 
 @mcp.tool()
-def message_send(to: str, text: str, mode: str = "auto", from_name: str = "",
-                  reply_to: str = "", idempotency_key: str = "") -> str:
+def message_send(to: str, text: str, ctx: Context, mode: str = "auto", from_name: str = "",
+                  reply_to: str = "", idempotency_key: str = "",
+                  room_id: str = "") -> str:
     """Deliver `text` to another agent session outside this room, picking a
     deterministic "postman" per harness (no LLM) and trying methods in order.
     `text` is sent unchanged inside a small envelope.
@@ -3769,9 +3801,29 @@ def message_send(to: str, text: str, mode: str = "auto", from_name: str = "",
     for a resume/spool method means the attempt started/was queued, not that
     it was read. See docs/delivery.md.
     """
+    caller = None
+    if _request_member_secret(ctx):
+        # A token-bearing caller must never become an unguarded external
+        # caller merely by omitting or lying about room_id.
+        caller = DeliveryCaller(readonly=None, room_id=room_id)
+        principal = _verified_member(ctx, room_id) if room_id else None
+        if principal is not None:
+            meta = bus.get_room_info(room_id)
+            profile = _swarm_assigned_profile(meta, principal["member"])
+            spec = spawn.get_enabled_spec(profile)
+            try:
+                writes = room_workspace.write_policy(meta) == room_workspace.SHARED_WRITE
+            except ValueError:
+                writes = False
+            readonly = (None if spec is None else
+                        False if writes else spawn.readonly_enforced(spec))
+            caller = DeliveryCaller(
+                verified_member=True, readonly=readonly, room_id=room_id,
+                agent=principal["member"], wake_id=principal["wake_id"],
+            )
     return delivery.message_send(
         to, text, mode=mode, from_name=from_name, reply_to=reply_to,
-        idempotency_key=idempotency_key,
+        idempotency_key=idempotency_key, caller=caller,
     )
 
 

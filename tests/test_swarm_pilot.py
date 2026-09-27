@@ -214,6 +214,54 @@ def test_recovery_stops_exact_owned_wake_when_original_finishes_after_claim(
     assert terminated == [(room, "owned-retry")]
 
 
+def test_idempotent_create_keeps_caller_supplied_recovery_capability(
+    isolated_home, monkeypatch,
+):
+    monkeypatch.setattr(server.spawn, "get_enabled_spec", lambda name: {"name": name})
+    secret = "caller-held-recovery-secret-0123456789"
+    args = ("retryable", "Organizer", "Decide", "team", ["A"])
+    first = server.swarm_pilot_create(
+        *args, start=False, client_request_id="same-create",
+        organizer_recovery_secret=secret,
+    )
+    again = server.swarm_pilot_create(
+        *args, start=False, client_request_id="same-create",
+        organizer_recovery_secret=secret,
+    )
+    assert again["room_id"] == first["room_id"]
+    assert again["reused"] is True
+    assert "organizer_recovery_sha256" not in swarm_pilot.status(first["room_id"])
+    with pytest.raises(ValueError, match="client_request_id conflict"):
+        server.swarm_pilot_create(
+            *args, start=False, client_request_id="same-create",
+            organizer_recovery_secret="another-caller-held-recovery-secret-012345",
+        )
+
+
+def test_superseded_recovery_stops_old_wake_after_round_advanced(
+    isolated_home, monkeypatch,
+):
+    room = swarm_pilot.create("pilot", "Organizer", "Decide", "team", ["A"])
+    retry_id = 17
+    server._merge_agent_meta(room, "A", {
+        "wake_claim_msg_id": retry_id,
+        "wake_claim_id": "old-wake",
+        "wake_id": "old-wake",
+        "swarm_pilot_recovery": {"round": 1, "recovery_request_id": retry_id},
+    })
+    def advance(meta):
+        meta["swarm_pilot"]["round"] = 2
+        meta["swarm_pilot"]["done"] = {}
+        return meta
+    bus._update_meta_locked(room, advance)
+    stopped = []
+    monkeypatch.setattr(server.child_processes, "state", lambda *args: "alive")
+    monkeypatch.setattr(server.child_processes, "terminate",
+                        lambda *args: stopped.append(args) or "sent")
+    server._swarm_stop_superseded_recovery(room, "A", retry_id)
+    assert stopped == [(room, "old-wake")]
+
+
 def test_round_done_stops_only_exact_local_generation_after_reply(
     isolated_home, monkeypatch,
 ):

@@ -17,9 +17,28 @@ import json
 
 import pytest
 
-from mcp_huddle import bus
+from mcp_huddle import bus, server
 from mcp_huddle.delivery import caller as caller_mod
 from mcp_huddle.delivery import core, methods
+
+
+def test_server_wrapper_passes_verified_readonly_caller_and_rejects_missing_room(monkeypatch):
+    observed = []
+    monkeypatch.setattr(server, "_request_member_secret", lambda ctx: "member-token")
+    monkeypatch.setattr(server, "_verified_member", lambda ctx, room_id: (
+        {"member": "A", "wake_id": "w1"} if room_id == "room_ok" else None
+    ))
+    monkeypatch.setattr(server.bus, "get_room_info", lambda room_id: {"swarm_pilot": {}})
+    monkeypatch.setattr(server, "_swarm_assigned_profile", lambda meta, member: "A")
+    monkeypatch.setattr(server.spawn, "get_enabled_spec", lambda profile: {"name": profile})
+    monkeypatch.setattr(server.spawn, "readonly_enforced", lambda spec: True)
+    monkeypatch.setattr(server.delivery, "message_send", lambda *args, **kwargs: (
+        observed.append(kwargs["caller"]) or "ok"
+    ))
+    assert server.message_send("codex:target", "body", object(), room_id="room_ok") == "ok"
+    assert observed[-1].verified_member and observed[-1].readonly is True
+    assert server.message_send("codex:target", "body", object()) == "ok"
+    assert observed[-1].readonly is None
 
 
 @pytest.fixture

@@ -145,11 +145,14 @@ availability has been checked by a real model request.
 
 If a dispatched member has a server-recorded terminal failure and no result,
 the organizer may call `swarm_pilot_recover_member(room_id, by, member,
-organizer_recovery_secret)`. New rooms return this private capability once in
-the `swarm_pilot_create` response. Keep it outside room messages and do not
-give it to participants. A repeated idempotent create does not reveal it again;
-the organizer must retain the initial response. Older rooms created before
-this capability was added cannot use manual recovery.
+organizer_recovery_secret)`. A non-idempotent create generates this private
+capability and returns it once. For `client_request_id` (retryable creation),
+the organizer should supply its own random 32–256 character
+`organizer_recovery_secret` to `swarm_pilot_create` and retain it across
+retries; without one, manual recovery is disabled for that room. Keep it
+outside room messages and do not give it to participants. A repeated create
+does not reveal it again. Older rooms created before this capability was
+added cannot use manual recovery.
 Huddle refuses recovery while the member has an active wake claim. It creates
 at most one new addressed request for that member in the current round, then
 wakes the member through its configured route and bounded replacement policy.
