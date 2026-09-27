@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import errno
 import json
+import os
 import shutil
 import socket
 import subprocess
@@ -65,7 +66,22 @@ def _log_dir() -> Path:
     return d
 
 
-def _spawn_detached(argv, *, cwd: str = "", label: str) -> Path:
+def _detached_grace() -> float:
+    """Seconds to watch a detached resume for an immediate failure."""
+    try:
+        return max(0.0, float(os.environ.get("MCP_HUDDLE_DELIVERY_DETACHED_GRACE", "3")))
+    except ValueError:
+        return 3.0
+
+
+def _spawn_detached(argv, *, cwd: str = "", label: str) -> tuple[Path, Optional[int]]:
+    """Start a detached resume and watch it for a short grace window.
+
+    Returns ``(log_path, returncode)``; ``returncode`` is ``None`` while the
+    process is still running after the window. A resume that exits non-zero
+    inside the window (e.g. an unknown conversation id) never started a turn,
+    so callers must report it as a failure instead of "started".
+    """
     log_path = _log_dir() / f"{label}-{int(time.time() * 1000)}.log"
     with open(log_path, "wb") as fh:
         proc = subprocess.Popen(
@@ -77,14 +93,30 @@ def _spawn_detached(argv, *, cwd: str = "", label: str) -> Path:
             start_new_session=True,
             close_fds=True,
         )
-    # start_new_session=True detaches the child from our process group, but
-    # it stays our child in the process-table sense: nothing ever calls
-    # wait()/poll() on it otherwise, so it becomes a zombie the moment it
-    # exits (the Popen object above is never referenced again and there's no
-    # SIGCHLD handler). A daemon thread blocking on wait() reaps it without
-    # making the caller wait for the detached process to finish.
+    try:
+        return log_path, proc.wait(timeout=_detached_grace())
+    except subprocess.TimeoutExpired:
+        pass
+    # Still running: reap it from a daemon thread so it never becomes a
+    # zombie, without making the caller wait for the whole turn.
     threading.Thread(target=proc.wait, daemon=True).start()
-    return log_path
+    return log_path, None
+
+
+def _log_tail(log_path: Path, limit: int = 160) -> str:
+    try:
+        lines = log_path.read_text(errors="replace").strip().splitlines()
+    except OSError:
+        return ""
+    return lines[-1][:limit] if lines else ""
+
+
+def _detached_result(method: str, log_path: Path, rc: Optional[int], note: str = "") -> MethodResult:
+    if rc is not None and rc != 0:
+        return MethodResult(False, method,
+                            f"exited {rc} immediately: {_log_tail(log_path)}; log: {log_path}")
+    state = "started" if rc is None else "started; exited 0"
+    return MethodResult(True, method, f"{state}{note}; log: {log_path}")
 
 
 def _resolve_binary(argv: Optional[list], method: str) -> Optional[str]:
@@ -129,10 +161,10 @@ def claude_resume(target: Target, envelope_text: str, cfg: delivery_config.Deliv
         return MethodResult(False, "claude.resume", "binary not found")
     argv = _fill(argv_tpl, id=target.id, text=envelope_text, cwd=target.cwd)
     try:
-        log_path = _spawn_detached(argv, cwd=target.cwd, label="claude-resume")
+        log_path, rc = _spawn_detached(argv, cwd=target.cwd, label="claude-resume")
     except OSError as exc:
         return MethodResult(False, "claude.resume", f"spawn failed: {exc}")
-    return MethodResult(True, "claude.resume", f"started; log: {log_path}")
+    return _detached_result("claude.resume", log_path, rc)
 
 
 # ── Codex ────────────────────────────────────────────────────────────────────
@@ -170,10 +202,10 @@ def codex_resume(target: Target, envelope_text: str, cfg: delivery_config.Delive
         return MethodResult(False, "codex.resume", "binary not found")
     argv = _fill(argv_tpl, id=target.id, text=envelope_text)
     try:
-        log_path = _spawn_detached(argv, label="codex-resume")
+        log_path, rc = _spawn_detached(argv, label="codex-resume")
     except OSError as exc:
         return MethodResult(False, "codex.resume", f"spawn failed: {exc}")
-    return MethodResult(True, "codex.resume", f"started; log: {log_path}")
+    return _detached_result("codex.resume", log_path, rc)
 
 
 # ── Hermes ───────────────────────────────────────────────────────────────────
@@ -217,10 +249,10 @@ def hermes_resume(target: Target, envelope_text: str, cfg: delivery_config.Deliv
         return MethodResult(False, "hermes.resume", "binary not found")
     argv = _fill(argv_tpl, id=target.id, text=envelope_text)
     try:
-        log_path = _spawn_detached(argv, label="hermes-resume")
+        log_path, rc = _spawn_detached(argv, label="hermes-resume")
     except OSError as exc:
         return MethodResult(False, "hermes.resume", f"spawn failed: {exc}")
-    return MethodResult(True, "hermes.resume", f"started (unverified template); log: {log_path}")
+    return _detached_result("hermes.resume", log_path, rc, ' (unverified template)')
 
 
 def _is_connection_refused(exc: BaseException) -> bool:
@@ -308,10 +340,10 @@ def opencode_resume(target: Target, envelope_text: str, cfg: delivery_config.Del
         return MethodResult(False, "opencode.resume", "binary not found")
     argv = _fill(argv_tpl, id=target.id, text=envelope_text)
     try:
-        log_path = _spawn_detached(argv, label="opencode-resume")
+        log_path, rc = _spawn_detached(argv, label="opencode-resume")
     except OSError as exc:
         return MethodResult(False, "opencode.resume", f"spawn failed: {exc}")
-    return MethodResult(True, "opencode.resume", f"started; log: {log_path}")
+    return _detached_result("opencode.resume", log_path, rc)
 
 
 # ── Agy ──────────────────────────────────────────────────────────────────────
@@ -323,10 +355,10 @@ def agy_resume(target: Target, envelope_text: str, cfg: delivery_config.Delivery
         return MethodResult(False, "agy.resume", "binary not found")
     argv = _fill(argv_tpl, id=target.id, text=envelope_text)
     try:
-        log_path = _spawn_detached(argv, label="agy-resume")
+        log_path, rc = _spawn_detached(argv, label="agy-resume")
     except OSError as exc:
         return MethodResult(False, "agy.resume", f"spawn failed: {exc}")
-    return MethodResult(True, "agy.resume", f"started; log: {log_path}")
+    return _detached_result("agy.resume", log_path, rc)
 
 
 # ── Spool (hook fallback, all harnesses) ───────────────────────────────────
