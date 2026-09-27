@@ -1,5 +1,6 @@
 """child_room children: own room, selected context, relay, close."""
 
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -112,7 +113,7 @@ def test_child_room_context_relay_and_close(launches):
         server.swarm_spawn_child(room, CHILD["name"], "fourth", ctx, invite="child_room")
 
 
-def test_child_room_relay_failure_is_visible_and_retry_is_idempotent(launches, monkeypatch):
+def test_child_room_relay_failure_heals_via_retry_sweep(launches, monkeypatch):
     room, ctx = _setup()
     child = server.swarm_spawn_child(room, CHILD["name"], "find risks", ctx,
                                      invite="child_room")
@@ -140,17 +141,103 @@ def test_child_room_relay_failure_is_visible_and_retry_is_idempotent(launches, m
     monkeypatch.setattr(server, "_post_message_checked", flaky_post)
     on_exit = launches[-1]["on_exit"]
     on_exit(0)
-    assert _child(room, name)["delivery"] == "relay_failed"
-    assert _child(room, name)["relay_status"] == "failed"
-    assert _child(room, name)["child_room_closed"] is True
+    record = _child(room, name)
+    assert record["delivery"] == "relay_failed"
+    assert record["relay_status"] == "failed"
+    assert record["relay_attempts"] == 1
+    assert record["child_room_closed"] is True
     assert not _relays(room)
 
-    on_exit(0)
-    assert _child(room, name)["delivery"] == "result"
-    assert _child(room, name)["relay_status"] == "sent"
+    # Sweeping before the backoff has elapsed must not retry yet.
+    assert server._swarm_retry_failed_relays() == []
+    assert _child(room, name)["relay_status"] == "failed"
+
+    # Fast-forward past relay_next_at: the sweep (as the watchdog/startup call
+    # it) re-attempts the relay post and it succeeds this time.
+    future = time.time() + 3600
+    monkeypatch.setattr(server.time, "time", lambda: future)
+    retried = server._swarm_retry_failed_relays()
+    assert retried == [f"{room}:{name}"]
+    record = _child(room, name)
+    assert record["delivery"] == "result"
+    assert record["relay_status"] == "sent"
     assert len(_relays(room)) == 1
-    on_exit(0)
+
+    # Further sweeps add nothing further, launch no new process, and the
+    # child room (already closed on exit) stays closed.
+    launches_before = len(launches)
+    assert server._swarm_retry_failed_relays() == []
     assert len(_relays(room)) == 1
+    assert len(launches) == launches_before
+    assert bus.get_room_info(child["child_room"])["status"] == "closed"
+
+
+def test_child_room_relay_gives_up_after_cap_and_uncertain_post_stays_single(
+    launches, monkeypatch,
+):
+    room, ctx = _setup()
+    child = server.swarm_spawn_child(room, CHILD["name"], "find risks", ctx,
+                                     invite="child_room")
+    name = child["child"]
+    server._post_message_checked(child["child_room"], name, "answer 42", "result",
+                                 reply_to=child["request_id"])
+    server._clear_wake_claim(room, "A", "wakeA")
+    real_post = server._post_message_checked
+    calls = 0
+
+    def flaky_then_uncertain(room_id, *args, **kwargs):
+        nonlocal calls
+        if room_id == room and kwargs.get("idempotency_key", "").startswith(
+            "swarm-child-relay:"
+        ):
+            calls += 1
+            if calls < 3:
+                raise OSError("temporary relay failure")
+            # 3rd attempt: the bus post actually lands, but the caller sees an
+            # exception anyway (e.g. the response was lost) — an "uncertain"
+            # outcome. Bus idempotency (durable across processes/restarts,
+            # keyed by idempotency_key in messages.jsonl) must keep this to
+            # exactly one stored message no matter how many times it's retried.
+            real_post(room_id, *args, **kwargs)
+            raise TimeoutError("uncertain: posted but response lost")
+        return real_post(room_id, *args, **kwargs)
+
+    monkeypatch.setattr(server, "_post_message_checked", flaky_then_uncertain)
+    on_exit = launches[-1]["on_exit"]
+    on_exit(0)  # attempt 1: fails
+    assert _child(room, name)["relay_attempts"] == 1
+    assert _child(room, name)["relay_status"] == "failed"
+
+    clock = {"t": time.time()}
+
+    def fast_forward():
+        clock["t"] += 3600
+        return clock["t"]
+
+    monkeypatch.setattr(server.time, "time", fast_forward)
+
+    server._swarm_retry_failed_relays()  # attempt 2: fails
+    record = _child(room, name)
+    assert record["relay_attempts"] == 2
+    assert record["relay_status"] == "failed"
+    assert not _relays(room)
+
+    server._swarm_retry_failed_relays()  # attempt 3: uncertain, cap reached
+    record = _child(room, name)
+    assert record["relay_attempts"] == 3
+    assert record["relay_status"] == "gave_up"
+    assert record["delivery"] == "relay_failed"
+    assert len(_relays(room)) == 1  # exactly one message despite the retries
+
+    # Terminal: no further attempts, and it stays visible rather than making
+    # the parent wait forever.
+    assert server._swarm_retry_failed_relays() == []
+    assert len(_relays(room)) == 1
+    snapshot = server.room_status(room)
+    issues = snapshot["child_relay_issues"]
+    assert len(issues) == 1
+    assert issues[0]["child"] == name
+    assert issues[0]["relay_status"] == "gave_up"
 
 
 def test_parent_waits_for_child_room_and_deleted_parent_does_not_orphan_it(launches):

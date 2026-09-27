@@ -1635,6 +1635,16 @@ _SWARM_CHILD_ROOM_NOTE = (
     "servers, including this Huddle."
 )
 
+# Bounded automatic retry for a failed child-room relay post (see
+# _swarm_deliver_child_room / _swarm_retry_failed_relays). Backoff is indexed
+# by (attempts - 1); once relay_attempts reaches the cap the relay is given up
+# on permanently (relay_status="gave_up") rather than retried forever.
+_SWARM_RELAY_BACKOFF_SECS = (5, 30, 120)
+_SWARM_RELAY_MAX_ATTEMPTS = 3
+# Terminal relay_status values: once set, _swarm_deliver_child_room never
+# attempts another post for that child generation.
+_SWARM_RELAY_TERMINAL = {"sent", "gave_up", "parent_gone"}
+
 
 def _swarm_child_room_result(child_room: str, name: str, request_id) -> tuple[int, str] | None:
     """The child's own ``result`` reply to its request, validated for relay."""
@@ -1652,13 +1662,24 @@ def _swarm_deliver_child_room(room_id: str, child_room: str, name: str,
     """After a child_room child exits: record and optionally relay its result.
 
     The exit callback closes the child's room independently of parent state.
+    Safe to call again for the same child generation (manual re-call, or the
+    ``_swarm_retry_failed_relays`` sweep after a prior ``relay_failed``): it
+    always re-reads current state and never re-attempts once the relay has
+    reached a terminal state (``sent``/``gave_up``/``parent_gone``). It never
+    wakes, resumes or reopens the child or its (already closed) room — a
+    retry only re-attempts the parent-room relay post.
     """
-    child = ((bus.get_room_info(room_id).get("swarm_pilot") or {})
+    try:
+        parent_meta = bus.get_room_info(room_id)
+    except Exception:
+        parent_meta = None
+    child = (((parent_meta or {}).get("swarm_pilot") or {})
              .get("children") or {}).get(name) or {}
     if child.get("wake_id") != child_wake:
         return
     if child.get("delivery") and (
-        child.get("relay") != "result" or child.get("relay_status") == "sent"
+        child.get("relay") != "result"
+        or child.get("relay_status") in _SWARM_RELAY_TERMINAL
     ):
         return
     found = _swarm_child_room_result(child_room, name, child.get("request_id"))
@@ -1666,26 +1687,93 @@ def _swarm_deliver_child_room(room_id: str, child_room: str, name: str,
     if found:
         fields["result_message_id"], text = found[0], found[1]
         fields["result_chars"] = len(text)
-    if child.get("relay") == "result" and child.get("relay_status") != "sent":
-        if found:
-            clipped = text if len(text) <= _SWARM_CHILD_RELAY_CHARS else (
-                text[:_SWARM_CHILD_RELAY_CHARS] + " […truncated]")
-            body = f"Result from child {name} (room {child_room}):\n{clipped}"
-        else:
-            body = (f"Child {name} ended without a result (exit {returncode}); "
-                    f"see room {child_room}.")
-        try:
-            fields["relay_message_id"] = _post_message_checked(
-                room_id, "System", body, "comment", to=child.get("parent"),
-                idempotency_key=f"swarm-child-relay:{room_id}:{name}:{child_wake}",
-            )
-            fields["relay_status"] = "sent"
-            fields["relay_error"] = ""
-        except Exception as exc:
+    if (child.get("relay") == "result"
+            and child.get("relay_status") not in _SWARM_RELAY_TERMINAL):
+        if parent_meta is None or parent_meta.get("status") in ("closing", "closed"):
+            # Nothing to relay into: the parent room is gone or no longer
+            # accepts messages. Terminal immediately, no retry loop.
             fields["delivery"] = "relay_failed"
-            fields["relay_status"] = "failed"
-            fields["relay_error"] = type(exc).__name__
+            fields["relay_status"] = "parent_gone"
+            fields["relay_error"] = "parent_room_unavailable"
+        else:
+            if found:
+                clipped = text if len(text) <= _SWARM_CHILD_RELAY_CHARS else (
+                    text[:_SWARM_CHILD_RELAY_CHARS] + " […truncated]")
+                body = f"Result from child {name} (room {child_room}):\n{clipped}"
+            else:
+                body = (f"Child {name} ended without a result (exit {returncode}); "
+                        f"see room {child_room}.")
+            try:
+                fields["relay_message_id"] = _post_message_checked(
+                    room_id, "System", body, "comment", to=child.get("parent"),
+                    idempotency_key=f"swarm-child-relay:{room_id}:{name}:{child_wake}",
+                )
+                fields["relay_status"] = "sent"
+                fields["relay_error"] = ""
+                fields.pop("relay_next_at", None)
+            except Exception as exc:
+                attempts = int(child.get("relay_attempts") or 0) + 1
+                fields["delivery"] = "relay_failed"
+                fields["relay_attempts"] = attempts
+                fields["relay_error"] = type(exc).__name__
+                if attempts >= _SWARM_RELAY_MAX_ATTEMPTS:
+                    fields["relay_status"] = "gave_up"
+                    fields.pop("relay_next_at", None)
+                else:
+                    fields["relay_status"] = "failed"
+                    idx = min(attempts - 1, len(_SWARM_RELAY_BACKOFF_SECS) - 1)
+                    fields["relay_next_at"] = int(time.time()) + _SWARM_RELAY_BACKOFF_SECS[idx]
     _swarm_set_child_fields(room_id, name, child_wake, fields)
+
+
+def _swarm_retry_failed_relays() -> list[str]:
+    """Retry child-room relays stuck at ``relay_status="failed"`` whose
+    backoff has elapsed and whose attempt cap is not yet reached.
+
+    Only re-attempts the parent-room relay post via ``_swarm_deliver_child_room``
+    (which re-reads state fresh and is itself idempotent/terminal-aware); it
+    never wakes, resumes or reopens a child or its room. Cheap: skips rooms
+    with no swarm_pilot children, and any per-child error is caught so one bad
+    child can never abort the sweep or the watchdog loop.
+    """
+    retried: list[str] = []
+    now = int(time.time())
+    try:
+        rooms = bus.list_rooms()
+    except Exception as exc:
+        print(f"[watchdog] relay retry sweep list_rooms error: "
+              f"{type(exc).__name__}", flush=True)
+        return retried
+    for meta in rooms:
+        room_id = meta.get("id")
+        pilot = meta.get("swarm_pilot")
+        if not room_id or not isinstance(pilot, dict):
+            continue
+        children = pilot.get("children")
+        if not isinstance(children, dict):
+            continue
+        for name, child in list(children.items()):
+            if not isinstance(child, dict):
+                continue
+            if child.get("relay") != "result" or child.get("relay_status") != "failed":
+                continue
+            if int(child.get("relay_attempts") or 0) >= _SWARM_RELAY_MAX_ATTEMPTS:
+                continue
+            if now < int(child.get("relay_next_at") or 0):
+                continue
+            child_room = child.get("child_room")
+            child_wake = child.get("wake_id")
+            if not child_room or not child_wake:
+                continue
+            try:
+                _swarm_deliver_child_room(
+                    room_id, child_room, name, child_wake, child.get("returncode"),
+                )
+                retried.append(f"{room_id}:{name}")
+            except Exception as exc:
+                print(f"[watchdog] relay retry error ({name}@{room_id}): "
+                      f"{type(exc).__name__}", flush=True)
+    return retried
 
 
 def _swarm_close_child_room(room_id: str, child_room: str, name: str,
@@ -1780,12 +1868,15 @@ def swarm_spawn_child(room_id: str, profile: str, task: str, ctx: Context,
     ``relay="result"`` posts its result (or a no-result notice) as a short
     comment to the parent here; ``relay="none"`` only records it. The child
     room closes when its process exits. Closing the parent does not stop an
-    already started child; it finishes independently. If its parent is gone,
-    relay cannot be delivered, but the child room still closes. A relay
-    failure is recorded as ``delivery="relay_failed"`` without automatic
-    retry. This is context selection only, NOT
-    confidentiality or isolation: the child can still read local files and
-    reach other MCP servers, including this Huddle.
+    already started child; it finishes independently. If its parent is gone
+    or closed, relay cannot be delivered: ``relay_status="parent_gone"``,
+    terminal immediately, no retry. Otherwise a relay failure is recorded as
+    ``delivery="relay_failed"``/``relay_status="failed"`` and retried
+    automatically with backoff, up to a small attempt cap; once that cap is
+    reached it becomes ``relay_status="gave_up"`` (still visible via
+    ``room_status``'s ``child_relay_issues``). This is context selection
+    only, NOT confidentiality or isolation: the child can still read local
+    files and reach other MCP servers, including this Huddle.
     """
     if not isinstance(task, str) or not task.strip() or len(task) > 4000:
         raise ValueError("task must be 1-4000 characters")
@@ -3234,6 +3325,18 @@ def room_status(room_id: str) -> dict:
         if isinstance(child, dict) and child.get("invite") == "child_room"
         and child.get("status") in {"reserved", "running"}
     ]
+    # A relay that has given up or lost its parent is a terminal outcome, not
+    # something an orchestrator should keep waiting on — surface it here so
+    # "wait forever" isn't the only visible state after a relay failure.
+    child_relay_issues = [
+        {"child": name, "room_id": child.get("child_room"),
+         "relay_status": child.get("relay_status"),
+         "relay_attempts": child.get("relay_attempts", 0),
+         "relay_error": child.get("relay_error", "")}
+        for name, child in children.items()
+        if isinstance(child, dict)
+        and child.get("relay_status") in ("failed", "gave_up", "parent_gone")
+    ]
     waiting = bool(pending) or active or bool(pending_child_rooms)
     return {
         "room_id": room_id,
@@ -3242,6 +3345,7 @@ def room_status(room_id: str) -> dict:
         "agents": agents,
         "pending_requests": pending,
         "pending_child_rooms": pending_child_rooms,
+        "child_relay_issues": child_relay_issues,
         "wait_recommended": waiting,
         "all_terminal": not waiting,
     }
@@ -3359,6 +3463,16 @@ def message_targets(harness: str = "") -> list:
 async def _background_watchdog():
     """Periodically check for zombie rooms and deadlocks."""
     last_retention_sweep = 0.0
+    try:
+        # Also run once at watchdog startup (process start, or first live
+        # entry into _watchdog_lifespan) so a relay stuck at relay_failed
+        # across a server restart heals without waiting a full tick.
+        retried = _swarm_retry_failed_relays()
+        if retried:
+            print(f"[watchdog] Retried child-room relays (startup): {retried}",
+                  flush=True)
+    except Exception as e:
+        print(f"[watchdog] relay retry (startup) error: {e}", flush=True)
     while True:
         await asyncio.sleep(bus.ZOMBIE_CHECK_SECS)
         try:
@@ -3429,6 +3543,13 @@ async def _background_watchdog():
                 print(f"[watchdog] Stuck-wake notices: {stuck}", flush=True)
         except Exception as e:
             print(f"[watchdog] stuck-wake check error: {e}", flush=True)
+
+        try:
+            retried = _swarm_retry_failed_relays()
+            if retried:
+                print(f"[watchdog] Retried child-room relays: {retried}", flush=True)
+        except Exception as e:
+            print(f"[watchdog] relay retry error: {e}", flush=True)
 
 
 def _reconcile_owned_children() -> list[str]:
