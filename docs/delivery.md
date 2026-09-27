@@ -128,8 +128,13 @@ argv list — never `shell=True`.
 | `spool` | Always available, last resort for every harness. Atomically writes the envelope to `$MCP_HUDDLE_HOME/delivery/spool/<harness>/<target_id>/<msg_id>.md` for a harness-side hook to pick up later. |
 
 A "detached" spawn uses `Popen(..., start_new_session=True)` with stdout/stderr
-redirected to a log file under `$MCP_HUDDLE_HOME/delivery/logs/`; it reports
-`ok=True` as soon as the process **starts**, not once it finishes.
+redirected to a log file under `$MCP_HUDDLE_HOME/delivery/logs/`. It watches
+the process for a short grace window (`MCP_HUDDLE_DELIVERY_DETACHED_GRACE`,
+default 3 s): a non-zero exit inside that window (e.g. `agy` "trajectory not
+found" for an unknown conversation) is reported as `ok=False` with the last log
+line, so auto mode falls through to the next method. Otherwise it reports
+`ok=True` ("started") — the process is running or exited 0 — not that the turn
+finished or was read.
 
 ### Default order per harness
 
