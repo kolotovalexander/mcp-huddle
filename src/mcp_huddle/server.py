@@ -5,6 +5,7 @@ HTTP mode (`--http`): uvicorn + Liquid Glass dashboard on :8014.
 """
 
 import asyncio
+import builtins
 import contextlib
 from functools import wraps
 import hashlib
@@ -41,6 +42,12 @@ from . import swarm_pilot
 from . import swarm_jev
 from . import swarm_replacement
 from . import swarm_planner
+
+
+def _log(*args, **kwargs) -> None:
+    """Write diagnostics away from MCP's JSON-RPC stdout channel."""
+    kwargs.setdefault("file", sys.stderr)
+    builtins.print(*args, **kwargs)
 
 # Shown to LLM clients in the `initialize` response. Keep tight — every agent
 # session sees this verbatim. Goal: stop one-shot misuse, enforce anti-loop.
@@ -197,7 +204,7 @@ def _env_num(name: str, default, cast):
     try:
         return cast(raw)
     except (TypeError, ValueError):
-        print(
+        _log(
             f"[mcp-huddle] WARNING: env {name}={raw!r} is not a valid "
             f"{cast.__name__}; using default {default!r}",
             file=sys.stderr,
@@ -1627,7 +1634,7 @@ def _make_child_done_callback(room_id: str, name: str, child_wake: str):
                 _on_wake_exit(room_id, name, child_wake, returncode)
                 _swarm_child_mark_exited(room_id, name, child_wake, returncode)
         except Exception as exc:  # never let a callback kill the reaper thread
-            print(f"[huddle] child exit callback error ({name}@{room_id}): {exc}",
+            _log(f"[huddle] child exit callback error ({name}@{room_id}): {exc}",
                   flush=True)
     return _callback
 
@@ -1785,7 +1792,7 @@ def _swarm_retry_failed_relays() -> list[str]:
     try:
         rooms = bus.list_rooms()
     except Exception as exc:
-        print(f"[watchdog] relay retry sweep list_rooms error: "
+        _log(f"[watchdog] relay retry sweep list_rooms error: "
               f"{type(exc).__name__}", flush=True)
         return retried
     for meta in rooms:
@@ -1815,7 +1822,7 @@ def _swarm_retry_failed_relays() -> list[str]:
                 )
                 retried.append(f"{room_id}:{name}")
             except Exception as exc:
-                print(f"[watchdog] relay retry error ({name}@{room_id}): "
+                _log(f"[watchdog] relay retry error ({name}@{room_id}): "
                       f"{type(exc).__name__}", flush=True)
     return retried
 
@@ -1827,7 +1834,7 @@ def _swarm_close_child_room(room_id: str, child_room: str, name: str,
         if bus.get_room_info(child_room).get("status") != "closed":
             bus.close_room(child_room, "System")
     except Exception as exc:
-        print(f"[huddle] child room close failed ({child_room}): "
+        _log(f"[huddle] child room close failed ({child_room}): "
               f"{type(exc).__name__}", flush=True)
         return
     try:
@@ -1850,7 +1857,7 @@ def _make_child_room_done_callback(room_id: str, child_room: str, name: str,
                 finally:
                     _swarm_child_mark_exited(room_id, name, child_wake, returncode)
             except Exception as exc:  # never let a callback kill the reaper thread
-                print(f"[huddle] child room exit callback error ({name}@{child_room}): "
+                _log(f"[huddle] child room exit callback error ({name}@{child_room}): "
                       f"{type(exc).__name__}", flush=True)
             finally:
                 _swarm_close_child_room(room_id, child_room, name, child_wake)
@@ -2485,7 +2492,7 @@ def _stop_completed_pilot_turn(
     _merge_agent_meta(room_id, member, {"intentional_stop_wake_id": wake_id})
     result = child_processes.terminate(room_id, wake_id)
     if result == "denied":
-        print(f"[huddle] could not stop completed pilot turn "
+        _log(f"[huddle] could not stop completed pilot turn "
               f"({member}@{room_id}, wake={wake_id})", flush=True)
     if result != "sent":
         # A vanished/unowned child was not intentionally signalled. Remove
@@ -2530,7 +2537,7 @@ def _schedule_completed_pilot_turn_exit(
         timer.daemon = True
         timer.start()
     except Exception as exc:
-        print(f"[huddle] could not schedule completed pilot turn exit "
+        _log(f"[huddle] could not schedule completed pilot turn exit "
               f"({member}@{room_id}): {exc}", flush=True)
 
 
@@ -2726,7 +2733,7 @@ def _recover_swarm_pilots() -> list[dict]:
         except Exception as exc:
             # One malformed/removed room must not prevent other rooms from
             # recovering on this tick. The next tick can retry this room.
-            print(f"[watchdog] swarm advance failed ({room_id}): {exc}",
+            _log(f"[watchdog] swarm advance failed ({room_id}): {exc}",
                   flush=True)
     return recovered
 
@@ -3048,7 +3055,7 @@ def _swarm_replacement_notice(room_id: str, agent_name: str, generation: str,
             idempotency_key=f"swarm-replace:{room_id}:{agent_name}:{generation}",
         )
     except Exception as exc:
-        print(f"[huddle] swarm replacement notice failed "
+        _log(f"[huddle] swarm replacement notice failed "
               f"({agent_name}@{room_id}): {exc}", flush=True)
 
 
@@ -3093,7 +3100,7 @@ def swarm_pilot_transfer(
                              f"{transfer['version']}"),
         )
     except Exception as exc:
-        print(f"[huddle] swarm transfer notice failed ({room_id}): {exc}",
+        _log(f"[huddle] swarm transfer notice failed ({room_id}): {exc}",
               flush=True)
     advanced = _swarm_advance(room_id) if (
         key == "reporter" and len(updated["done"]) == len(updated["members"])
@@ -3196,7 +3203,7 @@ def swarm_pilot_open_round(
             idempotency_key=f"swarm-pilot-round:{room_id}:{round_no}:open",
         )
     except Exception as exc:
-        print(f"[huddle] swarm round notice failed ({room_id}): {exc}", flush=True)
+        _log(f"[huddle] swarm round notice failed ({room_id}): {exc}", flush=True)
     advanced = _swarm_advance(room_id)
     return {"state": swarm_pilot.status(room_id), "round": round_no,
             "next_dispatch": advanced["next_dispatch"]}
@@ -3847,26 +3854,26 @@ async def _background_watchdog():
         # across a server restart heals without waiting a full tick.
         retried = _swarm_retry_failed_relays()
         if retried:
-            print(f"[watchdog] Retried child-room relays (startup): {retried}",
+            _log(f"[watchdog] Retried child-room relays (startup): {retried}",
                   flush=True)
     except Exception as e:
-        print(f"[watchdog] relay retry (startup) error: {e}", flush=True)
+        _log(f"[watchdog] relay retry (startup) error: {e}", flush=True)
     while True:
         await asyncio.sleep(bus.ZOMBIE_CHECK_SECS)
         try:
             reconciled = _reconcile_owned_children()
             if reconciled:
-                print(f"[watchdog] Reconciled terminal-room children: "
+                _log(f"[watchdog] Reconciled terminal-room children: "
                       f"{reconciled}", flush=True)
         except Exception as e:
-            print(f"[watchdog] child reconciliation error: {e}", flush=True)
+            _log(f"[watchdog] child reconciliation error: {e}", flush=True)
 
         try:
             closed = bus.check_zombie_rooms()
             if closed:
-                print(f"[watchdog] Zombie-closed rooms: {closed}", flush=True)
+                _log(f"[watchdog] Zombie-closed rooms: {closed}", flush=True)
         except Exception as e:
-            print(f"[watchdog] zombie check error: {e}", flush=True)
+            _log(f"[watchdog] zombie check error: {e}", flush=True)
 
         try:
             now = time.time()
@@ -3874,60 +3881,60 @@ async def _background_watchdog():
                 last_retention_sweep = now
                 purged = bus.delete_old_terminal_rooms(RETENTION_DAYS)
                 if purged.get("deleted"):
-                    print(f"[watchdog] Retention-purged {len(purged['deleted'])} "
+                    _log(f"[watchdog] Retention-purged {len(purged['deleted'])} "
                           f"terminal rooms (>{RETENTION_DAYS}d)", flush=True)
         except Exception as e:
-            print(f"[watchdog] retention sweep error: {e}", flush=True)
+            _log(f"[watchdog] retention sweep error: {e}", flush=True)
 
         try:
             idled = _mark_idle_rooms()
             if idled:
-                print(f"[watchdog] Idle rooms: {idled}", flush=True)
+                _log(f"[watchdog] Idle rooms: {idled}", flush=True)
         except Exception as e:
-            print(f"[watchdog] idle check error: {e}", flush=True)
+            _log(f"[watchdog] idle check error: {e}", flush=True)
 
         try:
             notified = bus.check_deadlock_rooms()
             if notified:
-                print(f"[watchdog] Deadlock-notified rooms: {notified}", flush=True)
+                _log(f"[watchdog] Deadlock-notified rooms: {notified}", flush=True)
         except Exception as e:
-            print(f"[watchdog] deadlock check error: {e}", flush=True)
+            _log(f"[watchdog] deadlock check error: {e}", flush=True)
 
         try:
             advanced = _recover_swarm_pilots()
             if advanced:
-                print(f"[watchdog] Recovered swarm requests: {advanced}",
+                _log(f"[watchdog] Recovered swarm requests: {advanced}",
                       flush=True)
         except Exception as e:
-            print(f"[watchdog] swarm recovery error: {e}", flush=True)
+            _log(f"[watchdog] swarm recovery error: {e}", flush=True)
 
         try:
             wakes = _wake_pending_agents()
             if wakes:
-                print(f"[watchdog] Agent wake-ups: {wakes}", flush=True)
+                _log(f"[watchdog] Agent wake-ups: {wakes}", flush=True)
         except Exception as e:
-            print(f"[watchdog] agent wake-up error: {e}", flush=True)
+            _log(f"[watchdog] agent wake-up error: {e}", flush=True)
 
         try:
             dead = _check_dead_wakes()
             if dead:
-                print(f"[watchdog] Dead-wake notices: {dead}", flush=True)
+                _log(f"[watchdog] Dead-wake notices: {dead}", flush=True)
         except Exception as e:
-            print(f"[watchdog] dead-wake check error: {e}", flush=True)
+            _log(f"[watchdog] dead-wake check error: {e}", flush=True)
 
         try:
             stuck = _check_stuck_wakes()
             if stuck:
-                print(f"[watchdog] Stuck-wake notices: {stuck}", flush=True)
+                _log(f"[watchdog] Stuck-wake notices: {stuck}", flush=True)
         except Exception as e:
-            print(f"[watchdog] stuck-wake check error: {e}", flush=True)
+            _log(f"[watchdog] stuck-wake check error: {e}", flush=True)
 
         try:
             retried = _swarm_retry_failed_relays()
             if retried:
-                print(f"[watchdog] Retried child-room relays: {retried}", flush=True)
+                _log(f"[watchdog] Retried child-room relays: {retried}", flush=True)
         except Exception as e:
-            print(f"[watchdog] relay retry error: {e}", flush=True)
+            _log(f"[watchdog] relay retry error: {e}", flush=True)
 
 
 def _reconcile_owned_children() -> list[str]:
@@ -3953,7 +3960,7 @@ def _reconcile_owned_children() -> list[str]:
             except Exception:
                 missing = False
             if not missing:
-                print(f"[watchdog] cannot reconcile children for {room_id}: "
+                _log(f"[watchdog] cannot reconcile children for {room_id}: "
                       f"{exc}", flush=True)
                 continue
             meta = {}
@@ -4749,7 +4756,7 @@ def _set_agent_phase(
             source=source,
         )
     except Exception as exc:
-        print(f"[huddle] lifecycle status update failed "
+        _log(f"[huddle] lifecycle status update failed "
               f"({agent_name}@{room_id}, {phase}): {exc}", flush=True)
 
 def _announce_spawn_failure(room_id: str, agent_name: str, exc: BaseException,
@@ -4775,7 +4782,7 @@ def _announce_spawn_failure(room_id: str, agent_name: str, exc: BaseException,
             idempotency_key=f"spawnfail:{room_id}:{agent_name}:{context_id}",
         )
     except Exception as post_exc:
-        print(f"[huddle] spawn-fail notice post failed "
+        _log(f"[huddle] spawn-fail notice post failed "
               f"({agent_name}@{room_id}): {post_exc}", flush=True)
 
 
@@ -4922,7 +4929,7 @@ def _record_spawned_pid(
     try:
         bus._update_meta_locked(room_id, _upd)
     except Exception as exc:
-        print(f"[huddle] failed to record delayed-spawn pid {pid} "
+        _log(f"[huddle] failed to record delayed-spawn pid {pid} "
               f"({room_id}): {exc}", flush=True)
     return published
 
@@ -5576,7 +5583,7 @@ def _make_wake_done_callback(room_id: str, agent_name: str, wake_id: str):
             with _wake_lock(room_id, agent_name):
                 _on_wake_exit(room_id, agent_name, wake_id, returncode)
         except Exception as exc:  # never let a callback kill the reaper thread
-            print(f"[huddle] wake-exit callback error "
+            _log(f"[huddle] wake-exit callback error "
                   f"({agent_name}@{room_id}): {exc}", flush=True)
     return _callback
 
@@ -5594,7 +5601,7 @@ def _make_initial_spawn_callback(
                 room_id, agent_name, initial_spawn_id, returncode,
             )
         except Exception as exc:
-            print(f"[huddle] initial-spawn exit callback error "
+            _log(f"[huddle] initial-spawn exit callback error "
                   f"({agent_name}@{room_id}): {exc}", flush=True)
     return _callback
 
@@ -5650,7 +5657,7 @@ def _handle_rate_limit_on_exit(room_id: str, agent_name: str) -> bool:
             idempotency_key=f"ratelimit:{room_id}:{agent_name}:{until}",
         )
     except Exception as exc:
-        print(f"[huddle] rate-limit notice post failed "
+        _log(f"[huddle] rate-limit notice post failed "
               f"({agent_name}@{room_id}): {exc}", flush=True)
     return True
 
@@ -5771,7 +5778,7 @@ def _announce_noreply_on_exit(room_id: str, agent_name: str, msg_id: int,
             idempotency_key=f"noreply:{room_id}:{agent_name}:{msg_id}",
         )
     except Exception as exc:
-        print(f"[huddle] noreply notice post failed "
+        _log(f"[huddle] noreply notice post failed "
               f"({agent_name}@{room_id}): {exc}", flush=True)
 
 
@@ -5806,7 +5813,7 @@ def _announce_noreply_on_initial_exit(room_id: str, agent_name: str, rc: int,
             idempotency_key=f"noreply:{room_id}:{agent_name}:init",
         )
     except Exception as exc:
-        print(f"[huddle] noreply notice post failed (init) "
+        _log(f"[huddle] noreply notice post failed (init) "
               f"({agent_name}@{room_id}): {exc}", flush=True)
 
 
@@ -5827,7 +5834,7 @@ def _on_initial_spawn_exit(
             room_id, agent_name, initial_spawn_id, "initial_spawn_id",
         )
     except Exception as exc:
-        print(f"[huddle] Claude model receipt failed (init) "
+        _log(f"[huddle] Claude model receipt failed (init) "
               f"({agent_name}@{room_id}): {exc}", flush=True)
     rc = -999 if returncode is None else int(returncode)
     rate_limit_announced = False
@@ -5835,7 +5842,7 @@ def _on_initial_spawn_exit(
         try:
             rate_limit_announced = _handle_rate_limit_on_exit(room_id, agent_name)
         except Exception as exc:
-            print(f"[huddle] rate-limit check error (init) "
+            _log(f"[huddle] rate-limit check error (init) "
                   f"({agent_name}@{room_id}): {exc}", flush=True)
     posted_result = _agent_result_posted_after(room_id, agent_name, 0)
     if rate_limit_announced:
@@ -5854,19 +5861,19 @@ def _on_initial_spawn_exit(
         try:
             _announce_noreply_on_initial_exit(room_id, agent_name, rc, log_path)
         except Exception as exc:
-            print(f"[huddle] noreply check error (init) "
+            _log(f"[huddle] noreply check error (init) "
                   f"({agent_name}@{room_id}): {exc}", flush=True)
     try:
         # Status has already reached its terminal phase. Clear the persisted
         # initial guard last so a concurrent request can only start afterwards.
         _mark_initial_spawn_finished(room_id, agent_name, initial_spawn_id)
     except Exception as exc:
-        print(f"[huddle] initial-spawn claim release error "
+        _log(f"[huddle] initial-spawn claim release error "
               f"({agent_name}@{room_id}): {exc}", flush=True)
     try:
         _drain_pending_wakes(room_id, agent_name)
     except Exception as exc:
-        print(f"[huddle] wake drain error ({agent_name}@{room_id}): {exc}",
+        _log(f"[huddle] wake drain error ({agent_name}@{room_id}): {exc}",
               flush=True)
 
 
@@ -5892,7 +5899,7 @@ def _on_wake_exit(room_id: str, agent_name: str, wake_id: str,
     try:
         _record_claude_model_receipt(room_id, agent_name, wake_id, "wake_id")
     except Exception as exc:
-        print(f"[huddle] Claude model receipt failed (wake) "
+        _log(f"[huddle] Claude model receipt failed (wake) "
               f"({agent_name}@{room_id}): {exc}", flush=True)
     if (not already_announced and (
         info.get("stuck_announced_wake_id") == wake_id
@@ -5926,7 +5933,7 @@ def _on_wake_exit(room_id: str, agent_name: str, wake_id: str,
         try:
             rate_limit_announced = _handle_rate_limit_on_exit(room_id, agent_name)
         except Exception as exc:
-            print(f"[huddle] rate-limit check error "
+            _log(f"[huddle] rate-limit check error "
                   f"({agent_name}@{room_id}): {exc}", flush=True)
     posted_result = _agent_result_posted_after(
         room_id, agent_name, int(info.get("last_wake_msg_id", 0) or 0))
@@ -5948,7 +5955,7 @@ def _on_wake_exit(room_id: str, agent_name: str, wake_id: str,
                 int(info.get("last_wake_msg_id", 0) or 0),
                 rc, info.get("log_path"))
         except Exception as exc:
-            print(f"[huddle] noreply check error "
+            _log(f"[huddle] noreply check error "
                   f"({agent_name}@{room_id}): {exc}", flush=True)
     if not posted_result and not intentional_pilot_stop:
         try:
@@ -5960,19 +5967,19 @@ def _on_wake_exit(room_id: str, agent_name: str, wake_id: str,
             ):
                 return
         except Exception as exc:
-            print(f"[huddle] swarm replacement error "
+            _log(f"[huddle] swarm replacement error "
                   f"({agent_name}@{room_id}): {exc}", flush=True)
     try:
         # Operational status is terminal now. Release only this exact
         # generation, then allow the queued-drain path to claim the next turn.
         _clear_wake_claim(room_id, agent_name, wake_id)
     except Exception as exc:
-        print(f"[huddle] wake-claim release error "
+        _log(f"[huddle] wake-claim release error "
               f"({agent_name}@{room_id}): {exc}", flush=True)
     try:
         _drain_pending_wakes(room_id, agent_name)
     except Exception as exc:
-        print(f"[huddle] wake drain error ({agent_name}@{room_id}): {exc}",
+        _log(f"[huddle] wake drain error ({agent_name}@{room_id}): {exc}",
               flush=True)
 
 
@@ -6175,10 +6182,10 @@ def _wake_agents_for_request(
                             room_id, agent_name, wake_id, rollback=True,
                         )
                     except Exception as rollback_exc:
-                        print(f"[huddle] wake-claim rollback failed "
+                        _log(f"[huddle] wake-claim rollback failed "
                               f"({agent_name}@{room_id}): {rollback_exc}",
                               flush=True)
-                    print(f"[huddle] codex_resume failed ({room_id}): {exc}",
+                    _log(f"[huddle] codex_resume failed ({room_id}): {exc}",
                           flush=True)
                     _announce_spawn_failure(room_id, agent_name, exc, str(msg_id))
                     continue
@@ -6210,10 +6217,10 @@ def _wake_agents_for_request(
                         room_id, agent_name, wake_id, rollback=True,
                     )
                 except Exception as rollback_exc:
-                    print(f"[huddle] wake-claim rollback failed "
+                    _log(f"[huddle] wake-claim rollback failed "
                           f"({agent_name}@{room_id}): {rollback_exc}",
                           flush=True)
-                print(f"[huddle] fresh spawn failed for {agent_name} "
+                _log(f"[huddle] fresh spawn failed for {agent_name} "
                       f"({room_id}): {exc}", flush=True)
                 _announce_spawn_failure(room_id, agent_name, exc, str(msg_id))
                 continue
@@ -6342,14 +6349,14 @@ def _check_dead_wakes() -> list[str]:
                         idempotency_key=f"deadwake:{room_id}:{agent_name}:{wake_id}",
                     )
                 except Exception as exc:
-                    print(f"[huddle] dead-wake notice post failed "
+                    _log(f"[huddle] dead-wake notice post failed "
                           f"({agent_name}@{room_id}): {exc}", flush=True)
             try:
                 with _wake_lock(room_id, agent_name):
                     _on_wake_exit(room_id, agent_name, wake_id, None,
                                   already_announced=True)
             except Exception as exc:
-                print(f"[huddle] dead-wake lease-clear error "
+                _log(f"[huddle] dead-wake lease-clear error "
                       f"({agent_name}@{room_id}): {exc}", flush=True)
             announced.append(f"{agent_name}@{room_id}")
     return announced
@@ -6366,7 +6373,7 @@ def _terminate_stuck_wake(
     """
     result = child_processes.terminate(room_id, wake_id)
     if result == "denied":
-        print(f"[huddle] stuck-wake kill denied ({agent_name}@{room_id}, "
+        _log(f"[huddle] stuck-wake kill denied ({agent_name}@{room_id}, "
               f"pid={pid})", flush=True)
     return result == "sent"
 
@@ -6487,7 +6494,7 @@ def _check_stuck_wakes() -> list[str]:
                 )
                 announced.append(f"{agent_name}@{room_id}")
             except Exception as exc:
-                print(f"[huddle] stuck-wake notice post failed "
+                _log(f"[huddle] stuck-wake notice post failed "
                       f"({agent_name}@{room_id}): {exc}", flush=True)
     return announced
 
