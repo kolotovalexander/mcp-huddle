@@ -1236,6 +1236,7 @@ def _subscription_opus_review_argv(brief: str, read_root: str, mcp_config: str) 
     argv[argv.index("--tools") + 1] = "Read,Glob,Grep,ToolSearch"
     argv[argv.index("--allowedTools") + 1] = (
         "Read,Glob,Grep,ToolSearch," + argv[argv.index("--allowedTools") + 1]
+        + ",mcp__huddle__swarm_pilot_round_done"
     )
     argv[argv.index("-p"):argv.index("-p")] = [
         "--setting-sources", "", "--disable-slash-commands", "--no-chrome",

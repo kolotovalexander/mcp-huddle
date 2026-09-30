@@ -58,6 +58,7 @@ def test_subscription_native_spawn_is_fixed_and_readonly(profile, monkeypatch, t
         "huddle": {"type": "http", "url": profile["mcp_url"]}}
     allowed = argv[argv.index("--allowedTools") + 1]
     assert "*" not in allowed and "mcp__huddle__room_create" not in allowed
+    assert "mcp__huddle__swarm_pilot_round_done" in allowed.split(",")
     assert "Bash" not in argv[argv.index("--tools") + 1]
     assert "ANTHROPIC_API_KEY" not in captured["env"]
     assert "AUDIT_UNRELATED_SECRET" not in captured["env"]
