@@ -2764,6 +2764,15 @@ def _post_swarm_final_if_missing(room_id: str, state: dict) -> int | None:
         # append-only final message. The pending queue recognizes that legacy
         # settlement without rewriting history or publishing a second final.
         return None
+    # A CLI wrapper may publish its completed turn as a `result` on the final
+    # request instead of the canonical `final` message. That reply settles the
+    # request; retrying the canonical append would be rejected as already
+    # answered on every watchdog tick.
+    if any(msg.get("agent") == member
+           and msg.get("reply_to") == request["id"]
+           and msg.get("kind") in {"result", "final"}
+           for msg in messages):
+        return None
     return message_post(
         room_id, member, result, "final", to=state["organizer"],
         reply_to=request["id"], idempotency_key=final_key,
