@@ -152,6 +152,8 @@ def _room_files(home: Path):
     if not rooms.is_dir():
         raise ValueError(f"Unsafe rooms directory: {rooms}")
     for room in sorted(rooms.iterdir()):
+        if room.name == ".DS_Store" and _regular_file(room):
+            continue
         if room.is_symlink() or not room.is_dir():
             raise ValueError(f"Refusing unknown room entry: {room}")
         for name, lock_name in (("meta.json", "meta.lock"),

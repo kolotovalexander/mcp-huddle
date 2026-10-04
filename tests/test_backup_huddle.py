@@ -82,6 +82,35 @@ def test_backup_uses_sqlite_online_snapshot_including_committed_rows(tmp_path):
     assert backup.verify_snapshot(snapshot)
 
 
+def test_room_inventory_ignores_only_regular_ds_store(tmp_path):
+    home = make_home(tmp_path)
+    (home / "rooms" / ".DS_Store").write_bytes(b"finder metadata")
+
+    snapshot = backup.create_backup(home, home / "backups")
+
+    manifest_paths = {item["path"] for item in
+                      json.loads((snapshot / "manifest.json").read_text())["files"]}
+    assert not any(path.endswith("/.DS_Store") for path in manifest_paths)
+
+    symlink_home = make_home(tmp_path / "symlink-case")
+    (symlink_home / "rooms" / ".DS_Store").symlink_to(tmp_path / "outside")
+    try:
+        backup.create_backup(symlink_home, symlink_home / "backups")
+    except ValueError as exc:
+        assert "unknown room entry" in str(exc)
+    else:
+        raise AssertionError("symlink .DS_Store was unexpectedly ignored")
+
+    unknown_home = make_home(tmp_path / "unknown-case")
+    (unknown_home / "rooms" / "unexpected.txt").write_text("keep strict inventory")
+    try:
+        backup.create_backup(unknown_home, unknown_home / "backups")
+    except ValueError as exc:
+        assert "unknown room entry" in str(exc)
+    else:
+        raise AssertionError("unknown room-container file was unexpectedly ignored")
+
+
 def test_rotation_keeps_two_verified_snapshots(tmp_path):
     home = make_home(tmp_path)
     destination = home / "backups" / "automatic"
