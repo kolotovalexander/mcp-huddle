@@ -4,9 +4,8 @@ Two modes:
   default   stdio transport — for MCP clients (Claude Code, Codex, Antigravity,
             Claude Desktop). Spawned per-client; storage in ~/.mcp-huddle/rooms/
             is shared across processes via file locks.
-  --http    HTTP server + Liquid Glass dashboard on :8014. Run once manually
-            to watch rooms in a browser. Dashboard is the only difference —
-            the MCP tools are the same.
+  --http    HTTP server + Liquid Glass dashboard on :8014. Optionally bind a
+            second loopback MCP endpoint with --mcp-port.
 """
 import argparse
 import os
@@ -81,6 +80,27 @@ def _port_arg(value: str) -> int:
     return port
 
 
+def _bind_http_sockets(host: str, ports: list[int]) -> list[socket.socket]:
+    """Bind every requested listener before announcing readiness.
+
+    If any bind fails, release all earlier sockets so startup is atomic from
+    the caller's point of view.
+    """
+    sockets: list[socket.socket] = []
+    try:
+        for port in ports:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sockets.append(sock)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host, port))
+            sock.listen()
+        return sockets
+    except OSError:
+        for sock in sockets:
+            sock.close()
+        raise
+
+
 def _install_hooks(dest: "str | None") -> None:
     """Copy the bundled example hooks (Claude Code PostToolUse / SessionEnd) to a
     directory and print how to wire them in. pip can't run post-install code
@@ -118,7 +138,7 @@ def main() -> None:
         description=(
             "Persistent multi-agent coordination rooms over MCP. "
             "Default mode is stdio transport for MCP clients; --http serves a "
-            "browser dashboard."
+            "browser dashboard and can optionally bind a second MCP port."
         ),
     )
     parser.add_argument(
@@ -145,6 +165,12 @@ def main() -> None:
         default=None,
         help=f"HTTP port (default: $PORT or {DEFAULT_PORT}); only used with --http",
     )
+    parser.add_argument(
+        "--mcp-port",
+        type=_port_arg,
+        default=None,
+        help="optional second loopback HTTP port for MCP clients; only used with --http",
+    )
     args = parser.parse_args()
 
     if args.install_hooks is not None:
@@ -160,21 +186,29 @@ def main() -> None:
 
         host = "127.0.0.1"
         port = _resolve_port(args.port)
+        if args.mcp_port is not None and args.mcp_port == port:
+            parser.error("--mcp-port must differ from the resolved --port")
 
-        # Bind first so the "ready" message only prints once we are actually
-        # listening — never advertise a URL the server failed to bind.
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        ports = [port]
+        if args.mcp_port is not None:
+            ports.append(args.mcp_port)
+
+        # Bind all listeners first so readiness never advertises a partially
+        # available service. Uvicorn serves the same app/lifespan on each.
         try:
-            sock.bind((host, port))
+            socks = _bind_http_sockets(host, ports)
         except OSError as exc:
-            sock.close()
-            print(f"error: cannot bind {host}:{port}: {exc}", file=sys.stderr, flush=True)
+            print(
+                f"error: cannot bind HTTP listener(s) on {host} ports {ports}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
             sys.exit(1)
-        sock.listen()
 
         print(f"mcp-huddle (HTTP + dashboard) on :{port}", flush=True)
         print(f"Dashboard: http://{host}:{port}/dashboard", flush=True)
+        if args.mcp_port is not None:
+            print(f"MCP: http://{host}:{args.mcp_port}/mcp", flush=True)
 
         # One-line-per-agent discovery summary (which agents are enabled / why
         # disabled) so the operator can see the roster at a glance.
@@ -185,9 +219,13 @@ def main() -> None:
         except Exception:
             pass
 
-        config = uvicorn.Config(build_app(), log_level="warning")
-        server = uvicorn.Server(config)
-        server.run(sockets=[sock])
+        try:
+            config = uvicorn.Config(build_app(), log_level="warning")
+            server = uvicorn.Server(config)
+            server.run(sockets=socks)
+        finally:
+            for sock in socks:
+                sock.close()
     else:
         # stdio transport — JSON-RPC over stdin/stdout. Default for MCP clients.
         from .server import mcp

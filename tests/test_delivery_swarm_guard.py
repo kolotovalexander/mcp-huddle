@@ -70,6 +70,19 @@ def test_readonly_caller_refused_before_any_attempt(codex_home, monkeypatch):
     assert out["reason"] == "readonly_caller"
     assert calls == []  # no method was ever invoked
 
+    # The native-route hint must not reveal more to a read-only member than
+    # the pre-existing caller guard already does.
+    out_native = json.loads(core.message_send(
+        "codex:th-ro", "hi", mode="codex.native", caller=caller,
+        native_routes=[{
+            "target": "codex:th-ro", "tool": "collaboration.send_message",
+            "reason": "available in the caller session",
+        }],
+    ))
+    assert out_native["reason"] == "readonly_caller"
+    assert "native_route_required" not in out_native["reason"]
+    assert calls == []
+
 
 def test_unknown_readonly_status_of_huddle_spawned_caller_refused(codex_home, monkeypatch):
     """caller.readonly is None (Huddle knows it spawned this agent -- it

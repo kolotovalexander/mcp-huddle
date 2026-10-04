@@ -9,7 +9,7 @@ text through unchanged. Implementation: `src/mcp_huddle/delivery/`.
 
 ## Tools
 
-### `message_send(to, text, mode="auto", from_name="", reply_to="", idempotency_key="", room_id="")`
+### `message_send(to, text, mode="auto", from_name="", reply_to="", idempotency_key="", room_id="", native_routes=None)`
 
 `room_id` lets
 Huddle verify the caller's own identity when it's a swarm pilot member, so
@@ -30,6 +30,30 @@ is treated as a forced single method (either a bare token resolved against
 the target's harness, e.g. `"resume"` -> `"codex.resume"`, or a full method
 id, e.g. `"claude.native"`, or `"spool"`); no fallback is attempted for a
 forced mode — if that one method isn't applicable, `delivered` is `false`.
+
+An optional `native_routes` list lets a caller declare native communication availability
+for an exact target:
+
+```json
+[{"target":"EXACT_TO_VALUE","available":true}]
+```
+
+When `target` exactly matches the requested target (`harness:id` after
+resolution, or the original `to` string), Huddle returns
+`reason: "native_route_required"` and a generic instruction to use native
+communication. The optional `tool` field can name a currently available tool;
+only then is `suggested_tool` included. No per-harness tool catalog is hardcoded.
+It makes no delivery attempt, writes no spool, and does not fall back to a
+different transport. The existing read-only-caller and Huddle-owned-session
+checks run first.
+
+This declaration is caller-provided and self-reported. The MCP protocol does
+not tell Huddle which native tools the agent can currently call. Declare only
+tools actually exposed in the current caller session, and only for the exact
+destination they can reach. If native availability is unknown, omit the
+declaration; Huddle keeps its configured cross-harness delivery behavior.
+This guard covers `message_send` only. It does not block persistent room,
+council, relay, team, or swarm workflows.
 
 ### `message_targets(harness="")`
 
@@ -340,3 +364,19 @@ that omit the header or use another server connection.
 
 `message_send`'s `note` field spells out which of these applies to the final
 result.
+
+### Same-harness direct messages
+
+Declare `sender_harness` (`claude`, `codex`, `hermes`, `opencode`, or `agy`).
+If it matches the resolved recipient, Huddle returns `native_route_required`
+without sending or reserving an idempotency key. Use native session messaging
+if it can reach that recipient. If it cannot, retry with a short nonempty
+`native_unavailable_reason`, for example `No exposed tool can address this session`.
+A permission denial does not authorize using another route.
+
+These fields are caller declarations, not authenticated identity or proof of
+native capability. Unknown senders and different harnesses keep normal delivery.
+The server never infers identity from `from_name` and never hardcodes native tool
+names. An explicit available `native_routes` match still takes precedence.
+Read-only and session-ownership restrictions still apply to fallback. Room
+messages, council, relay, team, and swarm operations are unaffected.

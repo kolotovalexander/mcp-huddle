@@ -433,6 +433,17 @@
       padding: 18px 22px;
       display: flex; flex-direction: column;
     }
+    .message-page-action {
+      align-self: center; flex: 0 0 auto; margin: 4px 0 14px;
+      border: 1px solid var(--reply-border); border-radius: 999px;
+      background: var(--reply-bg); color: var(--text-muted);
+      padding: 5px 12px; font: inherit; font-size: 11px; cursor: pointer;
+    }
+    .message-page-action:hover { color: var(--text); border-color: var(--text-muted); }
+    .message-page-action:disabled { opacity: .55; cursor: wait; }
+    .message-page-action[hidden] { display: none; }
+    .reply[role="button"] { cursor: pointer; }
+    .reply[role="button"]:focus-visible { outline: 2px solid var(--text-muted); outline-offset: 2px; }
     .msg {
       display: flex; gap: 0; margin-bottom: 14px;
       align-items: flex-start;

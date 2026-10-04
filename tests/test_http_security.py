@@ -229,6 +229,66 @@ def test_dashboard_keeps_credential_in_memory_and_fetches_sse():
     assert "sessionStorage" not in source
 
 
+def test_messages_json_preserves_full_default_and_supports_bounded_pages(monkeypatch):
+    monkeypatch.delenv("MCP_HUDDLE_TOKEN", raising=False)
+    messages = [
+        {"id": message_id, "agent": "Codex", "body": f"message {message_id}"}
+        for message_id in range(1, 6)
+    ]
+    monkeypatch.setattr(server.bus, "_load_messages", lambda _room_id: messages)
+    monkeypatch.setattr(server.bus, "_read_meta", lambda _room_id: {"id": "room_test"})
+    monkeypatch.setattr(server.bus, "get_status_details", lambda _room_id: {})
+    pages = []
+
+    def read_page(room_id, *, before_id=None, after_id=0, limit=100):
+        pages.append((room_id, before_id, after_id, limit))
+        selected = messages
+        if before_id is not None:
+            selected = [msg for msg in selected if msg["id"] < before_id][-limit:]
+        elif after_id:
+            selected = [msg for msg in selected if msg["id"] > after_id][:limit]
+        else:
+            selected = selected[-limit:]
+        return {
+            "messages": selected,
+            "has_more": bool(selected and selected[0]["id"] > 1),
+            "oldest_id": selected[0]["id"] if selected else None,
+            "latest_id": messages[-1]["id"],
+        }
+
+    monkeypatch.setattr(server.bus, "read_message_page", read_page, raising=False)
+    app = server.build_app()
+
+    async def scenario():
+        async with _client(app) as client:
+            legacy = await client.get("/api/messages_json?room_id=room_test")
+            assert [m["id"] for m in legacy.json()["messages"]] == [1, 2, 3, 4, 5]
+
+            initial = await client.get(
+                "/api/messages_json?room_id=room_test&limit=2",
+            )
+            assert [m["id"] for m in initial.json()["messages"]] == [4, 5]
+            assert initial.json()["has_more"] is True
+            assert initial.json()["latest_id"] == 5
+
+            older = await client.get(
+                "/api/messages_json?room_id=room_test&limit=2&before_id=4",
+            )
+            assert [m["id"] for m in older.json()["messages"]] == [2, 3]
+
+            newer = await client.get(
+                "/api/messages_json?room_id=room_test&limit=2&after_id=3",
+            )
+            assert [m["id"] for m in newer.json()["messages"]] == [4, 5]
+            assert pages == [
+                ("room_test", None, 0, 2),
+                ("room_test", 4, 0, 2),
+                ("room_test", None, 3, 2),
+            ]
+
+    asyncio.run(scenario())
+
+
 def test_public_path_normalization_rejects_ambiguous_root_path():
     assert server._public_route_path({
         "path": "/prefix/dashboard", "root_path": "/prefix",

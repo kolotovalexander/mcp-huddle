@@ -77,6 +77,77 @@ def test_message_send_target_not_found(codex_home):
     assert out["attempts"] == []
 
 
+def test_declared_native_route_refuses_before_transport_or_idempotency(codex_home, monkeypatch):
+    _write_codex_index(codex_home, [{"id": "native-th", "thread_name": "x", "updated_at": 1}])
+    reserved = []
+    finished = []
+    monkeypatch.setattr(core.idempotency, "reserve", lambda *args: reserved.append(args))
+    monkeypatch.setattr(core.idempotency, "finish", lambda *args: finished.append(args))
+    out = json.loads(core.message_send(
+        "codex:native-th", "please handle this", mode="spool",
+        idempotency_key="native-route",
+        native_routes=[{
+            "target": "codex:native-th",
+            "tool": "mcp__codex_app__send_message_to_thread",
+            "reason": "The caller confirmed this tool can reach this thread.",
+        }],
+    ))
+    assert out["delivered"] is False
+    assert out["attempts"] == []
+    assert out["reason"] == "native_route_required"
+    assert out["suggested_tool"] == "mcp__codex_app__send_message_to_thread"
+    assert "caller confirmed" in out["note"]
+    assert _spool_files() == []
+    assert reserved == []
+    assert finished == []
+
+
+@pytest.mark.parametrize("route,refused", [({"available": True}, True), ({"available": False}, False), ({"available": "true"}, False)])
+def test_generic_native_availability_without_tool_name(codex_home, route, refused):
+    _write_codex_index(codex_home, [{"id": "generic-th", "thread_name": "x", "updated_at": 1}])
+    out = json.loads(core.message_send(
+        "codex:generic-th", "hello", mode="spool",
+        native_routes=[{"target": "codex:generic-th", **route}],
+    ))
+    assert (out.get("reason") == "native_route_required") is refused
+    assert "suggested_tool" not in out
+    assert len(_spool_files()) == (0 if refused else 1)
+    if refused:
+        assert out["attempts"] == []
+        assert "native communication tools" in out["note"]
+
+
+def test_unknown_native_availability_keeps_huddle_fallback(codex_home):
+    _write_codex_index(codex_home, [{"id": "unknown-th", "thread_name": "x", "updated_at": 1}])
+    out = json.loads(core.message_send("codex:unknown-th", "please handle this", mode="spool"))
+    assert out["delivered"] is True
+    assert out["method"] == "spool"
+    assert len(_spool_files()) == 1
+
+
+def test_nonmatching_native_route_does_not_block_other_direct_targets(codex_home):
+    _write_codex_index(codex_home, [{"id": "room-th", "thread_name": "x", "updated_at": 1}])
+    out = json.loads(core.message_send(
+        "codex:room-th", "persistent council result", mode="spool",
+        native_routes=[{
+            "target": "codex:another-thread",
+            "tool": "collaboration.send_message",
+            "reason": "Internal subagent handoff only.",
+        }],
+    ))
+    assert out["delivered"] is True
+    assert out["method"] == "spool"
+
+
+def test_shared_room_workflow_remains_available():
+    from mcp_huddle import bus, server
+
+    room_id = server.room_create("council", owner="Organizer", owner_pid=0)
+    message_id = server.message_post(room_id, "Organizer", "review the proposal", "request")
+    assert message_id > 0
+    assert "review the proposal" in bus.read_messages(room_id)
+
+
 def test_message_send_ambiguous_target(claude_dir, codex_home, tmp_path):
     sock = tmp_path / "s.sock"
     sock.write_text("")
@@ -600,3 +671,41 @@ def test_message_targets_lists_resolvable_sessions(claude_dir, codex_home, tmp_p
 
     claude_only = core.message_targets("claude")
     assert {t["harness"] for t in claude_only} == {"claude"}
+
+
+@pytest.mark.parametrize('sender,reason,refused', [
+    ('codex', '', True), (' CODEX ', '  ', True),
+    ('codex', 'Native tool cannot address this session', False),
+    ('claude', '', False), ('', '', False), ('unknown', '', False),
+])
+def test_same_harness_guidance_and_fallback(codex_home, sender, reason, refused):
+    _write_codex_index(codex_home, [{'id': 'same-th', 'thread_name': 'x'}])
+    out = json.loads(core.message_send(
+        'codex:same-th', 'hello', mode='spool', sender_harness=sender,
+        native_unavailable_reason=reason, idempotency_key='same-route',
+    ))
+    assert out['delivered'] is not refused
+    assert len(_spool_files()) == (0 if refused else 1)
+    if refused:
+        assert out['reason'] == 'native_route_required'
+        assert out['attempts'] == []
+        # Refusal must not reserve the key and prevent the explicit fallback.
+        retry = json.loads(core.message_send(
+            'codex:same-th', 'hello', mode='spool', sender_harness=sender,
+            native_unavailable_reason='No exposed native session tool',
+            idempotency_key='same-route',
+        ))
+        assert retry['delivered'] is True
+
+
+def test_same_harness_fallback_does_not_override_guards(codex_home):
+    from mcp_huddle.delivery.caller import Caller
+    _write_codex_index(codex_home, [{'id': 'guard-th', 'thread_name': 'x'}])
+    args = dict(sender_harness='codex', native_unavailable_reason='No native tool')
+    out = json.loads(core.message_send('codex:guard-th', 'hello', mode='spool',
+                                      caller=Caller(readonly=True), **args))
+    assert out['reason'] == 'readonly_caller'
+    out = json.loads(core.message_send('codex:guard-th', 'hello', mode='spool',
+        native_routes=[{'target': 'codex:guard-th', 'available': True}], **args))
+    assert out['reason'] == 'native_route_required'
+    assert _spool_files() == []
