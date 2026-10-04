@@ -96,6 +96,42 @@ def test_rate_limited_member_continues_on_backup_under_same_identity(env):
     assert req not in _pending(room)
 
 
+@pytest.mark.parametrize("provider_error", [
+    "MiniMax HTTP 410 Gone: model retired",
+    "Cohere HTTP 400 Bad Request: tool_results.outputs is unsupported",
+])
+def test_provider_http_errors_continue_failed_request_on_backup(env, monkeypatch,
+                                                                 provider_error):
+    launched = env
+    room, req = _room()
+    monkeypatch.setattr(server, "_log_tail", lambda *a, **k: provider_error)
+
+    assert swarm_replacement.classify_failure({"text": "HTTP 400 Bad Request"}) == "unknown"
+
+    launched[0]["on_exit"](1)
+
+    assert [c["name"] for c in launched] == ["Alpha", "Backup"]
+    assert _alpha(room)["swarm_route"]["task_id"] == req
+    assert _alpha(room)["swarm_route"]["attempts"][-1]["route"] == "Backup"
+    assert req in _pending(room)
+
+
+def test_no_replacement_profile_reports_needs_profile(env, monkeypatch):
+    launched = env
+    room, _ = _room()
+    monkeypatch.setattr(spawn, "load_registry", lambda: [
+        {"name": "Alpha", "cmd": ["alpha-cli"], "enabled": True},
+    ])
+    monkeypatch.setattr(server, "_log_tail",
+                        lambda *a, **k: "MiniMax HTTP 410 Gone: model retired")
+
+    launched[0]["on_exit"](1)
+
+    assert len(launched) == 1
+    assert _alpha(room)["swarm_route"]["terminal"] == "needs_profile"
+    assert "swarm_replacement profile" in _alpha(room)["swarm_route"]["reason"]
+
+
 def test_stale_or_foreign_generation_never_relaunches(env, monkeypatch):
     launched = env
 

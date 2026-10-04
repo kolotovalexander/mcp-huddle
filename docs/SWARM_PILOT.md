@@ -143,6 +143,28 @@ harness integration before that specific branch can be relied on. Backup
 routes are an opt-in capability, not a claim that provider quota or model
 availability has been checked by a real model request.
 
+If a dispatched member has a server-recorded terminal failure and no result,
+the organizer may call `swarm_pilot_recover_member(room_id, by, member,
+organizer_recovery_secret)`. A non-idempotent create generates this private
+capability and returns it once. For `client_request_id` (retryable creation),
+the organizer should supply its own random 32–256 character
+`organizer_recovery_secret` to `swarm_pilot_create` and retain it across
+retries; without one, manual recovery is disabled for that room. Keep it
+outside room messages and do not give it to participants. A repeated create
+does not reveal it again. Older rooms created before this capability was
+added cannot use manual recovery.
+Huddle refuses recovery while the member has an active wake claim. It creates
+at most one new addressed request for that member in the current round, then
+wakes the member through its configured route and bounded replacement policy.
+The member must answer that new request with `kind="result"` and call
+`swarm_pilot_round_done`; launching the retry does not complete the round.
+Repeated calls reuse the same request. A late original result can supersede
+the retry. `needs_profile` means no usable configured route was available;
+correct the registry before expecting progress. A verified participant token
+cannot call organizer recovery even if supplied with that secret. The private
+secret authenticates this specific organizer action; other pilot operations
+still use the older name-based trust model.
+
 ## Room proposal checks
 
 `swarm_room_proposal` does not create rooms or launch task work. Its normal

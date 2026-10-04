@@ -37,6 +37,7 @@ def create(
     registry_availability_checked: bool | None = None,
     expected_specs: dict[str, str] | None = None,
     member_profiles: dict[str, str] | None = None,
+    organizer_recovery_sha256: str = "",
 ) -> str:
     if mode not in MODES:
         raise ValueError(f"mode must be one of {sorted(MODES)}")
@@ -70,6 +71,8 @@ def create(
             raise ValueError("expected_specs values must be sha256 fingerprints")
     if start_requested is not None and registry_availability_checked is None:
         raise ValueError("registry_availability_checked is required with start_requested")
+    if organizer_recovery_sha256 and not re.fullmatch(r"[0-9a-f]{64}", organizer_recovery_sha256):
+        raise ValueError("organizer_recovery_sha256 must be a SHA-256 hex digest")
     if (not members or len(members) > 8 or len(set(members)) != len(members)
             or organizer in members or {"Human", "System"}.intersection(members)):
         raise ValueError("members must be non-empty, unique and exclude organizer")
@@ -108,6 +111,8 @@ def create(
         if member_profiles:
             # Absent for legacy rooms: each member launches its own name.
             meta["swarm_pilot"]["member_profiles"] = dict(member_profiles)
+        if organizer_recovery_sha256:
+            meta["swarm_pilot"]["organizer_recovery_sha256"] = organizer_recovery_sha256
         if client_request_fingerprint:
             meta["swarm_pilot"]["client_request_fingerprint"] = client_request_fingerprint
         if plan_hash:
@@ -482,6 +487,7 @@ def _member_ids(room_id: str, members: list[str]) -> dict[str, str]:
 def _expose_member_ids(room_id: str, state: dict) -> dict:
     """Validate schema-2 IDs, or derive schema-1 IDs without writing them."""
     exposed = dict(state)
+    exposed.pop("organizer_recovery_sha256", None)
     schema = exposed.get("schema")
     stored = exposed.get("member_ids")
     members = exposed.get("members")

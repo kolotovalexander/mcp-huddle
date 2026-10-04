@@ -5,6 +5,7 @@ HTTP mode (`--http`): uvicorn + Liquid Glass dashboard on :8014.
 """
 
 import asyncio
+import builtins
 import contextlib
 from functools import wraps
 import hashlib
@@ -12,6 +13,7 @@ import hmac
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import stat
@@ -34,11 +36,18 @@ from . import child_processes
 from .claude_model_receipt import parse_claude_model_receipt
 from . import room_workspace
 from . import delivery
+from .delivery.caller import Caller as DeliveryCaller
 from . import spawn
 from . import swarm_pilot
 from . import swarm_jev
 from . import swarm_replacement
 from . import swarm_planner
+
+
+def _log(*args, **kwargs) -> None:
+    """Write diagnostics away from MCP's JSON-RPC stdout channel."""
+    kwargs.setdefault("file", sys.stderr)
+    builtins.print(*args, **kwargs)
 
 # Shown to LLM clients in the `initialize` response. Keep tight — every agent
 # session sees this verbatim. Goal: stop one-shot misuse, enforce anti-loop.
@@ -195,7 +204,7 @@ def _env_num(name: str, default, cast):
     try:
         return cast(raw)
     except (TypeError, ValueError):
-        print(
+        _log(
             f"[mcp-huddle] WARNING: env {name}={raw!r} is not a valid "
             f"{cast.__name__}; using default {default!r}",
             file=sys.stderr,
@@ -414,6 +423,7 @@ def _swarm_client_request_fingerprint(
     write_policy: str = room_workspace.READ_ONLY,
     *, member_profiles: dict[str, str] | None = None,
     child_agents: dict | None = None,
+    organizer_recovery_sha256: str = "",
 ) -> str:
     payload = {
         "name": name,
@@ -434,6 +444,8 @@ def _swarm_client_request_fingerprint(
     if child_agents:
         # Omitted when disabled so existing request fingerprints stay stable.
         payload["child_agents"] = dict(child_agents)
+    if organizer_recovery_sha256:
+        payload["organizer_recovery_sha256"] = organizer_recovery_sha256
     try:
         encoded = json.dumps(
             payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
@@ -536,6 +548,7 @@ def _swarm_existing_request(
             pilot["start_requested"], room_workspace.write_policy(meta),
             member_profiles=pilot.get("member_profiles"),
             child_agents=pilot.get("child_agents"),
+            organizer_recovery_sha256=pilot.get("organizer_recovery_sha256", ""),
         )
     except (KeyError, TypeError, ValueError):
         raise ValueError("partial_room: stored request data is incomplete") from None
@@ -1162,6 +1175,7 @@ def swarm_pilot_create(
     write_policy: str = "read_only",
     member_profiles: dict[str, str] | None = None,
     child_agents: dict | None = None,
+    organizer_recovery_secret: str = "",
 ) -> dict:
     """Create a pilot room; start exact enabled registry members when requested.
 
@@ -1212,6 +1226,10 @@ def swarm_pilot_create(
         raise ValueError("client_request_id must be 1-128 ASCII letters, digits, dot, underscore, colon or hyphen")
     if not isinstance(plan_hash, str) or (plan_hash and not _SWARM_HASH_RE.fullmatch(plan_hash)):
         raise ValueError("plan_hash must be empty or a sha256 fingerprint")
+    if not isinstance(organizer_recovery_secret, str):
+        raise ValueError("organizer_recovery_secret must be a string")
+    if organizer_recovery_secret and not 32 <= len(organizer_recovery_secret) <= 256:
+        raise ValueError("organizer_recovery_secret must contain 32-256 characters")
     if not isinstance(start, bool):
         raise ValueError("start must be a boolean")
     if write_policy not in room_workspace.WRITE_POLICIES:
@@ -1223,6 +1241,12 @@ def swarm_pilot_create(
     )
     request_fingerprint = ""
     deterministic_room_id = None
+    # An idempotent create must get the same secret again from its caller.
+    # Otherwise a partial-room retry could strand an unrecoverable capability.
+    recovery_secret = (organizer_recovery_secret or
+                       (secrets.token_urlsafe(32) if not client_request_id else ""))
+    recovery_sha256 = (hashlib.sha256(recovery_secret.encode("utf-8")).hexdigest()
+                       if recovery_secret else "")
     if client_request_id:
         if not all(isinstance(value, str) for value in (name, organizer, goal, cwd, workspace_strategy, mode)):
             raise ValueError("idempotent request fields must be strings")
@@ -1232,6 +1256,7 @@ def swarm_pilot_create(
             name, organizer, goal, mode, members, cwd, workspace_strategy, start,
             write_policy, member_profiles=profiles_by_member,
             child_agents=child_policy,
+            organizer_recovery_sha256=recovery_sha256,
         )
         deterministic_room_id = _swarm_request_room_id(organizer, client_request_id)
         existing = _swarm_existing_request(
@@ -1278,6 +1303,7 @@ def swarm_pilot_create(
             registry_availability_checked=(registry_checked if client_request_id else None),
             expected_specs=(expected if client_request_id else None),
             member_profiles=profiles_by_member,
+            organizer_recovery_sha256=recovery_sha256,
         )
     except FileExistsError:
         if deterministic_room_id:
@@ -1325,6 +1351,7 @@ def swarm_pilot_create(
         )
     return {
         "room_id": room_id,
+        "organizer_recovery_secret": recovery_secret,
         "mode": mode,
         "dispatched": dispatch,
         "started": start,
@@ -1607,7 +1634,7 @@ def _make_child_done_callback(room_id: str, name: str, child_wake: str):
                 _on_wake_exit(room_id, name, child_wake, returncode)
                 _swarm_child_mark_exited(room_id, name, child_wake, returncode)
         except Exception as exc:  # never let a callback kill the reaper thread
-            print(f"[huddle] child exit callback error ({name}@{room_id}): {exc}",
+            _log(f"[huddle] child exit callback error ({name}@{room_id}): {exc}",
                   flush=True)
     return _callback
 
@@ -1765,7 +1792,7 @@ def _swarm_retry_failed_relays() -> list[str]:
     try:
         rooms = bus.list_rooms()
     except Exception as exc:
-        print(f"[watchdog] relay retry sweep list_rooms error: "
+        _log(f"[watchdog] relay retry sweep list_rooms error: "
               f"{type(exc).__name__}", flush=True)
         return retried
     for meta in rooms:
@@ -1795,7 +1822,7 @@ def _swarm_retry_failed_relays() -> list[str]:
                 )
                 retried.append(f"{room_id}:{name}")
             except Exception as exc:
-                print(f"[watchdog] relay retry error ({name}@{room_id}): "
+                _log(f"[watchdog] relay retry error ({name}@{room_id}): "
                       f"{type(exc).__name__}", flush=True)
     return retried
 
@@ -1807,7 +1834,7 @@ def _swarm_close_child_room(room_id: str, child_room: str, name: str,
         if bus.get_room_info(child_room).get("status") != "closed":
             bus.close_room(child_room, "System")
     except Exception as exc:
-        print(f"[huddle] child room close failed ({child_room}): "
+        _log(f"[huddle] child room close failed ({child_room}): "
               f"{type(exc).__name__}", flush=True)
         return
     try:
@@ -1830,7 +1857,7 @@ def _make_child_room_done_callback(room_id: str, child_room: str, name: str,
                 finally:
                     _swarm_child_mark_exited(room_id, name, child_wake, returncode)
             except Exception as exc:  # never let a callback kill the reaper thread
-                print(f"[huddle] child room exit callback error ({name}@{child_room}): "
+                _log(f"[huddle] child room exit callback error ({name}@{child_room}): "
                       f"{type(exc).__name__}", flush=True)
             finally:
                 _swarm_close_child_room(room_id, child_room, name, child_wake)
@@ -2100,6 +2127,14 @@ def swarm_pilot_status(room_id: str) -> dict:
         }
         if model_receipt is not None:
             member_detail["last_model_receipt"] = model_receipt
+        recovery = info.get("swarm_pilot_recovery")
+        if isinstance(recovery, dict):
+            member_detail["recovery"] = {
+                key: recovery[key]
+                for key in ("round", "request_id", "attempts", "status",
+                            "recovery_request_id", "reason")
+                if key in recovery
+            }
         route = info.get("swarm_route")
         if isinstance(route, dict):
             member_detail["replacement"] = {
@@ -2109,6 +2144,267 @@ def swarm_pilot_status(room_id: str) -> dict:
             }
         details.append(member_detail)
     return {**state, "members_detail": details}
+
+
+@mcp.tool()
+def swarm_pilot_recover_member(
+    room_id: str, by: str, member: str, organizer_recovery_secret: str,
+    ctx: Context,
+) -> dict:
+    """Let the organizer retry one terminally failed member exactly once.
+
+    Requires a server-owned failure receipt for the current dispatch and no
+    active wake claim. The new organizer request does not mark the member done;
+    the member still has to post its result and call swarm_pilot_round_done.
+    """
+    state = swarm_pilot.status(room_id)
+    if _verified_member(ctx, room_id) is not None:
+        raise PermissionError("a verified swarm member cannot trigger organizer recovery")
+    stored_secret_hash = (bus.get_room_info(room_id).get("swarm_pilot") or {}).get(
+        "organizer_recovery_sha256"
+    )
+    supplied_secret_hash = hashlib.sha256(
+        organizer_recovery_secret.encode("utf-8")
+    ).hexdigest() if isinstance(organizer_recovery_secret, str) else ""
+    if (not isinstance(stored_secret_hash, str)
+            or not hmac.compare_digest(stored_secret_hash, supplied_secret_hash)):
+        raise PermissionError("organizer recovery requires the room's private secret")
+    organizer = swarm_pilot.resolve_member(room_id, by, allow_organizer=True)
+    if organizer != state["organizer"]:
+        raise PermissionError("only the pilot organizer can recover a member")
+    member = swarm_pilot.resolve_member(room_id, member)
+    if state.get("phase") != "working":
+        raise ValueError("swarm is not working")
+    if member in state.get("done", {}):
+        done_info = (bus.get_room_info(room_id).get("agent_meta") or {}).get(member) or {}
+        done_recovery = done_info.get("swarm_pilot_recovery")
+        if (isinstance(done_recovery, dict)
+                and done_recovery.get("round") == state.get("round", 1)
+                and str(done_recovery.get("request_id"))
+                == str(state.get("dispatched", {}).get(member))):
+            _swarm_store_manual_recovery(room_id, member, {
+                **done_recovery, "status": "superseded",
+            })
+            return {"status": "superseded", "member": member,
+                    "recovery_request_id": done_recovery.get("recovery_request_id")}
+        return {"status": "already_done", "member": member}
+    request_id = state.get("dispatched", {}).get(member)
+    if request_id is None:
+        raise ValueError("member has no dispatched request")
+
+    key = (f"swarm-pilot:{room_id}:{state.get('round', 1)}:{member}"
+           f":manual-recovery:1")
+    meta = bus.get_room_info(room_id)
+    info = (meta.get("agent_meta") or {}).get(member) or {}
+    if info.get("wake_claim_id") or info.get("initial_spawn_active") is True:
+        return {"status": "active_wake", "member": member,
+                "request_id": request_id}
+
+    recovery = info.get("swarm_pilot_recovery")
+    matches_recovery = (
+        isinstance(recovery, dict)
+        and recovery.get("round") == state.get("round", 1)
+        and str(recovery.get("request_id")) == str(request_id)
+    )
+    messages = bus._load_messages(room_id)
+    retry_message = next((msg for msg in messages
+                          if msg.get("idempotency_key") == key), None)
+    if retry_message is not None:
+        retry_id = retry_message["id"]
+        if (not matches_recovery
+                or recovery.get("recovery_request_id") not in (None, retry_id)):
+            return {"status": "conflict", "member": member,
+                    "request_id": request_id}
+        status_info = bus.get_status_details(room_id).get(member) or {}
+        latest_meta = bus.get_room_info(room_id)
+        latest_info = (latest_meta.get("agent_meta") or {}).get(member) or {}
+        if latest_info.get("wake_claim_id") or latest_info.get("initial_spawn_active") is True:
+            return {"status": "active_wake", "member": member,
+                    "request_id": request_id, "recovery_request_id": retry_id}
+        failed_ids = _server_terminal_failure_task_ids(status_info, latest_info)
+        if str(retry_id) in failed_ids:
+            try:
+                writes = room_workspace.write_policy(latest_meta) == room_workspace.SHARED_WRITE
+            except ValueError:
+                writes = True
+            candidates = _swarm_replacement_candidates(latest_meta, member, writes)
+            needs_profile = not any(
+                candidate.get("can_limit_writes") is True
+                for candidate in candidates
+            )
+            result_status = "needs_profile" if needs_profile else "terminal"
+            reason = ("retry failed; no enabled swarm_replacement profile"
+                      if needs_profile else "retry failed; inspect replacement route")
+            _swarm_store_manual_recovery(room_id, member, {
+                **(recovery if matches_recovery else {}),
+                "round": state.get("round", 1), "request_id": request_id,
+                "attempts": _SWARM_MANUAL_RECOVERY_LIMIT,
+                "status": result_status, "recovery_request_id": retry_id,
+                "reason": reason,
+            })
+            return {"status": result_status, "member": member,
+                    "request_id": request_id, "recovery_request_id": retry_id,
+                    "reason": reason}
+        if matches_recovery and recovery.get("status") == "dispatching":
+            _swarm_store_manual_recovery(room_id, member, {
+                **recovery, "status": "retry_dispatched",
+                "recovery_request_id": retry_id,
+            })
+            recovery = {**recovery, "status": "retry_dispatched",
+                        "recovery_request_id": retry_id}
+            _wake_agents_for_request(
+                room_id, retry_message.get("agent", ""), retry_message.get("body", ""),
+                retry_message.get("to"), retry_message.get("reply_to"), retry_id,
+            )
+            latest_state = swarm_pilot.status(room_id)
+            if (latest_state.get("round", 1) != state.get("round", 1)
+                    or member in latest_state.get("done", {})):
+                _swarm_stop_superseded_recovery(room_id, member, retry_id)
+                _swarm_store_manual_recovery(room_id, member, {
+                    **recovery, "status": "superseded",
+                    "recovery_request_id": retry_id,
+                })
+                return {"status": "superseded", "member": member,
+                        "request_id": request_id, "recovery_request_id": retry_id}
+        status_value = recovery.get("status") if matches_recovery else "retry_dispatched"
+        return {"status": status_value or "retry_dispatched", "member": member,
+                "request_id": request_id, "recovery_request_id": retry_id}
+
+    status_info = bus.get_status_details(room_id).get(member) or {}
+    failed_ids = _server_terminal_failure_task_ids(status_info, info)
+    if str(request_id) not in failed_ids:
+        return {"status": "awaiting_terminal_failure", "member": member,
+                "request_id": request_id}
+    if any(msg.get("agent") == member and msg.get("kind") in {"result", "final"}
+           and msg.get("reply_to") == request_id for msg in messages):
+        return {"status": "result_needs_round_done", "member": member,
+                "request_id": request_id}
+
+    spec, drift = _member_launch_spec(meta, member)
+    if spec is None or drift:
+        outcome = {"round": state.get("round", 1), "request_id": request_id,
+                   "attempts": 0, "status": "needs_profile",
+                   "reason": "assigned member profile is unavailable or changed"}
+        _swarm_store_manual_recovery(room_id, member, outcome)
+        return {"status": "needs_profile", "member": member,
+                "request_id": request_id, "reason": outcome["reason"]}
+
+    reservation = {}
+
+    def reserve(meta_update: dict) -> dict:
+        pilot = meta_update.get("swarm_pilot")
+        slot = (meta_update.get("agent_meta") or {}).get(member)
+        if (not isinstance(pilot, dict) or pilot.get("phase") != "working"
+                or pilot.get("round", 1) != state.get("round", 1)
+                or member in pilot.get("done", {})
+                or pilot.get("dispatched", {}).get(member) != request_id
+                or not isinstance(slot, dict)):
+            reservation["status"] = "stale"
+            return meta_update
+        if slot.get("wake_claim_id") or slot.get("initial_spawn_active") is True:
+            reservation["status"] = "active_wake"
+            return meta_update
+        current = slot.get("swarm_pilot_recovery")
+        if (isinstance(current, dict)
+                and current.get("round") == state.get("round", 1)
+                and str(current.get("request_id")) == str(request_id)
+                and int(current.get("attempts", 0) or 0) >= _SWARM_MANUAL_RECOVERY_LIMIT):
+            if current.get("status") == "dispatching":
+                # Resume the deterministic idempotent post after a crash
+                # between reservation and message creation.
+                reservation["status"] = "reserved"
+            else:
+                reservation["status"] = current.get("status", "terminal")
+                return meta_update
+        else:
+            slot["swarm_pilot_recovery"] = {
+                "round": state.get("round", 1), "request_id": request_id,
+                "attempts": 1, "status": "dispatching",
+            }
+            reservation["status"] = "reserved"
+        return meta_update
+
+    bus._update_meta_locked(room_id, reserve)
+    if reservation.get("status") != "reserved":
+        return {"status": reservation.get("status", "stale"), "member": member,
+                "request_id": request_id}
+
+    # A delayed result can arrive after the receipt check. Preserve it for the
+    # organizer; only round_done may settle the pilot member.
+    messages = bus._load_messages(room_id)
+    if any(msg.get("agent") == member and msg.get("kind") in {"result", "final"}
+           and msg.get("reply_to") == request_id for msg in messages):
+        outcome = {"round": state.get("round", 1), "request_id": request_id,
+                   "attempts": 1, "status": "result_needs_round_done"}
+        _swarm_store_manual_recovery(room_id, member, outcome)
+        return {"status": outcome["status"], "member": member,
+                "request_id": request_id}
+
+    retry_body = (
+        f"One-time organizer recovery for your pilot request #{request_id}. "
+        "Your previous turn ended with a server-recorded failure and no result. "
+        "Continue the same responsibility. Post a result replying to this recovery "
+        "request, then call swarm_pilot_round_done. If this route fails again, stop; "
+        "the organizer will inspect the profile."
+    )
+    retry_id = _post_message_checked(
+        room_id, organizer, retry_body, "request", to=member,
+        idempotency_key=key,
+    )
+    outcome = {"round": state.get("round", 1), "request_id": request_id,
+               "attempts": 1, "status": "retry_dispatched",
+               "recovery_request_id": retry_id}
+    _swarm_store_manual_recovery(room_id, member, outcome)
+    _wake_agents_for_request(room_id, organizer, retry_body, member, None, retry_id)
+    latest_state = swarm_pilot.status(room_id)
+    if (latest_state.get("round", 1) != state.get("round", 1)
+            or member in latest_state.get("done", {})):
+        _swarm_stop_superseded_recovery(room_id, member, retry_id)
+        outcome["status"] = "superseded"
+        _swarm_store_manual_recovery(room_id, member, outcome)
+        return {"status": "superseded", "member": member,
+                "request_id": request_id, "recovery_request_id": retry_id}
+    return {"status": "retry_dispatched", "member": member,
+            "request_id": request_id, "recovery_request_id": retry_id}
+
+
+def _swarm_store_manual_recovery(room_id: str, member: str, recovery: dict) -> None:
+    def update(meta: dict) -> dict:
+        slot = (meta.get("agent_meta") or {}).get(member)
+        if isinstance(slot, dict):
+            slot["swarm_pilot_recovery"] = dict(recovery)
+        return meta
+    bus._update_meta_locked(room_id, update)
+
+
+def _swarm_stop_superseded_recovery(room_id: str, member: str, retry_id: int) -> None:
+    """Stop only an owned recovery wake after a late original result wins."""
+    meta = bus.get_room_info(room_id)
+    info = (meta.get("agent_meta") or {}).get(member) or {}
+    if info.get("wake_claim_msg_id") != retry_id:
+        return
+    wake_id = info.get("wake_claim_id")
+    if not isinstance(wake_id, str) or not wake_id:
+        return
+    recovery = info.get("swarm_pilot_recovery") or {}
+    if recovery.get("recovery_request_id") != retry_id:
+        return
+    pilot = meta.get("swarm_pilot") or {}
+    if pilot.get("round", 1) == recovery.get("round"):
+        _stop_completed_pilot_turn(room_id, member, wake_id, "round_done")
+        return
+    # The next round cleared `done`; its old wake is nevertheless still the
+    # exact locally owned generation for the superseded recovery request.
+    if child_processes.state(room_id, wake_id) != "alive":
+        return
+    _merge_agent_meta(room_id, member, {"intentional_stop_wake_id": wake_id})
+    if child_processes.terminate(room_id, wake_id) != "sent":
+        def clear_marker(current_meta: dict) -> dict:
+            slot = (current_meta.get("agent_meta") or {}).get(member) or {}
+            if slot.get("wake_id") == wake_id:
+                slot.pop("intentional_stop_wake_id", None)
+            return current_meta
+        bus._update_meta_locked(room_id, clear_marker)
 
 
 def _swarm_pilot_request(room_id: str, member: str) -> str:
@@ -2161,6 +2457,7 @@ def _swarm_pilot_request(room_id: str, member: str) -> str:
 
 
 _PILOT_MEMBER_EXIT_DELAY_SECONDS = 1.5
+_SWARM_MANUAL_RECOVERY_LIMIT = 1
 
 
 def _stop_completed_pilot_turn(
@@ -2195,7 +2492,7 @@ def _stop_completed_pilot_turn(
     _merge_agent_meta(room_id, member, {"intentional_stop_wake_id": wake_id})
     result = child_processes.terminate(room_id, wake_id)
     if result == "denied":
-        print(f"[huddle] could not stop completed pilot turn "
+        _log(f"[huddle] could not stop completed pilot turn "
               f"({member}@{room_id}, wake={wake_id})", flush=True)
     if result != "sent":
         # A vanished/unowned child was not intentionally signalled. Remove
@@ -2240,7 +2537,7 @@ def _schedule_completed_pilot_turn_exit(
         timer.daemon = True
         timer.start()
     except Exception as exc:
-        print(f"[huddle] could not schedule completed pilot turn exit "
+        _log(f"[huddle] could not schedule completed pilot turn exit "
               f"({member}@{room_id}): {exc}", flush=True)
 
 
@@ -2436,7 +2733,7 @@ def _recover_swarm_pilots() -> list[dict]:
         except Exception as exc:
             # One malformed/removed room must not prevent other rooms from
             # recovering on this tick. The next tick can retry this room.
-            print(f"[watchdog] swarm advance failed ({room_id}): {exc}",
+            _log(f"[watchdog] swarm advance failed ({room_id}): {exc}",
                   flush=True)
     return recovered
 
@@ -2655,21 +2952,29 @@ def _swarm_replace_failed_member(
             "failure_class": plan["failure_class"], "reason": plan["reason"]}
 
     if plan["action"] != "replace":
-        if not route and (plan["failure_class"] == "unknown" or (
-                not candidates and plan["action"] != "needs_user")):
+        if not route and plan["failure_class"] == "unknown":
             # Replacement is not configured or not applicable: the ordinary
             # noreply / rate-limit notice already explains this failure.
             return False
 
+        terminal = ("needs_profile" if not candidates
+                    and plan["action"] not in {"needs_user", "wait_child_stop"}
+                    else plan["action"])
+        outcome_reason = ("no enabled swarm_replacement profile"
+                          if terminal == "needs_profile" else plan["reason"])
         def record_outcome(slot: dict) -> None:
-            slot["swarm_route"] = {**route, **base, "profile": route.get("profile"),
-                                   "attempts": attempts, "terminal": plan["action"]}
+            slot["swarm_route"] = {**route, **base, "reason": outcome_reason,
+                                   "profile": route.get("profile"),
+                                   "attempts": attempts, "terminal": terminal}
         if _swarm_route_cas(room_id, agent_name, wake_id, record_outcome):
-            prefix = ("Ждёт решения человека" if plan["action"] == "needs_user"
+            prefix = ("Ждёт решения человека" if terminal == "needs_user"
+                      else "Нужен резервный профиль" if terminal == "needs_profile"
                       else "Замена не выполнена")
+            detail = ("В registry нет включённого профиля с swarm_replacement=true."
+                      if terminal == "needs_profile" else plan["reason"])
             _swarm_replacement_notice(
                 room_id, agent_name, wake_id,
-                f"{agent_name} ({current_profile}): {prefix} — {plan['reason']} "
+                f"{agent_name} ({current_profile}): {prefix} — {detail} "
                 f"[{plan['failure_class']}].")
         return False
 
@@ -2750,7 +3055,7 @@ def _swarm_replacement_notice(room_id: str, agent_name: str, generation: str,
             idempotency_key=f"swarm-replace:{room_id}:{agent_name}:{generation}",
         )
     except Exception as exc:
-        print(f"[huddle] swarm replacement notice failed "
+        _log(f"[huddle] swarm replacement notice failed "
               f"({agent_name}@{room_id}): {exc}", flush=True)
 
 
@@ -2795,7 +3100,7 @@ def swarm_pilot_transfer(
                              f"{transfer['version']}"),
         )
     except Exception as exc:
-        print(f"[huddle] swarm transfer notice failed ({room_id}): {exc}",
+        _log(f"[huddle] swarm transfer notice failed ({room_id}): {exc}",
               flush=True)
     advanced = _swarm_advance(room_id) if (
         key == "reporter" and len(updated["done"]) == len(updated["members"])
@@ -2813,17 +3118,24 @@ def swarm_pilot_round_done(room_id: str, member: str, summary: str) -> dict:
         raise ValueError("member has no dispatched request")
     messages = bus._load_messages(room_id)
     valid_request_ids = {request_id}
-    # An organizer may issue a direct recovery request after a provider error
-    # (for example, retrying a wake that failed before the member could use
-    # Huddle tools). The member's result belongs to that retry request, not the
-    # original dispatch. Only organizer-authored requests explicitly addressed
-    # to this member qualify; peer chatter cannot complete another task.
+    recovery_key = (f"swarm-pilot:{room_id}:{state.get('round', 1)}:{member}"
+                    ":manual-recovery:1")
+    member_info = (bus.get_room_info(room_id).get("agent_meta") or {}).get(member)
+    recovery_state = (member_info.get("swarm_pilot_recovery") or {}
+                      if isinstance(member_info, dict) else {})
+    authorized_recovery_id = recovery_state.get("recovery_request_id")
+    # Only the one bounded request created by swarm_pilot_recover_member may
+    # substitute for the original pilot dispatch. Other organizer requests
+    # or a caller-supplied idempotency key must never count as completion.
     valid_request_ids.update(
         int(msg["id"])
         for msg in messages
-        if int(msg.get("id", 0) or 0) > int(request_id)
+        if isinstance(authorized_recovery_id, int)
+        and msg.get("id") == authorized_recovery_id
+        and int(msg.get("id", 0) or 0) > int(request_id)
         and msg.get("kind") == "request"
         and msg.get("reply_to") is None
+        and msg.get("idempotency_key") == recovery_key
         and msg.get("agent") == state["organizer"]
         and msg.get("to") == member
     )
@@ -2891,7 +3203,7 @@ def swarm_pilot_open_round(
             idempotency_key=f"swarm-pilot-round:{room_id}:{round_no}:open",
         )
     except Exception as exc:
-        print(f"[huddle] swarm round notice failed ({room_id}): {exc}", flush=True)
+        _log(f"[huddle] swarm round notice failed ({room_id}): {exc}", flush=True)
     advanced = _swarm_advance(room_id)
     return {"state": swarm_pilot.status(room_id), "round": round_no,
             "next_dispatch": advanced["next_dispatch"]}
@@ -2933,6 +3245,18 @@ def message_post(
       kind=request with reply_to!=null is someone's answer — NOT a new request to you.
       For all other kinds: read silently, do not reply.
     """
+    if idempotency_key:
+        pilot = bus.get_room_info(room_id).get("swarm_pilot")
+        if isinstance(pilot, dict):
+            reserved_keys = {
+                f"swarm-pilot:{room_id}:{pilot.get('round', 1)}:{member}"
+                ":manual-recovery:1"
+                for member in pilot.get("members", [])
+            }
+            if idempotency_key in reserved_keys:
+                raise PermissionError(
+                    "manual-recovery idempotency keys are reserved for the recovery tool"
+                )
     msg_id = _post_message_checked(room_id, agent, body, kind, to, reply_to, idempotency_key, meta)
     if kind == "request":
         _wake_agents_for_request(room_id, agent, body, to, reply_to, msg_id)
@@ -3208,6 +3532,10 @@ def _swarm_pilot_request_superseded(
     if not isinstance(key, str) or not key.startswith(prefix):
         return False
     suffix = key[len(prefix):]
+    for member in pilot.get("members", []):
+        if key == f"{prefix}{member}:manual-recovery:1":
+            return (pilot.get("phase") != "working"
+                    or member in pilot.get("done", {}))
     if suffix == "final-request-missing-reporter":
         return bool(pilot.get("responsibilities", {}).get("reporter", {}).get("member"))
     if suffix.startswith("final-request") and key != _swarm_final_request_key(room_id, pilot):
@@ -3464,8 +3792,9 @@ def notify_register(room_id: str, agent: str, notify_file_path: str) -> str:
 # ── Native cross-harness message delivery ──────────────────────────────────────
 
 @mcp.tool()
-def message_send(to: str, text: str, mode: str = "auto", from_name: str = "",
-                  reply_to: str = "", idempotency_key: str = "") -> str:
+def message_send(to: str, text: str, ctx: Context, mode: str = "auto", from_name: str = "",
+                  reply_to: str = "", idempotency_key: str = "",
+                  room_id: str = "") -> str:
     """Deliver `text` to another agent session outside this room, picking a
     deterministic "postman" per harness (no LLM) and trying methods in order.
     `text` is sent unchanged inside a small envelope.
@@ -3479,9 +3808,29 @@ def message_send(to: str, text: str, mode: str = "auto", from_name: str = "",
     for a resume/spool method means the attempt started/was queued, not that
     it was read. See docs/delivery.md.
     """
+    caller = None
+    if _request_member_secret(ctx):
+        # A token-bearing caller must never become an unguarded external
+        # caller merely by omitting or lying about room_id.
+        caller = DeliveryCaller(readonly=None, room_id=room_id)
+        principal = _verified_member(ctx, room_id) if room_id else None
+        if principal is not None:
+            meta = bus.get_room_info(room_id)
+            profile = _swarm_assigned_profile(meta, principal["member"])
+            spec = spawn.get_enabled_spec(profile)
+            try:
+                writes = room_workspace.write_policy(meta) == room_workspace.SHARED_WRITE
+            except ValueError:
+                writes = False
+            readonly = (None if spec is None else
+                        False if writes else spawn.readonly_enforced(spec))
+            caller = DeliveryCaller(
+                verified_member=True, readonly=readonly, room_id=room_id,
+                agent=principal["member"], wake_id=principal["wake_id"],
+            )
     return delivery.message_send(
         to, text, mode=mode, from_name=from_name, reply_to=reply_to,
-        idempotency_key=idempotency_key,
+        idempotency_key=idempotency_key, caller=caller,
     )
 
 
@@ -3505,26 +3854,26 @@ async def _background_watchdog():
         # across a server restart heals without waiting a full tick.
         retried = _swarm_retry_failed_relays()
         if retried:
-            print(f"[watchdog] Retried child-room relays (startup): {retried}",
+            _log(f"[watchdog] Retried child-room relays (startup): {retried}",
                   flush=True)
     except Exception as e:
-        print(f"[watchdog] relay retry (startup) error: {e}", flush=True)
+        _log(f"[watchdog] relay retry (startup) error: {e}", flush=True)
     while True:
         await asyncio.sleep(bus.ZOMBIE_CHECK_SECS)
         try:
             reconciled = _reconcile_owned_children()
             if reconciled:
-                print(f"[watchdog] Reconciled terminal-room children: "
+                _log(f"[watchdog] Reconciled terminal-room children: "
                       f"{reconciled}", flush=True)
         except Exception as e:
-            print(f"[watchdog] child reconciliation error: {e}", flush=True)
+            _log(f"[watchdog] child reconciliation error: {e}", flush=True)
 
         try:
             closed = bus.check_zombie_rooms()
             if closed:
-                print(f"[watchdog] Zombie-closed rooms: {closed}", flush=True)
+                _log(f"[watchdog] Zombie-closed rooms: {closed}", flush=True)
         except Exception as e:
-            print(f"[watchdog] zombie check error: {e}", flush=True)
+            _log(f"[watchdog] zombie check error: {e}", flush=True)
 
         try:
             now = time.time()
@@ -3532,60 +3881,60 @@ async def _background_watchdog():
                 last_retention_sweep = now
                 purged = bus.delete_old_terminal_rooms(RETENTION_DAYS)
                 if purged.get("deleted"):
-                    print(f"[watchdog] Retention-purged {len(purged['deleted'])} "
+                    _log(f"[watchdog] Retention-purged {len(purged['deleted'])} "
                           f"terminal rooms (>{RETENTION_DAYS}d)", flush=True)
         except Exception as e:
-            print(f"[watchdog] retention sweep error: {e}", flush=True)
+            _log(f"[watchdog] retention sweep error: {e}", flush=True)
 
         try:
             idled = _mark_idle_rooms()
             if idled:
-                print(f"[watchdog] Idle rooms: {idled}", flush=True)
+                _log(f"[watchdog] Idle rooms: {idled}", flush=True)
         except Exception as e:
-            print(f"[watchdog] idle check error: {e}", flush=True)
+            _log(f"[watchdog] idle check error: {e}", flush=True)
 
         try:
             notified = bus.check_deadlock_rooms()
             if notified:
-                print(f"[watchdog] Deadlock-notified rooms: {notified}", flush=True)
+                _log(f"[watchdog] Deadlock-notified rooms: {notified}", flush=True)
         except Exception as e:
-            print(f"[watchdog] deadlock check error: {e}", flush=True)
+            _log(f"[watchdog] deadlock check error: {e}", flush=True)
 
         try:
             advanced = _recover_swarm_pilots()
             if advanced:
-                print(f"[watchdog] Recovered swarm requests: {advanced}",
+                _log(f"[watchdog] Recovered swarm requests: {advanced}",
                       flush=True)
         except Exception as e:
-            print(f"[watchdog] swarm recovery error: {e}", flush=True)
+            _log(f"[watchdog] swarm recovery error: {e}", flush=True)
 
         try:
             wakes = _wake_pending_agents()
             if wakes:
-                print(f"[watchdog] Agent wake-ups: {wakes}", flush=True)
+                _log(f"[watchdog] Agent wake-ups: {wakes}", flush=True)
         except Exception as e:
-            print(f"[watchdog] agent wake-up error: {e}", flush=True)
+            _log(f"[watchdog] agent wake-up error: {e}", flush=True)
 
         try:
             dead = _check_dead_wakes()
             if dead:
-                print(f"[watchdog] Dead-wake notices: {dead}", flush=True)
+                _log(f"[watchdog] Dead-wake notices: {dead}", flush=True)
         except Exception as e:
-            print(f"[watchdog] dead-wake check error: {e}", flush=True)
+            _log(f"[watchdog] dead-wake check error: {e}", flush=True)
 
         try:
             stuck = _check_stuck_wakes()
             if stuck:
-                print(f"[watchdog] Stuck-wake notices: {stuck}", flush=True)
+                _log(f"[watchdog] Stuck-wake notices: {stuck}", flush=True)
         except Exception as e:
-            print(f"[watchdog] stuck-wake check error: {e}", flush=True)
+            _log(f"[watchdog] stuck-wake check error: {e}", flush=True)
 
         try:
             retried = _swarm_retry_failed_relays()
             if retried:
-                print(f"[watchdog] Retried child-room relays: {retried}", flush=True)
+                _log(f"[watchdog] Retried child-room relays: {retried}", flush=True)
         except Exception as e:
-            print(f"[watchdog] relay retry error: {e}", flush=True)
+            _log(f"[watchdog] relay retry error: {e}", flush=True)
 
 
 def _reconcile_owned_children() -> list[str]:
@@ -3611,7 +3960,7 @@ def _reconcile_owned_children() -> list[str]:
             except Exception:
                 missing = False
             if not missing:
-                print(f"[watchdog] cannot reconcile children for {room_id}: "
+                _log(f"[watchdog] cannot reconcile children for {room_id}: "
                       f"{exc}", flush=True)
                 continue
             meta = {}
@@ -4407,7 +4756,7 @@ def _set_agent_phase(
             source=source,
         )
     except Exception as exc:
-        print(f"[huddle] lifecycle status update failed "
+        _log(f"[huddle] lifecycle status update failed "
               f"({agent_name}@{room_id}, {phase}): {exc}", flush=True)
 
 def _announce_spawn_failure(room_id: str, agent_name: str, exc: BaseException,
@@ -4433,7 +4782,7 @@ def _announce_spawn_failure(room_id: str, agent_name: str, exc: BaseException,
             idempotency_key=f"spawnfail:{room_id}:{agent_name}:{context_id}",
         )
     except Exception as post_exc:
-        print(f"[huddle] spawn-fail notice post failed "
+        _log(f"[huddle] spawn-fail notice post failed "
               f"({agent_name}@{room_id}): {post_exc}", flush=True)
 
 
@@ -4580,7 +4929,7 @@ def _record_spawned_pid(
     try:
         bus._update_meta_locked(room_id, _upd)
     except Exception as exc:
-        print(f"[huddle] failed to record delayed-spawn pid {pid} "
+        _log(f"[huddle] failed to record delayed-spawn pid {pid} "
               f"({room_id}): {exc}", flush=True)
     return published
 
@@ -5033,6 +5382,14 @@ def _claim_wake(
             info = {}
         if info.get("wake_claim_id") or info.get("initial_spawn_active"):
             return meta
+        pilot = meta.get("swarm_pilot")
+        recovery = info.get("swarm_pilot_recovery")
+        if (isinstance(pilot, dict) and isinstance(recovery, dict)
+                and recovery.get("recovery_request_id") == msg_id
+                and (pilot.get("phase") != "working"
+                     or pilot.get("round", 1) != recovery.get("round")
+                     or agent_name in pilot.get("done", {}))):
+            return meta
         if info.get("swarm_child_of"):
             return meta  # one-shot participant child: never relaunched
         if int(info.get("last_wake_msg_id", 0) or 0) >= msg_id:
@@ -5226,7 +5583,7 @@ def _make_wake_done_callback(room_id: str, agent_name: str, wake_id: str):
             with _wake_lock(room_id, agent_name):
                 _on_wake_exit(room_id, agent_name, wake_id, returncode)
         except Exception as exc:  # never let a callback kill the reaper thread
-            print(f"[huddle] wake-exit callback error "
+            _log(f"[huddle] wake-exit callback error "
                   f"({agent_name}@{room_id}): {exc}", flush=True)
     return _callback
 
@@ -5244,7 +5601,7 @@ def _make_initial_spawn_callback(
                 room_id, agent_name, initial_spawn_id, returncode,
             )
         except Exception as exc:
-            print(f"[huddle] initial-spawn exit callback error "
+            _log(f"[huddle] initial-spawn exit callback error "
                   f"({agent_name}@{room_id}): {exc}", flush=True)
     return _callback
 
@@ -5300,7 +5657,7 @@ def _handle_rate_limit_on_exit(room_id: str, agent_name: str) -> bool:
             idempotency_key=f"ratelimit:{room_id}:{agent_name}:{until}",
         )
     except Exception as exc:
-        print(f"[huddle] rate-limit notice post failed "
+        _log(f"[huddle] rate-limit notice post failed "
               f"({agent_name}@{room_id}): {exc}", flush=True)
     return True
 
@@ -5421,7 +5778,7 @@ def _announce_noreply_on_exit(room_id: str, agent_name: str, msg_id: int,
             idempotency_key=f"noreply:{room_id}:{agent_name}:{msg_id}",
         )
     except Exception as exc:
-        print(f"[huddle] noreply notice post failed "
+        _log(f"[huddle] noreply notice post failed "
               f"({agent_name}@{room_id}): {exc}", flush=True)
 
 
@@ -5456,7 +5813,7 @@ def _announce_noreply_on_initial_exit(room_id: str, agent_name: str, rc: int,
             idempotency_key=f"noreply:{room_id}:{agent_name}:init",
         )
     except Exception as exc:
-        print(f"[huddle] noreply notice post failed (init) "
+        _log(f"[huddle] noreply notice post failed (init) "
               f"({agent_name}@{room_id}): {exc}", flush=True)
 
 
@@ -5477,7 +5834,7 @@ def _on_initial_spawn_exit(
             room_id, agent_name, initial_spawn_id, "initial_spawn_id",
         )
     except Exception as exc:
-        print(f"[huddle] Claude model receipt failed (init) "
+        _log(f"[huddle] Claude model receipt failed (init) "
               f"({agent_name}@{room_id}): {exc}", flush=True)
     rc = -999 if returncode is None else int(returncode)
     rate_limit_announced = False
@@ -5485,7 +5842,7 @@ def _on_initial_spawn_exit(
         try:
             rate_limit_announced = _handle_rate_limit_on_exit(room_id, agent_name)
         except Exception as exc:
-            print(f"[huddle] rate-limit check error (init) "
+            _log(f"[huddle] rate-limit check error (init) "
                   f"({agent_name}@{room_id}): {exc}", flush=True)
     posted_result = _agent_result_posted_after(room_id, agent_name, 0)
     if rate_limit_announced:
@@ -5504,19 +5861,19 @@ def _on_initial_spawn_exit(
         try:
             _announce_noreply_on_initial_exit(room_id, agent_name, rc, log_path)
         except Exception as exc:
-            print(f"[huddle] noreply check error (init) "
+            _log(f"[huddle] noreply check error (init) "
                   f"({agent_name}@{room_id}): {exc}", flush=True)
     try:
         # Status has already reached its terminal phase. Clear the persisted
         # initial guard last so a concurrent request can only start afterwards.
         _mark_initial_spawn_finished(room_id, agent_name, initial_spawn_id)
     except Exception as exc:
-        print(f"[huddle] initial-spawn claim release error "
+        _log(f"[huddle] initial-spawn claim release error "
               f"({agent_name}@{room_id}): {exc}", flush=True)
     try:
         _drain_pending_wakes(room_id, agent_name)
     except Exception as exc:
-        print(f"[huddle] wake drain error ({agent_name}@{room_id}): {exc}",
+        _log(f"[huddle] wake drain error ({agent_name}@{room_id}): {exc}",
               flush=True)
 
 
@@ -5542,7 +5899,7 @@ def _on_wake_exit(room_id: str, agent_name: str, wake_id: str,
     try:
         _record_claude_model_receipt(room_id, agent_name, wake_id, "wake_id")
     except Exception as exc:
-        print(f"[huddle] Claude model receipt failed (wake) "
+        _log(f"[huddle] Claude model receipt failed (wake) "
               f"({agent_name}@{room_id}): {exc}", flush=True)
     if (not already_announced and (
         info.get("stuck_announced_wake_id") == wake_id
@@ -5576,7 +5933,7 @@ def _on_wake_exit(room_id: str, agent_name: str, wake_id: str,
         try:
             rate_limit_announced = _handle_rate_limit_on_exit(room_id, agent_name)
         except Exception as exc:
-            print(f"[huddle] rate-limit check error "
+            _log(f"[huddle] rate-limit check error "
                   f"({agent_name}@{room_id}): {exc}", flush=True)
     posted_result = _agent_result_posted_after(
         room_id, agent_name, int(info.get("last_wake_msg_id", 0) or 0))
@@ -5598,7 +5955,7 @@ def _on_wake_exit(room_id: str, agent_name: str, wake_id: str,
                 int(info.get("last_wake_msg_id", 0) or 0),
                 rc, info.get("log_path"))
         except Exception as exc:
-            print(f"[huddle] noreply check error "
+            _log(f"[huddle] noreply check error "
                   f"({agent_name}@{room_id}): {exc}", flush=True)
     if not posted_result and not intentional_pilot_stop:
         try:
@@ -5610,19 +5967,19 @@ def _on_wake_exit(room_id: str, agent_name: str, wake_id: str,
             ):
                 return
         except Exception as exc:
-            print(f"[huddle] swarm replacement error "
+            _log(f"[huddle] swarm replacement error "
                   f"({agent_name}@{room_id}): {exc}", flush=True)
     try:
         # Operational status is terminal now. Release only this exact
         # generation, then allow the queued-drain path to claim the next turn.
         _clear_wake_claim(room_id, agent_name, wake_id)
     except Exception as exc:
-        print(f"[huddle] wake-claim release error "
+        _log(f"[huddle] wake-claim release error "
               f"({agent_name}@{room_id}): {exc}", flush=True)
     try:
         _drain_pending_wakes(room_id, agent_name)
     except Exception as exc:
-        print(f"[huddle] wake drain error ({agent_name}@{room_id}): {exc}",
+        _log(f"[huddle] wake drain error ({agent_name}@{room_id}): {exc}",
               flush=True)
 
 
@@ -5825,10 +6182,10 @@ def _wake_agents_for_request(
                             room_id, agent_name, wake_id, rollback=True,
                         )
                     except Exception as rollback_exc:
-                        print(f"[huddle] wake-claim rollback failed "
+                        _log(f"[huddle] wake-claim rollback failed "
                               f"({agent_name}@{room_id}): {rollback_exc}",
                               flush=True)
-                    print(f"[huddle] codex_resume failed ({room_id}): {exc}",
+                    _log(f"[huddle] codex_resume failed ({room_id}): {exc}",
                           flush=True)
                     _announce_spawn_failure(room_id, agent_name, exc, str(msg_id))
                     continue
@@ -5860,10 +6217,10 @@ def _wake_agents_for_request(
                         room_id, agent_name, wake_id, rollback=True,
                     )
                 except Exception as rollback_exc:
-                    print(f"[huddle] wake-claim rollback failed "
+                    _log(f"[huddle] wake-claim rollback failed "
                           f"({agent_name}@{room_id}): {rollback_exc}",
                           flush=True)
-                print(f"[huddle] fresh spawn failed for {agent_name} "
+                _log(f"[huddle] fresh spawn failed for {agent_name} "
                       f"({room_id}): {exc}", flush=True)
                 _announce_spawn_failure(room_id, agent_name, exc, str(msg_id))
                 continue
@@ -5992,14 +6349,14 @@ def _check_dead_wakes() -> list[str]:
                         idempotency_key=f"deadwake:{room_id}:{agent_name}:{wake_id}",
                     )
                 except Exception as exc:
-                    print(f"[huddle] dead-wake notice post failed "
+                    _log(f"[huddle] dead-wake notice post failed "
                           f"({agent_name}@{room_id}): {exc}", flush=True)
             try:
                 with _wake_lock(room_id, agent_name):
                     _on_wake_exit(room_id, agent_name, wake_id, None,
                                   already_announced=True)
             except Exception as exc:
-                print(f"[huddle] dead-wake lease-clear error "
+                _log(f"[huddle] dead-wake lease-clear error "
                       f"({agent_name}@{room_id}): {exc}", flush=True)
             announced.append(f"{agent_name}@{room_id}")
     return announced
@@ -6016,7 +6373,7 @@ def _terminate_stuck_wake(
     """
     result = child_processes.terminate(room_id, wake_id)
     if result == "denied":
-        print(f"[huddle] stuck-wake kill denied ({agent_name}@{room_id}, "
+        _log(f"[huddle] stuck-wake kill denied ({agent_name}@{room_id}, "
               f"pid={pid})", flush=True)
     return result == "sent"
 
@@ -6137,7 +6494,7 @@ def _check_stuck_wakes() -> list[str]:
                 )
                 announced.append(f"{agent_name}@{room_id}")
             except Exception as exc:
-                print(f"[huddle] stuck-wake notice post failed "
+                _log(f"[huddle] stuck-wake notice post failed "
                       f"({agent_name}@{room_id}): {exc}", flush=True)
     return announced
 
