@@ -216,7 +216,7 @@ IDLE_TIMEOUT_SECS = _env_num("IDLE_TIMEOUT_SECS", 600, int)
 # Retention: terminal rooms (closed/resolved) older than this are purged by the
 # background sweep. 0 disables. Sweep runs at most once per RETENTION_SWEEP_SECS
 # (not every zombie-check tick) — deletion is cheap but no need to scan hourly.
-RETENTION_DAYS = _env_num("HUDDLE_RETENTION_DAYS", 7.0, float)
+RETENTION_DAYS = _env_num("HUDDLE_RETENTION_DAYS", 21.0, float)
 RETENTION_SWEEP_SECS = _env_num("HUDDLE_RETENTION_SWEEP_SECS", 3600, int)
 # When a spawned agent exits because it hit its provider usage/rate-limit, do
 # not re-spawn it for this many seconds — a fresh spawn would instantly fail
