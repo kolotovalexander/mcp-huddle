@@ -189,7 +189,7 @@ def message_send(to: str, text: str, mode: str = "auto", from_name: str = "",
                 return _refusal(
                     msg_id, native_refusal["note"],
                     reason=native_refusal["reason"],
-                    suggested_tool=native_refusal["suggested_tool"],
+                    suggested_tool=native_refusal.get("suggested_tool"),
                 )
 
     if idempotency_key:

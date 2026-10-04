@@ -26,7 +26,7 @@ def refusal_for_declared_route(
     """Return a native-route refusal for an exact, caller-declared target.
 
     Each declaration has ``target`` (the exact input target or normalized
-    ``harness:id``), ``tool`` (a concrete caller-available tool name), and an
+    ``harness:id``), ``available: true`` or ``tool`` (an optional concrete tool name), and an
     optional ``reason``. No matching declaration means normal Huddle delivery.
     """
     if not isinstance(declared_routes, list):
@@ -40,20 +40,24 @@ def refusal_for_declared_route(
         tool = route.get("tool")
         if route_target not in (canonical_target, original_target):
             continue
-        if not isinstance(tool, str) or not _TOOL_NAME.fullmatch(tool):
+        valid_tool = isinstance(tool, str) and bool(_TOOL_NAME.fullmatch(tool))
+        if not valid_tool and route.get("available") is not True:
             continue
+        tool = tool if valid_tool else None
         reason = route.get("reason", "The caller declared this native route available.")
         if not isinstance(reason, str):
             reason = "The caller declared this native route available."
         reason = reason.strip()[:_REASON_MAX]
         if not reason:
             reason = "The caller declared this native route available."
-        return {
+        result = {
             "reason": "native_route_required",
-            "suggested_tool": tool,
             "note": (
-                f"Use the declared native tool {tool!r} for {canonical_target}; "
+                f"Use your available native communication tools for {canonical_target}; "
                 f"Huddle delivery was refused. {reason}"
             ),
         }
+        if tool:
+            result["suggested_tool"] = tool
+        return result
     return None

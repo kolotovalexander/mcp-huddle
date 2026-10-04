@@ -3810,10 +3810,10 @@ def message_send(to: str, text: str, ctx: Context, mode: str = "auto", from_name
     cross-session delivery. Keep persistent shared-room, council, relay, team,
     and swarm work in Huddle. If a native tool available to this caller can
     reach the exact `to` target, declare it in `native_routes`; Huddle refuses
-    that delivery before transport and returns the tool name to use. Example:
-    `native_routes=[{"target":"codex:<thread-id>",
-    "tool":"mcp__codex_app__send_message_to_thread",
-    "reason":"available in this caller session"}]`. This is self-reported:
+    that delivery before transport and advises using native communication.
+    Declare `native_routes=[{"target":"<exact to value>","available":true}]`.
+    An optional `tool` names a tool actually exposed to this caller; no harness
+    tool names are hardcoded by this guard. This is self-reported:
     MCP does not expose the caller's live tool catalog. If availability is
     unknown, omit the declaration and normal Huddle routing remains available.
 
@@ -3827,7 +3827,7 @@ def message_send(to: str, text: str, ctx: Context, mode: str = "auto", from_name
 
     Returns JSON: {msg_id, delivered, method, attempts, note}. A declared
     native-route refusal also includes `reason=native_route_required` and
-    `suggested_tool`. `delivered`
+    optional `suggested_tool`. `delivered`
     for a resume/spool method means the attempt started/was queued, not that
     it was read. See docs/delivery.md.
     """

@@ -31,17 +31,18 @@ the target's harness, e.g. `"resume"` -> `"codex.resume"`, or a full method
 id, e.g. `"claude.native"`, or `"spool"`); no fallback is attempted for a
 forced mode — if that one method isn't applicable, `delivered` is `false`.
 
-An optional `native_routes` list lets a caller declare a concrete native tool
+An optional `native_routes` list lets a caller declare native communication availability
 for an exact target:
 
 ```json
-[{"target":"codex:THREAD_ID","tool":"mcp__codex_app__send_message_to_thread",
-  "reason":"This tool is available here and can reach that thread."}]
+[{"target":"EXACT_TO_VALUE","available":true}]
 ```
 
 When `target` exactly matches the requested target (`harness:id` after
 resolution, or the original `to` string), Huddle returns
-`reason: "native_route_required"`, `suggested_tool`, and a short explanation.
+`reason: "native_route_required"` and a generic instruction to use native
+communication. The optional `tool` field can name a currently available tool;
+only then is `suggested_tool` included. No per-harness tool catalog is hardcoded.
 It makes no delivery attempt, writes no spool, and does not fall back to a
 different transport. The existing read-only-caller and Huddle-owned-session
 checks run first.

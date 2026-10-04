@@ -102,6 +102,21 @@ def test_declared_native_route_refuses_before_transport_or_idempotency(codex_hom
     assert finished == []
 
 
+@pytest.mark.parametrize("route,refused", [({"available": True}, True), ({"available": False}, False), ({"available": "true"}, False)])
+def test_generic_native_availability_without_tool_name(codex_home, route, refused):
+    _write_codex_index(codex_home, [{"id": "generic-th", "thread_name": "x", "updated_at": 1}])
+    out = json.loads(core.message_send(
+        "codex:generic-th", "hello", mode="spool",
+        native_routes=[{"target": "codex:generic-th", **route}],
+    ))
+    assert (out.get("reason") == "native_route_required") is refused
+    assert "suggested_tool" not in out
+    assert len(_spool_files()) == (0 if refused else 1)
+    if refused:
+        assert out["attempts"] == []
+        assert "native communication tools" in out["note"]
+
+
 def test_unknown_native_availability_keeps_huddle_fallback(codex_home):
     _write_codex_index(codex_home, [{"id": "unknown-th", "thread_name": "x", "updated_at": 1}])
     out = json.loads(core.message_send("codex:unknown-th", "please handle this", mode="spool"))
