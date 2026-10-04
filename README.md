@@ -31,7 +31,7 @@ tree is **v0.7.0.dev0** under PolyForm Noncommercial 1.0.0. See
 
 ## Two ways to run
 
-`mcp-huddle` runs in **stdio mode by default** (the transport every MCP client expects), and in **HTTP + dashboard mode** when you pass `--http`. Both modes share the same JSONL storage at `~/.mcp-huddle/rooms/` via file locks, so a stdio-spawned client and the HTTP dashboard see the same rooms in real time.
+`mcp-huddle` runs in **stdio mode by default** (the transport every MCP client expects), and in **HTTP + dashboard mode** when you pass `--http`. Both modes share storage at `~/.mcp-huddle/rooms/` via file locks. JSONL is the default; optional SQLite message history requires explicit offline migration and `MCP_HUDDLE_MESSAGE_STORE=sqlite` for every writer. See [migration and backups](docs/OPS_BACKUPS.md). HTTP mode can serve both existing ports in one process with `--mcp-port`; see [single-server deployment](docs/SINGLE_SERVER.md).
 
 ### 1) Stdio mode — for MCP clients (Claude Code, Codex, Antigravity, Claude Desktop)
 
@@ -89,7 +89,7 @@ Dashboard: <http://127.0.0.1:8014/dashboard>. The dashboard reads the same files
 ## Features
 
 - **MCP tools** for room creation, messaging, rounds, lifecycle status, consensus, and a bounded four-mode swarm pilot
-- **JSONL storage** at `~/.mcp-huddle/rooms/` — grep-able, no DB
+- **Message storage** at `~/.mcp-huddle/rooms/`: JSONL by default, optional SQLite with explicit migration; room metadata remains JSON.
 - **Bounded writes and anti-loop guards**: `kind` enum, per-message dedup,
   a server-side circuit breaker, a persisted 120-messages/minute room limit,
   and hard 256 KiB body / 320 KiB serialized-entry caps
@@ -288,7 +288,7 @@ mcp-huddle is designed to run **locally, on a single trusted machine**:
   default model and is wrapped in a bounded timeout. Headless it is effectively
   read-only anyway — its `"ask"` permissions auto-reject with no TTY to confirm.
 - **All data lives under `~/.mcp-huddle/`** (override with `MCP_HUDDLE_HOME`) as
-  plain JSONL/JSON files. Anything posted to a room is stored in clear text on
+  plain JSONL/JSON files or unencrypted SQLite message databases. Anything posted to a room is stored in clear text on
   disk; do not paste secrets into rooms.
 - **Persisted PIDs are diagnostics, not permission to signal.** Each process
   may terminate only children represented by its own exact `Popen` objects.
@@ -324,7 +324,7 @@ src/mcp_huddle/
   __main__.py   # CLI entrypoint: stdio (default) vs --http (uvicorn + dashboard)
   server.py     # FastMCP server: @mcp.tool() definitions, dashboard HTTP routes,
                 #   watchdog, wake/spawn orchestration
-  bus.py        # storage layer: JSONL rooms under ~/.mcp-huddle, file locks,
+  bus.py        # storage layer: JSONL or opt-in SQLite messages, file locks,
                 #   dedup, resolutions, retention
   child_processes.py          # exact local Popen ownership; no raw-PID signalling
   spawn.py      # SpawnSpec registry + agent process spawning / availability probes
