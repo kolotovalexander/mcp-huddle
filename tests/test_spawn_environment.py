@@ -1,6 +1,8 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from mcp_huddle import child_processes, spawn
 
 
@@ -8,6 +10,21 @@ def _secret_markers(monkeypatch) -> None:
     monkeypatch.setenv("AUDIT_UNRELATED_SECRET", "must-not-pass")
     monkeypatch.setenv("GH_TOKEN", "must-not-pass")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "must-not-pass")
+
+
+@pytest.mark.parametrize("store", ["sqlite", "file"])
+def test_spawn_environment_preserves_message_store_mode_without_secrets(
+    monkeypatch, store: str,
+) -> None:
+    _secret_markers(monkeypatch)
+    monkeypatch.setenv("MCP_HUDDLE_MESSAGE_STORE", store)
+
+    env = spawn._spawn_environment({"name": "runner", "cmd": ["runner"]})
+
+    assert env["MCP_HUDDLE_MESSAGE_STORE"] == store
+    assert "AUDIT_UNRELATED_SECRET" not in env
+    assert "GH_TOKEN" not in env
+    assert "AWS_SECRET_ACCESS_KEY" not in env
 
 
 def test_initial_spawn_passes_only_baseline_and_explicit_provider_env(
