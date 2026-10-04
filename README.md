@@ -179,6 +179,8 @@ All configuration is via environment variables (defaults shown):
 
 Automatic room-data backups, verification and restore steps are documented in
 [docs/OPS_BACKUPS.md](docs/OPS_BACKUPS.md).
+Current local deployment, measured memory use and unverified optimization targets:
+[docs/MEMORY_AND_DEPLOYMENT.md](docs/MEMORY_AND_DEPLOYMENT.md).
 
 ### Opus through an existing Claude Code subscription
 
