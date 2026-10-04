@@ -216,7 +216,7 @@ IDLE_TIMEOUT_SECS = _env_num("IDLE_TIMEOUT_SECS", 600, int)
 # Retention: terminal rooms (closed/resolved) older than this are purged by the
 # background sweep. 0 disables. Sweep runs at most once per RETENTION_SWEEP_SECS
 # (not every zombie-check tick) — deletion is cheap but no need to scan hourly.
-RETENTION_DAYS = _env_num("HUDDLE_RETENTION_DAYS", 7.0, float)
+RETENTION_DAYS = _env_num("HUDDLE_RETENTION_DAYS", 21.0, float)
 RETENTION_SWEEP_SECS = _env_num("HUDDLE_RETENTION_SWEEP_SECS", 3600, int)
 # When a spawned agent exits because it hit its provider usage/rate-limit, do
 # not re-spawn it for this many seconds — a fresh spawn would instantly fail
@@ -2763,6 +2763,15 @@ def _post_swarm_final_if_missing(room_id: str, state: dict) -> int | None:
         # Pilots completed before final replies carried reply_to have an
         # append-only final message. The pending queue recognizes that legacy
         # settlement without rewriting history or publishing a second final.
+        return None
+    # A CLI wrapper may publish its completed turn as a `result` on the final
+    # request instead of the canonical `final` message. That reply settles the
+    # request; retrying the canonical append would be rejected as already
+    # answered on every watchdog tick.
+    if any(msg.get("agent") == member
+           and msg.get("reply_to") == request["id"]
+           and msg.get("kind") in {"result", "final"}
+           for msg in messages):
         return None
     return message_post(
         room_id, member, result, "final", to=state["organizer"],

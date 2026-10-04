@@ -174,8 +174,11 @@ All configuration is via environment variables (defaults shown):
 | `MCP_HUDDLE_OPENCODE_ENABLED` | `0` | Explicitly enable the optional OpenCode slot. It uses OpenCode's configured default model and a bounded initial/wake process timeout. |
 | `MCP_HUDDLE_OPENCODE_TIMEOUT_SEC` | `1200` | Maximum runtime for one OpenCode turn when the slot is enabled. |
 | `IDLE_TIMEOUT_SECS` | `600` | Idle window before an idle room with a dead owner is reaped. |
-| `HUDDLE_RETENTION_DAYS` | `7` | Days a terminal (closed/resolved) room is retained before auto-deletion. |
+| `HUDDLE_RETENTION_DAYS` | `21` | Days a terminal (closed/resolved) room is retained before auto-deletion. |
 | `HUDDLE_RETENTION_SWEEP_SECS` | `3600` | Interval between retention sweeps. |
+
+Automatic room-data backups, verification and restore steps are documented in
+[docs/OPS_BACKUPS.md](docs/OPS_BACKUPS.md).
 
 ### Opus through an existing Claude Code subscription
 

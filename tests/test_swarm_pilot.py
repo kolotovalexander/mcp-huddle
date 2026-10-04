@@ -899,6 +899,38 @@ def test_existing_pilot_final_without_reply_to_is_settled_without_duplicate(
     assert len([msg for msg in bus._load_messages(room) if msg["kind"] == "final"]) == 1
 
 
+def test_watchdog_accepts_member_result_already_answering_final_request(
+    isolated_home, monkeypatch,
+):
+    monkeypatch.setattr(server.spawn, "get_enabled_spec", lambda name: {"name": name})
+    monkeypatch.setattr(server, "_wake_agents_for_request", lambda *args: [])
+    watchdog_errors = []
+    monkeypatch.setattr(server, "_log", lambda message, **kwargs:
+                        watchdog_errors.append(message))
+    room = server.swarm_pilot_create(
+        "result completed final", "Organizer", "Tiny result", "team", ["A"],
+        start=True,
+    )["room_id"]
+    server.swarm_pilot_record(room, "A", "responsibility", "reporter", "Final")
+    first = swarm_pilot.status(room)["dispatched"]["A"]
+    server.message_post(room, "A", "A result", "result", to="Organizer",
+                        reply_to=first)
+    final_request = server.swarm_pilot_round_done(room, "A", "done")["final_request"]
+    # A CLI wrapper can append its terminal result for the final request before
+    # the member calls swarm_pilot_finish in the same turn.
+    server.message_post(room, "A", "Combined final", "result", to="Organizer",
+                        reply_to=final_request, idempotency_key="agent-wake-final")
+    swarm_pilot.finish(room, "A", "Combined final")
+
+    assert server._recover_swarm_pilots() == []
+    assert server._recover_swarm_pilots() == []
+    assert server._agent_replied_to_request(room, "A", final_request)
+    assert not watchdog_errors
+    assert len([msg for msg in bus._load_messages(room)
+                if msg.get("reply_to") == final_request
+                and msg.get("kind") in {"result", "final"}]) == 1
+
+
 @pytest.mark.parametrize("mode", ["council", "relay"])
 def test_watchdog_recovers_next_dispatch_after_persisted_round_done(
     isolated_home, monkeypatch, mode,
