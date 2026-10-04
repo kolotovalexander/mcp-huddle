@@ -26,6 +26,7 @@ from starlette.responses import FileResponse, JSONResponse, StreamingResponse
 
 from . import bus
 from . import child_processes
+from . import jev_judge
 from . import spawn
 
 # Shown to LLM clients in the `initialize` response. Keep tight — every agent
@@ -87,7 +88,8 @@ LIFECYCLE / WAITING:
   `room_status(room_id)` to see `process_alive`, phase, pending request ids,
   and `wait_recommended`; wait while a participant is in an active phase.
 - Agents should report active work with `status_set` and publish the final
-  answer with `message_post(kind="result", ...)`.
+  answer with `message_post(kind="result", ...)`. Optional automatic Jev
+  scoring: attach `meta={"judge": {...}}` — see message_post's docstring.
 
 KIND ENUM (vital — wrong kind breaks anti-loop):
 - `request`: a question/task expecting a reply (auto-notifies addressee)
@@ -410,6 +412,35 @@ def message_post(
       Reply ONLY to kind=request addressed to you (to=your_name or to=all).
       kind=request with reply_to!=null is someone's answer — NOT a new request to you.
       For all other kinds: read silently, do not reply.
+
+    Optional Jev result judging (kind=result or kind=final only): pass
+      meta={"judge": {"task": str, "acceptance_criteria": str, "result": str,
+                       "evidence": str, "version": str, "task_id": str (optional)}}
+      task/acceptance_criteria/result/evidence must be short non-empty
+      strings (each is redacted for private paths/secrets and clipped
+      before any external call — keep them minimal, evidence gets the most
+      room). version is required and must change for each new attempt at
+      the same task_id (default task_id = reply_to); resending the same
+      version is a no-op, and a failed/unavailable Jev attempt also counts
+      as the one attempt for that version — no automatic retries, submit a
+      new version to try again. Verdict routing: ready -> a jev-judge
+      comment only; revise -> comment + a new kind=request back to you;
+      insufficient -> comment + a request to an explicit Claude/Antigravity
+      reviewer already in the room, or (if none present) a needs-review
+      comment addressed to the room owner — never a broadcast to all.
+      Jev's own score (ready/revise/insufficient) is NOT a consumer
+      acceptance and NOT an observed outcome; revise is the only verdict
+      that alone records an action (Huddle really did send it back).
+
+    Optional feedback on a judged result (any kind — usually comment/
+    system): pass meta={"judge_feedback": {"worker": str, "task_id":
+    str (optional, must match the judge request's), "action":
+    "accepted"|"rejected" (optional), "outcome": "success"|"failure"|
+    "partial" (optional)}}. This is how a REAL consumer (a human via the
+    dashboard, or another agent) records what actually happened after a
+    verdict — at least one of action/outcome is required. Until this is
+    reported, a judged result simply has no recorded action/outcome (not
+    fabricated as accepted or successful).
     """
     msg_id = _post_message_checked(room_id, agent, body, kind, to, reply_to, idempotency_key, meta)
     if kind == "request":
@@ -752,6 +783,28 @@ def room_status(room_id: str) -> dict:
     }
 
 
+# Jev evaluation runs on a background thread (see _maybe_judge_result) so a
+# multi-second Jev HTTP call never blocks message_post's return: the
+# installed mcp SDK calls a sync @mcp.tool() function directly on whatever
+# loop is driving the request (verified in
+# mcp/server/fastmcp/utilities/func_metadata.py: `else: return fn(...)`, no
+# thread/executor offload for sync tools), so anything slow done inline here
+# would stall all other MCP traffic on that connection. Plain daemon threads
+# are already this codebase's own pattern for bounded background completion
+# work (see spawn.py's reaper threads) — reused here, not new infrastructure.
+_JUDGE_THREADS: "weakref.WeakSet[threading.Thread]" = weakref.WeakSet()
+_JUDGE_THREADS_LOCK = threading.Lock()
+
+
+def _drain_judge_threads_for_tests(timeout: float = 5.0) -> None:
+    """Test-only: block until in-flight background judge threads finish, so
+    an assertion right after message_post isn't racing the judge thread."""
+    with _JUDGE_THREADS_LOCK:
+        threads = list(_JUDGE_THREADS)
+    for t in threads:
+        t.join(timeout=timeout)
+
+
 def _post_message_checked(
     room_id: str,
     agent: str,
@@ -772,7 +825,83 @@ def _post_message_checked(
     )
     if kind in ("result", "final"):
         _set_agent_phase(room_id, agent, "completed", task_id=reply_to or "")
+        judge_meta = meta.get("judge") if isinstance(meta, dict) else None
+        if judge_meta is not None:
+            _maybe_judge_result(room_id, agent, reply_to, judge_meta)
+    feedback_meta = meta.get("judge_feedback") if isinstance(meta, dict) else None
+    if feedback_meta is not None:
+        _apply_judge_feedback(room_id, feedback_meta)
     return msg_id
+
+
+def _apply_judge_feedback(room_id: str, feedback_meta: Any) -> None:
+    """Opt-in hook for a real consumer to report action/outcome for a judged
+    result via ordinary message metadata (see jev_judge.record_feedback).
+    Local journal writes only, no network call — safe to run inline."""
+    if not isinstance(feedback_meta, dict):
+        return
+    try:
+        jev_judge.record_feedback(
+            room_id,
+            feedback_meta.get("worker"),
+            feedback_meta.get("task_id"),
+            feedback_meta.get("action"),
+            feedback_meta.get("outcome"),
+        )
+    except Exception:
+        pass
+
+
+def _maybe_judge_result(
+    room_id: str,
+    agent: str,
+    reply_to: Optional[int],
+    judge_meta: Any,
+) -> None:
+    """Opt-in Jev judging hook for a just-posted result/final message.
+
+    Runs on a background daemon thread (see _JUDGE_THREADS above) — the
+    triggering message is already durably posted before this is even
+    scheduled, so a Jev failure or slow call can never block or break
+    message_post's return.
+    """
+    thread = threading.Thread(
+        target=_run_judge_in_background,
+        args=(room_id, agent, reply_to, judge_meta),
+        name=f"mcp-huddle-jev-judge-{room_id}",
+        daemon=True,
+    )
+    with _JUDGE_THREADS_LOCK:
+        _JUDGE_THREADS.add(thread)
+    thread.start()
+
+
+def _run_judge_in_background(
+    room_id: str,
+    agent: str,
+    reply_to: Optional[int],
+    judge_meta: Any,
+) -> None:
+    try:
+        verdict = jev_judge.evaluate_result(room_id, agent, reply_to, judge_meta)
+        if verdict is None:
+            return
+        _post_message_checked(
+            room_id, "jev-judge", verdict.comment_body, "comment", verdict.comment_to,
+        )
+        # route_to must be an explicit name here — never None/"all". A bare
+        # comment (no route_body) is how an "insufficient" verdict with no
+        # designated reviewer in the room stays a needs-review note instead
+        # of waking every participant.
+        if verdict.route_body and verdict.route_to:
+            req_id = _post_message_checked(
+                room_id, "jev-judge", verdict.route_body, "request", verdict.route_to,
+            )
+            _wake_agents_for_request(
+                room_id, "jev-judge", verdict.route_body, verdict.route_to, None, req_id,
+            )
+    except Exception:
+        pass
 
 
 # ── Consensus tools ───────────────────────────────────────────────────────────
@@ -1303,7 +1432,14 @@ async def api_message_post(request: Request) -> JSONResponse:
         return denied
     try:
         data = await request.json()
-        msg_id = _post_message_checked(
+        # Jev evaluation itself now runs on its own background thread (see
+        # _maybe_judge_result), so _post_message_checked no longer blocks on
+        # the network call either way. This route still offloads the call
+        # via the stdlib's asyncio.to_thread as a second, cheap safety
+        # margin against any other synchronous work in the same path
+        # (locking/file I/O) stalling the shared uvicorn event loop.
+        msg_id = await asyncio.to_thread(
+            _post_message_checked,
             data["room_id"], data["agent"], data["body"], data["kind"],
             data.get("to"), data.get("reply_to"), data.get("idempotency_key"),
             data.get("meta"),
