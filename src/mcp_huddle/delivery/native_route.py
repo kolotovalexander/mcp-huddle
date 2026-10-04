@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from .targets import Target
+from .targets import Target, HARNESS_PREFIXES
 
 _TOOL_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,160}$")
 _REASON_MAX = 500
@@ -61,3 +61,23 @@ def refusal_for_declared_route(
             result["suggested_tool"] = tool
         return result
     return None
+
+
+def refusal_for_same_harness(target: Target, sender_harness: str,
+                             native_unavailable_reason: str = "") -> dict[str, str] | None:
+    """Advisory routing only: a caller declaration never grants permissions."""
+    sender = sender_harness.strip().lower() if isinstance(sender_harness, str) else ""
+    if sender not in HARNESS_PREFIXES or sender != target.harness:
+        return None
+    if isinstance(native_unavailable_reason, str) and native_unavailable_reason.strip():
+        return None
+    return {
+        "reason": "native_route_required",
+        "note": (
+            "The recipient uses the same harness you declared. Use your native "
+            "session-messaging tools if they can reach this recipient. Nothing was sent. "
+            "If no native route is available, retry with native_unavailable_reason "
+            "briefly explaining why. Do not bypass a permission denial. "
+            "Huddle rooms and collaboration modes remain available."
+        ),
+    }

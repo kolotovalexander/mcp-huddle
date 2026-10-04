@@ -125,7 +125,8 @@ def _refusal(msg_id: str, note: str, reason: Optional[str] = None,
 def message_send(to: str, text: str, mode: str = "auto", from_name: str = "",
                   reply_to: str = "", idempotency_key: str = "",
                   caller: "caller_mod.Caller | None" = None,
-                  native_routes=None) -> str:
+                  native_routes=None, sender_harness: str = "",
+                  native_unavailable_reason: str = "") -> str:
     """Send `text` to `to`, trying delivery methods per the configured order
     (or a single forced method). Returns a JSON string:
     ``{msg_id, delivered, method, attempts, note}``.
@@ -158,7 +159,7 @@ def message_send(to: str, text: str, mode: str = "auto", from_name: str = "",
     # order: resolve only to run the existing readonly and Huddle-ownership
     # guards first. Nonmatching or unknown declarations continue through the
     # pre-existing path below without changing its idempotency behavior.
-    if native_routes is not None:
+    if native_routes is not None or sender_harness:
         try:
             declared_target = targets_mod.resolve(to)
         except (targets_mod.AmbiguousTarget, targets_mod.TargetNotFound):
@@ -185,6 +186,10 @@ def message_send(to: str, text: str, mode: str = "auto", from_name: str = "",
             native_refusal = native_route.refusal_for_declared_route(
                 declared_target, native_routes, original_target=to,
             )
+            if native_refusal is None:
+                native_refusal = native_route.refusal_for_same_harness(
+                    declared_target, sender_harness, native_unavailable_reason,
+                )
             if native_refusal:
                 return _refusal(
                     msg_id, native_refusal["note"],

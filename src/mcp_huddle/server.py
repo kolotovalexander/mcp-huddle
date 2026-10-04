@@ -3803,7 +3803,8 @@ def notify_register(room_id: str, agent: str, notify_file_path: str) -> str:
 @mcp.tool()
 def message_send(to: str, text: str, ctx: Context, mode: str = "auto", from_name: str = "",
                   reply_to: str = "", idempotency_key: str = "",
-                  room_id: str = "", native_routes: Optional[list[dict]] = None) -> str:
+                  room_id: str = "", native_routes: Optional[list[dict]] = None,
+                  sender_harness: str = "", native_unavailable_reason: str = "") -> str:
     """Deliver `text` to another agent session outside this room, picking a
     deterministic "postman" per harness (no LLM) and trying methods in order.
     `text` is sent unchanged inside a small envelope. This tool is for direct
@@ -3816,6 +3817,15 @@ def message_send(to: str, text: str, ctx: Context, mode: str = "auto", from_name
     tool names are hardcoded by this guard. This is self-reported:
     MCP does not expose the caller's live tool catalog. If availability is
     unknown, omit the declaration and normal Huddle routing remains available.
+
+    Always declare `sender_harness` as claude, codex, hermes, opencode, or agy
+    when known. For same-harness direct delivery, first use your native
+    session-messaging tools if they reach the recipient. Otherwise retry with
+    `native_unavailable_reason` explaining the missing capability or unreachable
+    session. A permission denial is not a reason to bypass authorization.
+    This is advisory, self-reported identity, not authentication. Unknown sender
+    identity preserves existing delivery; from_name is never used to infer it.
+    An explicit available native_routes declaration still takes precedence.
 
     `to`: 'claude:<name|sessionId>', 'codex:<threadId|thread_name>',
     'codex://threads/<id>', 'hermes:<peer[/agent]|session>',
@@ -3854,7 +3864,8 @@ def message_send(to: str, text: str, ctx: Context, mode: str = "auto", from_name
     return delivery.message_send(
         to, text, mode=mode, from_name=from_name, reply_to=reply_to,
         idempotency_key=idempotency_key, caller=caller,
-        native_routes=native_routes,
+        native_routes=native_routes, sender_harness=sender_harness,
+        native_unavailable_reason=native_unavailable_reason,
     )
 
 

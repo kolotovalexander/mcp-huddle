@@ -671,3 +671,41 @@ def test_message_targets_lists_resolvable_sessions(claude_dir, codex_home, tmp_p
 
     claude_only = core.message_targets("claude")
     assert {t["harness"] for t in claude_only} == {"claude"}
+
+
+@pytest.mark.parametrize('sender,reason,refused', [
+    ('codex', '', True), (' CODEX ', '  ', True),
+    ('codex', 'Native tool cannot address this session', False),
+    ('claude', '', False), ('', '', False), ('unknown', '', False),
+])
+def test_same_harness_guidance_and_fallback(codex_home, sender, reason, refused):
+    _write_codex_index(codex_home, [{'id': 'same-th', 'thread_name': 'x'}])
+    out = json.loads(core.message_send(
+        'codex:same-th', 'hello', mode='spool', sender_harness=sender,
+        native_unavailable_reason=reason, idempotency_key='same-route',
+    ))
+    assert out['delivered'] is not refused
+    assert len(_spool_files()) == (0 if refused else 1)
+    if refused:
+        assert out['reason'] == 'native_route_required'
+        assert out['attempts'] == []
+        # Refusal must not reserve the key and prevent the explicit fallback.
+        retry = json.loads(core.message_send(
+            'codex:same-th', 'hello', mode='spool', sender_harness=sender,
+            native_unavailable_reason='No exposed native session tool',
+            idempotency_key='same-route',
+        ))
+        assert retry['delivered'] is True
+
+
+def test_same_harness_fallback_does_not_override_guards(codex_home):
+    from mcp_huddle.delivery.caller import Caller
+    _write_codex_index(codex_home, [{'id': 'guard-th', 'thread_name': 'x'}])
+    args = dict(sender_harness='codex', native_unavailable_reason='No native tool')
+    out = json.loads(core.message_send('codex:guard-th', 'hello', mode='spool',
+                                      caller=Caller(readonly=True), **args))
+    assert out['reason'] == 'readonly_caller'
+    out = json.loads(core.message_send('codex:guard-th', 'hello', mode='spool',
+        native_routes=[{'target': 'codex:guard-th', 'available': True}], **args))
+    assert out['reason'] == 'native_route_required'
+    assert _spool_files() == []

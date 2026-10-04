@@ -364,3 +364,19 @@ that omit the header or use another server connection.
 
 `message_send`'s `note` field spells out which of these applies to the final
 result.
+
+### Same-harness direct messages
+
+Declare `sender_harness` (`claude`, `codex`, `hermes`, `opencode`, or `agy`).
+If it matches the resolved recipient, Huddle returns `native_route_required`
+without sending or reserving an idempotency key. Use native session messaging
+if it can reach that recipient. If it cannot, retry with a short nonempty
+`native_unavailable_reason`, for example `No exposed tool can address this session`.
+A permission denial does not authorize using another route.
+
+These fields are caller declarations, not authenticated identity or proof of
+native capability. Unknown senders and different harnesses keep normal delivery.
+The server never infers identity from `from_name` and never hardcodes native tool
+names. An explicit available `native_routes` match still takes precedence.
+Read-only and session-ownership restrictions still apply to fallback. Room
+messages, council, relay, team, and swarm operations are unaffected.
