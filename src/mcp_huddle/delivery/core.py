@@ -18,6 +18,7 @@ from . import config as delivery_config
 from . import envelope as envelope_mod
 from . import idempotency
 from . import methods
+from . import native_route
 from . import ownership
 from . import targets as targets_mod
 
@@ -107,21 +108,24 @@ def _log_attempt(msg_id: str, to: str, harness: str, method: str, ok: bool,
         fh.write(json.dumps(entry) + "\n")
 
 
-def _refusal(msg_id: str, note: str, reason: Optional[str] = None) -> str:
+def _refusal(msg_id: str, note: str, reason: Optional[str] = None,
+             suggested_tool: Optional[str] = None) -> str:
     out = {
         "msg_id": msg_id, "delivered": False, "method": None, "attempts": [], "note": note,
     }
     if reason is not None:
-        # Only the two policy guards below (readonly-caller /
-        # huddle-owned-session) set this; every pre-existing refusal path
+        # Policy guards set this; every pre-existing refusal path
         # keeps its old shape (no "reason" key) for backward compatibility.
         out["reason"] = reason
+    if suggested_tool is not None:
+        out["suggested_tool"] = suggested_tool
     return json.dumps(out)
 
 
 def message_send(to: str, text: str, mode: str = "auto", from_name: str = "",
                   reply_to: str = "", idempotency_key: str = "",
-                  caller: "caller_mod.Caller | None" = None) -> str:
+                  caller: "caller_mod.Caller | None" = None,
+                  native_routes=None) -> str:
     """Send `text` to `to`, trying delivery methods per the configured order
     (or a single forced method). Returns a JSON string:
     ``{msg_id, delivered, method, attempts, note}``.
@@ -148,6 +152,45 @@ def message_send(to: str, text: str, mode: str = "auto", from_name: str = "",
     """
     msg_id = uuid.uuid4().hex[:16]
     cfg = delivery_config.load()
+
+    # For callers that explicitly attest a native route, make the route
+    # decision before reserving an idempotency key. Preserve the authorization
+    # order: resolve only to run the existing readonly and Huddle-ownership
+    # guards first. Nonmatching or unknown declarations continue through the
+    # pre-existing path below without changing its idempotency behavior.
+    if native_routes is not None:
+        try:
+            declared_target = targets_mod.resolve(to)
+        except (targets_mod.AmbiguousTarget, targets_mod.TargetNotFound):
+            declared_target = None
+        if declared_target is not None:
+            readonly_reason = caller_mod.check_readonly_caller(
+                caller, to, cfg, declared_target,
+            )
+            if readonly_reason:
+                return _refusal(
+                    msg_id,
+                    "refused: caller is a read-only Huddle discussant (or its read-only "
+                    "status is unknown) -- message_send would launder that restriction",
+                    reason=readonly_reason,
+                )
+            owned_reason = ownership.check_not_huddle_owned(declared_target)
+            if owned_reason:
+                return _refusal(
+                    msg_id,
+                    "refused: this target is a session/thread Huddle itself currently owns "
+                    "via an active wake claim -- delivering now would run two turns in one history",
+                    reason=owned_reason,
+                )
+            native_refusal = native_route.refusal_for_declared_route(
+                declared_target, native_routes, original_target=to,
+            )
+            if native_refusal:
+                return _refusal(
+                    msg_id, native_refusal["note"],
+                    reason=native_refusal["reason"],
+                    suggested_tool=native_refusal["suggested_tool"],
+                )
 
     if idempotency_key:
         reservation = idempotency.reserve(idempotency_key, msg_id)

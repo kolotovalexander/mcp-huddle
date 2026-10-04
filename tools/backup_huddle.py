@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import stat
 import sys
 import tempfile
@@ -80,6 +81,7 @@ def _copy_locked(home_fd: int, relative: Path, dst: Path, lock_name: str) -> Non
                     raise ValueError(f"Refusing non-regular room data: {relative}")
                 with os.fdopen(source_fd, "rb") as source, dst.open("xb") as target:
                     source_fd = -1
+                    source_stat = os.fstat(source.fileno())
                     shutil.copyfileobj(source, target)
                     target.flush()
                     os.fsync(target.fileno())
@@ -97,9 +99,50 @@ def _copy_locked(home_fd: int, relative: Path, dst: Path, lock_name: str) -> Non
         raise
     finally:
         os.close(parent_fd)
+    # SQLite migration drift checks use size + mtime_ns. Preserve JSONL's
+    # source timestamp so an intact snapshot restored in place stays valid.
+    os.utime(dst, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
     os.chmod(dst, 0o600)
 
 
+def _copy_sqlite_locked(home_fd: int, home: Path, relative: Path,
+                        dst: Path, lock_relative: Path) -> None:
+    """Use SQLite's online backup API so committed WAL data is included."""
+    _reject_symlink_components(home / relative)
+    source = home / relative
+    if not _regular_file(source):
+        raise ValueError(f"Refusing non-regular SQLite database: {relative}")
+    dst.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(dst.parent, 0o700)
+    lock_parent_fd, lock_name = _open_parent_at(home_fd, lock_relative)
+    lock_fd = os.open(lock_name, os.O_RDWR | os.O_APPEND | os.O_CREAT |
+                      getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=lock_parent_fd)
+    try:
+        if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
+            raise ValueError(f"Refusing non-regular lock for {relative}")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(fd)
+        source_db = sqlite3.connect(source, timeout=30)
+        target_db = sqlite3.connect(dst)
+        try:
+            source_db.backup(target_db)
+        finally:
+            target_db.close()
+            source_db.close()
+        with dst.open("rb") as target:
+            os.fsync(target.fileno())
+        os.chmod(dst, 0o600)
+    except Exception:
+        try:
+            dst.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+        os.close(lock_parent_fd)
 def _room_files(home: Path):
     rooms = home / "rooms"
     if rooms.is_symlink():
@@ -114,6 +157,7 @@ def _room_files(home: Path):
         for name, lock_name in (("meta.json", "meta.lock"),
                                 ("status.json", "status.lock"),
                                 ("messages.jsonl", "messages.jsonl"),
+                                ("messages.sqlite3", "messages.jsonl"),
                                 ("notify_registry.json", "notify.lock")):
             source = room / name
             if _regular_file(source):
@@ -254,7 +298,12 @@ def create_backup(home: Path, destination: Path, keep_days: int = 21,
         try:
             for rel, source, lock_path in _source_files(home):
                 target = stage / rel
-                _copy_locked(home_fd, rel, target, lock_path.name)
+                if source.name == "messages.sqlite3":
+                    _copy_sqlite_locked(
+                        home_fd, home, rel, target, lock_path.relative_to(home),
+                    )
+                else:
+                    _copy_locked(home_fd, rel, target, lock_path.name)
                 digest, size = _hash(target)
                 files.append({"path": rel.as_posix(), "sha256": digest, "size": size})
         finally:

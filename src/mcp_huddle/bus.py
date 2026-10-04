@@ -18,11 +18,14 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from . import child_processes
+from . import sqlite_storage as _sqlite_storage
 
 HUDDLE_HOME = Path(os.environ.get("MCP_HUDDLE_HOME", Path.home() / ".mcp-huddle"))
 BUS_DIR = HUDDLE_HOME / "rooms"
 NOTIFICATIONS_DIR = HUDDLE_HOME / "notifications"
 NOTIFICATION_LOCKS_DIR = HUDDLE_HOME / "internal" / "notification-locks"
+MESSAGE_STORE = os.environ.get("MCP_HUDDLE_MESSAGE_STORE", "file").strip().lower()
+_SQLITE_MESSAGE_STORE = MESSAGE_STORE == "sqlite"
 
 
 def _secure_dir(path: Path) -> None:
@@ -44,6 +47,7 @@ MAX_BODY_CHARS = 2000         # per-message body cap in read_messages — one fa
 MAX_STORED_BODY_BYTES = 256 * 1024  # hard persistence cap; unlike
                                     # MAX_BODY_CHARS this rejects, not truncates
 MAX_STORED_MESSAGE_BYTES = 320 * 1024  # complete serialized JSONL entry cap
+MAX_MESSAGE_PAGE_SIZE = 500
 # Machine/process-independent admission control. The persisted room log is the
 # authority, and check+append happen under the same messages lock.
 ROOM_MESSAGE_RATE_LIMIT = 120
@@ -321,6 +325,9 @@ def create_room(name: str, owner: str, owner_pid: int, cwd: str = "",
             "session_id": session_id, "updated_at": now, "source": "server",
         }
     })
+    if _SQLITE_MESSAGE_STORE:
+        with _lock(rdir / "messages.jsonl"):
+            _ensure_sqlite_room_locked(room_id)
     return room_id
 
 
@@ -634,32 +641,39 @@ def post_message(room_id: str, agent: str, body: str, kind: str,
         if cur["status"] == "resolved" and kind not in ("system", "close"):
             raise ValueError("Room is resolved and read-only.")
 
-        # Load the locked history once. Idempotency keys must remain durable
-        # after arbitrarily many later messages and across process restarts.
-        persisted_messages = _load_messages_unlocked(room_id)
-        if idempotency_key:
-            for msg in persisted_messages:
-                if (isinstance(msg, dict)
-                        and msg.get("idempotency_key") == idempotency_key
-                        and "id" in msg):
-                    return msg["id"]
-
-        _check_room_rate_locked(persisted_messages, int(time.time()))
-
-        # Check and append are one atomic decision. Previously two concurrent
-        # posts could both pass the pre-lock check and exceed the streak cap.
-        # Human override retains its documented bypass.
-        if agent != "Human" and kind not in ("request", "system"):
-            _check_circuit_breaker_messages(persisted_messages, agent)
-
-        # reply_to validation — done under the messages lock so the check is
-        # atomic with the append below: a parallel duplicate reply from the
-        # same agent cannot slip through the gap between validate and write.
-        if reply_to is not None:
-            _validate_reply_to_locked(room_id, int(reply_to), agent, kind)
-
-        # Assign next ID
-        msg_id = _next_id(msgs_file)
+        sqlite_mode = _sqlite_mode_for_write(room_id)
+        if sqlite_mode:
+            _require_sqlite_room_locked(room_id)
+            if idempotency_key:
+                duplicate = _sqlite_storage.find_idempotency(rdir, idempotency_key)
+                if duplicate is not None:
+                    return duplicate
+            now = int(time.time())
+            recent = _sqlite_storage.since_time(
+                rdir, now - ROOM_MESSAGE_RATE_WINDOW_SECS,
+            )
+            _check_room_rate_locked(recent, now)
+            last_messages = _sqlite_storage.recent(rdir, CIRCUIT_BREAKER_WINDOW)
+            if agent != "Human" and kind not in ("request", "system"):
+                _check_circuit_breaker_messages(last_messages, agent)
+            if reply_to is not None:
+                _validate_reply_to_sqlite_locked(room_id, int(reply_to), agent, kind)
+            msg_id = _sqlite_storage.next_id(rdir)
+        else:
+            # File mode retains its locked history semantics.
+            persisted_messages = _load_messages_unlocked(room_id)
+            if idempotency_key:
+                for msg in persisted_messages:
+                    if (isinstance(msg, dict)
+                            and msg.get("idempotency_key") == idempotency_key
+                            and "id" in msg):
+                        return msg["id"]
+            _check_room_rate_locked(persisted_messages, int(time.time()))
+            if agent != "Human" and kind not in ("request", "system"):
+                _check_circuit_breaker_messages(persisted_messages, agent)
+            if reply_to is not None:
+                _validate_reply_to_locked(room_id, int(reply_to), agent, kind)
+            msg_id = _next_id(msgs_file)
 
         entry: dict = {
             "id": msg_id,
@@ -685,8 +699,11 @@ def post_message(room_id: str, agent: str, body: str, kind: str,
                 entry["meta"] = clean
 
         serialized = _serialize_message_entry(entry)
-        f.seek(0, 2)  # EOF
-        f.write(serialized + "\n")
+        if sqlite_mode:
+            _sqlite_storage.append(rdir, entry)
+        else:
+            f.seek(0, 2)  # EOF
+            f.write(serialized + "\n")
 
     # Update activity in meta.
     def update_activity(current: dict) -> dict:
@@ -738,6 +755,26 @@ def _validate_reply_to_locked(room_id: str, target_id: int, agent: str, kind: st
             and m.get("agent") == agent
             and m.get("kind") in {"result", "final"}
             for m in messages):
+        raise ValueError(f"{agent} already answered request #{target_id}")
+
+
+def _validate_reply_to_sqlite_locked(room_id: str, target_id: int,
+                                     agent: str, kind: str) -> None:
+    room_dir = _room_dir(room_id)
+    target = _sqlite_storage.get(room_dir, target_id)
+    if target is None:
+        raise ValueError("reply_to target not found")
+    if target.get("kind") != "request":
+        if kind == "comment":
+            return
+        raise ValueError("reply_to target must be a request for this message kind")
+    target_to = target.get("to")
+    if agent not in ("Human", "System") and target_to and target_to not in ("all", agent):
+        raise ValueError(
+            f"reply_to target #{target_id} was addressed to {target_to!r}, "
+            f"not to {agent!r}")
+    if kind in {"result", "final"} and _sqlite_storage.has_terminal_reply(
+            room_dir, target_id, agent):
         raise ValueError(f"{agent} already answered request #{target_id}")
 
 
@@ -796,6 +833,84 @@ def read_messages(room_id: str, since_id: int = 0, limit: int = 20,
     if not msgs:
         lines.append("(no new messages)")
     return "\n".join(lines)
+
+
+def read_message_page(room_id: str, before_id: int | None = None,
+                      after_id: int = 0, limit: int = 100) -> dict:
+    """Return a bounded message page in ascending ID order.
+
+    ``before_id`` selects the newest page strictly before that ID;
+    ``after_id`` selects the earliest page strictly after it. With neither,
+    return the latest page. Legacy file mode parses the log but caches it only
+    while the global byte budget permits.
+    """
+    if (isinstance(limit, bool) or not isinstance(limit, int)
+            or not 1 <= limit <= MAX_MESSAGE_PAGE_SIZE):
+        raise ValueError(f"limit must be an integer from 1 to {MAX_MESSAGE_PAGE_SIZE}")
+    if before_id is not None and after_id:
+        raise ValueError("before_id and after_id cannot both be set")
+    for label, value in (("before_id", before_id), ("after_id", after_id)):
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+            raise ValueError(f"{label} must be a non-negative integer")
+
+    rdir = _room_dir(room_id)
+    if _sqlite_room_enabled(rdir):
+        lock_path = rdir / "messages.jsonl"
+        with _lock(lock_path):
+            _require_sqlite_room_locked(room_id)
+            return _sqlite_storage.page(
+                rdir, before_id=before_id, after_id=after_id, limit=limit,
+            )
+
+    messages = _load_messages(room_id)
+    all_ids = [m["id"] for m in messages if isinstance(m, dict) and "id" in m]
+    if before_id is not None:
+        eligible = [m for m in messages if m.get("id", 0) < before_id]
+        selected = eligible[-limit:]
+        has_more = len(eligible) > limit
+    elif after_id:
+        eligible = [m for m in messages if m.get("id", 0) > after_id]
+        selected = eligible[:limit]
+        has_more = len(eligible) > limit
+    else:
+        selected = messages[-limit:]
+        has_more = len(messages) > limit
+    return {
+        "messages": selected,
+        "has_more": has_more,
+        "oldest_id": min(all_ids) if all_ids else None,
+        "latest_id": max(all_ids) if all_ids else None,
+    }
+
+
+def export_sqlite_history_to_jsonl(room_id: str) -> int:
+    """Atomically restore the current SQLite history to the legacy file store.
+
+    Stop all Huddle processes before calling this administrative rollback API.
+    It serializes the current database, then marks SQLite inactive under the
+    same room lock so a subsequent file-mode process has one source of truth.
+    """
+    room_dir = _room_dir(room_id)
+    lock_path = room_dir / "messages.jsonl"
+    with _lock(lock_path):
+        if not _sqlite_storage.is_active(room_dir):
+            raise ValueError("Room does not have an active SQLite message store")
+        _require_sqlite_room_locked(room_id)
+        messages = _sqlite_storage.load_all(room_dir)
+        raw = "".join(_serialize_message_entry(message) + "\n" for message in messages)
+        _atomic_write_text(lock_path, raw)
+        st = _safe_stat(lock_path)
+        _sqlite_storage.mark_exported(room_dir, st.st_size, st.st_mtime_ns)
+        _evict_msg_cache(room_id)
+        return len(messages)
+
+
+def migrate_room_to_sqlite(room_id: str) -> int:
+    """Explicitly migrate one room; caller must stop all Huddle processes."""
+    room_dir = _room_dir(room_id)
+    with _lock(room_dir / "messages.jsonl"):
+        _ensure_sqlite_room_locked(room_id)
+        return len(_sqlite_storage.load_all(room_dir))
 
 
 def summarize_messages(room_id: str, since_id: int = 0, round: int = 0) -> str:
@@ -1324,6 +1439,8 @@ _msg_cache_lock = threading.Lock()
 # Cap the cache so it can't grow unbounded across many rooms. Oldest entries are
 # evicted FIFO/LRU-ish on insert (room deletion also evicts via _evict_msg_cache).
 _MSG_CACHE_MAX = 256
+_MSG_CACHE_MAX_BYTES = 8 * 1024 * 1024
+_msg_cache_bytes = 0
 
 
 def _parse_messages_text(raw: str) -> list[dict]:
@@ -1339,7 +1456,12 @@ def _parse_messages_text(raw: str) -> list[dict]:
 
 
 def _load_messages(room_id: str) -> list[dict]:
-    p = _room_dir(room_id) / "messages.jsonl"
+    rdir = _room_dir(room_id)
+    p = rdir / "messages.jsonl"
+    if _sqlite_room_enabled(rdir):
+        with _lock(p):
+            _require_sqlite_room_locked(room_id)
+        return _sqlite_storage.load_all(rdir)
     try:
         st = _safe_stat(p)
     except (FileNotFoundError, NotADirectoryError):
@@ -1366,11 +1488,21 @@ def _load_messages(room_id: str) -> list[dict]:
     msgs = _parse_messages_text(raw)
     with _msg_cache_lock:
         # Re-insert at the tail (LRU-ish) then evict the oldest while over cap.
-        _msg_cache.pop(pstr, None)
-        _msg_cache[pstr] = (key, msgs)
-        while len(_msg_cache) > _MSG_CACHE_MAX:
+        global _msg_cache_bytes
+        previous = _msg_cache.pop(pstr, None)
+        if previous:
+            _msg_cache_bytes -= previous[2] if len(previous) > 2 else 0
+        # Parsed Python dictionaries/strings cost several times the JSONL
+        # bytes. Use a conservative multiplier for a bounded cache estimate.
+        cache_cost = fst.st_size * 4
+        if cache_cost <= _MSG_CACHE_MAX_BYTES:
+            _msg_cache[pstr] = (key, msgs, cache_cost)
+            _msg_cache_bytes += cache_cost
+        while len(_msg_cache) > _MSG_CACHE_MAX or _msg_cache_bytes > _MSG_CACHE_MAX_BYTES:
             oldest = next(iter(_msg_cache))
-            _msg_cache.pop(oldest, None)
+            removed = _msg_cache.pop(oldest, None)
+            if removed:
+                _msg_cache_bytes -= removed[2] if len(removed) > 2 else 0
     return msgs
 
 
@@ -1378,7 +1510,11 @@ def _load_messages_unlocked(room_id: str) -> list[dict]:
     """Parse messages WITHOUT taking the messages lock. Only safe to call from
     code that already holds the LOCK_EX on messages.jsonl (re-locking the same
     file from a second fd in the same thread would deadlock)."""
-    p = _room_dir(room_id) / "messages.jsonl"
+    rdir = _room_dir(room_id)
+    if _sqlite_room_enabled(rdir):
+        _require_sqlite_room_locked(room_id)
+        return _sqlite_storage.load_all(rdir)
+    p = rdir / "messages.jsonl"
     try:
         return _parse_messages_text(_safe_read_text(p))
     except (FileNotFoundError, NotADirectoryError):
@@ -1388,7 +1524,75 @@ def _load_messages_unlocked(room_id: str) -> list[dict]:
 def _evict_msg_cache(room_id: str) -> None:
     pstr = str(_room_dir(room_id) / "messages.jsonl")
     with _msg_cache_lock:
-        _msg_cache.pop(pstr, None)
+        global _msg_cache_bytes
+        removed = _msg_cache.pop(pstr, None)
+        if removed:
+            _msg_cache_bytes -= removed[2] if len(removed) > 2 else 0
+
+
+def _sqlite_room_enabled(room_dir: Path) -> bool:
+    return _SQLITE_MESSAGE_STORE or _sqlite_storage.is_active(room_dir)
+
+
+def _sqlite_mode_for_write(room_id: str) -> bool:
+    room_dir = _room_dir(room_id)
+    if _SQLITE_MESSAGE_STORE:
+        if not _sqlite_storage.is_active(room_dir):
+            raise RuntimeError(
+                "This room has legacy file history but SQLite is enabled. Run "
+                "tools/migrate_huddle_messages.py after stopping every Huddle process."
+            )
+        return True
+    if _sqlite_storage.is_active(room_dir):
+        raise RuntimeError(
+            "This room uses SQLite message storage. Set MCP_HUDDLE_MESSAGE_STORE=sqlite "
+            "before starting Huddle; file writers are disabled to prevent mixed history."
+        )
+    return False
+
+
+def _ensure_sqlite_room_locked(room_id: str) -> None:
+    room_dir = _room_dir(room_id)
+    legacy_path = room_dir / "messages.jsonl"
+    try:
+        legacy_messages = _parse_legacy_messages_strict(_safe_read_text(legacy_path))
+    except (FileNotFoundError, NotADirectoryError):
+        legacy_messages = []
+    _sqlite_storage.ensure_room(room_dir, room_id, legacy_messages)
+
+
+def _require_sqlite_room_locked(room_id: str) -> None:
+    room_dir = _room_dir(room_id)
+    if not _sqlite_storage.is_active(room_dir):
+        raise RuntimeError(
+            "SQLite message history is not activated for this room. Run "
+            "tools/migrate_huddle_messages.py after stopping every Huddle process."
+        )
+    _sqlite_storage.validate_legacy_fingerprint(room_dir)
+
+
+def _parse_legacy_messages_strict(raw: str) -> list[dict]:
+    """Reject malformed legacy history; migration must never skip a line."""
+    messages = []
+    previous_id = 0
+    for line_number, line in enumerate(raw.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid messages.jsonl line {line_number}; migration aborted") from exc
+        if (not isinstance(message, dict)
+                or isinstance(message.get("id"), bool)
+                or not isinstance(message.get("id"), int)
+                or message["id"] <= previous_id):
+            raise ValueError(
+                f"Invalid or out-of-order message ID at messages.jsonl line {line_number}; "
+                "migration aborted"
+            )
+        previous_id = message["id"]
+        messages.append(message)
+    return messages
 
 
 def _next_id(msgs_file: Path) -> int:
@@ -1524,7 +1728,12 @@ def _append_terminal_system(room_id: str, text: str) -> int:
         raise ValueError("System message body is too large")
     msgs_file = _room_dir(room_id) / "messages.jsonl"
     with _lock(msgs_file) as f:
-        msg_id = _next_id(msgs_file)
+        sqlite_mode = _sqlite_mode_for_write(room_id)
+        if sqlite_mode:
+            _require_sqlite_room_locked(room_id)
+            msg_id = _sqlite_storage.next_id(_room_dir(room_id))
+        else:
+            msg_id = _next_id(msgs_file)
         entry = {
             "id": msg_id,
             "agent": "System",
@@ -1533,8 +1742,11 @@ def _append_terminal_system(room_id: str, text: str) -> int:
             "body": text,
         }
         serialized = _serialize_message_entry(entry)
-        f.seek(0, 2)
-        f.write(serialized + "\n")
+        if sqlite_mode:
+            _sqlite_storage.append(_room_dir(room_id), entry)
+        else:
+            f.seek(0, 2)
+            f.write(serialized + "\n")
     return msg_id
 
 

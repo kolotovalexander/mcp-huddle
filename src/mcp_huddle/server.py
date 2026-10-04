@@ -3803,17 +3803,31 @@ def notify_register(room_id: str, agent: str, notify_file_path: str) -> str:
 @mcp.tool()
 def message_send(to: str, text: str, ctx: Context, mode: str = "auto", from_name: str = "",
                   reply_to: str = "", idempotency_key: str = "",
-                  room_id: str = "") -> str:
+                  room_id: str = "", native_routes: Optional[list[dict]] = None) -> str:
     """Deliver `text` to another agent session outside this room, picking a
     deterministic "postman" per harness (no LLM) and trying methods in order.
-    `text` is sent unchanged inside a small envelope.
+    `text` is sent unchanged inside a small envelope. This tool is for direct
+    cross-session delivery. Keep persistent shared-room, council, relay, team,
+    and swarm work in Huddle. If a native tool available to this caller can
+    reach the exact `to` target, declare it in `native_routes`; Huddle refuses
+    that delivery before transport and returns the tool name to use. Example:
+    `native_routes=[{"target":"codex:<thread-id>",
+    "tool":"mcp__codex_app__send_message_to_thread",
+    "reason":"available in this caller session"}]`. This is self-reported:
+    MCP does not expose the caller's live tool catalog. If availability is
+    unknown, omit the declaration and normal Huddle routing remains available.
 
     `to`: 'claude:<name|sessionId>', 'codex:<threadId|thread_name>',
     'codex://threads/<id>', 'hermes:<peer[/agent]|session>',
     'opencode:<sessionId>', 'agy:<conversationId>', or a bare name.
     `mode`: 'auto' (default) or a forced method id, e.g. 'claude.native'.
+    `native_routes`: optional caller declaration of exact destinations and
+    native tools already available to this caller. A matching exact route is
+    refused before delivery; MCP cannot independently verify this declaration.
 
-    Returns JSON: {msg_id, delivered, method, attempts, note}. `delivered`
+    Returns JSON: {msg_id, delivered, method, attempts, note}. A declared
+    native-route refusal also includes `reason=native_route_required` and
+    `suggested_tool`. `delivered`
     for a resume/spool method means the attempt started/was queued, not that
     it was read. See docs/delivery.md.
     """
@@ -3840,6 +3854,7 @@ def message_send(to: str, text: str, ctx: Context, mode: str = "auto", from_name
     return delivery.message_send(
         to, text, mode=mode, from_name=from_name, reply_to=reply_to,
         idempotency_key=idempotency_key, caller=caller,
+        native_routes=native_routes,
     )
 
 
@@ -4396,16 +4411,45 @@ async def api_messages_json(request: Request) -> JSONResponse:
     room_id = request.query_params.get("room_id", "")
     try:
         since = int(request.query_params.get("since_id", 0))
-        msgs = bus._load_messages(room_id)
-        if since > 0:
-            msgs = [m for m in msgs if m["id"] > since]
+        # Paging is opt-in so existing clients keep the historical full
+        # response (including the legacy since_id filter) by default.
+        page_mode = "limit" in request.query_params
+        page = None
+        if page_mode:
+            limit = int(request.query_params["limit"])
+            before_raw = request.query_params.get("before_id")
+            before_id = int(before_raw) if before_raw is not None else None
+            after_id = int(request.query_params.get("after_id", 0))
+            if limit < 1 or limit > 500:
+                raise ValueError("limit must be between 1 and 500")
+            if before_id is not None and before_id < 1:
+                raise ValueError("before_id must be a positive integer")
+            if after_id < 0:
+                raise ValueError("after_id must be a non-negative integer")
+            if before_id is not None and after_id:
+                raise ValueError("before_id and after_id cannot be used together")
+            if since:
+                raise ValueError("since_id cannot be used with paged messages")
+            page = bus.read_message_page(
+                room_id, before_id=before_id, after_id=after_id, limit=limit,
+            )
+            msgs = page["messages"]
+        else:
+            msgs = bus._load_messages(room_id)
+            if since > 0:
+                msgs = [m for m in msgs if m["id"] > since]
         room_meta = bus._read_meta(room_id)
         status_details = bus.get_status_details(room_id)
         statuses = {name: info["status"] for name, info in status_details.items()}
         phases = {name: info.get("phase", "online")
                   for name, info in status_details.items()}
-        return JSONResponse({"messages": msgs, "room": room_meta,
-                             "statuses": statuses, "phases": phases})
+        response = {"messages": msgs, "room": room_meta,
+                    "statuses": statuses, "phases": phases}
+        if page is not None:
+            response.update({key: page[key] for key in (
+                "has_more", "oldest_id", "latest_id",
+            )})
+        return JSONResponse(response)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 

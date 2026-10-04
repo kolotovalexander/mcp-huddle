@@ -77,6 +77,62 @@ def test_message_send_target_not_found(codex_home):
     assert out["attempts"] == []
 
 
+def test_declared_native_route_refuses_before_transport_or_idempotency(codex_home, monkeypatch):
+    _write_codex_index(codex_home, [{"id": "native-th", "thread_name": "x", "updated_at": 1}])
+    reserved = []
+    finished = []
+    monkeypatch.setattr(core.idempotency, "reserve", lambda *args: reserved.append(args))
+    monkeypatch.setattr(core.idempotency, "finish", lambda *args: finished.append(args))
+    out = json.loads(core.message_send(
+        "codex:native-th", "please handle this", mode="spool",
+        idempotency_key="native-route",
+        native_routes=[{
+            "target": "codex:native-th",
+            "tool": "mcp__codex_app__send_message_to_thread",
+            "reason": "The caller confirmed this tool can reach this thread.",
+        }],
+    ))
+    assert out["delivered"] is False
+    assert out["attempts"] == []
+    assert out["reason"] == "native_route_required"
+    assert out["suggested_tool"] == "mcp__codex_app__send_message_to_thread"
+    assert "caller confirmed" in out["note"]
+    assert _spool_files() == []
+    assert reserved == []
+    assert finished == []
+
+
+def test_unknown_native_availability_keeps_huddle_fallback(codex_home):
+    _write_codex_index(codex_home, [{"id": "unknown-th", "thread_name": "x", "updated_at": 1}])
+    out = json.loads(core.message_send("codex:unknown-th", "please handle this", mode="spool"))
+    assert out["delivered"] is True
+    assert out["method"] == "spool"
+    assert len(_spool_files()) == 1
+
+
+def test_nonmatching_native_route_does_not_block_other_direct_targets(codex_home):
+    _write_codex_index(codex_home, [{"id": "room-th", "thread_name": "x", "updated_at": 1}])
+    out = json.loads(core.message_send(
+        "codex:room-th", "persistent council result", mode="spool",
+        native_routes=[{
+            "target": "codex:another-thread",
+            "tool": "collaboration.send_message",
+            "reason": "Internal subagent handoff only.",
+        }],
+    ))
+    assert out["delivered"] is True
+    assert out["method"] == "spool"
+
+
+def test_shared_room_workflow_remains_available():
+    from mcp_huddle import bus, server
+
+    room_id = server.room_create("council", owner="Organizer", owner_pid=0)
+    message_id = server.message_post(room_id, "Organizer", "review the proposal", "request")
+    assert message_id > 0
+    assert "review the proposal" in bus.read_messages(room_id)
+
+
 def test_message_send_ambiguous_target(claude_dir, codex_home, tmp_path):
     sock = tmp_path / "s.sock"
     sock.write_text("")

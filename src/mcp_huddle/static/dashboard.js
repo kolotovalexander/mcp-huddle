@@ -211,6 +211,7 @@ const I18N = {
     'btn.view': 'View', 'btn.live': 'live', 'btn.copy': 'Copy', 'btn.send': 'Send',
     'btn.search': 'Search',
     'room.owner': 'Owner', 'room.round': 'Round', 'room.noRound': 'No recorded round', 'room.messages': 'messages',
+    'history.older': 'Load older messages', 'history.newer': 'Load newer messages', 'history.openMessage': 'Open the referenced message', 'history.windowTotals': 'Totals for loaded messages', 'history.loadedSuffix': 'loaded', 'history.loadError': 'Could not load message history: {error}', 'history.retry': 'Retry',
     'room.created': 'Created', 'room.updated': 'Updated',
     'room.copyName': 'Copy name', 'room.copyId': 'Copy room ID',
     'room.copied': 'Copied', 'room.copyFailed': 'Copy failed',
@@ -337,6 +338,7 @@ const I18N = {
     'btn.view': 'Вид', 'btn.live': 'онлайн', 'btn.copy': 'Копировать', 'btn.send': 'Отправить',
     'btn.search': 'Поиск', 'search.placeholder': 'Название комнаты или слова из переписки',
     'room.owner': 'Владелец', 'room.round': 'Раунд', 'room.noRound': 'Раунд не задан', 'room.messages': 'сообщений',
+    'history.older': 'Загрузить более ранние сообщения', 'history.newer': 'Загрузить новые сообщения', 'history.openMessage': 'Открыть исходное сообщение', 'history.windowTotals': 'Сумма по загруженным сообщениям', 'history.loadedSuffix': 'загружено', 'history.loadError': 'Не удалось загрузить историю сообщений: {error}', 'history.retry': 'Повторить',
     'room.created': 'Создана', 'room.updated': 'Обновлена',
     'room.copyName': 'Копировать имя', 'room.copyId': 'Копировать ID комнаты',
     'room.copied': 'Скопировано', 'room.copyFailed': 'Не удалось скопировать',
@@ -603,14 +605,18 @@ function messageRecipientLabel(to) {
 }
 
 // ── State ─────────────────────────────────────────────────
-let currentRoom = null, currentOwner = null, lastId = 0;
+let currentRoom = null, currentOwner = null, lastId = 0, roomViewGeneration = 0, messagePageGeneration = 0, messageNavigationGeneration = 0;
 let rooms = [], msgMap = {};
 let searchResults = null, searchPending = false, searchTimer = null, searchSequence = 0;
 let agentMetaTotals = {}; // {agentName: {tokens_total, tokens_in, tokens_out, msgs, models:Set, last_reasoning}}
 let lastStatuses = {};    // {agentName: 'online'|'busy'|...} — latest room status snapshot
 let lastPhases = {};      // lifecycle phase explicitly reported by agent/server
 let lastHealth = {};      // wake-health from /api/room_agents (rate-limit window, last wake)
+const MESSAGE_PAGE_SIZE = 100, MESSAGE_WINDOW_LIMIT = 300;
 let roomMessages = [], laneCollapsed = false, composerKind = 'request', lastRenderedRound = null;
+let hasOlderMessages = false, hasNewerMessages = false, messageWindowAtTail = true;
+let latestKnownMessageId = 0;
+let legacyMessagesEndpoint = false;
 let selectedReplyTarget = null;
 let roomData = null;
 
@@ -1169,6 +1175,13 @@ function buildChatShell(room) {
   const lanes = el('section', {class: 'room-lanes', id: 'room-lanes', 'aria-label': t('lanes.title')});
   const swarmPanel = el('section', {class: 'swarm-pilot', id: 'swarm-pilot', hidden: '', 'aria-label': t('swarm.title')});
   const messages = el('div', {class: 'messages', id: 'messages'});
+  const olderButton = el('button', {type: 'button', class: 'message-page-action', id: 'messages-load-older', text: t('history.older')});
+  olderButton.hidden = true;
+  olderButton.onclick = () => loadMessagePage('older');
+  const newerButton = el('button', {type: 'button', class: 'message-page-action', id: 'messages-load-newer', text: t('history.newer')});
+  newerButton.hidden = true;
+  newerButton.onclick = () => loadMessagePage('newer');
+  messages.append(olderButton, newerButton);
 
   const inputAttrs = {
     id: 'human-inp',
@@ -1418,6 +1431,7 @@ function renderSwarmPilot(room) {
 }
 
 async function openRoom(id, owner) {
+  roomViewGeneration += 1;
   currentRoom = id;
   currentOwner = owner;
   selectedReplyTarget = null;
@@ -1425,6 +1439,11 @@ async function openRoom(id, owner) {
   lastId = 0;
   msgMap = {};
   roomMessages = [];
+  hasOlderMessages = false;
+  hasNewerMessages = false;
+  messageWindowAtTail = true;
+  latestKnownMessageId = 0;
+  legacyMessagesEndpoint = false;
   roomData = null;
   lastPhases = {};
   lastHealth = {};
@@ -1792,7 +1811,7 @@ async function attachAgentPanels(roomId) {
       el('span', {class: 'agent-panel-name', text: name}),
       el('span', {class: `agent-status-dot ${isFailed ? 'failed' : 'offline'}`, id: `agent-sdot-${name}`,
                   title: outcome ? `${name}: ${swarmOutcomeText(outcome)}` : `${name}: offline`}),
-      el('span', {class: 'agent-panel-totals', id: `agent-totals-${name}`, text: ''}),
+      el('span', {class: 'agent-panel-totals', id: `agent-totals-${name}`, title: t('history.windowTotals'), text: ''}),
       el('span', {class: `agent-panel-status${isFailed ? ' failed' : ''}`, id: `agent-status-${name}`,
                   text: outcome ? swarmOutcomeText(outcome) : (isSpawned ? t('activity.pending') : t('activity.noStream'))}),
       healthSpan,
@@ -2102,6 +2121,9 @@ function updateAgentTranscripts(messages) {
       if (id <= lastId) continue;
       if (message.agent === name || message.to === name || message.to === 'all') {
         content.appendChild(agentTranscriptMessage(message));
+        while (content.querySelectorAll('.agent-transcript-message').length > MESSAGE_WINDOW_LIMIT) {
+          content.querySelector('.agent-transcript-message')?.remove();
+        }
         const summary = transcript.querySelector('summary');
         if (summary) {
           const count = content.querySelectorAll('.agent-transcript-message').length;
@@ -2115,14 +2137,31 @@ function updateAgentTranscripts(messages) {
   });
 }
 
-function renderOne(m) {
+function refreshAgentTranscripts() {
+  document.querySelectorAll('.agent-transcript').forEach(transcript => {
+    const name = transcript.dataset.agent;
+    const content = transcript.querySelector('.agent-transcript-scroll');
+    if (!content) return;
+    const relevant = transcriptMessagesFor(name, roomMessages);
+    content.replaceChildren(...relevant.map(agentTranscriptMessage));
+    content.dataset.lastId = String(roomMessages.reduce(
+      (max, message) => Math.max(max, Number(message.id) || 0), 0,
+    ));
+    const summary = transcript.querySelector('summary');
+    if (summary) summary.textContent = `${t('activity.transcript')} · ${relevant.length}`;
+  });
+}
+
+function renderOne(m, scrollToEnd = true) {
   const list = document.getElementById('messages');
   if (!list) return;
+  const newerButton = document.getElementById('messages-load-newer');
+  const appendNode = node => newerButton ? list.insertBefore(node, newerButton) : list.appendChild(node);
   msgMap[m.id] = {id: Number(m.id), body: m.body, agent: m.agent};
   const round = Number(m.round) > 0 ? Number(m.round) : 0;
   if (round !== lastRenderedRound) {
     const label = round ? `${t('round.label')} ${round}` : t('round.discussion');
-    list.appendChild(el('div', {class: 'round-divider'}, [el('span', {text: label})]));
+    appendNode(el('div', {class: 'round-divider'}, [el('span', {text: label})]));
     lastRenderedRound = round;
   }
 
@@ -2134,8 +2173,8 @@ function renderOne(m) {
       el('div', {class: 'msg-body', text: m.body}),
       replyButton(m),
     ]);
-    list.appendChild(div);
-    list.scrollTop = list.scrollHeight;
+    appendNode(div);
+    if (scrollToEnd) list.scrollTop = list.scrollHeight;
     return;
   }
 
@@ -2171,6 +2210,16 @@ function renderOne(m) {
         el('div', {class: 'reply-text', text: preview}),
       ]),
     ]);
+    replyEl.title = t('history.openMessage');
+    replyEl.setAttribute('role', 'button');
+    replyEl.tabIndex = 0;
+    replyEl.onclick = () => navigateToMessage(m.reply_to);
+    replyEl.onkeydown = event => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        navigateToMessage(m.reply_to);
+      }
+    };
     replyEl.querySelector('.reply-bar').style.background = replyAgentColor;
     replyEl.querySelector('.reply-name').style.color = replyAgentColor;
     bubble.appendChild(replyEl);
@@ -2200,8 +2249,8 @@ function renderOne(m) {
     el('div', {class: 'msg-content'}, [line, el('div', {class: 'msg-main'}, [kindLine, bubble])]),
   ]);
 
-  list.appendChild(div);
-  list.scrollTop = list.scrollHeight;
+  appendNode(div);
+  if (scrollToEnd) list.scrollTop = list.scrollHeight;
 }
 
 // Lane state comes only from the live snapshot: explicit phase first, then the
@@ -2310,9 +2359,7 @@ function renderRoomLanes(room, statuses) {
         'aria-label': `${name}: ${messageKindLabel(m.kind)} #${m.id}`});
       tick.style.left = pos(m.timestamp);
       tick.onclick = () => {
-        const target = document.querySelector(`#messages .msg[data-id="${m.id}"]`);
-        if (target) { target.scrollIntoView({block: 'center'}); target.classList.add('lane-flash');
-          setTimeout(() => target.classList.remove('lane-flash'), 1500); }
+        navigateToMessage(m.id);
       };
       track.appendChild(tick);
     }
@@ -2332,7 +2379,7 @@ function renderRoomLanes(room, statuses) {
     if (expanded.has(name)) log.open = true;
     log.querySelectorAll('.lane-log-body button').forEach((b, i) => {
       b.onclick = () => { const m = relevant[i]; const target = document.querySelector(`#messages .msg[data-id="${m.id}"]`);
-        if (target) target.scrollIntoView({block: 'center'}); };
+        if (target) target.scrollIntoView({block: 'center'}); else navigateToMessage(m.id); };
     });
     const detail = laneDetail(room, name, phase, authored);
     root.appendChild(el('div', {class: 'lane-row' + (LANE_ACTIVE.has(phase) ? ' is-active' : ''),
@@ -2402,7 +2449,9 @@ function renderChatMeta(room, statuses) {
   const details = [t(`status.${room.status}`)];
   details.push(activeRound ? `${t('room.round')} ${activeRound}` : t('room.noRound'));
   if (room.owner) details.push(`${t('room.owner')} ${room.owner}`);
-  details.push(messageCount(roomMessages.length));
+  const loadedCount = messageCount(roomMessages.length);
+  details.push(hasOlderMessages || hasNewerMessages
+    ? `${loadedCount} ${t('history.loadedSuffix')}` : loadedCount);
   if (room.created_at) details.push(`${t('room.created')} ${fmtDateTime(room.created_at)}`);
   if (room.last_activity) details.push(`${t('room.updated')} ${fmtDateTime(room.last_activity)}`);
   meta.textContent = details.join('  /  ');
@@ -2414,38 +2463,184 @@ function renderChatMeta(room, statuses) {
 async function fetchMessages(initial) {
   if (!currentRoom) return;
   const requestedRoom = currentRoom;
+  const requestedGeneration = roomViewGeneration;
+  const requestedPageGeneration = messagePageGeneration;
   try {
-    const url = `/api/messages_json?room_id=${encodeURIComponent(requestedRoom)}&since_id=${lastId}`;
+    const params = new URLSearchParams({room_id: requestedRoom});
+    if (!initial && legacyMessagesEndpoint) {
+      params.set('since_id', String(lastId));
+    } else {
+      params.set('limit', String(MESSAGE_PAGE_SIZE));
+      if (!initial) params.set('after_id', String(lastId));
+    }
+    const url = `/api/messages_json?${params}`;
     const resp = await apiFetch(url);
     const data = await resp.json();
     // A fetch from the previous room can finish after close/delete or a room
     // switch. It must not resurrect stale room state or move the footer back.
-    if (requestedRoom !== currentRoom) return;
+    if (requestedRoom !== currentRoom || requestedGeneration !== roomViewGeneration
+        || requestedPageGeneration !== messagePageGeneration) return;
+    if (typeof data.has_more !== 'boolean') legacyMessagesEndpoint = true;
 
     if (data.room) roomData = data.room;
     lastStatuses = data.statuses || {};
     lastPhases = data.phases || {};
     updateActivityStatuses(lastStatuses);
 
+    const boundary = initial ? null : lastId;
+    const page = normalizeMessagePage(data, initial ? 'latest' : 'updates', boundary);
+    latestKnownMessageId = Math.max(latestKnownMessageId, page.latestId);
+    if (page.messages.length) lastId = Math.max(lastId, Number(page.messages.at(-1).id) || 0);
+    else if (!page.hasMore) lastId = Math.max(lastId, latestKnownMessageId);
     if (initial) {
-      const list = document.getElementById('messages');
-      if (list) list.innerHTML = '';
-      msgMap = {};
-      roomMessages = [];
-      lastRenderedRound = null;
+      roomMessages = page.messages.slice(-MESSAGE_WINDOW_LIMIT);
+      hasOlderMessages = page.hasMore;
+      hasNewerMessages = false;
+      messageWindowAtTail = true;
+      renderMessageWindow(true);
+      updateAgentTranscripts(roomMessages);
+    } else if (page.messages.length && messageWindowAtTail) {
+      const additions = page.messages.filter(m => Number(m.id) > Number(roomMessages.at(-1)?.id || 0));
+      if (additions.length) {
+        roomMessages = mergeMessageWindow(roomMessages, additions, 'newer');
+        hasOlderMessages = hasOlderMessages || Number(roomMessages[0]?.id) > 1;
+        const list = document.getElementById('messages');
+        const oldHeight = list?.scrollHeight || 0;
+        const oldTop = list?.scrollTop || 0;
+        const keepAtEnd = list
+          ? list.scrollHeight - list.scrollTop - list.clientHeight < 32
+          : true;
+        renderMessageWindow(false);
+        updateAgentTranscripts(additions);
+        if (list) list.scrollTop = keepAtEnd
+          ? list.scrollHeight
+          : oldTop + (list.scrollHeight - oldHeight);
+      }
+      hasNewerMessages = false;
+    } else if (latestKnownMessageId > Number(roomMessages.at(-1)?.id || 0)) {
+      hasNewerMessages = true;
     }
-
-    const msgs = data.messages || [];
-    for (const m of msgs) renderOne(m);
-    roomMessages.push(...msgs);
-    updateAgentTranscripts(msgs);
-    if (msgs.length) lastId = msgs[msgs.length-1].id;
+    if (initial && roomMessages.length) lastId = Math.max(lastId, Number(roomMessages.at(-1).id) || 0);
+    updateMessagePageControls();
     if (roomData) {
       renderChatMeta(roomData, lastStatuses);
       renderRoomLanes(roomData, lastStatuses);
       updateFooterStatus();
     }
   } catch(e) {}
+}
+
+function normalizeMessagePage(data, direction, boundary = null, requestedLimit = MESSAGE_PAGE_SIZE) {
+  const all = (data.messages || []).slice().sort((a, b) => Number(a.id) - Number(b.id));
+  let messages = all;
+  if ((direction === 'older' || direction === 'focus') && boundary != null) messages = all.filter(m => Number(m.id) < boundary).slice(-requestedLimit);
+  else if (direction === 'newer' && boundary != null) messages = all.filter(m => Number(m.id) > boundary).slice(0, requestedLimit);
+  else if (direction === 'updates' && boundary != null) messages = all.filter(m => Number(m.id) > boundary).slice(0, requestedLimit);
+  else messages = all.slice(-requestedLimit);
+  const maxId = all.reduce((max, m) => Math.max(max, Number(m.id) || 0), 0);
+  const latestId = Math.max(Number(data.latest_id) || 0, maxId);
+  const hasMore = typeof data.has_more === 'boolean'
+    ? data.has_more
+    : direction === 'older' || direction === 'focus'
+      ? all.filter(m => Number(m.id) < (boundary || Infinity)).length > requestedLimit
+      : direction === 'newer' || direction === 'updates'
+        ? all.filter(m => Number(m.id) > (boundary || 0)).length > requestedLimit
+        : all.length > requestedLimit;
+  return {messages, hasMore, latestId};
+}
+
+function mergeMessageWindow(existing, incoming, direction, limit = MESSAGE_WINDOW_LIMIT) {
+  const byId = new Map((existing || []).map(message => [Number(message.id), message]));
+  for (const message of incoming || []) byId.set(Number(message.id), message);
+  const ordered = [...byId.values()].sort((a, b) => Number(a.id) - Number(b.id));
+  return direction === 'older' ? ordered.slice(0, limit) : ordered.slice(-limit);
+}
+
+function renderMessageWindow(resetScroll) {
+  const list = document.getElementById('messages');
+  if (!list) return;
+  const older = document.getElementById('messages-load-older');
+  const newer = document.getElementById('messages-load-newer');
+  list.replaceChildren();
+  if (older) list.appendChild(older);
+  if (newer) list.appendChild(newer);
+  agentMetaTotals = {};
+  document.querySelectorAll('.agent-panel-totals').forEach(tag => { tag.textContent = ''; });
+  msgMap = {};
+  lastRenderedRound = null;
+  for (const message of roomMessages) renderOne(message, false);
+  updateMessagePageControls();
+  if (resetScroll) list.scrollTop = list.scrollHeight;
+}
+
+function updateMessagePageControls() {
+  const older = document.getElementById('messages-load-older');
+  const newer = document.getElementById('messages-load-newer');
+  if (older) older.hidden = !hasOlderMessages;
+  if (newer) newer.hidden = !hasNewerMessages;
+}
+
+async function loadMessagePage(direction, focusId = null) {
+  if (!currentRoom) return;
+  const roomId = currentRoom;
+  const roomGeneration = roomViewGeneration;
+  const pageGeneration = ++messagePageGeneration;
+  const boundary = direction === 'older'
+    ? Number(roomMessages[0]?.id)
+    : direction === 'newer'
+      ? Number(roomMessages.at(-1)?.id)
+      : Number(focusId) + 1;
+  if (!Number.isSafeInteger(boundary) || boundary <= 0) return;
+  const params = new URLSearchParams({room_id: roomId, limit: String(MESSAGE_PAGE_SIZE)});
+  if (direction === 'older') params.set('before_id', String(boundary));
+  else if (direction === 'newer') params.set('after_id', String(boundary));
+  else params.set('before_id', String(boundary));
+  const button = document.getElementById(direction === 'older' ? 'messages-load-older' : 'messages-load-newer');
+  if (button) button.disabled = true;
+  try {
+    const response = await apiFetch(`/api/messages_json?${params}`);
+    const data = await response.json();
+    if (roomId !== currentRoom || roomGeneration !== roomViewGeneration
+        || pageGeneration !== messagePageGeneration) return;
+    const page = normalizeMessagePage(data, direction, boundary);
+    latestKnownMessageId = Math.max(latestKnownMessageId, page.latestId);
+    if (page.messages.length) lastId = Math.max(lastId, Number(page.messages.at(-1).id) || 0);
+    if (direction === 'older') {
+      roomMessages = mergeMessageWindow(roomMessages, page.messages, 'older');
+      hasOlderMessages = page.hasMore;
+      hasNewerMessages = Number(roomMessages.at(-1)?.id || 0) < latestKnownMessageId;
+      messageWindowAtTail = false;
+      renderMessageWindow(false);
+      const list = document.getElementById('messages');
+      if (list) list.scrollTop = 0;
+      refreshAgentTranscripts();
+    } else if (direction === 'newer') {
+      roomMessages = mergeMessageWindow(roomMessages, page.messages, 'newer');
+      hasNewerMessages = page.hasMore || Number(roomMessages.at(-1)?.id || 0) < latestKnownMessageId;
+      hasOlderMessages = hasOlderMessages || Number(roomMessages[0]?.id || 0) > 1;
+      messageWindowAtTail = !hasNewerMessages;
+      renderMessageWindow(true);
+      refreshAgentTranscripts();
+    } else {
+      roomMessages = mergeMessageWindow([], page.messages, 'newer');
+      hasOlderMessages = page.hasMore;
+      hasNewerMessages = Number(roomMessages.at(-1)?.id || 0) < latestKnownMessageId;
+      messageWindowAtTail = false;
+      renderMessageWindow(false);
+      const target = document.querySelector(`#messages .msg[data-id="${focusId}"]`);
+      target?.scrollIntoView({block: 'center'});
+      refreshAgentTranscripts();
+    }
+    updateMessagePageControls();
+    if (roomData) renderRoomLanes(roomData, lastStatuses);
+  } catch (error) {
+    if (roomId === currentRoom && roomGeneration === roomViewGeneration
+        && pageGeneration === messagePageGeneration) {
+      showDashboardNotice(t('history.loadError').replace('{error}', error.message), t('history.retry'), () => loadMessagePage(direction, focusId));
+    }
+  } finally {
+    if (button) button.disabled = false;
+  }
 }
 
 function replyButton(message) {
@@ -2468,6 +2663,31 @@ function replyButton(message) {
     if (input) input.focus();
   };
   return button;
+}
+
+async function navigateToMessage(messageId) {
+  const id = Number(messageId);
+  if (!Number.isSafeInteger(id) || id <= 0) return;
+  const roomId = currentRoom;
+  const roomGeneration = roomViewGeneration;
+  const navigationGeneration = ++messageNavigationGeneration;
+  // Supersede any older page request, even when this target is already loaded.
+  messagePageGeneration += 1;
+  let target = document.querySelector(`#messages .msg[data-id="${id}"]`);
+  if (!target) {
+    const pendingPage = loadMessagePage('focus', id);
+    const focusPageGeneration = messagePageGeneration;
+    await pendingPage;
+    if (roomId !== currentRoom || roomGeneration !== roomViewGeneration
+        || navigationGeneration !== messageNavigationGeneration
+        || focusPageGeneration !== messagePageGeneration) return;
+    target = document.querySelector(`#messages .msg[data-id="${id}"]`);
+  }
+  if (!target || roomId !== currentRoom || roomGeneration !== roomViewGeneration
+      || navigationGeneration !== messageNavigationGeneration) return;
+  target.scrollIntoView({block: 'center'});
+  target.classList.add('lane-flash');
+  setTimeout(() => target.classList.remove('lane-flash'), 1500);
 }
 
 function renderComposerReplyTarget() {
@@ -2527,6 +2747,7 @@ async function sendMsg() {
 }
 
 function clearSelectedRoom() {
+  roomViewGeneration += 1;
   closeAgentStreams();
   currentRoom = null;
   selectedReplyTarget = null;
@@ -2655,16 +2876,16 @@ async function bulkNuke() {
 document.addEventListener('click', e => {
   const item = e.target.closest('.room-item');
   if (item) {
-    openRoom(item.dataset.id, item.dataset.owner).then(() => {
-      if (item.dataset.messageId) {
+    const opening = openRoom(item.dataset.id, item.dataset.owner);
+    const expectedRoomGeneration = roomViewGeneration;
+    opening.then(() => {
+      if (currentRoom !== item.dataset.id || roomViewGeneration !== expectedRoomGeneration
+          || !item.dataset.messageId) return;
+      navigateToMessage(item.dataset.messageId).then(() => {
+        if (currentRoom !== item.dataset.id) return;
         const match = document.querySelector(`#messages .msg[data-id="${item.dataset.messageId}"]`);
-        if (match) {
-          document.querySelectorAll('#messages .msg.is-search-hit').forEach(x => x.classList.remove('is-search-hit'));
-          match.classList.add('is-search-hit', 'lane-flash');
-          match.scrollIntoView({block: 'center'});
-          setTimeout(() => match.classList.remove('lane-flash'), 1500);
-        }
-      }
+        if (match) match.classList.add('is-search-hit');
+      });
     });
     return;
   }

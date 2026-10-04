@@ -9,7 +9,7 @@ text through unchanged. Implementation: `src/mcp_huddle/delivery/`.
 
 ## Tools
 
-### `message_send(to, text, mode="auto", from_name="", reply_to="", idempotency_key="", room_id="")`
+### `message_send(to, text, mode="auto", from_name="", reply_to="", idempotency_key="", room_id="", native_routes=None)`
 
 `room_id` lets
 Huddle verify the caller's own identity when it's a swarm pilot member, so
@@ -30,6 +30,29 @@ is treated as a forced single method (either a bare token resolved against
 the target's harness, e.g. `"resume"` -> `"codex.resume"`, or a full method
 id, e.g. `"claude.native"`, or `"spool"`); no fallback is attempted for a
 forced mode — if that one method isn't applicable, `delivered` is `false`.
+
+An optional `native_routes` list lets a caller declare a concrete native tool
+for an exact target:
+
+```json
+[{"target":"codex:THREAD_ID","tool":"mcp__codex_app__send_message_to_thread",
+  "reason":"This tool is available here and can reach that thread."}]
+```
+
+When `target` exactly matches the requested target (`harness:id` after
+resolution, or the original `to` string), Huddle returns
+`reason: "native_route_required"`, `suggested_tool`, and a short explanation.
+It makes no delivery attempt, writes no spool, and does not fall back to a
+different transport. The existing read-only-caller and Huddle-owned-session
+checks run first.
+
+This declaration is caller-provided and self-reported. The MCP protocol does
+not tell Huddle which native tools the agent can currently call. Declare only
+tools actually exposed in the current caller session, and only for the exact
+destination they can reach. If native availability is unknown, omit the
+declaration; Huddle keeps its configured cross-harness delivery behavior.
+This guard covers `message_send` only. It does not block persistent room,
+council, relay, team, or swarm workflows.
 
 ### `message_targets(harness="")`
 
