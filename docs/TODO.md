@@ -2,6 +2,12 @@
 
 Open items, roughly by priority.
 
+## Distribution and multi-device follow-up
+
+- [ ] **Cloud coordinator + per-device executors.** Keep room history and SQLite on one server; authenticated local executors own native sessions and project folders. Support local and cloud clients, offline status, durable job claims and deduplicated delivery. Start with private networking; external HTTPS requires an explicit authentication design. Preserve native-first routing. This is future work, not implemented cloud support.
+- [ ] Persistent dashboard service installation for macOS/Linux and an explicit uninstall/restore command. Current setup starts a detached server only; reboot requires another start.
+- [ ] Verified MCP adapters for additional harness versions; report unsupported integrations rather than inventing keys. Native Windows requires replacement of POSIX file locking.
+
 ## Spawn / agents
 - [ ] **Interactive agent sessions (option).** Today every turn is a fresh
   one-shot subprocess (`cd <project> && codex exec / claude -p "<brief>"`),
