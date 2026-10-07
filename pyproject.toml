@@ -37,6 +37,7 @@ dev = [
 
 [project.scripts]
 mcp-huddle = "mcp_huddle.__main__:main"
+mcp-huddle-setup = "mcp_huddle.setup:cli"
 
 [project.urls]
 Homepage = "https://github.com/kolotovalexander/mcp-huddle"
@@ -49,6 +50,7 @@ packages = ["src/mcp_huddle"]
 # Ship only source + docs/examples/tests; never local runtime/dev state.
 include = [
     "/src",
+    "/install.py",
     "/tests",
     "/docs",
     "/examples",

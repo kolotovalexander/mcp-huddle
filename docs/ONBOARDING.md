@@ -1,120 +1,37 @@
-# Onboarding mcp-huddle — paste-a-prompt setup
+# Install Huddle by sending a repository link
 
-You don't have to wire huddle up by hand. Open your AI coding agent (Claude
-Code, Codex, Antigravity, …), fill in the short block below, and paste the whole
-thing. The agent will install huddle, register it as an MCP server for each tool
-you use, install the hooks, and write a spawn registry for your agents.
+Send this message to your coding agent:
 
----
+> Install https://github.com/kolotovalexander/mcp-huddle on this device. Read and follow the bundled huddle-install Skill at src/mcp_huddle/skills/huddle-install/SKILL.md. Discover available agent clients, configure Huddle MCP and install its Skills for them. Preserve my existing settings. Complete setup and report anything that needs my login or approval.
 
-## The prompt (fill in the `>>> ... <<<` part, then paste it to your agent)
+No AgentSync, Jev, 9router or personal configuration is required. Use the source checkout for the current features; an older PyPI release can contain different functionality.
 
-```
-You are setting up "mcp-huddle" (https://github.com/kolotovalexander/mcp-huddle)
-on my machine. It is a persistent multi-agent chat MCP server: AI agents join
-rooms and discuss. Use Huddle's read-only transform where the selected CLI
-supports it (Claude and Codex). Do not describe Antigravity as read-only: its
-CLI has no enforced read-only mode. MiMo must stay in its neutral temp cwd, and
-cloud API runners may only read the room and post their validated reply.
+## One command after cloning
 
->>> MY AGENTS (edit this list) <<<
-- Claude Code  — CLI, command: claude        (I use it: yes/no)
-- Codex        — CLI, command: codex         (I use it: yes/no)
-- Antigravity  — CLI, command: agy           (I use it: yes/no, logged in: yes/no)
-- A cloud API agent — provider: <e.g. OpenAI>, base_url: <https://api.openai.com/v1>,
-  model: <gpt-4o>, API key env var: <OPENAI_API_KEY>   (I use it: yes/no)
->>> END <<<
+Requirements: macOS/Linux (or WSL), Python 3.11+, network access for Python package installation. The server uses POSIX file locking; native Windows is not supported yet. Your agents must already be installed. Login remains with their native tools.
 
-Do this, step by step, asking me only if something is ambiguous:
-
-1. Install huddle: `pipx install mcp-huddle` (or `pip install --user mcp-huddle`).
-   Confirm `mcp-huddle --version` works.
-2. Ask whether I want `MCP_HUDDLE_TOKEN` enabled. If yes, have me provide or
-   generate a strong value outside registry files, export it before starting
-   the HTTP server, and configure each trusted HTTP MCP client to send it as a
-   Bearer token or `X-Huddle-Token`. Explain that it is server-wide, not
-   room-scoped, before passing it to any spawned reviewer. Then start the HTTP server once:
-   `mcp-huddle --http`
-   (dashboard + MCP at http://127.0.0.1:8014 ; MCP endpoint is /mcp). Leave it
-   running (or set it up as a background service). The MCP URL is
-   http://127.0.0.1:8014/mcp .
-3. Register huddle as an MCP server for each CLI agent I marked "yes":
-   - Claude Code:  `claude mcp add --transport http huddle http://127.0.0.1:8014/mcp`
-   - Codex (~/.codex/config.toml): add
-       [mcp_servers.huddle]
-       url = "http://127.0.0.1:8014/mcp"
-   - Antigravity (~/.gemini/settings.json): add to "mcpServers":
-       "huddle": { "httpUrl": "http://127.0.0.1:8014/mcp", "timeout": 30000 }
-     (Antigravity must be logged in first — run `agy` once and complete login.)
-4. Install the hooks: `mcp-huddle --install-hooks` and wire the printed snippet
-   into the relevant agent's settings (e.g. ~/.claude/settings.json) so I get
-   notified of pending huddle requests and rooms close on exit.
-5. Write ~/.mcp-huddle/registry.json enabling ONLY the agents I marked "yes".
-   - For CLI agents, copy the matching default spec (see examples/registry.json).
-   - For a cloud API agent, add a runner entry (no CLI needed):
-       {
-         "name": "<DisplayName>",
-         "cmd": ["python","-m","mcp_huddle.openai_compatible_runner",
-                 "--agent","<DisplayName>",
-                 "--base-url","<base_url>","--model","<model>",
-                 "--api-key-env","<API_KEY_ENV_VAR>","--brief","{brief}"],
-         "enabled": true
-       }
-   The runner's `--api-key-env` automatically opts that one named variable into
-   the otherwise scrubbed child environment. For any other custom CLI variable,
-   add its exact name to the entry's `"pass_env": ["NAME"]`; never put secret
-   values in registry JSON. Keep agents I marked "no" out of the registry.
-6. Tell me which env vars to set (e.g. MCP_HUDDLE_ANTIGRAVITY_ENABLED=1 if I
-   enabled Antigravity; the API key env var for any API agent), and how to keep
-   the server running. Then verify: open http://127.0.0.1:8014/dashboard (enter
-   the token when prompted, if enabled) and, from one agent, call room_create +
-   message_post to confirm round-trip.
-
-Read https://github.com/kolotovalexander/mcp-huddle README for tool names and
-configuration before writing any config. Do not enable agents I didn't list.
+```sh
+git clone https://github.com/kolotovalexander/mcp-huddle.git
+cd mcp-huddle
+python3 install.py --apply --start
 ```
 
----
+Without `--apply`, `python3 install.py` only previews detected clients. Installation creates an isolated environment in `~/.mcp-huddle/venv`; it does not modify your system Python. Existing custom home overrides or a token-protected Huddle deployment require native setup and are preserved. Client settings are merged or registered through native commands. Conflicting Huddle entries and unsupported formats are retained and reported. Original changed settings are backed up under `~/.mcp-huddle/setup-backups/`; keep these private because your original configuration can contain credentials.
 
-## How agents participate (so you can reason about the setup)
+The setup report is `~/.mcp-huddle/setup-report.json`. It distinguishes installed Skills, configured MCP clients and deferred work. Binary/config discovery does not prove login, remaining quota, supported model or successful agent execution. No model prompt is sent by the installer.
 
-Each turn is a **one-shot spawn** (`cd <project> && <agent> ...`), re-run when a
-message is addressed to the agent. There are two ways an agent's reply reaches a
-room:
+## Supported clients
 
-| Kind | How it joins | Registry `cmd` |
-|------|-------------|----------------|
-| **CLI + MCP** (Claude, Codex, Antigravity, OpenCode) | The CLI is spawned with the room brief and calls huddle's MCP tools itself (`message_post`). Needs huddle registered as an MCP server for that CLI (step 3). OpenCode is a built-in opt-in slot (`MCP_HUDDLE_OPENCODE_ENABLED=1`); headless it is effectively read-only, since its `"ask"` permissions auto-reject with no TTY. | the CLI invocation |
-| **CLI runner** (MiMo) | A Python runner calls the CLI without MCP and posts the reply via the bus. Used when the CLI can't speak MCP. | `python -m mcp_huddle.mimo_runner …` |
-| **Cloud API** (OpenAI/Anthropic-compatible) | `openai_compatible_runner` reads the room, calls `<base_url>/chat/completions` with your key, and posts the reply via the bus. **No CLI, no MCP needed on the agent side.** | `python -m mcp_huddle.openai_compatible_runner --base-url … --model … --api-key-env … --brief "{brief}"` |
+Claude Code and Codex use native registration commands. Antigravity and Hermes also use native configuration commands. Gemini CLI and OpenCode use their supported local JSON formats. Custom profile paths and incompatible configurations are reported for native setup. Disabled managed-spawn profiles are created for Codex, Claude, Antigravity and OpenCode; enable selected profiles in ~/.mcp-huddle/registry.json after checking native login/model availability. Antigravity has no enforced read-only transform; Gemini/Hermes may connect as participants, but managed-spawn profiles are not bundled. Unsupported or unavailable environments are not silently considered installed. Review the report after every setup.
 
-### "What if my agent is only an API (no CLI)?"
+Huddle provides two bundled Skills: `huddle-install` for setup and `huddle` for native-first routing, room modes, permissions and delivery. Newly installed Skills may require a new agent session. Agents communicate in English; human summaries use the user's language.
 
-Use the **cloud API** row above. `openai_compatible_runner` speaks the
-OpenAI-compatible `/chat/completions` shape and authenticates with
-`Authorization: Bearer $<API_KEY_ENV_VAR>` (set `--api-key-env`). It works with
-any OpenAI-compatible endpoint (OpenAI, OpenRouter, local llama.cpp/vLLM,
-Anthropic via a compatible proxy, etc.). The key is read from the environment;
-the variable named by `--api-key-env` is the only provider credential
-automatically copied into that child process. Never hard-code the value in the
-registry.
+## Start, update and verify
 
-## Read-only by default
+The dashboard is http://127.0.0.1:8014/dashboard; MCP clients connect to http://127.0.0.1:8014/mcp. `--start` starts a detached process with logs in `~/.mcp-huddle/logs/setup-server.log`. It does not install automatic startup after reboot. An existing listener is retained. Setup checks MCP initialization and the required Huddle tool names without launching agents or creating rooms. Do not terminate an unknown process to free the port.
 
-`MCP_HUDDLE_READONLY` defaults to ON and is enforced by Huddle's reviewed
-Claude and Codex command transforms. Set `=0` only when you deliberately want a
-full-access worker. Antigravity has no equivalent enforced read-only flag;
-MiMo is isolated from the project by a temporary cwd. API-runner agents only
-read the room and post a validated reply. All spawned children receive a
-minimal environment plus explicit `pass_env` names; this does not replace the
-CLI's own filesystem or OS sandbox.
+After reboot, run the installed environment's `mcp-huddle --http`, or rerun setup with `--start`. To update, preserve checkout changes, fetch the chosen revision, and rerun installation. A running server still uses its loaded code: arrange a controlled restart of the owned process to activate Python changes. Installation does not restart existing services.
 
-## Manual fallback (the same steps without an agent)
+Verify from one configured client: list MCP tools, create a room with `auto_spawn=False`, post a comment, read it back and close the room. This checks connectivity without invoking a paid model. Before using managed modes, verify login and choose an available profile/model. See [README](../README.md), [mode and delivery Skill](../src/mcp_huddle/skills/huddle/SKILL.md), and [backups](OPS_BACKUPS.md).
 
-```bash
-pipx install mcp-huddle
-mcp-huddle --http &                               # dashboard+MCP on :8014
-claude mcp add --transport http huddle http://127.0.0.1:8014/mcp
-mcp-huddle --install-hooks                          # then wire the printed snippet
-$EDITOR ~/.mcp-huddle/registry.json                 # see examples/registry.json
-```
+Keep Huddle local. External network access and multiple devices are future work in [TODO](TODO.md). Configuration does not disable client safeguards, grant write access to projects or install agent applications.

@@ -10,10 +10,13 @@
 
 ## Install
 
-> **One-paste setup:** instead of wiring this up by hand, see
-> [`docs/ONBOARDING.md`](docs/ONBOARDING.md) — fill in which agents you use
-> (CLI or cloud API) and paste the prompt to your AI agent; it installs huddle,
-> registers the MCP server, installs hooks, and writes your spawn registry.
+**Install by sending a link to your agent:**
+
+> Install https://github.com/kolotovalexander/mcp-huddle on this device using its bundled huddle-install Skill. Configure available local clients and install the Huddle Skills, preserving existing settings.
+
+Or clone this repository and run `python3 install.py --apply --start`. The installer creates a private Python environment and a per-client setup report. Supported server platforms: macOS, Linux and WSL; Python 3.11+. See [onboarding and limitations](docs/ONBOARDING.md).
+
+The package commands below are alternatives; use the checkout installer for current source features.
 
 ```bash
 pip install mcp-huddle
@@ -25,9 +28,7 @@ Or run it without installing, using [`uvx`](https://docs.astral.sh/uv/):
 uvx mcp-huddle --http        # HTTP + dashboard
 ```
 
-PyPI currently provides **v0.6.0** under the MIT License. The current source
-tree is **v0.7.0.dev0** under PolyForm Noncommercial 1.0.0. See
-[CHANGELOG.md](CHANGELOG.md) for release notes.
+Published packages can lag the repository. This source installer uses the checked-out revision. The current source is under PolyForm Noncommercial 1.0.0; see [LICENSE](LICENSE) for sharing and usage terms and [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## Two ways to run
 
@@ -37,7 +38,7 @@ tree is **v0.7.0.dev0** under PolyForm Noncommercial 1.0.0. See
 
 Each client spawns its own `mcp-huddle` process and communicates via JSON-RPC over stdin/stdout. Use either the PyPI-installed `mcp-huddle` binary or `uvx mcp-huddle`.
 
-**Claude Code** — edit `~/.claude/.mcp.json`:
+**Claude Code** — prefer native user registration (`claude mcp add --scope user huddle uvx mcp-huddle`). A project-local `.mcp.json` has this shape:
 
 ```json
 {
@@ -58,7 +59,7 @@ command = "uvx"
 args = ["mcp-huddle"]
 ```
 
-**Antigravity** (`agy`, Google-model slot — uses the `~/.gemini` config home) — add to `~/.gemini/config.json` `mcpServers`:
+**Antigravity** (`agy`, Google-model slot — uses the `~/.gemini` config home) — add to `~/.gemini/config/mcp_config.json` `mcpServers`:
 
 ```json
 {
