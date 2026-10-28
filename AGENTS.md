@@ -1,31 +1,22 @@
-<!-- AGENTSYNC-GENERATED v1
-canon_file: CLAUDE.md
-canon_agent: claude
-canon_hash: sha256:41c8dd46575e349ead7ad13012647c6122d6c6526317309a7ea08021056215d4
-body_hash: sha256:364cbf5726fbeec8e583c26e99e2a2d583b12c8d96e45e8a80c96350c717c87e
-render_rules_hash: sha256:c05a3284711a2baf049f656149b22bf11e7c0df5443924bf48240c5c3184c624
-generated_at: 2026-09-09T15:24:30Z
--->
-# AGENTS.md — working on mcp-huddle
+# CLAUDE.md — working on mcp-huddle
 
-Guidance for AI agents and humans editing this repo. User-facing docs:
-[README.md](README.md); onboarding: [docs/ONBOARDING.md](docs/ONBOARDING.md);
-open work: [docs/TODO.md](docs/TODO.md).
+Guidance for AI agents (and humans) editing this repo. User-facing docs:
+`README.md`; onboarding: `docs/ONBOARDING.md`; open work: `docs/TODO.md`.
 
 ## What this is
 A persistent multi-agent chat MCP server. AI agents join rooms and discuss;
 a web dashboard lets humans watch/intervene. Two run modes (one binary):
 `mcp-huddle` (stdio MCP) and `mcp-huddle --http` (HTTP MCP + dashboard on :8014).
 
-## Layout
+## Layout (deep modules, clear seams)
 - `src/mcp_huddle/server.py` — MCP tools + HTTP/SSE routes + spawn/wake
-  orchestration. Public surface; keep tool/route signatures stable.
+  orchestration. The public surface; keep tool/route signatures stable.
 - `src/mcp_huddle/bus.py` — file-locked room/message/meta store with an
-  in-process message cache. Concurrency-critical: never change lock ordering or
-  acquire two locks at once; additions must stay defensive.
+  in-process message cache. **Concurrency-critical**: never change lock
+  ordering or acquire two locks at once; additions must stay defensive.
 - `src/mcp_huddle/spawn.py` — agent registry + spawning. Agents are spawned
-  one-shot per turn (`cd <project> && <cli> ...`), re-woken per addressed
-  message; Codex resumes its thread. `DEFAULT_REGISTRY`, read-only transform
+  one-shot per turn (`cd <project> && <cli> …`), re-woken per addressed message;
+  Codex resumes its thread. `DEFAULT_REGISTRY`, read-only transform
   (`_apply_readonly`, default ON), on-disk registry merge.
 - `src/mcp_huddle/child_processes.py` — process-local ownership of exact
   `Popen` objects. Persisted PIDs are diagnostics only: never signal, clear or
@@ -35,29 +26,31 @@ a web dashboard lets humans watch/intervene. Two run modes (one binary):
   model, post via the bus. Both validate output before posting.
 - `src/mcp_huddle/__main__.py` — CLI (argparse): `--http`, `--port`,
   `--version`, `--install-hooks`.
-- `src/mcp_huddle/static/{dashboard.html,css,js}` — dashboard (vanilla JS, no
-  build step). Themes axis `data-theme`, skin axis `data-skin`, palette axis
+- `src/mcp_huddle/static/{dashboard.html,css,js}` — the dashboard (vanilla JS,
+  no build step). Themes axis `data-theme`, skin axis `data-skin`, palette axis
   `data-palette`, language `data-lang`; settings popover + i18n live in
   `dashboard.js`.
 
 ## Conventions
-- Python 3.11+ stdlib only; no third-party runtime code beyond `mcp` /
-  starlette / uvicorn. Keep it dependency-light.
-- Agents are read-only discussants by default where the CLI supports an
+- Python 3.11+ stdlib only (no third-party in runtime code beyond `mcp` /
+  starlette / uvicorn). Keep it dependency-light.
+- Agents are **read-only discussants by default** where the CLI supports an
   enforced transform (`MCP_HUDDLE_READONLY`; currently Claude and Codex).
-  Antigravity has no enforced read-only mode; MiMo uses a neutral temp cwd. Do
-  not claim environment scrubbing is an OS/filesystem sandbox.
-- New agent slots: prefer `~/.mcp-huddle/registry.json` or
+  Antigravity has no enforced read-only mode; MiMo instead uses a neutral temp
+  cwd. Do not claim that environment scrubbing is an OS/filesystem sandbox.
+- New agent slots: prefer a `~/.mcp-huddle/registry.json` entry or the
   `openai_compatible_runner` over hard-coding; cloud APIs use `--api-key-env`.
-  Child environments are allowlisted: use `pass_env` for required names, never
-  values. The variable named by `--api-key-env` is copied automatically.
-- `registry.json` merges by `name` and REPLACES the whole entry; an override for
-  an existing default agent must carry its full `cmd`.
-- While the owning server is running, it announces known woken-agent failures
-  (rate-limit, spawn exception, error exit, silent exit, hung wake) in the room;
-  do not build orchestrator-side polling/timeout logic for this.
-- Dashboard JS: no framework, no bundler. Edit files directly. UI strings go
-  through `t()` / `data-i18n`.
+  Child environments are allowlisted: use `pass_env` for other required names,
+  never values. The variable named by `--api-key-env` is copied automatically.
+  Note: merging in `registry.json` is by `name` and REPLACES the whole entry —
+  an override for an existing default agent must carry its full `cmd`.
+- While the owning server is running, it announces the known ways a woken agent
+  can fail to reply (rate-limit, spawn exception, error exit, silent exit, hung wake — see
+  `server.py::_handle_rate_limit_on_exit` / `_announce_spawn_failure` /
+  `_announce_noreply_on_exit` / `_check_stuck_wakes`). Don't build
+  orchestrator-side polling/timeout logic for this — read the room instead.
+- Dashboard JS: no framework, no bundler — edit the files directly. UI strings
+  go through `t()` / `data-i18n`.
 - Keep every HTTP data/action/MCP route behind the default-deny guard when
   `MCP_HUDDLE_TOKEN` is set. The dashboard may retain only its derived
   process-local credential in memory; never put the raw token in URLs, cookies
@@ -71,14 +64,13 @@ a web dashboard lets humans watch/intervene. Two run modes (one binary):
 
 ## Verify before claiming done
 ```bash
-.venv/bin/pytest tests/ -q
-node --check src/mcp_huddle/static/dashboard.js
+.venv/bin/pytest tests/ -q          # full suite
+node --check src/mcp_huddle/static/dashboard.js   # JS syntax
 .venv/bin/python -m compileall -q src/mcp_huddle
 .venv/bin/python -m pip check
 ```
-
-For dashboard changes, the server serves files fresh (no-cache): reload the
-browser. Python changes (server/spawn) require a server restart to go live.
+For dashboard changes, the server serves files fresh (no-cache) — just reload
+the browser. Python changes (server/spawn) require a server restart to go live.
 
 ## Don't
 - Don't break `bus.py` locking or `server.py` tool/route signatures.
